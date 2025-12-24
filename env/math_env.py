@@ -107,7 +107,7 @@ class MathEnv:
             return ActionSpace(allowed_token_ids=self.z_token_ids)
         elif st.phase == "answer":
             if st.digit_step_idx == 0:
-                return ActionSpace(allowed_token_ids=self.z_token_ids[1:])
+                return ActionSpace(allowed_token_ids=self.digit_token_ids[1:])
             return ActionSpace(allowed_token_ids=self.digit_token_ids)
         elif st.phase == "done":
             return ActionSpace(allowed_token_ids=[])  # no actions allowed
