@@ -53,7 +53,7 @@ def compute_advantages(
         if not torch.isfinite(mean) or not torch.isfinite(std):
             raise RuntimeError("Non-finite mean/std encountered during advantage normalization.")
         if std <= 0:
-            raise RuntimeError("Standard deviation is non-positive; cannot normalize advantages.")
+            raise RuntimeError(f"Standard deviation is non-positive; cannot normalize advantages. std={std.item()}")
         adv = (adv - mean) / (std + eps)
 
         # Required checks after normalization
