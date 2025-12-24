@@ -145,19 +145,28 @@ def compute_ppo_losses(
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
 
-    print("[PPO DEBUG]")
-    for i in range(actions.shape[0]):
+    print("\n[PPO STEP DEBUG]")
+    for i in range(N):
         print(f" step {i}:")
-        print("  phase:", phases[i])
-        print("  action:", int(actions[i].item()))
-        print("  reward:", float(rewards[i].item()))
-        print("  value_new:", float(values_new[i].item()))
-        print("  advantage:", float(advantages[i].item()))
-        print("  logprob_old:", float(logprob_old[i].item()))
-        print("  logprob_new:", float(logprob_new[i].item()))
-        print("  ratio:", float(ratio[i].item()))
-        print("  entropy:", float(entropy_new[i].item()))
+        print(f"  phase: {phases[i]}")
+        print(f"  action_id: {actions[i].item()}")
+        if tokenizer is not None:
+            print(f"  action_tok: {tokenizer.convert_ids_to_tokens([actions[i].item()])[0]}")
+        print(f"  reward: {rewards[i].item():.3f}")
+        print(f"  value_new: {values_new[i].item():.3f}")
+        print(f"  advantage: {advantages[i].item():.3f}")
+        print(f"  logprob_old: {logprob_old[i].item():.3f}")
+        print(f"  logprob_new: {logprob_new[i].item():.3f}")
+        print(f"  ratio: {ratio[i].item():.3f}")
+        print(f"  entropy: {entropy_new[i].item():.3f}")
         print("-----")
+
+    print("[PPO AGGREGATES]")
+    print(" policy_loss:", policy_loss.item())
+    print(" value_loss:", value_loss.item())
+    print(" entropy_loss:", entropy_loss.item())
+    print(" ratio_mean:", ratio.mean().item())
+    print(" ratio_std:", ratio.std().item())
 
     return {
         "policy_loss": policy_loss,
