@@ -86,21 +86,12 @@ def collect_rollout(
             if latent_strategy != "sample":
                 raise ValueError(f"Unsupported latent decoding strategy: {latent_strategy}")
             # Apply temperature for sampling (decoding-only; policy unchanged)
-            probs = torch.softmax(masked_logits[0], dim=-1)
-            allowed_ids = torch.nonzero(probs > 1e-10, as_tuple=False).squeeze(-1).tolist()
-            allowed_tokens = tokenizer.convert_ids_to_tokens(allowed_ids)
-            print(f"[LATENT] allowed tokens (p>1e-4): {allowed_tokens}")
-
             logits_for_sampling = masked_logits / latent_temperature
             dist = torch.distributions.Categorical(logits=logits_for_sampling)
             action = dist.sample()  # [1]
             entropy = dist.entropy()  # [1]
         elif phase == "answer":
             if answer_strategy == "greedy":
-                probs = torch.softmax(masked_logits[0], dim=-1)
-                allowed_ids = torch.nonzero(probs > 1e-4, as_tuple=False).squeeze(-1).tolist()
-                allowed_tokens = tokenizer.convert_ids_to_tokens(allowed_ids)
-                print(f"[LATENT] allowed tokens (p>1e-4): {allowed_tokens}")
                 action = torch.argmax(masked_logits, dim=-1)  # [1]
                 entropy = torch.zeros_like(value_t)  # [1]
             else:
@@ -153,7 +144,7 @@ def collect_rollout(
         raise RuntimeError(f"Recorded digit actions {digit_count} != length_ans {st.length_ans}")
     if not (len(actions) == len(logprobs) == len(values) == len(entropies) == len(phases) == len(input_ids_steps) == len(attention_mask_steps) == len(inserted_token_ids_steps)):
         raise RuntimeError("Step list lengths mismatch.")
-    raise
+
     return {
         "K": st.K,
         "length_ans": st.length_ans,
