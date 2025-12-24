@@ -64,7 +64,9 @@ def _apply_embedding_freeze(model, tokenizer, z_token_ids: List[int], answer_tok
     vocab_size = weight.shape[0]
 
     # Build mask: 1 for z-token rows, 0 otherwise (including answer token)
-    mask = torch.zeros(vocab_size, dtype=weight.dtype, device=weight.device)
+    mask = torch.zeros(vocab_size, dtype=weight.dtype)
+    model.register_buffer("_z_grad_mask", mask)
+
     for i in z_token_ids:
         if not (0 <= i < vocab_size):
             raise ValueError(f"z-token id {i} out of embedding range 0..{vocab_size-1}")
@@ -77,7 +79,7 @@ def _apply_embedding_freeze(model, tokenizer, z_token_ids: List[int], answer_tok
     weight.requires_grad_(True)
 
     def grad_mask_hook(grad):
-        # grad shape: [vocab_size, embed_dim]
+        mask = model._z_grad_mask.to(grad.device)
         return grad * mask.unsqueeze(1)
 
     # Remove existing hooks if any to avoid stacking
