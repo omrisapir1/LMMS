@@ -146,15 +146,18 @@ def compute_ppo_losses(
             raise RuntimeError(f"Non-finite values detected in {name}.")
 
     print("[PPO DEBUG]")
-    print(" action:", actions.item())
-    print(" phase:", phases[0])
-    print(" reward:", rewards.item())
-    print(" advantage:", advantages.item())
-    print(" value_new:", values_new.item())
-    print(" logprob_old:", logprob_old.item())
-    print(" logprob_new:", logprob_new.item())
-    print(" ratio:", ratio.item())
-    print(" entropy:", entropy_new.item())
+    for i in range(actions.shape[0]):
+        print(f" step {i}:")
+        print("  phase:", phases[i])
+        print("  action:", int(actions[i].item()))
+        print("  reward:", float(rewards[i].item()))
+        print("  value_new:", float(values_new[i].item()))
+        print("  advantage:", float(advantages[i].item()))
+        print("  logprob_old:", float(logprob_old[i].item()))
+        print("  logprob_new:", float(logprob_new[i].item()))
+        print("  ratio:", float(ratio[i].item()))
+        print("  entropy:", float(entropy_new[i].item()))
+        print("-----")
 
     return {
         "policy_loss": policy_loss,
