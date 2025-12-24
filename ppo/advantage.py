@@ -62,6 +62,7 @@ def compute_advantages(
         if not torch.isfinite(adv).all():
             raise RuntimeError("Non-finite values encountered in normalized advantages.")
         if abs(float(adv.mean().item())) >= 1e-5:
-            raise RuntimeError("Normalized advantages mean is not ~0.")
+
+            raise RuntimeError(f"Normalized advantages mean is not ~0. anomalous mean={adv.mean().item()}")
 
     return adv
