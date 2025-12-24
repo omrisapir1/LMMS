@@ -73,7 +73,8 @@ rollout:
     strategy: sample
     temperature: 1.0
   answer:
-    strategy: greedy
+    strategy: sample
+    temperature: 1.0
 
 # ----------------------------
 # PPO Training

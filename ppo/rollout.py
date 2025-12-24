@@ -37,7 +37,8 @@ def collect_rollout(
     answer_cfg = rollout_cfg["answer"]
     latent_strategy = str(latent_cfg["strategy"])  # expected "sample"
     latent_temperature = float(latent_cfg["temperature"])  # e.g., 1.0
-    answer_strategy = str(answer_cfg["strategy"])  # expected "greedy"
+    answer_strategy = str(answer_cfg["strategy"])  # expected "sample"
+    answer_temperature = float(answer_cfg["temperature"])  # e.g., 1.0
 
     # Reset environment
     env.reset(question, label)
@@ -91,9 +92,12 @@ def collect_rollout(
             action = dist.sample()  # [1]
             entropy = dist.entropy()  # [1]
         elif phase == "answer":
-            if answer_strategy == "greedy":
-                action = torch.argmax(masked_logits, dim=-1)  # [1]
-                entropy = torch.zeros_like(value_t)  # [1]
+            if answer_strategy == "sample":
+                logits_for_sampling = masked_logits / answer_temperature
+                dist = torch.distributions.Categorical(logits=logits_for_sampling)
+                action = dist.sample()  # [1]
+
+                entropy = torch.zeros_like(value_t)  # we dont want entropy loss for answer phase
             else:
                 raise ValueError(f"Unsupported answer decoding strategy: {answer_strategy}")
         else:
