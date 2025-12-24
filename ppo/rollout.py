@@ -154,7 +154,7 @@ def collect_rollout(
         raise RuntimeError(f"Recorded digit actions {digit_count} != length_ans {st.length_ans}")
     if not (len(actions) == len(logprobs) == len(values) == len(entropies) == len(phases) == len(input_ids_steps) == len(attention_mask_steps) == len(inserted_token_ids_steps)):
         raise RuntimeError("Step list lengths mismatch.")
-    
+
     return {
         "K": st.K,
         "length_ans": st.length_ans,
