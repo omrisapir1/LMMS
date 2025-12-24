@@ -146,7 +146,7 @@ def collect_rollout(
         print(" logprob_old:", float(logprob.item()))
         print(" masked_logits max/min:", float(masked_logits.max().item()), float(masked_logits.min().item()))
         # also show how many tokens are allowed by mask
-        allowed = torch.isfinite(mask).sum().item()  # mask is 0 or -inf usually
+        allowed = int((masked_logits > -1e8).sum().item())
         print(" allowed_count:", int(allowed))
         print("-----")
 

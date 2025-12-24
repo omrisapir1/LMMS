@@ -10,6 +10,7 @@ def compute_ppo_losses(
     batch: Dict[str, torch.Tensor],
     advantages: torch.Tensor,     # [N]
     clip_epsilon: float,
+    tokenizer: Any = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute Phase-1 PPO losses (separate): policy, value, entropy, and return ratio.
@@ -19,6 +20,7 @@ def compute_ppo_losses(
     - Entropy scaling is handled outside this function.
     - No reward/advantage normalization here (advantages provided).
     - Entropy is recomputed from current policy logits (not rollout batch) and applied only on latent steps.
+    - CRITICAL FIX: Reapply phase-dependent action masks before computing logprob_new and entropy.
     """
     if advantages.requires_grad:
         raise RuntimeError("advantages must not require gradients")
@@ -38,7 +40,7 @@ def compute_ppo_losses(
     # Basic shape checks
     if logits_new.ndim != 2:
         raise RuntimeError(f"logits_new must be [N, V], got shape {tuple(logits_new.shape)}")
-    N = logits_new.shape[0]
+    N, V = logits_new.shape
     for name, t in {
         "values_new": values_new,
         "actions": actions,
@@ -57,8 +59,53 @@ def compute_ppo_losses(
     if not (advantages.shape == rewards.shape == values_new.shape):
         raise RuntimeError("Shape mismatch among advantages, rewards, and values_new.")
 
-    # Recompute log-probs under new policy
-    log_probs_new = torch.log_softmax(logits_new, dim=-1)      # [N, V]
+    # Build phase-dependent mask over vocabulary [N, V]
+    if tokenizer is None:
+        raise RuntimeError("tokenizer must be provided to compute_ppo_losses for phase masking.")
+
+    # Cache token id sets on first use for this tokenizer instance
+    cache_key = id(tokenizer)
+    if not hasattr(compute_ppo_losses, "_token_cache"):
+        compute_ppo_losses._token_cache = {}
+    cache = compute_ppo_losses._token_cache  # type: ignore[attr-defined]
+    if cache_key not in cache:
+        # z-token strings are deterministic in Phase-1
+        z_tokens = [f"<z{i}>" for i in range(64)]
+        z_token_ids = tokenizer.convert_tokens_to_ids(z_tokens)
+        if any(i is None for i in z_token_ids):
+            missing = [t for t, i in zip(z_tokens, z_token_ids) if i is None]
+            raise ValueError(f"Some z-tokens missing ids in tokenizer: {missing}")
+        z_token_ids = [int(i) for i in z_token_ids]
+
+        digit_tokens = [str(i) for i in range(10)]
+        digit_token_ids = tokenizer.convert_tokens_to_ids(digit_tokens)
+        if any(i is None for i in digit_token_ids):
+            missing = [t for t, i in zip(digit_tokens, digit_token_ids) if i is None]
+            raise ValueError(f"Some digit tokens missing ids in tokenizer: {missing}")
+        digit_token_ids = [int(i) for i in digit_token_ids]
+
+        cache[cache_key] = {
+            "z_ids": torch.tensor(sorted(set(z_token_ids)), dtype=torch.long),
+            "digit_ids": torch.tensor(sorted(set(digit_token_ids)), dtype=torch.long),
+        }
+    ids = cache[cache_key]
+    z_ids: torch.Tensor = ids["z_ids"].to(logits_new.device)
+    digit_ids: torch.Tensor = ids["digit_ids"].to(logits_new.device)
+
+    # Construct mask
+    mask = torch.full((N, V), -1e9, dtype=logits_new.dtype, device=logits_new.device)
+    for i, phase in enumerate(phases):
+        if phase == "latent":
+            mask[i, z_ids] = 0.0
+        elif phase == "answer":
+            mask[i, digit_ids] = 0.0
+        else:
+            raise RuntimeError(f"Unknown phase '{phase}' in batch['phases']")
+
+    masked_logits_new = logits_new + mask
+
+    # Recompute log-probs under new policy with masking
+    log_probs_new = torch.log_softmax(masked_logits_new, dim=-1)      # [N, V]
     logprob_new = log_probs_new.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [N]
 
     # Importance sampling ratio
@@ -77,8 +124,8 @@ def compute_ppo_losses(
     # Value loss: no clipping, no coefficient here
     value_loss = torch.mean((values_new - rewards) ** 2)
 
-    # Entropy loss from current policy (new logits), applied only on latent steps
-    dist_new = torch.distributions.Categorical(logits=logits_new)
+    # Entropy loss from current policy (new masked logits), applied only on latent steps
+    dist_new = torch.distributions.Categorical(logits=masked_logits_new)
     entropy_new = dist_new.entropy()  # [N]
     latent_mask = torch.tensor([p == "latent" for p in phases], device=entropy_new.device, dtype=torch.float32)
     latent_count = latent_mask.sum()

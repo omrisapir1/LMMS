@@ -91,7 +91,6 @@ class PPOTrainer:
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [N, H]
         values_new = self.policy.value_head(last_hidden.detach()).squeeze(-1)  # [N]
 
-
         return last_logits, values_new
 
     def train_epoch(self, dataset) -> Dict[str, float]:
@@ -161,7 +160,6 @@ class PPOTrainer:
         # 4) PPO updates
         last_metrics: Dict[str, float] = {}
         for _ in range(self.updates_per_epoch):
-            # Re-evaluate policy on batch
             logits_new, values_new = self._policy_forward_on_batch(batch)
 
             # Compute losses
@@ -171,6 +169,7 @@ class PPOTrainer:
                 batch=batch,
                 advantages=advantages,
                 clip_epsilon=self.clip_epsilon,
+                tokenizer=self.tokenizer,
             )
 
             policy_loss = losses["policy_loss"]
