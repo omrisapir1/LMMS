@@ -117,8 +117,8 @@ logging:
 # Training Schedule
 # ----------------------------
 training:
-  batch_size: 4
-  rollout_batch_size: 4          # number of episodes per PPO update
+  batch_size: 1
+  rollout_batch_size: 1          # number of episodes per PPO update
   updates_per_epoch: 1
   num_epochs: 1                   # keep small for Phase 1 experimentation
 
