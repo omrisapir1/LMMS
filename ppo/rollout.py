@@ -104,8 +104,12 @@ def collect_rollout(
             raise RuntimeError(f"Unknown env phase '{phase}' during rollout.")
 
         # e) Logprob (even for greedy) from unscaled masked logits
-        log_probs = torch.log_softmax(masked_logits, dim=-1)
+        # log_probs = torch.log_softmax(masked_logits, dim=-1)
+        log_probs = torch.log_softmax(logits_for_sampling, dim=-1)
         logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
+
+
+
 
         # f) Record step
         actions.append(int(action.item()))
