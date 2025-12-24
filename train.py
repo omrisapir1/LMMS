@@ -130,7 +130,8 @@ def load_and_filter_dataset(cfg: Phase1Config):
     ds_f = ds.filter(
         lambda ex: ex["is_correct_by_qwen_small"]
         and ex["length_ans"] <= cfg.filter_length_ans_max
-        and ex['split'] == cfg.dataset_split,
+        and ex['split'] == cfg.dataset_split
+        and ex["length_ans"] == 1,
         desc="Phase-1 filters",
     )
 
