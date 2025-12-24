@@ -59,10 +59,14 @@ class PPOTrainer:
         if question is None:
             # fallback
             question = ex.get("question_text") if isinstance(ex, dict) else ex["question_text"]
-        label = {
-            "label_int": int(ex.get("label_int") if isinstance(ex, dict) else ex["label_int"]),
-            "length_ans": int(ex.get("length_ans") if isinstance(ex, dict) else ex["length_ans"]),
-        }
+        try:
+            label = {
+                "label_int": int(ex.get("label_int") if isinstance(ex, dict) else ex["label_int"]),
+                "length_ans": int(ex.get("length_ans") if isinstance(ex, dict) else ex["length_ans"]),
+            }
+        except:
+            print(ex)
+            raise
         return {"question": question, "label": label}
 
     def _policy_forward_on_batch(self, batch: Dict[str, torch.Tensor]):
