@@ -92,6 +92,9 @@ def collect_rollout(
             entropy = dist.entropy()  # [1]
         elif phase == "answer":
             if answer_strategy == "greedy":
+                print(masked_logits.shape)
+                print('------------')
+                print(masked_logits)
                 action = torch.argmax(masked_logits, dim=-1)  # [1]
                 entropy = torch.zeros_like(value_t)  # [1]
             else:
@@ -144,7 +147,7 @@ def collect_rollout(
         raise RuntimeError(f"Recorded digit actions {digit_count} != length_ans {st.length_ans}")
     if not (len(actions) == len(logprobs) == len(values) == len(entropies) == len(phases) == len(input_ids_steps) == len(attention_mask_steps) == len(inserted_token_ids_steps)):
         raise RuntimeError("Step list lengths mismatch.")
-
+    raise
     return {
         "K": st.K,
         "length_ans": st.length_ans,
