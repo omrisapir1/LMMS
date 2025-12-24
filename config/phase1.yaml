@@ -91,7 +91,7 @@ ppo:
   clip_epsilon: 0.2
 
   # Entropy bonus (important for exploration of z-tokens)
-  entropy_coefficient: 0.02
+  entropy_coefficient: 0.00
 
   # KL penalty (disabled in Phase 1)
   kl_penalty:
