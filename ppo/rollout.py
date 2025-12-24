@@ -98,7 +98,7 @@ def collect_rollout(
         elif phase == "answer":
             if answer_strategy == "greedy":
                 probs = torch.softmax(masked_logits[0], dim=-1)
-                allowed_ids = torch.nonzero(probs > 1e-4, as_tuple=False).squeeze(-1).tolist()
+                allowed_ids = torch.nonzero(probs > 1e-10, as_tuple=False).squeeze(-1).tolist()
                 allowed_tokens = tokenizer.convert_ids_to_tokens(allowed_ids)
                 print(f"[LATENT] allowed tokens (p>1e-4): {allowed_tokens}")
                 action = torch.argmax(masked_logits, dim=-1)  # [1]
