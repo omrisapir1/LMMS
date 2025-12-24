@@ -103,10 +103,6 @@ def set_seeds(seed: int) -> None:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         # Enable deterministic algorithms where possible
-        try:
-            torch.use_deterministic_algorithms(True)
-        except Exception:
-            pass
 
 
 def log_kv(**kwargs: Any) -> None:
