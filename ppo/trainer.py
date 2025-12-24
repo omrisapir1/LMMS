@@ -93,7 +93,7 @@ class PPOTrainer:
 
         return last_logits, values_new
 
-    def train_epoch(self, dataset) -> Dict[str, float]:
+    def train_epoch(self, dataset, vocab_size: int=64) -> Dict[str, float]:
         buffer = TrajectoryBuffer()
         episodes_collected = 0
         for _ in range(self.rollout_batch_size):
@@ -170,6 +170,7 @@ class PPOTrainer:
                 advantages=advantages,
                 clip_epsilon=self.clip_epsilon,
                 tokenizer=self.tokenizer,
+                vocab_size=vocab_size
             )
 
             policy_loss = losses["policy_loss"]

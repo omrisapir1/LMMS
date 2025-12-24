@@ -11,6 +11,7 @@ def compute_ppo_losses(
     advantages: torch.Tensor,     # [N]
     clip_epsilon: float,
     tokenizer: Any = None,
+    vocab_size: int = 64,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute Phase-1 PPO losses (separate): policy, value, entropy, and return ratio.
@@ -70,7 +71,7 @@ def compute_ppo_losses(
     cache = compute_ppo_losses._token_cache  # type: ignore[attr-defined]
     if cache_key not in cache:
         # z-token strings are deterministic in Phase-1
-        z_tokens = [f"<z{i}>" for i in range(64)]
+        z_tokens = [f"<z{i}>" for i in range(vocab_size)]
         z_token_ids = tokenizer.convert_tokens_to_ids(z_tokens)
         if any(i is None for i in z_token_ids):
             missing = [t for t, i in zip(z_tokens, z_token_ids) if i is None]
@@ -144,19 +145,7 @@ def compute_ppo_losses(
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
 
-    print("[PPO LOSS]")
-    print(" logprob_old stats:",
-          logprob_old.min().item(),
-          logprob_old.mean().item(),
-          logprob_old.max().item())
-    print(" logprob_new stats:",
-          logprob_new.min().item(),
-          logprob_new.mean().item(),
-          logprob_new.max().item())
-    print(" ratio stats:",
-          ratio.min().item(),
-          ratio.mean().item(),
-          ratio.max().item())
+
 
     return {
         "policy_loss": policy_loss,

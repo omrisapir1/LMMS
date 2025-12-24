@@ -138,18 +138,6 @@ def collect_rollout(
             digit_count += 1
 
 
-        print("[ROLLOUT]")
-
-        print(" phase:", phase)
-        print(" action_id:", int(action.item()))
-        print(" action_tok:", tokenizer.convert_ids_to_tokens([int(action.item())])[0])
-        print(" logprob_old:", float(logprob.item()))
-        print(" masked_logits max/min:", float(masked_logits.max().item()), float(masked_logits.min().item()))
-        # also show how many tokens are allowed by mask
-        allowed = int((masked_logits > -1e8).sum().item())
-        print(" allowed_count:", int(allowed))
-        print("-----")
-
     # Episode end
     reward = env.get_reward()
 
