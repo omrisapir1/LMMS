@@ -12,6 +12,7 @@ def compute_ppo_losses(
     clip_epsilon: float,
     tokenizer: Any = None,
     vocab_size: int = 64,
+    answer_temperature: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute Phase-1 PPO losses (separate): policy, value, entropy, and return ratio.
@@ -103,11 +104,15 @@ def compute_ppo_losses(
         else:
             raise RuntimeError(f"Unknown phase '{phase}' in batch['phases']")
 
-    masked_logits_new = logits_new + mask
+    # For debugging: compute unscaled masked logits as well
+    masked_logits_unscaled = logits_new + mask
+    masked_logits_new = (logits_new + mask) / answer_temperature
 
-    # Recompute log-probs under new policy with masking
+    # Recompute log-probs under new policy with masking (scaled and unscaled for diagnostics)
     log_probs_new = torch.log_softmax(masked_logits_new, dim=-1)      # [N, V]
+    log_probs_new_unscaled = torch.log_softmax(masked_logits_unscaled, dim=-1)
     logprob_new = log_probs_new.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [N]
+    logprob_new_unscaled = log_probs_new_unscaled.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
 
     # Importance sampling ratio
     ratio = torch.exp(logprob_new - logprob_old)  # [N]
@@ -145,20 +150,67 @@ def compute_ppo_losses(
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
 
+    # Detailed per-step diagnostics
     print("\n[PPO STEP DEBUG]")
+    # Show short summaries of allowed id sets
+    try:
+        z_ids_list = z_ids[:10].tolist()
+        digit_ids_list = digit_ids[:10].tolist()
+        z_toks = tokenizer.convert_ids_to_tokens(z_ids_list) if tokenizer is not None else [str(i) for i in z_ids_list]
+        digit_toks = tokenizer.convert_ids_to_tokens(digit_ids_list) if tokenizer is not None else [str(i) for i in digit_ids_list]
+        print(f" z_ids[:10]: {z_ids_list}  z_toks[:10]: {z_toks}")
+        print(f" digit_ids[:10]: {digit_ids_list}  digit_toks[:10]: {digit_toks}")
+        print(f" answer_temperature_used_in_loss: {answer_temperature}")
+    except Exception as e:
+        print(f" [DEBUG] token id preview failed: {e}")
+
     for i in range(N):
+        a_id = int(actions[i].item())
+        phase = phases[i]
+        mask_val = float(mask[i, a_id].item())
+        try:
+            a_tok = tokenizer.convert_ids_to_tokens([a_id])[0] if tokenizer is not None else str(a_id)
+        except Exception:
+            a_tok = str(a_id)
+
+        # LSE diagnostics
+        lse_scaled = float(torch.logsumexp(masked_logits_new[i], dim=-1).item())
+        lse_unscaled = float(torch.logsumexp(masked_logits_unscaled[i], dim=-1).item())
+        masked_logit_scaled = float(masked_logits_new[i, a_id].item())
+        masked_logit_unscaled = float(masked_logits_unscaled[i, a_id].item())
+
+        # Top-3 allowed tokens by prob (scaled)
+        probs_i = torch.softmax(masked_logits_new[i], dim=-1)
+        # Only consider allowed indices for top-k
+        allowed_i = (mask[i] == 0.0)
+        probs_allowed = probs_i.masked_fill(~allowed_i, -1.0)
+        topk_vals, topk_idx = torch.topk(probs_allowed, k=min(3, V))
+        topk_idx = topk_idx.tolist()
+        topk_vals = topk_vals.tolist()
+        try:
+            topk_toks = tokenizer.convert_ids_to_tokens(topk_idx) if tokenizer is not None else [str(x) for x in topk_idx]
+        except Exception:
+            topk_toks = [str(x) for x in topk_idx]
+
         print(f" step {i}:")
-        print(f"  phase: {phases[i]}")
-        print(f"  action_id: {actions[i].item()}")
-        if tokenizer is not None:
-            print(f"  action_tok: {tokenizer.convert_ids_to_tokens([actions[i].item()])[0]}")
-        print(f"  reward: {rewards[i].item():.3f}")
-        print(f"  value_new: {values_new[i].item():.3f}")
-        print(f"  advantage: {advantages[i].item():.3f}")
-        print(f"  logprob_old: {logprob_old[i].item():.3f}")
-        print(f"  logprob_new: {logprob_new[i].item():.3f}")
-        print(f"  ratio: {ratio[i].item():.3f}")
-        print(f"  entropy: {entropy_new[i].item():.3f}")
+        print(f"  phase: {phase}")
+        print(f"  action_id: {a_id}  action_tok: {a_tok}  mask_value_for_action: {mask_val}")
+        print(f"  reward: {rewards[i].item():.3f}  value_new: {values_new[i].item():.6f}  advantage: {advantages[i].item():.6f}")
+        print(f"  logprob_old: {logprob_old[i].item():.9f}")
+        print(f"  logprob_new_scaled: {logprob_new[i].item():.9f}  logprob_new_unscaled: {logprob_new_unscaled[i].item():.9f}")
+        print(f"  delta(new_scaled - old): {(logprob_new[i] - logprob_old[i]).item():.9f}")
+        print(f"  LSE_scaled: {lse_scaled:.6f}  LSE_unscaled: {lse_unscaled:.6f}")
+        print(f"  masked_logit_scaled[a]: {masked_logit_scaled:.6f}  masked_logit_unscaled[a]: {masked_logit_unscaled:.6f}")
+        # Allowed set size preview
+        allowed_count_i = int(allowed_i.sum().item())
+        allowed_ids_preview = torch.nonzero(allowed_i, as_tuple=False).view(-1)[:10].tolist()
+        try:
+            allowed_toks_preview = tokenizer.convert_ids_to_tokens(allowed_ids_preview) if tokenizer is not None else [str(x) for x in allowed_ids_preview]
+        except Exception:
+            allowed_toks_preview = [str(x) for x in allowed_ids_preview]
+        print(f"  allowed_count: {allowed_count_i}  allowed_ids[:10]: {allowed_ids_preview}  allowed_toks[:10]: {allowed_toks_preview}")
+        # Top-k within allowed
+        print(f"  top_allowed_scaled: {[f'({idx},{tok},{val:.6f})' for idx, tok, val in zip(topk_idx, topk_toks, topk_vals)]}")
         print("-----")
 
     print("[PPO AGGREGATES]")

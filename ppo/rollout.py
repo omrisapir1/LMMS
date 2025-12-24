@@ -108,8 +108,58 @@ def collect_rollout(
         log_probs = torch.log_softmax(logits_for_sampling, dim=-1)
         logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
 
+        # Extra debug: compare scaled vs unscaled logprob, mask composition, and temperatures
+        try:
+            with torch.no_grad():
+                # Allowed set info
+                allowed = (mask == 0.0)
+                allowed_count = int(allowed.sum().item())
+                allowed_ids = allowed.nonzero(as_tuple=False).view(-1).tolist()
+                # Show up to first 10 allowed ids and tokens
+                show_ids = allowed_ids[:10]
+                show_toks = []
+                if len(show_ids) > 0:
+                    try:
+                        show_toks = tokenizer.convert_ids_to_tokens(show_ids)
+                    except Exception:
+                        show_toks = [str(i) for i in show_ids]
 
+                # Alt unscaled logprob
+                log_probs_unscaled = torch.log_softmax(masked_logits, dim=-1)
+                logprob_unscaled = log_probs_unscaled.gather(-1, action.unsqueeze(-1)).squeeze(-1)
 
+                # Raw/Masked logits for chosen action
+                a = int(action.item())
+                raw_logit = float(logits_t[0, a].item())
+                masked_logit = float(masked_logits[0, a].item())
+                scaled_logit = float((logits_for_sampling[0, a]).item())
+
+                # LogSumExp diagnostics
+                lse_unscaled = float(torch.logsumexp(masked_logits, dim=-1).item())
+                lse_scaled = float(torch.logsumexp(logits_for_sampling, dim=-1).item())
+
+                # Token name
+                try:
+                    action_tok = tokenizer.convert_ids_to_tokens([a])[0]
+                except Exception:
+                    action_tok = str(a)
+
+                print("\n[ROLLOUT STEP DEBUG]")
+                print(f" phase: {phase}")
+                print(f" prefix_len: {input_ids.size(1)}  last_prefix_ids: {input_ids[0, -min(8, input_ids.size(1)):].tolist()}")
+                print(f" allowed_count: {allowed_count}  sample_allowed_ids[:10]: {show_ids}  sample_allowed_toks[:10]: {show_toks}")
+                print(f" temps: latent_T={latent_temperature} answer_T={answer_temperature}")
+                print(f" action_id: {a}  action_tok: {action_tok}  in_allowed: {bool(mask[0, a].item() == 0.0)}")
+                print(f" raw_logit: {raw_logit:.6f}  masked_logit: {masked_logit:.6f}  scaled_logit: {scaled_logit:.6f}")
+                print(f" logprob_scaled(old): {float(logprob.item()):.9f}  logprob_unscaled_alt: {float(logprob_unscaled.item()):.9f}")
+                print(f" logsumexp_unscaled: {lse_unscaled:.6f}  logsumexp_scaled: {lse_scaled:.6f}")
+
+                # Probability mass over allowed set should be ~1.0
+                probs_scaled = torch.softmax(logits_for_sampling, dim=-1)
+                mass_allowed = float(probs_scaled[0][allowed[0]].sum().item())
+                print(f" prob_mass_allowed_scaled: {mass_allowed:.9f}")
+        except Exception as e:
+            print(f"[ROLLOUT DEBUG ERROR] {e}")
 
         # f) Record step
         actions.append(int(action.item()))
