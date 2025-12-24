@@ -54,10 +54,12 @@ def collect_rollout(
     values: List[float] = []
     entropies: List[float] = []
     phases: List[str] = []
-    # New: store per-step sequences (prefix that produced the action)
+    # sequences
     input_ids_steps: List[List[int]] = []
     attention_mask_steps: List[List[int]] = []
     inserted_token_ids_steps: List[List[int]] = []
+    # NEW: record allowed token ids per step for exact mask replication in loss
+    allowed_token_ids_steps: List[List[int]] = []
 
     z_count = 0
     digit_count = 0
@@ -65,6 +67,8 @@ def collect_rollout(
     while not env.is_done():
         # a) Action space
         space = env.get_action_space()
+        # Record allowed ids for this step
+        allowed_token_ids_steps.append(list(space.allowed_token_ids))
 
         # b) Forward policy under no_grad (rollout should not build graphs)
         with torch.no_grad():
@@ -154,9 +158,9 @@ def collect_rollout(
                 print(f" logprob_scaled(old): {float(logprob.item()):.9f}  logprob_unscaled_alt: {float(logprob_unscaled.item()):.9f}")
                 print(f" logsumexp_unscaled: {lse_unscaled:.6f}  logsumexp_scaled: {lse_scaled:.6f}")
 
-                # Probability mass over allowed set should be ~1.0
+                # Probability mass over allowed set should be ~1.0 (use boolean mask directly)
                 probs_scaled = torch.softmax(logits_for_sampling, dim=-1)
-                mass_allowed = float(probs_scaled[0][allowed[0]].sum().item())
+                mass_allowed = float(probs_scaled[0][allowed].sum().item())
                 print(f" prob_mass_allowed_scaled: {mass_allowed:.9f}")
         except Exception as e:
             print(f"[ROLLOUT DEBUG ERROR] {e}")
@@ -219,4 +223,6 @@ def collect_rollout(
         "input_ids_steps": input_ids_steps,
         "attention_mask_steps": attention_mask_steps,
         "inserted_token_ids_steps": inserted_token_ids_steps,
+        # NEW: include per-step allowed ids
+        "allowed_token_ids_steps": allowed_token_ids_steps,
     }

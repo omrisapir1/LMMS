@@ -35,6 +35,7 @@ def compute_ppo_losses(
     logprob_old = batch["logprob_old"]  # [N] float
     rewards = batch["rewards"]          # [N] float
     phases = batch["phases"]            # List[str] length N
+    allowed_ids_per_step = batch.get("allowed_token_ids")  # List[List[int]] length N
 
     if logprob_old.requires_grad:
         raise RuntimeError("logprob_old must not require gradients")
@@ -56,53 +57,24 @@ def compute_ppo_losses(
             raise RuntimeError(f"{name} length {t.shape[0]} != N {N}")
     if not isinstance(phases, list) or len(phases) != N:
         raise RuntimeError("batch['phases'] must be a list of length N")
+    if allowed_ids_per_step is None or not isinstance(allowed_ids_per_step, list) or len(allowed_ids_per_step) != N:
+        raise RuntimeError("batch['allowed_token_ids'] must be a list of length N")
 
     # Required equality for core shapes
     if not (advantages.shape == rewards.shape == values_new.shape):
         raise RuntimeError("Shape mismatch among advantages, rewards, and values_new.")
 
-    # Build phase-dependent mask over vocabulary [N, V]
-    if tokenizer is None:
-        raise RuntimeError("tokenizer must be provided to compute_ppo_losses for phase masking.")
-
-    # Cache token id sets on first use for this tokenizer instance
-    cache_key = id(tokenizer)
-    if not hasattr(compute_ppo_losses, "_token_cache"):
-        compute_ppo_losses._token_cache = {}
-    cache = compute_ppo_losses._token_cache  # type: ignore[attr-defined]
-    if cache_key not in cache:
-        # z-token strings are deterministic in Phase-1
-        z_tokens = [f"<z{i}>" for i in range(vocab_size)]
-        z_token_ids = tokenizer.convert_tokens_to_ids(z_tokens)
-        if any(i is None for i in z_token_ids):
-            missing = [t for t, i in zip(z_tokens, z_token_ids) if i is None]
-            raise ValueError(f"Some z-tokens missing ids in tokenizer: {missing}")
-        z_token_ids = [int(i) for i in z_token_ids]
-
-        digit_tokens = [str(i) for i in range(10)]
-        digit_token_ids = tokenizer.convert_tokens_to_ids(digit_tokens)
-        if any(i is None for i in digit_token_ids):
-            missing = [t for t, i in zip(digit_tokens, digit_token_ids) if i is None]
-            raise ValueError(f"Some digit tokens missing ids in tokenizer: {missing}")
-        digit_token_ids = [int(i) for i in digit_token_ids]
-
-        cache[cache_key] = {
-            "z_ids": torch.tensor(sorted(set(z_token_ids)), dtype=torch.long),
-            "digit_ids": torch.tensor(sorted(set(digit_token_ids)), dtype=torch.long),
-        }
-    ids = cache[cache_key]
-    z_ids: torch.Tensor = ids["z_ids"].to(logits_new.device)
-    digit_ids: torch.Tensor = ids["digit_ids"].to(logits_new.device)
-
-    # Construct mask
+    # Build per-step mask from allowed ids recorded during rollout [N, V]
     mask = torch.full((N, V), -1e9, dtype=logits_new.dtype, device=logits_new.device)
-    for i, phase in enumerate(phases):
-        if phase == "latent":
-            mask[i, z_ids] = 0.0
-        elif phase == "answer":
-            mask[i, digit_ids] = 0.0
-        else:
-            raise RuntimeError(f"Unknown phase '{phase}' in batch['phases']")
+    for i in range(N):
+        allowed_ids_i = allowed_ids_per_step[i]
+        if not isinstance(allowed_ids_i, list):
+            raise RuntimeError(f"allowed_token_ids[{i}] must be a list")
+        if len(allowed_ids_i) == 0:
+            # Should only occur if phase is done, which shouldn't be in batch
+            raise RuntimeError(f"Empty allowed ids at step {i}")
+        idx = torch.tensor(sorted(set(int(x) for x in allowed_ids_i)), dtype=torch.long, device=logits_new.device)
+        mask[i].index_fill_(0, idx, 0.0)
 
     # For debugging: compute unscaled masked logits as well
     masked_logits_unscaled = logits_new + mask
@@ -152,17 +124,10 @@ def compute_ppo_losses(
 
     # Detailed per-step diagnostics
     print("\n[PPO STEP DEBUG]")
-    # Show short summaries of allowed id sets
     try:
-        z_ids_list = z_ids[:10].tolist()
-        digit_ids_list = digit_ids[:10].tolist()
-        z_toks = tokenizer.convert_ids_to_tokens(z_ids_list) if tokenizer is not None else [str(i) for i in z_ids_list]
-        digit_toks = tokenizer.convert_ids_to_tokens(digit_ids_list) if tokenizer is not None else [str(i) for i in digit_ids_list]
-        print(f" z_ids[:10]: {z_ids_list}  z_toks[:10]: {z_toks}")
-        print(f" digit_ids[:10]: {digit_ids_list}  digit_toks[:10]: {digit_toks}")
         print(f" answer_temperature_used_in_loss: {answer_temperature}")
     except Exception as e:
-        print(f" [DEBUG] token id preview failed: {e}")
+        print(f" [DEBUG] preview failed: {e}")
 
     for i in range(N):
         a_id = int(actions[i].item())
@@ -192,6 +157,13 @@ def compute_ppo_losses(
         except Exception:
             topk_toks = [str(x) for x in topk_idx]
 
+        # Allowed set preview from batch
+        allowed_ids_preview = allowed_ids_per_step[i][:10]
+        try:
+            allowed_toks_preview = tokenizer.convert_ids_to_tokens(allowed_ids_preview) if tokenizer is not None else [str(x) for x in allowed_ids_preview]
+        except Exception:
+            allowed_toks_preview = [str(x) for x in allowed_ids_preview]
+
         print(f" step {i}:")
         print(f"  phase: {phase}")
         print(f"  action_id: {a_id}  action_tok: {a_tok}  mask_value_for_action: {mask_val}")
@@ -201,15 +173,7 @@ def compute_ppo_losses(
         print(f"  delta(new_scaled - old): {(logprob_new[i] - logprob_old[i]).item():.9f}")
         print(f"  LSE_scaled: {lse_scaled:.6f}  LSE_unscaled: {lse_unscaled:.6f}")
         print(f"  masked_logit_scaled[a]: {masked_logit_scaled:.6f}  masked_logit_unscaled[a]: {masked_logit_unscaled:.6f}")
-        # Allowed set size preview
-        allowed_count_i = int(allowed_i.sum().item())
-        allowed_ids_preview = torch.nonzero(allowed_i, as_tuple=False).view(-1)[:10].tolist()
-        try:
-            allowed_toks_preview = tokenizer.convert_ids_to_tokens(allowed_ids_preview) if tokenizer is not None else [str(x) for x in allowed_ids_preview]
-        except Exception:
-            allowed_toks_preview = [str(x) for x in allowed_ids_preview]
-        print(f"  allowed_count: {allowed_count_i}  allowed_ids[:10]: {allowed_ids_preview}  allowed_toks[:10]: {allowed_toks_preview}")
-        # Top-k within allowed
+        print(f"  allowed_count: {len(allowed_ids_per_step[i])}  allowed_ids[:10]: {allowed_ids_preview}  allowed_toks[:10]: {allowed_toks_preview}")
         print(f"  top_allowed_scaled: {[f'({idx},{tok},{val:.6f})' for idx, tok, val in zip(topk_idx, topk_toks, topk_vals)]}")
         print("-----")
 

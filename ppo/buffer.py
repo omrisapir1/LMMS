@@ -55,6 +55,8 @@ class TrajectoryBuffer:
         input_ids_steps = episode["input_ids_steps"]
         attention_mask_steps = episode["attention_mask_steps"]
         inserted_token_ids_steps = episode["inserted_token_ids_steps"]
+        # NEW: allowed ids per step
+        allowed_token_ids_steps = episode.get("allowed_token_ids_steps")
 
         # Optional metadata
         question = episode.get("question")
@@ -70,6 +72,9 @@ class TrajectoryBuffer:
             raise ValueError("Episode length must be > 0 for all per-step lists")
         if len(set(lengths)) != 1:
             raise ValueError(f"Per-step lists have mismatched lengths: {lengths}")
+        # NEW: verify allowed_token_ids_steps length if provided
+        if allowed_token_ids_steps is None or len(allowed_token_ids_steps) != lengths[0]:
+            raise KeyError("Episode missing key: allowed_token_ids_steps or length mismatch")
 
         # Basic type sanity
         if not all(isinstance(a, int) for a in actions):
@@ -103,6 +108,12 @@ class TrajectoryBuffer:
                 raise TypeError(f"inserted_token_ids_steps[{step_idx}] must be a list")
             if not all(isinstance(x, int) for x in ids):
                 raise TypeError(f"inserted_token_ids_steps[{step_idx}] must contain int elements")
+        # NEW: type checks for allowed ids
+        for step_idx, ids in enumerate(allowed_token_ids_steps):
+            if not isinstance(ids, list):
+                raise TypeError(f"allowed_token_ids_steps[{step_idx}] must be a list")
+            if not all(isinstance(x, int) for x in ids):
+                raise TypeError(f"allowed_token_ids_steps[{step_idx}] must contain int elements")
 
         # Store episode (keep original structure)
         stored = {
@@ -115,6 +126,8 @@ class TrajectoryBuffer:
             "input_ids_steps": [list(ids) for ids in input_ids_steps],
             "attention_mask_steps": [list(msk) for msk in attention_mask_steps],
             "inserted_token_ids_steps": [list(ids) for ids in inserted_token_ids_steps],
+            # NEW
+            "allowed_token_ids_steps": [list(ids) for ids in allowed_token_ids_steps],
         }
         if question is not None:
             stored["question"] = str(question)
@@ -154,6 +167,7 @@ class TrajectoryBuffer:
         episode_index_all: List[int] = []
         seqs_all: List[List[int]] = []
         masks_all: List[List[int]] = []
+        allowed_ids_all: List[List[int]] = []
 
         for epi, ep in enumerate(self._episodes):
             L = len(ep["actions"])
@@ -166,6 +180,8 @@ class TrajectoryBuffer:
             episode_index_all.extend([epi] * L)
             seqs_all.extend(ep["input_ids_steps"])
             masks_all.extend(ep["attention_mask_steps"])
+            # NEW: collect allowed ids per step
+            allowed_ids_all.extend(ep["allowed_token_ids_steps"])
 
         # NOTE:
         # inserted_token_ids_steps is intentionally NOT included in the PPO batch.
@@ -175,6 +191,8 @@ class TrajectoryBuffer:
         # Minor robustness: ensure we collected exactly one sequence per step
         if len(seqs_all) != total_steps:
             raise RuntimeError("Mismatch between total steps and collected sequences")
+        if len(allowed_ids_all) != total_steps:
+            raise RuntimeError("Mismatch between total steps and collected allowed ids")
 
         # Pad sequences to max length (LEFT padding to align last index with last real token)
         max_T = max(len(s) for s in seqs_all)
@@ -221,6 +239,8 @@ class TrajectoryBuffer:
             "episode_index": episode_index_t,
             "input_ids": input_ids_t,
             "attention_mask": attention_mask_t,
+            # NEW: pass allowed ids per step as Python lists for loss masking
+            "allowed_token_ids": allowed_ids_all,
         }
 
     def reconstruct_full_sequence(self, ep: Dict[str, Any]) -> List[int]:
