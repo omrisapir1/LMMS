@@ -86,15 +86,19 @@ def collect_rollout(
             if latent_strategy != "sample":
                 raise ValueError(f"Unsupported latent decoding strategy: {latent_strategy}")
             # Apply temperature for sampling (decoding-only; policy unchanged)
+            allowed_ids = torch.nonzero(torch.isfinite(masked_logits[0])).squeeze(-1).tolist()
+            allowed_tokens = tokenizer.convert_ids_to_tokens(allowed_ids)
+            print(f"[ANSWER] allowed tokens: {allowed_tokens}")
+
             logits_for_sampling = masked_logits / latent_temperature
             dist = torch.distributions.Categorical(logits=logits_for_sampling)
             action = dist.sample()  # [1]
             entropy = dist.entropy()  # [1]
         elif phase == "answer":
             if answer_strategy == "greedy":
-                print(masked_logits.shape)
-                print('------------')
-                print(masked_logits)
+                allowed_ids = torch.nonzero(torch.isfinite(masked_logits[0])).squeeze(-1).tolist()
+                allowed_tokens = tokenizer.convert_ids_to_tokens(allowed_ids)
+                print(f"[ANSWER] allowed tokens: {allowed_tokens}")
                 action = torch.argmax(masked_logits, dim=-1)  # [1]
                 entropy = torch.zeros_like(value_t)  # [1]
             else:
