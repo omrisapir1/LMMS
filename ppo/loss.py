@@ -64,21 +64,6 @@ def compute_ppo_losses(
     # Importance sampling ratio
     ratio = torch.exp(logprob_new - logprob_old)  # [N]
 
-    print("=== PPO DEBUG ===")
-    print(f"logprob_old: mean={logprob_old.mean().item():.4f}, "
-          f"std={logprob_old.std().item():.4f}, "
-          f"min={logprob_old.min().item():.4f}, "
-          f"max={logprob_old.max().item():.4f}")
-
-    print(f"logprob_new: mean={logprob_new.mean().item():.4f}, "
-          f"std={logprob_new.std().item():.4f}, "
-          f"min={logprob_new.min().item():.4f}, "
-          f"max={logprob_new.max().item():.4f}")
-
-    print(f"ratio: mean={ratio.mean().item():.4f}, "
-          f"std={ratio.std().item():.4f}, "
-          f"min={ratio.min().item():.4f}, "
-          f"max={ratio.max().item():.4f}")
 
     # Numerical safety checks for ratio
     if not torch.isfinite(ratio).all():
@@ -111,6 +96,20 @@ def compute_ppo_losses(
     }.items():
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
+
+    print("[PPO LOSS]")
+    print(" logprob_old stats:",
+          logprob_old.min().item(),
+          logprob_old.mean().item(),
+          logprob_old.max().item())
+    print(" logprob_new stats:",
+          logprob_new.min().item(),
+          logprob_new.mean().item(),
+          logprob_new.max().item())
+    print(" ratio stats:",
+          ratio.min().item(),
+          ratio.mean().item(),
+          ratio.max().item())
 
     return {
         "policy_loss": policy_loss,

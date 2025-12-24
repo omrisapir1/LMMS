@@ -91,6 +91,7 @@ class PPOTrainer:
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [N, H]
         values_new = self.policy.value_head(last_hidden.detach()).squeeze(-1)  # [N]
 
+
         return last_logits, values_new
 
     def train_epoch(self, dataset) -> Dict[str, float]:
