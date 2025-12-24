@@ -223,6 +223,17 @@ class PPOTrainer:
         self.global_step += 1
         self.batch_idx += 1
 
+        ### FOR DEBUGGING: print policy grad norm
+
+        total_norm = torch.norm(
+            torch.stack([
+                p.grad.norm()
+                for p in self._policy_params_cached
+                if p.grad is not None
+            ])
+        )
+        print(" policy_grad_norm:", total_norm.item())
+
         return last_metrics
 
     def _collect_single(self, question: str, label: Dict[str, Any]) -> Dict[str, Any]:

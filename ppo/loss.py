@@ -145,7 +145,16 @@ def compute_ppo_losses(
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
 
-
+    print("[PPO DEBUG]")
+    print(" action:", actions.item())
+    print(" phase:", phases[0])
+    print(" reward:", rewards.item())
+    print(" advantage:", advantages.item())
+    print(" value_new:", values_new.item())
+    print(" logprob_old:", logprob_old.item())
+    print(" logprob_new:", logprob_new.item())
+    print(" ratio:", ratio.item())
+    print(" entropy:", entropy_new.item())
 
     return {
         "policy_loss": policy_loss,
