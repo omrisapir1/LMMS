@@ -128,10 +128,11 @@ def load_and_filter_dataset(cfg: Phase1Config):
 
     # Apply filters: is_correct_by_qwen_small == True and length_ans <= max
     ds_f = ds.filter(
-        lambda ex: ex["is_correct_by_qwen_small"]
+        lambda ex: not ex["is_correct_by_qwen_small"]
         and ex["length_ans"] <= cfg.filter_length_ans_max
         and ex['split'] == cfg.dataset_split
-        and ex["length_ans"] == 1,
+        and ex["length_ans"] == 1
+        and random.random() < 0.1485,
         desc="Phase-1 filters",
     )
 
