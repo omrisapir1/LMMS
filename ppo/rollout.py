@@ -5,6 +5,7 @@ import torch
 from env.math_env import MathEnv
 from policy.policy_model import PolicyModel
 
+SEPERATOR = "<|im_end|>\n<|im_start|>assistant\n"
 
 def _append_tokens(input_ids: torch.Tensor, attention_mask: torch.Tensor, token_ids: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     if not isinstance(token_ids, list):
@@ -45,7 +46,7 @@ def collect_rollout(
     st = env._require_state()
 
     # Build initial sequence: encode question with special tokens
-    question_ids = tokenizer.encode(question, add_special_tokens=True)
+    question_ids = tokenizer.encode(question + SEPERATOR, add_special_tokens=True)
     input_ids = torch.tensor(question_ids, dtype=torch.long, device=device).view(1, -1)
     attention_mask = torch.ones_like(input_ids)
 
