@@ -194,10 +194,9 @@ def validate_tokenizer_and_model(cfg: Dict[str, Any], tokenizer, model) -> None:
     # 1) tokenizer.vocab_size == model input embedding size
     emb = model.get_input_embeddings().weight
     vocab_model = int(emb.shape[0])
-    vocab_tok = int(tokenizer.vocab_size)
-    if vocab_tok != vocab_model:
+    if len(tokenizer) == model.get_input_embeddings().weight.shape[0]:
         raise RuntimeError(
-            f"Tokenizer/model vocab mismatch: tokenizer.vocab_size={vocab_tok} vs model_embeddings={vocab_model}. Phase-0 checkpoint incompatible or corrupted."
+            f"Tokenizer/model vocab mismatch: tokenizer.vocab_size={len(tokenizer)} vs model_embeddings={vocab_model}. Phase-0 checkpoint incompatible or corrupted."
         )
     # 2) z-token count and prefix
     z_cfg = cfg["model"]["z_tokens"]
