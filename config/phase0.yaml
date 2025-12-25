@@ -103,7 +103,7 @@ logging:
 training:
   rollout_batch_size: 8          # number of episodes per PPO update
   updates_per_epoch: 1
-  num_epochs: 1500                  # keep short by default
+  num_epochs: 15000                  # keep short by default
 
   # Mixed precision / performance
   precision: bf16
