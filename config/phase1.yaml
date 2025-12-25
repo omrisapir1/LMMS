@@ -135,7 +135,7 @@ trainable:
 
   # Transformer layers
   transformer:
-    train_top_fraction: 1.0      # top ~25% layers are trainable
+    train_top_fraction: 0      # top ~25% layers are trainable
 
   # Heads
   heads:
