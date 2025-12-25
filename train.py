@@ -206,7 +206,7 @@ def validate_tokenizer_and_model(cfg: Dict[str, Any], tokenizer, model) -> None:
     if not vocab_dict:
         raise RuntimeError("Tokenizer does not expose vocabulary for z-token validation. Phase-0 checkpoint may be incompatible.")
     vocab_dict = tokenizer.get_vocab()
-    z_token_ids = [tid for tok, tid in vocab_dict.items() if tok.startswith(z_prefix[-:1])]
+    z_token_ids = [tid for tok, tid in vocab_dict.items() if tok.startswith(z_prefix[:-1])]
     if len(z_token_ids) != z_expected:
         raise RuntimeError(
             f"Z-token mismatch: tokenizer extension incompatible or corrupted Phase-0 checkpoint (expected={z_expected} tokens with prefix '{z_prefix}', found={len(z_token_ids)})."
