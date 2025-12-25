@@ -1,0 +1,128 @@
+# ============================
+# Phase 0 Configuration (Protocol Pretraining)
+# ============================
+# Purpose:
+# Learn protocol usage (z-tokens, delayed answering) and PPO stability on
+# a very simple local dataset with single-digit answers.
+
+phase: 0
+
+# ----------------------------
+# Dataset (Local JSONL only)
+# ----------------------------
+dataset:
+  local_jsonl_path: data/easy_1to9.jsonl
+
+# ----------------------------
+# Model
+# ----------------------------
+model:
+  base_model: Qwen/Qwen2.5-Math-1.5B-Instruct
+
+  # Latent action (z-token) configuration
+  z_tokens:
+    vocab_size: 64
+    prefix: "<z>"
+
+  # Special control tokens
+  special_tokens:
+    answer_token: "</answer>"
+
+# ----------------------------
+# Environment (Protocol)
+# ----------------------------
+environment:
+  # Latent reasoning steps (Phase 0: random in [2, 4])
+  latent_steps:
+    mode: random
+    min: 2
+    max: 4
+
+  # Answer formatting
+  answer:
+    total_width: 5                # fixed-width numeric answer
+    padding:
+      mode: environment            # environment inserts leading zeros
+    emit_answer_token:
+      mode: environment            # </answer> is inserted by environment
+
+  # Action masking rules
+  action_space:
+    latent_phase:
+      allowed_tokens: z_tokens     # only <z*> tokens allowed
+    answer_phase:
+      allowed_tokens: digits       # only 0–9 tokens allowed
+
+rollout:
+  latent:
+    strategy: sample
+    temperature: 1.0
+  answer:
+    strategy: sample
+    temperature: 1.0
+
+# ----------------------------
+# PPO Training
+# ----------------------------
+ppo:
+  algorithm: PPO
+
+  # Learning rates
+  learning_rate:
+    policy: 1e-5
+    value: 1e-5
+
+  # PPO clipping
+  clip_epsilon: 0.2
+
+  # Entropy bonus (encourages exploration of z-tokens)
+  entropy_coefficient: 0.00
+
+  # KL penalty (disabled in Phase 0)
+  kl_penalty:
+    enabled: false
+
+  # Advantage computation
+  advantage:
+    method: simple               # no GAE
+    normalize: true
+
+  # Optimization details
+  optimizer:
+    type: adamw
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+logging:
+  log_episodes: true
+  log_every_n_in_batch: 1
+
+# ----------------------------
+# Training Schedule
+# ----------------------------
+training:
+  rollout_batch_size: 8          # number of episodes per PPO update
+  updates_per_epoch: 1
+  num_epochs: 1500                  # keep short by default
+
+  # Mixed precision / performance
+  precision: bf16
+  gradient_checkpointing: true
+
+# ----------------------------
+# Trainable Parameters
+# ----------------------------
+trainable:
+  # Token embeddings
+  embeddings:
+    train_z_tokens_only: true     # only <z*> embeddings are trainable
+
+  # Transformer layers
+  transformer:
+    train_top_fraction: 0.15      # top ~25% layers are trainable
+
+  # Heads
+  heads:
+    lm_head: true
+    value_head: true
+
