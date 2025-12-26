@@ -98,10 +98,9 @@ class PolicyModel(nn.Module):
                 p.requires_grad = (i in trainable_idx)
 
         # Unfreeze LM head
-        lm_head = getattr(self.lm, "lm_head", None)
-        if lm_head is not None:
-            for p in lm_head.parameters():
-                p.requires_grad = True
+
+        for p in self.lm.lm_head.parameters():
+            p.requires_grad = True
 
         # Unfreeze answer head
         for p in self.answer_head.parameters():
