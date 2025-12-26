@@ -11,6 +11,27 @@ from ppo.loss import compute_ppo_losses
 from LMMS_logging.episode_logger import log_episode
 
 
+# Minibatch iterator for PPO updates
+# - Tensors are indexed with a LongTensor of indices
+# - Python lists (e.g., phases, action_kinds, allowed_action_ids) are reassembled by element-wise selection
+# - Advantages must already be attached to the batch for consistent slicing
+
+def iterate_minibatches(batch: Dict[str, Any], minibatch_size: int, shuffle: bool = True):
+    N = batch["actions"].shape[0]
+    if shuffle:
+        indices = torch.randperm(N)
+    else:
+        indices = torch.arange(N)
+
+    for start in range(0, N, minibatch_size):
+        idx = indices[start:start + minibatch_size]
+        idx_list = idx.tolist()
+        yield {
+            k: (v[idx] if torch.is_tensor(v) else [v[i] for i in idx_list])
+            for k, v in batch.items()
+        }
+
+
 class PPOTrainer:
     def __init__(self, cfg: Dict[str, Any], policy, tokenizer, device: torch.device, run_id: str = "run"):
         self.cfg = cfg
@@ -50,6 +71,8 @@ class PPOTrainer:
         self.rollout_batch_size = int(cfg["training"]["rollout_batch_size"])
         self.updates_per_epoch = int(cfg["training"]["updates_per_epoch"])
         self.clip_epsilon = float(cfg["ppo"]["clip_epsilon"])  # PPO clipping
+        # New: minibatch size for PPO updates
+        self.ppo_minibatch_size = int(cfg["training"]["mini_batch_rollout_batch_size"])
 
     def _sample_datapoint(self, dataset) -> Dict[str, Any]:
         idx = random.randint(0, len(dataset) - 1)
@@ -100,7 +123,7 @@ class PPOTrainer:
         # Masking and usage are handled later in the PPO loss.
         # This avoids phase-conditional branching in the forward pass.
         logits_answer_new = self.policy.answer_head(last_hidden)  # [N, 10]
-        values_new = self.policy.value_head(last_hidden.detach()).squeeze(-1)  # [N]
+        values_new = self.policy.value_head(last_hidden).squeeze(-1)  # [N]
 
         return logits_token_new, logits_answer_new, values_new
 
@@ -166,7 +189,8 @@ class PPOTrainer:
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = 0
-        batch = buffer.get_batch(self.device, pad_token_id=pad_id)
+        # Store the entire PPO batch on CPU to reduce GPU memory usage
+        batch = buffer.get_batch(torch.device("cpu"), pad_token_id=pad_id)
 
         # Optional safety assertion: exactly one answer action per episode
         try:
@@ -182,65 +206,71 @@ class PPOTrainer:
             raise RuntimeError("Advantages shape mismatch vs rewards.")
         if not torch.isfinite(advantages).all():
             raise RuntimeError("Advantages contain non-finite values.")
+        # Attach to batch for deterministic minibatch slicing
+        batch["advantages"] = advantages
 
-        # 4) PPO updates
+        # 4) PPO updates (minibatched)
         last_metrics: Dict[str, float] = {}
         for _ in range(self.updates_per_epoch):
-            logits_token_new, logits_answer_new, values_new = self._policy_forward_on_batch(batch)
+            for mb in iterate_minibatches(batch, self.ppo_minibatch_size, shuffle=True):
+                # Move only minibatch tensors to GPU; keep lists on CPU
+                mb = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in mb.items()}
 
-            # Compute losses with mixed action spaces
-            losses = compute_ppo_losses(
-                logits_token_new=logits_token_new,
-                logits_answer_new=logits_answer_new,
-                values_new=values_new,
-                batch=batch,
-                advantages=advantages,
-                clip_epsilon=self.clip_epsilon,
-            )
+                logits_token_new, logits_answer_new, values_new = self._policy_forward_on_batch(mb)
 
-            policy_loss = losses["policy_loss"]
-            value_loss = losses["value_loss"]
-            entropy_loss = losses["entropy_loss"]
-            ratio = losses["ratio"]
+                # Compute losses with mixed action spaces
+                losses = compute_ppo_losses(
+                    logits_token_new=logits_token_new,
+                    logits_answer_new=logits_answer_new,
+                    values_new=values_new,
+                    batch=mb,
+                    advantages=mb["advantages"],
+                    clip_epsilon=self.clip_epsilon,
+                )
 
-            # Safety checks
-            for name, t in {
-                "policy_loss": policy_loss,
-                "value_loss": value_loss,
-                "entropy_loss": entropy_loss,
-                "ratio": ratio,
-            }.items():
-                if not torch.isfinite(t).all():
-                    raise RuntimeError(f"Non-finite tensor detected in {name}.")
+                policy_loss = losses["policy_loss"]
+                value_loss = losses["value_loss"]
+                entropy_loss = losses["entropy_loss"]
+                ratio = losses["ratio"]
 
-            # Policy backward pass
-            self.policy_optimizer.zero_grad(set_to_none=True)
-            (policy_loss + self.entropy_coef * entropy_loss).backward()
-            torch.nn.utils.clip_grad_norm_(
-                self._policy_params_cached, self.max_grad_norm
-            )
-            self.policy_optimizer.step()
+                # Safety checks
+                for name, t in {
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
+                    "entropy_loss": entropy_loss,
+                    "ratio": ratio,
+                }.items():
+                    if not torch.isfinite(t).all():
+                        raise RuntimeError(f"Non-finite tensor detected in {name}.")
 
-            # Value backward pass
-            self.value_optimizer.zero_grad(set_to_none=True)
-            value_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self._value_params_cached, self.max_grad_norm
-            )
-            self.value_optimizer.step()
+                # Policy backward pass
+                self.policy_optimizer.zero_grad(set_to_none=True)
+                (policy_loss + self.entropy_coef * entropy_loss).backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self._policy_params_cached, self.max_grad_norm
+                )
+                self.policy_optimizer.step()
 
-            # Record/aggregate metrics (use last update for now)
-            last_metrics = {
-                "mean_reward": float(batch["rewards"].mean().item()),
-                "policy_loss": float(policy_loss.item()),
-                "value_loss": float(value_loss.item()),
-                "entropy_loss": float(entropy_loss.item()),
-                "mean_advantage": float(advantages.mean().item()),
-                "ratio_mean": float(ratio.mean().item()),
-                "ratio_std": float(ratio.std().item()),
-                "episodes_collected": float(episodes_collected),
-                "total_steps": float(len(buffer)),
-            }
+                # Value backward pass
+                self.value_optimizer.zero_grad(set_to_none=True)
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self._value_params_cached, self.max_grad_norm
+                )
+                self.value_optimizer.step()
+
+                # Record/aggregate metrics (use last minibatch/update for now)
+                last_metrics = {
+                    "mean_reward": float(batch["rewards"].mean().item()),
+                    "policy_loss": float(policy_loss.item()),
+                    "value_loss": float(value_loss.item()),
+                    "entropy_loss": float(entropy_loss.item()),
+                    "mean_advantage": float(advantages.mean().item()),
+                    "ratio_mean": float(ratio.mean().item()),
+                    "ratio_std": float(ratio.std().item()),
+                    "episodes_collected": float(episodes_collected),
+                    "total_steps": float(len(buffer)),
+                }
 
         # 5) Cleanup
         buffer.clear()
