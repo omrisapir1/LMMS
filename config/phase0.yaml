@@ -77,6 +77,7 @@ ppo:
 
   # Entropy bonus (encourages exploration of z-tokens)
   entropy_coefficient: 0.00
+  value_loss_coef: 1.0
 
   # KL penalty (disabled in Phase 0)
   kl_penalty:

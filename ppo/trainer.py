@@ -243,20 +243,24 @@ class PPOTrainer:
                     if not torch.isfinite(t).all():
                         raise RuntimeError(f"Non-finite tensor detected in {name}.")
 
-                # Policy backward pass
                 self.policy_optimizer.zero_grad(set_to_none=True)
-                (policy_loss + self.entropy_coef * entropy_loss).backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self._policy_params_cached, self.max_grad_norm
-                )
-                self.policy_optimizer.step()
-
-                # Value backward pass
                 self.value_optimizer.zero_grad(set_to_none=True)
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self._value_params_cached, self.max_grad_norm
+
+                total_loss = (
+                        policy_loss
+                        + self.entropy_coef * entropy_loss
+                        + self.value_loss_coef * value_loss
                 )
+
+                # Single backward pass
+                total_loss.backward()
+
+                # Optional: clip shared parameters once
+                torch.nn.utils.clip_grad_norm_(self._policy_params_cached, self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self._value_params_cached, self.max_grad_norm)
+
+                # Step optimizers
+                self.policy_optimizer.step()
                 self.value_optimizer.step()
 
                 # Record/aggregate metrics (use last minibatch/update for now)

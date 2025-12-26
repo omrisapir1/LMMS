@@ -78,6 +78,7 @@ class TrainingPhaseConfig:
     latent_steps_min: int
     latent_steps_max: int
     entropy_coefficient: float
+    value_loss_coef: float
     answer_total_width: int
     seed: Optional[int] = 42
 
@@ -94,6 +95,7 @@ class TrainingPhaseConfig:
                 latent_steps_min=int(d["environment"]["latent_steps"]["min"]),
                 latent_steps_max=int(d["environment"]["latent_steps"]["max"]),
                 entropy_coefficient=float(d["ppo"]["entropy_coefficient"]),
+                value_loss_coef=float(d["ppo"]["value_loss_coefficient"]),
                 answer_total_width=int(d["environment"]["answer"]["total_width"]),
                 seed=int(d.get("seed", 42)),
             )
