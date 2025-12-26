@@ -153,6 +153,11 @@ def collect_rollout(
             if not hasattr(outputs, "answer_logits"):
                 raise RuntimeError("PolicyModel missing answer_logits for classification phase")
             answer_logits = outputs.answer_logits  # [1, 10]
+            if answer_logits.ndim == 3:
+                # [B, T, 10] -> take last token
+                answer_logits = answer_logits[:, -1, :]
+            elif answer_logits.ndim != 2:
+                raise RuntimeError(f"Unexpected answer_logits shape: {answer_logits.shape}")
             values_tensor = outputs.values  # [1, T]
             value_t = values_tensor[:, -1]  # [1]
 
