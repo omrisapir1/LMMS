@@ -185,6 +185,19 @@ class PPOTrainer:
                     label_int=label_int,
                     reward=reward,
                 )
+                # Debug: print rollout-time probabilities for first 2 episodes per epoch
+                if i < 2 and ep.get("debug_rollout"):
+                    for dr in ep["debug_rollout"]:
+                        print(
+                            "[ROLLOUT] step_uid=" + str(dr.get("step_uid")) +
+                            ", phase=" + str(dr.get("phase")) +
+                            ", kind=" + str(dr.get("action_kind")) +
+                            ", action=" + str(dr.get("action")) +
+                            ", allowed_ids=" + str(dr.get("allowed_action_ids")) +
+                            ", masked_logit[action]=" + str(dr.get("masked_logit_action")) +
+                            ", logprob_old=" + str(dr.get("logprob_old")) +
+                            ", softmax_den=" + str(dr.get("softmax_den"))
+                        )
 
         # 2) Build PPO batch (includes padded input_ids/attention_mask)
         pad_id = self.tokenizer.pad_token_id
@@ -192,6 +205,19 @@ class PPOTrainer:
             pad_id = 0
         # Store the entire PPO batch on CPU to reduce GPU memory usage
         batch = buffer.get_batch(torch.device("cpu"), pad_token_id=pad_id)
+
+        # Attach flattened step_uid to batch for PPO checking
+        try:
+            step_uids_flat: list[int] = []
+            for ep in buffer._episodes:
+                if "step_uid_steps" in ep:
+                    step_uids_flat.extend(ep["step_uid_steps"])
+            if len(step_uids_flat) != batch["actions"].shape[0]:
+                raise RuntimeError("step_uid length mismatch vs batch size")
+            batch["step_uid"] = step_uids_flat
+        except Exception as e:
+            print("[DEBUG] step_uid attach failed:", e)
+            batch["step_uid"] = [int(i) for i in range(batch["actions"].shape[0])]
 
         # Optional safety assertion: exactly one answer action per episode
         try:
@@ -209,6 +235,8 @@ class PPOTrainer:
             raise RuntimeError("Advantages contain non-finite values.")
         # Attach to batch for deterministic minibatch slicing
         batch["advantages"] = advantages
+        # Attach global_step for invariant assertion in loss
+        batch["global_step"] = self.global_step
 
         # 4) PPO updates (minibatched)
         last_metrics: Dict[str, float] = {}

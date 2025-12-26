@@ -62,9 +62,13 @@ def collect_rollout(
     inserted_token_ids_steps: List[List[int]] = []
     # Record allowed ids per step for exact mask replication in loss
     allowed_action_ids_steps: List[List[int]] = []
+    # Debug: step unique ID per episode and rollout-time logs
+    step_uid_steps: List[int] = []
+    debug_rollout: List[Dict[str, Any]] = []
 
     z_count = 0
     answer_count = 0
+    step_uid_counter = 0
 
     while not env.is_done():
         # a) Action space
@@ -84,7 +88,6 @@ def collect_rollout(
         if space.kind == "answer" and phase != "answer":
             raise RuntimeError("Answer action space used outside answer phase")
 
-        # c) Route logits and apply appropriate mask
         if space.kind == "token":
             # Use LM logits at last position
             logits = outputs.logits  # [1, T, V]
@@ -124,11 +127,23 @@ def collect_rollout(
             values.append(float(value_t.item()))
             entropies.append(float(entropy.item()))
             phases.append(phase)
-
             action_kinds.append("token")
-            # Record the exact prefix used for this action
             input_ids_steps.append(input_ids.squeeze(0).tolist())
             attention_mask_steps.append(attention_mask.squeeze(0).tolist())
+            step_uid_steps.append(step_uid_counter)
+
+            # Debug rollout storage
+            softmax_den = torch.exp(masked_logits).sum().item()
+            debug_rollout.append({
+                "step_uid": step_uid_counter,
+                "phase": phase,
+                "action_kind": "token",
+                "action": int(action.item()),
+                "allowed_action_ids": list(space.allowed_ids),
+                "masked_logit_action": float(masked_logits[0, int(action.item())].item()),
+                "logprob_old": float(logprob.item()),
+                "softmax_den": float(softmax_den),
+            })
 
             # g) Step env with the sampled token id
             env.step(int(action.item()))
@@ -197,21 +212,35 @@ def collect_rollout(
             entropies.append(float(entropy.item()))
             phases.append(phase)
             action_kinds.append("answer")
-            # Record the exact prefix used for this action
             input_ids_steps.append(input_ids.squeeze(0).tolist())
             attention_mask_steps.append(attention_mask.squeeze(0).tolist())
+            inserted_token_ids_steps.append([])
+            step_uid_steps.append(step_uid_counter)
+
+            # Debug rollout storage
+            softmax_den = torch.exp(masked_logits).sum().item()
+            debug_rollout.append({
+                "step_uid": step_uid_counter,
+                "phase": phase,
+                "action_kind": "answer",
+                "action": act_int,
+                "allowed_action_ids": list(space.allowed_ids),
+                "masked_logit_action": float(masked_logits[0, act_int].item()),
+                "logprob_old": float(logprob.item()),
+                "softmax_den": float(softmax_den),
+            })
 
             # g) Step env with class index; DO NOT touch text sequence
             env.step(act_int)
-
-            # h) Do NOT append any tokens to the input sequence for classification answers
-            inserted_token_ids_steps.append([])
 
             # Track counts
             answer_count += 1
 
         else:
             raise RuntimeError(f"Unknown ActionSpace kind '{space.kind}'")
+
+        # increment step UID per step
+        step_uid_counter += 1
 
     # Episode end
     reward = env.get_reward()
@@ -259,4 +288,7 @@ def collect_rollout(
         "inserted_token_ids_steps": inserted_token_ids_steps,
         # include per-step allowed ids (token ids for latent; class indices for answer)
         "allowed_action_ids_steps": allowed_action_ids_steps,
+        # Debug: per-step unique IDs and rollout-time logs
+        "step_uid_steps": step_uid_steps,
+        "debug_rollout": debug_rollout,
     }
