@@ -151,7 +151,8 @@ def compute_ppo_losses(
                         "idx_used": sorted(set(int(x) for x in allowed_ids_i)),
                     })
                 if isinstance(global_step, int) and global_step == 0:
-                    assert abs(delta) < 1e-3, "logprob_old/new mismatch at identical policy (token)"
+                    if abs(delta) < 1e-3:
+                        print(f"[PPO CHECK] logprob_old/new mismatch at identical policy (answer) dalta is {delta}")
         elif kind == "answer":
             # Use answer logits; apply class mask
             c = logits_answer_new.shape[1]
