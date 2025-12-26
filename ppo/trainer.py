@@ -72,7 +72,7 @@ class PPOTrainer:
         self.updates_per_epoch = int(cfg["training"]["updates_per_epoch"])
         self.clip_epsilon = float(cfg["ppo"]["clip_epsilon"])  # PPO clipping
         # New: minibatch size for PPO updates
-        self.ppo_minibatch_size = int(cfg["training"]["mini_batch_rollout_batch_size"])
+        self.ppo_minibatch_size = int(cfg["training"]["ppo_minibatch_size"])
 
     def _sample_datapoint(self, dataset) -> Dict[str, Any]:
         idx = random.randint(0, len(dataset) - 1)
