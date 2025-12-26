@@ -118,7 +118,7 @@ class PPOTrainer:
         # Batch-based episode logging (before PPO updates)
         log_cfg = self.cfg.get("logging", {})
         if log_cfg.get("log_episodes", False):
-            stride = int(log_cfg.get("log_every_n_in_batch", 8))
+            stride = int(log_cfg.get("log_every_n_in_batch"))
             for i in range(0, len(buffer._episodes), stride):
                 ep = buffer._episodes[i]
                 # Reconstruct full sequence step-by-step from first prefix

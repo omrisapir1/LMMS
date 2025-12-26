@@ -101,7 +101,7 @@ logging:
 # Training Schedule
 # ----------------------------
 training:
-  rollout_batch_size: 8          # number of episodes per PPO update
+  rollout_batch_size: 512          # number of episodes per PPO update
   updates_per_epoch: 1
   num_epochs: 15000                  # keep short by default
 

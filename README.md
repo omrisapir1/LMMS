@@ -29,8 +29,8 @@ This project explores an alternative paradigm:
 This repository is built around three non-negotiable principles:
 
 1. **No language decoding**
-   - The model does not generate natural language explanations.
-   - Tokens are treated as *latent actions*, not as communicative text.
+   - The model never generates natural language answers or explanations.
+   - Tokens are treated as *latent control actions*, not as communicative text.
 
 2. **Iterative Markov reasoning**
    - Reasoning is performed through a sequence of latent steps.
@@ -49,22 +49,36 @@ protocols evolve.
 
 The system consists of three conceptual components:
 
-- **Policy Model**
-  - A pretrained math LLM (Qwen-Math-1.5B) augmented with:
-    - latent action tokens (`<z*>`)
-    - a value head for PPO
-  - Language understanding is retained internally, but language is never decoded.
+### **Policy Model**
+- A pretrained math-focused LLM (e.g. Qwen-Math-1.5B)
+- Augmented with:
+  - **Latent action tokens** (`<z*>`) used exclusively during reasoning
+  - **Answer classification head** producing discrete numeric answers
+  - **Value head** for PPO
 
-- **Environment**
-  - A Gym-like environment that:
-    - enforces interaction protocols and structural constraints during training
-    - applies step-dependent action masking
-    - inserts scaffold tokens during early phases
-    - computes rewards based solely on final answer correctness
+The language model backbone is used only for **encoding and latent state transitions**.
+No language is ever decoded as output.
 
-- **PPO Trainer**
-  - Optimizes the policy using Proximal Policy Optimization (PPO)
-  - Uses sparse, delayed rewards aligned with evaluation metrics
+---
+
+### **Environment**
+A Gym-like environment that:
+
+- Enforces interaction protocols during training
+- Applies phase-dependent action masking
+- Inserts training scaffolds where needed
+- Computes rewards **only from final answer correctness**
+
+The environment owns protocol correctness but never performs reasoning itself.
+
+---
+
+### **PPO Trainer**
+- Optimizes the policy using **Proximal Policy Optimization (PPO)**
+- Treats:
+  - latent tokens as discrete actions
+  - the answer as a discrete classification action
+- Uses sparse, delayed rewards aligned with evaluation metrics
 
 ---
 
@@ -73,82 +87,81 @@ The system consists of three conceptual components:
 This project explicitly distinguishes between **training scaffolds** and the **intended
 end-state behavior**.
 
-### Phase 1: Enforced Protocol (Training Scaffold)
+---
 
-In the initial training phase, the environment enforces a structured interaction
-protocol designed to bootstrap latent reasoning and policy control.
+## Phase 1: Enforced Protocol (Training Scaffold)
+
+In the initial training phase, the environment enforces a strict interaction protocol
+designed to bootstrap latent reasoning and policy control.
 
 For each training episode:
 
 1. The environment provides a natural language math question.
 2. A latent step count `K` is sampled uniformly from a predefined range
    (e.g. `K ∈ [K_min, K_max]`).
-3. The policy emits exactly `K` latent action tokens, where:
+3. The policy emits exactly `K` latent actions, where:
    - only `<z*>` tokens are allowed
    - all other tokens are masked out
-4. The environment inserts an answer scaffold beginning with:
-```</answer>```
-5. Based on the known length of the labeled answer, the environment inserts a number
-   of leading `0` tokens such that the **total numeric answer width is fixed to 5 digits**.
-6. The policy emits the remaining digit tokens required to complete the 5-digit answer
-   representation, with:
-   - the action space restricted to `{0..9}`
+4. After the final latent step, the environment transitions to the **answer phase**.
+5. The policy emits **one discrete answer action**:
+   - sampled from a **classification head**
+   - action space: `{0, 1, 2, ..., 9}` (or larger ranges in later phases)
+6. The episode terminates immediately after the answer action.
 7. A reward is assigned:
-   - `+1` if the predicted number exactly matches the labeled answer
+   - `+1` if the predicted answer equals the labeled answer
    - `0` otherwise
 
-Examples of Phase-1 answer formats:
+### Key properties of Phase 1
 
-```</answer>``` 0 0 0 0 d1
-```</answer>``` 0 0 0 d1 d2
-```</answer>``` 0 0 d1 d2 d3
+- The answer is **not a token**
+- The answer does **not** affect the input sequence
+- The answer is a **pure control action**
+- The reward depends only on the final answer
 
-Only policy-sampled tokens (latent actions and digit tokens) participate in PPO
-optimization.
-
----
-
-### Phase-1 Scaffolding Notes
-
-The use of labeled answer length to determine the number of leading `0` tokens is a
-deliberate Phase-1 training scaffold. It simplifies early learning by decoupling
-latent reasoning from output-length prediction.
-
-Similarly, the emission of the `</answer>` token and the termination of latent steps
-are controlled by the environment during this phase to enforce a minimum reasoning
-depth.
-
-These constraints are **temporary** and exist solely to stabilize early learning.
+Only policy-sampled actions (latent actions + answer classification)
+participate in PPO optimization.
 
 ---
 
-### End State: Fully Policy-Controlled Protocol
+## Training Scaffolding Notes
+
+Several constraints in Phase 1 are **deliberate training scaffolds**:
+
+- The number of latent steps `K` is externally controlled
+- The answer is emitted via a dedicated classification head
+- The episode terminates immediately after answering
+
+These constraints exist solely to stabilize early learning and ensure
+clear credit assignment between latent reasoning and final answers.
+
+They are **not** part of the intended end-state behavior.
+
+---
+
+## End State: Fully Policy-Controlled Reasoning
 
 The intended final behavior of the system is:
 
-- The policy decides when to emit `</answer>`.
-- The policy decides how many latent steps to perform, as in a standard autoregressive
-  language model.
-- The policy generates all answer digits, without environment-provided padding.
-- The environment no longer inserts scaffold tokens.
-
-In later phases, answers are generated directly in fixed-width form:
-</answer> d1 d2 d3 d4 d5
+- The policy decides **when** to stop reasoning
+- The policy decides **how many** latent steps to take
+- The policy decides **when** to answer
+- The policy produces the answer directly, without environment-imposed structure
 
 In the end state:
 
 > **All control over reasoning depth and answer emission belongs to the policy.**
 
+The environment becomes a passive evaluator rather than a protocol enforcer.
+
 ---
 
 ## Latent Action Tokens (`<z*>`)
 
-- `<z*>` tokens represent **latent micro-actions**.
-- They have no predefined semantics and are not natural language.
-- Their meaning emerges entirely through reinforcement learning.
+- `<z*>` tokens represent **latent micro-actions**
+- They have no predefined semantics and are not natural language
+- Their meaning emerges entirely through reinforcement learning
 
-At early stages, only micro tokens are used. Hierarchical or macro-action structures
-may be introduced later, but are not yet committed to.
+They are never decoded, logged, or interpreted linguistically.
 
 ---
 
@@ -156,13 +169,13 @@ may be introduced later, but are not yet committed to.
 
 Training uses **Proximal Policy Optimization (PPO)**:
 
-- Tokens are treated as actions.
-- Transformer hidden states are treated as environment states.
-- Rewards are sparse and delayed.
-- A shared-backbone value head estimates expected final reward.
+- Latent tokens and answer classifications are treated as actions
+- Transformer hidden states are treated as environment states
+- Rewards are sparse and delayed
+- A shared-backbone value head estimates expected final reward
 
-Early phases train only a subset of model parameters to preserve pretrained math
-capabilities. Additional layers are gradually unfrozen as task difficulty increases.
+Early phases train only a subset of model parameters to preserve pretrained
+language understanding. Additional layers may be unfrozen gradually.
 
 ---
 
@@ -171,34 +184,28 @@ capabilities. Additional layers are gradually unfrozen as task difficulty increa
 Training proceeds through increasingly difficult stages:
 
 ### Phase 1
-
-- Very simple arithmetic (answers in the range `0–999`)
-- One- to three-digit answers
-- Fixed-width (5-digit) output with environment-provided padding
-- Latent step count externally controlled and randomized
-- Goal: learn the latent action protocol and deferred answering
+- Very simple arithmetic
+- Small answer spaces (e.g. digits `0–9`)
+- Fixed latent step count range
+- Environment-controlled termination
+- Goal: learn latent action protocol and deferred answering
 
 ### Later Phases (Planned)
-
-- Larger numeric ranges
-- Fully policy-controlled answer formatting
-- Longer and variable reasoning horizons
+- Larger answer spaces
+- Learned termination policies
+- Variable and longer reasoning horizons
 - Harder word problems
-- Learned termination (`</answer>`)
+- Removal of all environment-enforced structure
 - Optional hierarchical latent actions
 
 ---
 
 ## Output Representation
 
-All answers are represented in **fixed-width numeric form**:
+The system **does not generate textual output**.
 
-- Total width: **5 digits**
-- Right-aligned
-- Left-padded with `0` tokens when necessary
-
-Padding is environment-controlled in early phases and policy-controlled in later
-phases.
+Answers are represented as **discrete actions** sampled from a classification head.
+No decoding, formatting, or token-level output is required.
 
 ---
 
@@ -207,8 +214,8 @@ phases.
 This project intentionally does **not** aim to:
 
 - Generate human-readable reasoning traces
-- Optimize for interpretability of intermediate steps
-- Use chain-of-thought supervision
+- Produce chain-of-thought explanations
+- Optimize interpretability of intermediate steps
 - Perform standard supervised fine-tuning (SFT)
 
 Any of the above would violate the core design principles.
@@ -221,9 +228,9 @@ This repository is intended to be used for the **entire lifetime of the project*
 
 The README is written to:
 
-- clearly separate temporary training scaffolds from permanent design principles
-- remain correct as training protocols evolve
-- be unambiguous for automated agents modifying the code
+- Clearly separate temporary training scaffolds from permanent principles
+- Remain correct as training protocols evolve
+- Be unambiguous for automated agents modifying the code
 
 When in doubt:
 
@@ -234,6 +241,7 @@ When in doubt:
 ## Future Directions (Non-Exhaustive)
 
 - Learned termination policies
+- Larger answer spaces
 - Hierarchical latent action systems
-- Value shaping and verifier-guided rewards
+- Verifier-guided rewards
 - Scaling to competition-level math benchmarks
