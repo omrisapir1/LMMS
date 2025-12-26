@@ -169,7 +169,7 @@ def compute_ppo_losses(
             entropy_list.append(torch.zeros((), device=logits_i.device, dtype=logits_i.dtype))
 
             # Debug first 3 steps
-            if i True:
+            if True:
                 print({
                     "step": i,
                     "kind": "answer",
