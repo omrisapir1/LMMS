@@ -61,11 +61,7 @@ def test_reset_initializes_state(env_fixture):
     assert st.phase == "latent"
     assert cfg["environment"]["latent_steps"]["min"] <= st.K <= cfg["environment"]["latent_steps"]["max"]
     assert st.latent_step_idx == 0
-    assert st.digit_step_idx == 0
-    total_width = int(cfg["environment"]["answer"]["total_width"])
-    zeros_needed = total_width - label["length_ans"]
-    zero_id = tok.convert_tokens_to_ids("0")
-    assert st.padding_zeros == [zero_id] * zeros_needed
+
 
 
 def test_latent_phase_allows_only_z_tokens(env_fixture):

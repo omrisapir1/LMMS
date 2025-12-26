@@ -5,28 +5,25 @@ import torch
 
 def compute_ppo_losses(
     *,
-    logits_new: torch.Tensor,     # [N, V]
+    logits_token_new: torch.Tensor,     # [N, V]
+    logits_answer_new: torch.Tensor,   # [N, 10]
     values_new: torch.Tensor,     # [N]
-    batch: Dict[str, torch.Tensor],
+    batch: Dict[str, Any],
     advantages: torch.Tensor,     # [N]
     clip_epsilon: float,
-    tokenizer: Any = None,
     vocab_size: int = 64,
-    answer_temperature: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
-    Compute Phase-1 PPO losses (separate): policy, value, entropy, and return ratio.
+    Compute PPO losses (policy, value, entropy, ratio) for mixed action spaces.
 
-    Notes:
-    - No KL penalty, no value clipping.
-    - Entropy scaling is handled outside this function.
-    - No reward/advantage normalization here (advantages provided).
-    - Entropy is recomputed from current policy logits (not rollout batch) and applied only on latent steps.
-    - CRITICAL FIX: Reapply phase-dependent action masks before computing logprob_new and entropy.
+    - Token actions use logits_token_new with vocab masking.
+    - Answer actions use logits_answer_new with class masking.
+    - Entropy is computed ONLY for token actions.
+    - Temperature is NOT applied here (rollout-only).
     """
     if advantages.requires_grad:
         raise RuntimeError("advantages must not require gradients")
-    required = ("actions", "logprob_old", "rewards", "phases")
+    required = ("actions", "logprob_old", "rewards", "action_kinds")
     for k in required:
         if k not in batch:
             raise KeyError(f"Batch missing required key: {k}")
@@ -34,16 +31,27 @@ def compute_ppo_losses(
     actions = batch["actions"]          # [N] long
     logprob_old = batch["logprob_old"]  # [N] float
     rewards = batch["rewards"]          # [N] float
-    phases = batch["phases"]            # List[str] length N
-    allowed_ids_per_step = batch.get("allowed_token_ids")  # List[List[int]] length N
+    action_kinds = batch["action_kinds"] # List[str], length N
+    allowed_ids_per_step = batch.get("allowed_action_ids")  # List[List[int]] length N
 
     if logprob_old.requires_grad:
         raise RuntimeError("logprob_old must not require gradients")
 
-    # Basic shape checks
-    if logits_new.ndim != 2:
-        raise RuntimeError(f"logits_new must be [N, V], got shape {tuple(logits_new.shape)}")
-    N, V = logits_new.shape
+    # Basic shape checks (conditional for mixed spaces)
+    if logits_token_new.ndim != 2:
+        raise RuntimeError(f"logits_token_new must be [N, V], got shape {tuple(logits_token_new.shape)}")
+    if logits_answer_new.ndim != 2:
+        raise RuntimeError(f"logits_answer_new must be [N, 10], got ndim={logits_answer_new.ndim}")
+    if logits_answer_new.shape[1] != 10:
+        raise RuntimeError(f"logits_answer_new second dim must be 10, got {logits_answer_new.shape[1]}")
+
+    N = values_new.shape[0]
+    # Enforce batch-size consistency across outputs
+    if logits_token_new.shape[0] != N:
+        raise RuntimeError(f"Batch-size mismatch: logits_token_new.shape[0]={logits_token_new.shape[0]} != N={N}")
+    if logits_answer_new.shape[0] != N:
+        raise RuntimeError(f"Batch-size mismatch: logits_answer_new.shape[0]={logits_answer_new.shape[0]} != N={N}")
+
     for name, t in {
         "values_new": values_new,
         "actions": actions,
@@ -55,45 +63,112 @@ def compute_ppo_losses(
             raise RuntimeError(f"{name} must be 1D [N], got ndim={t.ndim}")
         if t.shape[0] != N:
             raise RuntimeError(f"{name} length {t.shape[0]} != N {N}")
-    if not isinstance(phases, list) or len(phases) != N:
-        raise RuntimeError("batch['phases'] must be a list of length N")
+
+    if not isinstance(action_kinds, list) or len(action_kinds) != N:
+        raise RuntimeError("batch['action_kinds'] must be a list of length N")
     if allowed_ids_per_step is None or not isinstance(allowed_ids_per_step, list) or len(allowed_ids_per_step) != N:
-        raise RuntimeError("batch['allowed_token_ids'] must be a list of length N")
+        raise RuntimeError("batch['allowed_action_ids'] must be a list of length N")
 
     # Required equality for core shapes
-    if not (advantages.shape == rewards.shape == values_new.shape):
-        raise RuntimeError("Shape mismatch among advantages, rewards, and values_new.")
+    if not (advantages.shape == rewards.shape == values_new.shape == actions.shape == logprob_old.shape):
+        raise RuntimeError("Shape mismatch among core 1D tensors.")
 
-    # Build per-step mask from allowed ids recorded during rollout [N, V]
-    mask = torch.full((N, V), -1e9, dtype=logits_new.dtype, device=logits_new.device)
+    # Prepare outputs per step
+    logprob_new_list = []
+    entropy_list = []
+
+    # Iterate per step; build masked logits and compute logprob and entropy as specified
     for i in range(N):
+        kind = action_kinds[i]
         allowed_ids_i = allowed_ids_per_step[i]
         if not isinstance(allowed_ids_i, list):
-            raise RuntimeError(f"allowed_token_ids[{i}] must be a list")
+            raise RuntimeError(f"allowed_action_ids[{i}] must be a list")
         if len(allowed_ids_i) == 0:
-            # Should only occur if phase is done, which shouldn't be in batch
             raise RuntimeError(f"Empty allowed ids at step {i}")
-        idx = torch.tensor(sorted(set(int(x) for x in allowed_ids_i)), dtype=torch.long, device=logits_new.device)
-        mask[i].index_fill_(0, idx, 0.0)
 
-    # For debugging: compute unscaled masked logits as well
-    masked_logits_unscaled = logits_new + mask
-    masked_logits_new = (logits_new + mask) / answer_temperature
+        if kind == "token":
+            # Use vocab logits; apply vocab mask
+            v = logits_token_new.shape[1]
+            logits_i = logits_token_new[i]
+            if logits_i.shape[0] != v:
+                raise RuntimeError(f"Token logits length mismatch at step {i}: {logits_i.shape[0]} vs {v}")
+            # Validate allowed ids range for vocab
+            for id_ in allowed_ids_i:
+                if not (0 <= int(id_) < v):
+                    raise RuntimeError(
+                        f"Out-of-range allowed id at step {i} (token): id={id_}, valid range [0, {vocab_size})"
+                    )
+            # Device-safe idx on logits_i.device
+            idx = torch.tensor(sorted(set(int(x) for x in allowed_ids_i)), dtype=torch.long, device=logits_i.device)
+            # Build mask using smallest finite value to strongly exclude
+            neg_large = torch.finfo(logits_i.dtype).min
+            mask_i = torch.full((v,), neg_large, dtype=logits_i.dtype, device=logits_i.device)
+            mask_i.index_fill_(0, idx, 0.0)
+            masked_logits_i = logits_i + mask_i  # no temperature
+            log_probs_i = torch.log_softmax(masked_logits_i, dim=-1)
+            # Validate chosen action correctness
+            a_i = int(actions[i])
+            if not (0 <= a_i < vocab_size):
+                raise RuntimeError(
+                    f"Chosen action out of range at step {i} (token): action={a_i}, valid range [0, {vocab_size})"
+                )
+            if a_i not in allowed_ids_i:
+                raise RuntimeError(
+                    f"Chosen action not in allowed ids at step {i} (token): action={a_i}, allowed={allowed_ids_i}"
+                )
+            logprob_new_list.append(log_probs_i[a_i])
+            # Entropy only for token steps
+            dist_i = torch.distributions.Categorical(logits=masked_logits_i)
+            entropy_list.append(dist_i.entropy())
+        elif kind == "answer":
+            # Use answer logits; apply class mask
+            c = logits_answer_new.shape[1]
+            logits_i = logits_answer_new[i]
+            if c != 10:
+                raise RuntimeError(f"Answer logits second dim must be 10, got {c}")
+            if logits_i.shape[0] != c:
+                raise RuntimeError(f"Answer logits length mismatch at step {i}: {logits_i.shape[0]} vs {c}")
+            # Validate allowed ids range for classes
+            for id_ in allowed_ids_i:
+                if not (0 <= int(id_) < 10):
+                    raise RuntimeError(
+                        f"Out-of-range allowed id at step {i} (answer): id={id_}, valid range [0, 10)"
+                    )
+            # Device-safe idx on logits_i.device
+            idx = torch.tensor(sorted(set(int(x) for x in allowed_ids_i)), dtype=torch.long, device=logits_i.device)
+            neg_large = torch.finfo(logits_i.dtype).min
+            mask_i = torch.full((c,), neg_large, dtype=logits_i.dtype, device=logits_i.device)
+            mask_i.index_fill_(0, idx, 0.0)
+            masked_logits_i = logits_i + mask_i  # no temperature
+            log_probs_i = torch.log_softmax(masked_logits_i, dim=-1)
+            # Validate chosen action correctness
+            a_i = int(actions[i].item()) if actions.dtype != torch.long else int(actions[i])
+            if not (0 <= a_i < 10):
+                raise RuntimeError(
+                    f"Chosen action out of range at step {i} (answer): action={a_i}, valid range [0, 10)"
+                )
+            if a_i not in allowed_ids_i:
+                raise RuntimeError(
+                    f"Chosen action not in allowed ids at step {i} (answer): action={a_i}, allowed={allowed_ids_i}"
+                )
+            logprob_new_list.append(log_probs_i[a_i])
+            # Entropy is zero for answer steps
+            entropy_list.append(torch.zeros((), dtype=logits_i.dtype, device=logits_i.device))
+        else:
+            raise RuntimeError(f"Unknown action kind at step {i}: {kind}")
 
-    # Recompute log-probs under new policy with masking (scaled and unscaled for diagnostics)
-    log_probs_new = torch.log_softmax(masked_logits_new, dim=-1)      # [N, V]
-    log_probs_new_unscaled = torch.log_softmax(masked_logits_unscaled, dim=-1)
-    logprob_new = log_probs_new.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [N]
+    # Stack results
+    logprob_new = torch.stack(logprob_new_list)  # [N]
+    entropy = torch.stack(entropy_list)          # [N]
 
     # Importance sampling ratio
     ratio = torch.exp(logprob_new - logprob_old)  # [N]
-
 
     # Numerical safety checks for ratio
     if not torch.isfinite(ratio).all():
         raise RuntimeError("Non-finite values in importance sampling ratio.")
 
-    # Clipped surrogate policy loss (includes both latent and answer steps)
+    # Clipped surrogate policy loss (includes both token and answer steps)
     surr1 = ratio * advantages
     surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
     policy_loss = -torch.mean(torch.min(surr1, surr2))
@@ -101,15 +176,13 @@ def compute_ppo_losses(
     # Value loss: no clipping, no coefficient here
     value_loss = torch.mean((values_new - rewards) ** 2)
 
-    # Entropy loss from current policy (new masked logits), applied only on latent steps
-    dist_new = torch.distributions.Categorical(logits=masked_logits_new)
-    entropy_new = dist_new.entropy()  # [N]
-    latent_mask = torch.tensor([p == "latent" for p in phases], device=entropy_new.device, dtype=torch.float32)
-    latent_count = latent_mask.sum()
-    if latent_count.item() > 0:
-        entropy_loss = -((entropy_new * latent_mask).sum() / latent_count)
+    # Entropy loss: mean over token steps only (entropy for answer steps is zero)
+    token_mask = torch.tensor([k == "token" for k in action_kinds], device=entropy.device, dtype=torch.float32)
+    token_count = token_mask.sum()
+    if token_count.item() > 0:
+        entropy_loss = -((entropy * token_mask).sum() / token_count)
     else:
-        entropy_loss = torch.zeros((), device=entropy_new.device)
+        entropy_loss = torch.zeros((), device=entropy.device)
 
     # Final numerical safety checks
     for name, t in {
@@ -120,8 +193,6 @@ def compute_ppo_losses(
     }.items():
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
-
-
 
     return {
         "policy_loss": policy_loss,

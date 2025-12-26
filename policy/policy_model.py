@@ -12,6 +12,7 @@ class PolicyForwardOutput:
     logits: torch.Tensor
     hidden_states: Tuple[torch.Tensor, ...]
     values: torch.Tensor
+    answer_logits: Optional[torch.Tensor] = None
 
 
 class PolicyModel(nn.Module):
@@ -50,6 +51,8 @@ class PolicyModel(nn.Module):
 
         # Log trainable parameter counts
         self._log_param_counts()
+
+        self.answer_head = nn.Linear(hidden_size, 10)
 
     def _infer_hidden_size(self) -> int:
         # Try common attributes
@@ -100,6 +103,10 @@ class PolicyModel(nn.Module):
             for p in lm_head.parameters():
                 p.requires_grad = True
 
+        # Unfreeze answer head
+        for p in self.answer_head.parameters():
+            p.requires_grad = True
+
         # Ensure value head is trainable
         for p in self.value_head.parameters():
             p.requires_grad = True
@@ -141,11 +148,12 @@ class PolicyModel(nn.Module):
 
         values = self.value_head(last_hidden)  # [B, T, 1]
         values = values.squeeze(-1)   # [B, T]
-
+        answer_logits = self.answer_head(last_hidden)  # [B, T, 10]
         return PolicyForwardOutput(
             logits=logits,
             hidden_states=hidden_states if return_hidden_states else (hidden_states[-1],),
             values=values,
+            answer_logits=answer_logits,
         )
 
 

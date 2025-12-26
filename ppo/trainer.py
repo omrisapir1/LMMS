@@ -32,10 +32,10 @@ class PPOTrainer:
         self.entropy_coef = float(cfg["ppo"]["entropy_coefficient"]) if "entropy_coefficient" in cfg["ppo"] else 0.0
 
         # Parameter groups (cached once)
-        self._policy_params_cached = [
+        self._policy_params_cached = list(
             p for n, p in self.policy.named_parameters()
-            if not n.startswith("value_head") and p.requires_grad
-        ]
+            if n.startswith("lm.") or n.startswith("answer_head.")
+        )
         self._value_params_cached = list(self.policy.value_head.parameters())
 
         if len(self._policy_params_cached) == 0:
@@ -71,8 +71,13 @@ class PPOTrainer:
         """Re-evaluate policy on the exact prefixes used for each PPO step.
 
         Returns:
-            logits_new: [N, V] last-token logits
+            logits_token_new: [N, V] last-token logits
+            logits_answer_new: [N, 10] classification head logits
             values_new: [N] value estimates computed from detached hidden states
+
+        Notes:
+            - Both heads (token LM logits and answer_head logits) are always computed for all steps.
+            - Mixed-action masking/usage occurs later inside compute_ppo_losses; no phase-conditional logic here.
         """
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
@@ -85,15 +90,21 @@ class PPOTrainer:
             return_dict=True,
         )
         logits_full = outputs.logits  # [N, T, V]
-        last_logits = logits_full[:, -1, :]  # [N, V]
+        logits_token_new = logits_full[:, -1, :]  # [N, V]
 
-        # Detach hidden states before value head to avoid backbone gradients via value loss
+        # Last hidden state
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [N, H]
+
+        # NOTE:
+        # answer_head is intentionally computed for all steps (including token-only steps).
+        # Masking and usage are handled later in the PPO loss.
+        # This avoids phase-conditional branching in the forward pass.
+        logits_answer_new = self.policy.answer_head(last_hidden)  # [N, 10]
         values_new = self.policy.value_head(last_hidden.detach()).squeeze(-1)  # [N]
 
-        return last_logits, values_new
+        return logits_token_new, logits_answer_new, values_new
 
-    def train_epoch(self, dataset, vocab_size: int=64) -> Dict[str, float]:
+    def train_epoch(self, dataset) -> Dict[str, float]:
         buffer = TrajectoryBuffer()
         episodes_collected = 0
         for _ in range(self.rollout_batch_size):
@@ -114,21 +125,26 @@ class PPOTrainer:
                 full_ids: list[int] = []
                 if ep["input_ids_steps"]:
                     full_ids.extend(ep["input_ids_steps"][0])
-                for step_i in range(len(ep["actions"])):
-                    full_ids.append(ep["actions"][step_i])
-                    # Append environment-inserted tokens for this step
-                    inserted_ids = ep.get("inserted_token_ids_steps", [])
-                    if inserted_ids:
-                        full_ids.extend(inserted_ids[step_i])
+                for action, kind, inserted in zip(
+                        ep["actions"],
+                        ep["action_kinds"],
+                        ep["inserted_token_ids_steps"],
+                ):
+                    if kind == "token":
+                        full_ids.append(action)
+                        if inserted:
+                            full_ids.extend(inserted)
                 full_tokens = self.tokenizer.convert_ids_to_tokens(full_ids)
-                # Predicted integer from the final length_ans tokens (defensive decoding)
-                length_ans = int(ep.get("length_ans", 0))
-                if length_ans > 0 and len(full_tokens) >= length_ans:
-                    digit_tokens = full_tokens[-length_ans:]
-                    digit_str = "".join(t for t in digit_tokens if t.isdigit())
-                    pred_int = int(digit_str) if digit_str else 0
-                else:
+
+                # Extract predicted integer from answer action
+                pred_int = None
+                for action, kind in zip(ep["actions"], ep["action_kinds"]):
+                    if kind == "answer":
+                        pred_int = int(action)
+                        break
+                if pred_int is None:
                     pred_int = 0
+
                 question = ep.get("question", "")
                 K = int(ep.get("K", 0))
                 label_int = int(ep.get("label_int", 0))
@@ -147,10 +163,20 @@ class PPOTrainer:
                 )
 
         # 2) Build PPO batch (includes padded input_ids/attention_mask)
-        batch = buffer.get_batch(self.device, pad_token_id=self.tokenizer.pad_token_id)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+        batch = buffer.get_batch(self.device, pad_token_id=pad_id)
+
+        # Optional safety assertion: exactly one answer action per episode
+        try:
+            assert batch["action_kinds"].count("answer") == len(buffer._episodes)
+        except Exception:
+            raise RuntimeError(
+                f"Protocol violation: expected one 'answer' action per episode; got {batch['action_kinds'].count('answer')} answers for {len(buffer._episodes)} episodes"
+            )
 
         # 3) Compute advantages (computed once per batch in Phase-1)
-        # NOTE: Advantages are intentionally computed once per batch in Phase-1.
         advantages = compute_advantages(batch, normalize=True)
         if advantages.shape != batch["rewards"].shape:
             raise RuntimeError("Advantages shape mismatch vs rewards.")
@@ -160,17 +186,16 @@ class PPOTrainer:
         # 4) PPO updates
         last_metrics: Dict[str, float] = {}
         for _ in range(self.updates_per_epoch):
-            logits_new, values_new = self._policy_forward_on_batch(batch)
+            logits_token_new, logits_answer_new, values_new = self._policy_forward_on_batch(batch)
 
-            # Compute losses
+            # Compute losses with mixed action spaces
             losses = compute_ppo_losses(
-                logits_new=logits_new,
+                logits_token_new=logits_token_new,
+                logits_answer_new=logits_answer_new,
                 values_new=values_new,
                 batch=batch,
                 advantages=advantages,
                 clip_epsilon=self.clip_epsilon,
-                tokenizer=self.tokenizer,
-                vocab_size=vocab_size
             )
 
             policy_loss = losses["policy_loss"]
@@ -219,11 +244,8 @@ class PPOTrainer:
 
         # 5) Cleanup
         buffer.clear()
-        # Increment counters after this PPO batch
         self.global_step += 1
         self.batch_idx += 1
-
-        ### FOR DEBUGGING: print policy grad norm
 
         total_norm = torch.norm(
             torch.stack([
@@ -250,5 +272,6 @@ class PPOTrainer:
         # Attach metadata for logging
         episode["question"] = question
         episode["label_int"] = int(label["label_int"]) if "label_int" in label else 0
-        episode["length_ans"] = int(label["length_ans"]) if "length_ans" in label else 0
+        # Remove length_ans assumption from logging; keep if needed for external refs
+        episode["length_ans"] = int(label.get("length_ans", 0))
         return episode

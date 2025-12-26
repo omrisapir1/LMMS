@@ -18,21 +18,11 @@ def build_phase1_tokens(z_vocab_size: int = 64, answer_token: str = "</answer>")
 
 
 def _add_special_tokens(tokenizer, z_tokens: List[str], answer_token: str) -> None:
-    # Register all tokens as special to ensure they are atomic and never split
+    # Register all tokens as special to ensure <z*> and </answer> tokens are atomic and never split
     special_set = list(z_tokens) + [answer_token]
     added = tokenizer.add_special_tokens({"additional_special_tokens": special_set})
     # Note: if some tokens already exist, added may be < len(special_set)
     print(f"Added {added} new special tokens (requested {len(special_set)}).")
-
-
-def _validate_digits_atomic(tokenizer) -> None:
-    # Ensure each digit maps to exactly one token id
-    for d in [str(i) for i in range(10)]:
-        ids = tokenizer.encode(d, add_special_tokens=False)
-        if len(ids) != 1:
-            raise ValueError(f"Digit token '{d}' is not atomic; got ids {ids}.")
-    print("Digit token validation passed: '0'..'9' are atomic.")
-
 
 def _get_token_ids(tokenizer, tokens: List[str]) -> List[int]:
     ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -53,60 +43,93 @@ def _validate_contiguous(ids: List[int]) -> Tuple[int, int]:
     print(f"z-token ids contiguous: range [{min_id},{max_id}]")
     return min_id, max_id
 
+def _apply_embedding_freeze(
+    model,
+    z_token_ids: List[int],
+    answer_token_id: int,
+) -> None:
+    """
+    Apply embedding-level gradient masking so that:
+      - <z*> token embeddings are trainable
+      - </answer> token embedding is trainable
+      - all other token embeddings are frozen
 
-def _apply_embedding_freeze(model, tokenizer, z_token_ids: List[int], answer_token_id: int) -> None:
-    # Only <z*> embeddings are trainable; all others frozen. </answer> is frozen.
+    This is implemented via a gradient hook on the embedding matrix.
+    """
+
     emb = model.get_input_embeddings()
     if emb is None:
         raise ValueError("Model does not expose input embeddings via get_input_embeddings().")
 
     weight = emb.weight
-    vocab_size = weight.shape[0]
+    vocab_size, hidden_dim = weight.shape
 
-    # Build mask: 1 for z-token rows, 0 otherwise (including answer token)
+    # -------------------------------
+    # Build gradient mask
+    # -------------------------------
+    # mask[i] == 1 → gradients allowed for token i
+    # mask[i] == 0 → gradients blocked for token i
     mask = torch.zeros(vocab_size, dtype=weight.dtype)
-    model.register_buffer("_z_grad_mask", mask)
 
-    for i in z_token_ids:
-        if not (0 <= i < vocab_size):
-            raise ValueError(f"z-token id {i} out of embedding range 0..{vocab_size-1}")
-        mask[i] = 1.0
-    # Ensure answer token is frozen
+    trainable_ids = set(z_token_ids)
+
     if 0 <= answer_token_id < vocab_size:
-        mask[answer_token_id] = 0.0
+        trainable_ids.add(answer_token_id)
+    else:
+        raise ValueError(f"answer_token_id {answer_token_id} out of embedding range")
 
-    # Require gradients on embedding weights, then mask them via a gradient hook
+    for i in trainable_ids:
+        if not (0 <= i < vocab_size):
+            raise ValueError(f"Trainable token id {i} out of embedding range 0..{vocab_size - 1}")
+        mask[i] = 1.0
+
+    # Register mask as a persistent buffer on the model
+    model.register_buffer("_lmms_embedding_grad_mask", mask)
+
+    # -------------------------------
+    # Enable gradients + attach hook
+    # -------------------------------
     weight.requires_grad_(True)
 
-    def grad_mask_hook(grad):
-        mask = model._z_grad_mask.to(grad.device)
-        return grad * mask.unsqueeze(1)
+    def grad_mask_hook(grad: torch.Tensor) -> torch.Tensor:
+        """
+        grad: [vocab_size, hidden_dim]
+        """
+        m = model._lmms_embedding_grad_mask.to(grad.device)
+        return grad * m.unsqueeze(1)
 
-    # Remove existing hooks if any to avoid stacking
+    # Remove existing hook to avoid stacking
     if hasattr(weight, "_lmms_grad_hook") and weight._lmms_grad_hook is not None:
         weight._lmms_grad_hook.remove()
+
     hook = weight.register_hook(grad_mask_hook)
-    # Track hook on the tensor for potential future cleanup
     weight._lmms_grad_hook = hook  # type: ignore[attr-defined]
 
-    # Sanity check: simulate a ones grad and assert rows
+    # -------------------------------
+    # Sanity check
+    # -------------------------------
     with torch.no_grad():
-        test = torch.ones_like(weight)
-        masked = grad_mask_hook(test)
-        # All z rows should be non-zero; others zero
-        non_z = set(range(vocab_size)) - set(z_token_ids)
-        if masked[z_token_ids].abs().sum() == 0:
-            raise RuntimeError("Gradient mask failed: z-token rows became zero.")
-        if masked[list(non_z)].abs().sum() != 0:
-            raise RuntimeError("Gradient mask failed: non z-token rows are not zero.")
-    print("Embedding freezing applied: only <z*> rows trainable; </answer> frozen.")
+        test_grad = torch.ones_like(weight)
+        masked = grad_mask_hook(test_grad)
 
+        non_trainable_ids = set(range(vocab_size)) - trainable_ids
+
+        if masked[list(trainable_ids)].abs().sum() == 0:
+            raise RuntimeError("Gradient mask failure: trainable rows became zero.")
+
+        if non_trainable_ids and masked[list(non_trainable_ids)].abs().sum() != 0:
+            raise RuntimeError("Gradient mask failure: frozen rows received gradients.")
+
+    print(
+        f"Embedding freeze applied: "
+        f"{len(z_token_ids)} <z*> tokens + </answer> are trainable; "
+        f"{vocab_size - len(trainable_ids)} tokens frozen."
+    )
 
 def extend_tokenizer_and_resize(model, tokenizer, z_vocab_size: int = 64, answer_token: str = "</answer>"):
     """
     Extend tokenizer with <z0>..<z63> and </answer>, resize model embeddings/LM head,
-    validate Phase-1 assumptions, and apply embedding-level freezing so only z-token
-    rows are trainable.
+    validate Phase-1 assumptions,  apply embedding-level freezing so <z*> tokens and </answer> are trainable.
     """
     # Build tokens
     z_tokens, ans_tok = build_phase1_tokens(z_vocab_size=z_vocab_size, answer_token=answer_token)
@@ -120,7 +143,6 @@ def extend_tokenizer_and_resize(model, tokenizer, z_vocab_size: int = 64, answer
     print(f"Resized model embeddings to vocab size {new_vocab_size}.")
 
     # Validations
-    _validate_digits_atomic(tokenizer)
     z_ids = _get_token_ids(tokenizer, z_tokens)
     ans_id = tokenizer.convert_tokens_to_ids(ans_tok)
     if ans_id is None:
@@ -128,7 +150,7 @@ def extend_tokenizer_and_resize(model, tokenizer, z_vocab_size: int = 64, answer
     z_min, z_max = _validate_contiguous(z_ids)
 
     # Apply embedding-level freeze rules
-    _apply_embedding_freeze(model, tokenizer, z_ids, ans_id)
+    _apply_embedding_freeze(model, z_ids, ans_id)
 
     # Final log summary
     print(

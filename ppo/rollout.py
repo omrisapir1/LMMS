@@ -30,7 +30,7 @@ def collect_rollout(
 
     Phase-1 decoding:
     - Latent <z*> actions: sampled (temperature-controlled via config)
-    - Answer digits: greedy argmax (via config)
+    - Answer digits: sampled from classification head (0-9)
     """
     # Read decoding strategies and temperature from config
     rollout_cfg = env.cfg["rollout"]
@@ -55,94 +55,158 @@ def collect_rollout(
     values: List[float] = []
     entropies: List[float] = []
     phases: List[str] = []
+    action_kinds: List[str] = []
     # sequences
     input_ids_steps: List[List[int]] = []
     attention_mask_steps: List[List[int]] = []
     inserted_token_ids_steps: List[List[int]] = []
-    # NEW: record allowed token ids per step for exact mask replication in loss
-    allowed_token_ids_steps: List[List[int]] = []
+    # Record allowed ids per step for exact mask replication in loss
+    allowed_ids_steps: List[List[int]] = []
 
     z_count = 0
-    digit_count = 0
+    answer_count = 0
 
     while not env.is_done():
         # a) Action space
         space = env.get_action_space()
-        # Record allowed ids for this step
-        allowed_token_ids_steps.append(list(space.allowed_token_ids))
-
         # b) Forward policy under no_grad (rollout should not build graphs)
         with torch.no_grad():
             outputs = policy(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Safety: must not mask after termination
+        assert not env.is_done(), "Attempted to sample action after episode termination."
+
+        phase = env._require_state().phase
+
+        # Mandatory runtime safety checks for phase-kind routing
+        if space.kind == "token" and phase == "answer":
+            raise RuntimeError("Token action space used during answer phase")
+        if space.kind == "answer" and phase != "answer":
+            raise RuntimeError("Answer action space used outside answer phase")
+
+        # c) Route logits and apply appropriate mask
+        if space.kind == "token":
+            # Use LM logits at last position
             logits = outputs.logits  # [1, T, V]
             values_tensor = outputs.values  # [1, T]
             logits_t = logits[:, -1, :]  # [1, V]
             value_t = values_tensor[:, -1]  # [1]
 
-        # Safety: must not mask after termination
-        assert not env.is_done(), "Attempted to sample action after episode termination."
+            # Record allowed ids for this step (vocab token ids)
+            allowed_ids_steps.append(list(space.allowed_ids))
 
-        # c) Apply action mask
-        mask = space.logit_mask(vocab_size=logits_t.size(-1), device=logits_t.device, dtype=logits_t.dtype)
-        masked_logits = logits_t + mask  # [1, V]
+            # Apply token mask
+            mask = space.logit_mask(vocab_size=logits_t.size(-1), device=logits_t.device, dtype=logits_t.dtype)
+            masked_logits = logits_t + mask  # [1, V]
 
-        # d) Select action per phase using config-driven strategies
-        phase = env._require_state().phase
-        if phase == "latent":
-            if latent_strategy != "sample":
-                raise ValueError(f"Unsupported latent decoding strategy: {latent_strategy}")
-            # Apply temperature for sampling (decoding-only; policy unchanged)
-            logits_for_sampling = masked_logits / latent_temperature
-            dist = torch.distributions.Categorical(logits=logits_for_sampling)
-            action = dist.sample()  # [1]
-            entropy = dist.entropy()  # [1]
-        elif phase == "answer":
-            if answer_strategy == "sample":
-                logits_for_sampling = masked_logits / answer_temperature
+            # d) Select action per phase using config-driven strategies (latent stays token-based)
+            if phase == "latent":
+                if latent_strategy != "sample":
+                    raise ValueError(f"Unsupported latent decoding strategy: {latent_strategy}")
+                # Apply temperature for sampling (decoding-only; policy unchanged)
+                logits_for_sampling = masked_logits / latent_temperature
                 dist = torch.distributions.Categorical(logits=logits_for_sampling)
                 action = dist.sample()  # [1]
-
-                entropy = torch.zeros_like(value_t)  # we dont want entropy loss for answer phase
+                entropy = dist.entropy()  # [1]
+            elif phase == "answer":
+                # Strict protocol: tokens must not be used during answer phase
+                raise RuntimeError("Token action space used during answer phase")
             else:
+                raise RuntimeError(f"Unknown env phase '{phase}' during rollout.")
+
+            # e) Logprob from unscaled masked token logits
+            log_probs = torch.log_softmax(masked_logits, dim=-1)
+            logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
+
+            # f) Record step
+            actions.append(int(action.item()))
+            logprobs.append(float(logprob.item()))
+            values.append(float(value_t.item()))
+            entropies.append(float(entropy.item()))
+            phases.append(phase)
+
+            action_kinds.append("token")
+            # Record the exact prefix used for this action
+            input_ids_steps.append(input_ids.squeeze(0).tolist())
+            attention_mask_steps.append(attention_mask.squeeze(0).tolist())
+
+            # g) Step env with the sampled token id
+            env.step(int(action.item()))
+
+            # h) Append sampled token id to input_ids
+            input_ids, attention_mask = _append_tokens(input_ids, attention_mask, [int(action.item())])
+
+            # i) Append environment-inserted scaffold tokens AFTER
+            inserted = env.get_inserted_token_ids()
+            if inserted:
+                input_ids, attention_mask = _append_tokens(input_ids, attention_mask, inserted)
+                inserted_token_ids_steps.append(list(inserted))
+            else:
+                inserted_token_ids_steps.append([])
+
+            # Track counts
+            if phase == "latent":
+                z_count += 1
+
+        elif space.kind == "answer":
+            # Use classification head logits
+            if not hasattr(outputs, "answer_logits"):
+                raise RuntimeError("PolicyModel missing answer_logits for classification phase")
+            answer_logits = outputs.answer_logits  # [1, 10]
+            values_tensor = outputs.values  # [1, T]
+            value_t = values_tensor[:, -1]  # [1]
+
+            # Record allowed ids for this step (class indices)
+            allowed_ids_steps.append(list(space.allowed_ids))
+
+            # Apply class mask (10 classes)
+            num_classes = answer_logits.size(-1)
+            if num_classes != 10:
+                raise RuntimeError(f"Answer head size {num_classes} != expected 10")
+            mask = space.class_mask(num_classes=num_classes, device=answer_logits.device, dtype=answer_logits.dtype)
+            masked_logits = answer_logits + mask  # [1, 10]
+
+            # d) Select classification action using config-driven strategies
+            if phase != "answer":
+                raise RuntimeError("Answer action space used outside answer phase")
+            if answer_strategy != "sample":
                 raise ValueError(f"Unsupported answer decoding strategy: {answer_strategy}")
-        else:
-            raise RuntimeError(f"Unknown env phase '{phase}' during rollout.")
+            logits_for_sampling = masked_logits / answer_temperature
+            dist = torch.distributions.Categorical(logits=logits_for_sampling)
+            action = dist.sample()  # [1]
 
-        # e) Logprob (even for greedy) from unscaled masked logits
-        # log_probs = torch.log_softmax(masked_logits, dim=-1)
-        log_probs = torch.log_softmax(masked_logits, dim=-1)
-        logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
+            # No entropy bonus by default for answer phase
+            entropy = torch.zeros_like(value_t)
 
-        # f) Record step
-        actions.append(int(action.item()))
-        logprobs.append(float(logprob.item()))
-        values.append(float(value_t.item()))
-        entropies.append(float(entropy.item()))
-        phases.append(phase)
-        # Record the exact prefix used for this action
-        input_ids_steps.append(input_ids.squeeze(0).tolist())
-        attention_mask_steps.append(attention_mask.squeeze(0).tolist())
+            # e) Logprob from masked classification logits
+            log_probs = torch.log_softmax(masked_logits, dim=-1)
+            logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
 
-        # g) Step env
-        env.step(int(action.item()))
+            # f) Record step
+            act_int = int(action.item())
+            if act_int not in range(10):
+                raise RuntimeError("Invalid answer class selected")
+            actions.append(act_int)
+            logprobs.append(float(logprob.item()))
+            values.append(float(value_t.item()))
+            entropies.append(float(entropy.item()))
+            phases.append(phase)
+            action_kinds.append("answer")
+            # Record the exact prefix used for this action
+            input_ids_steps.append(input_ids.squeeze(0).tolist())
+            attention_mask_steps.append(attention_mask.squeeze(0).tolist())
 
-        # h) Append chosen action token FIRST
-        input_ids, attention_mask = _append_tokens(input_ids, attention_mask, [int(action.item())])
+            # g) Step env with class index; DO NOT touch text sequence
+            env.step(act_int)
 
-        # i) Append environment-inserted scaffold tokens AFTER
-        inserted = env.get_inserted_token_ids()
-        if inserted:
-            input_ids, attention_mask = _append_tokens(input_ids, attention_mask, inserted)
-            inserted_token_ids_steps.append(list(inserted))
-        else:
+            # h) Do NOT append any tokens to the input sequence for classification answers
             inserted_token_ids_steps.append([])
 
-        # Track counts
-        if phase == "latent":
-            z_count += 1
-        elif phase == "answer":
-            digit_count += 1
+            # Track counts
+            answer_count += 1
 
+        else:
+            raise RuntimeError(f"Unknown ActionSpace kind '{space.kind}'")
 
     # Episode end
     reward = env.get_reward()
@@ -151,10 +215,26 @@ def collect_rollout(
     st = env._require_state()
     if z_count != st.K:
         raise RuntimeError(f"Recorded z-actions {z_count} != K {st.K}")
-    if digit_count != st.length_ans:
-        raise RuntimeError(f"Recorded digit actions {digit_count} != length_ans {st.length_ans}")
+    if answer_count != 1:
+        raise RuntimeError("Expected exactly one answer classification action.")
     if not (len(actions) == len(logprobs) == len(values) == len(entropies) == len(phases) == len(input_ids_steps) == len(attention_mask_steps) == len(inserted_token_ids_steps)):
         raise RuntimeError("Step list lengths mismatch.")
+
+    # Validate answer range if present
+    if answer_count == 1:
+        ans_idx = None
+        for i, ph in enumerate(phases):
+            if ph == "answer":
+                ans_idx = i
+                break
+        if ans_idx is None:
+            raise RuntimeError("No answer phase recorded despite answer_count=1")
+        if actions[ans_idx] not in range(10):
+            raise RuntimeError("Final answer action out of range [0..9]")
+
+    if len(action_kinds) != len(actions):
+        raise RuntimeError("action_kinds length mismatch with actions")
+
 
     return {
         "K": st.K,
@@ -164,13 +244,14 @@ def collect_rollout(
         "value_old": values,
         "entropy": entropies,
         "phases": phases,
+        "action_kinds": action_kinds,
         "reward": float(reward),
         "z_count": z_count,
-        "digit_count": digit_count,
+        "answer_count": answer_count,
         # sequences
         "input_ids_steps": input_ids_steps,
         "attention_mask_steps": attention_mask_steps,
         "inserted_token_ids_steps": inserted_token_ids_steps,
-        # NEW: include per-step allowed ids
-        "allowed_token_ids_steps": allowed_token_ids_steps,
+        # include per-step allowed ids (token ids for latent; class indices for answer)
+        "allowed_ids_steps": allowed_ids_steps,
     }
