@@ -108,10 +108,6 @@ def compute_ppo_losses(
             log_probs_i = torch.log_softmax(masked_logits_i, dim=-1)
             # Validate chosen action correctness
             a_i = int(actions[i])
-            if not (0 <= a_i < vocab_size):
-                raise RuntimeError(
-                    f"Chosen action out of range at step {i} (token): action={a_i}, valid range [0, {vocab_size})"
-                )
             if a_i not in allowed_ids_i:
                 raise RuntimeError(
                     f"Chosen action not in allowed ids at step {i} (token): action={a_i}, allowed={allowed_ids_i}"
