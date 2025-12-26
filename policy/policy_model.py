@@ -45,14 +45,14 @@ class PolicyModel(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_size, 1),
         )
-
+        self.answer_head = nn.Linear(hidden_size, 10)
         # Apply freezing rules according to Phase-1
         self._apply_freezing(train_top_fraction)
 
         # Log trainable parameter counts
         self._log_param_counts()
 
-        self.answer_head = nn.Linear(hidden_size, 10)
+
 
     def _infer_hidden_size(self) -> int:
         # Try common attributes
