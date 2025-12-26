@@ -51,6 +51,7 @@ class PPOTrainer:
         weight_decay = float(cfg["ppo"]["optimizer"]["weight_decay"]) if "optimizer" in cfg["ppo"] else 0.0
         self.max_grad_norm = float(cfg["ppo"]["optimizer"]["max_grad_norm"]) if "optimizer" in cfg["ppo"] else 1.0
         self.entropy_coef = float(cfg["ppo"]["entropy_coefficient"]) if "entropy_coefficient" in cfg["ppo"] else 0.0
+        self.value_loss_coef = float(cfg["ppo"]["value_loss_coefficient"]) if "value_loss_coefficient" in cfg["ppo"] else 0.5
 
         # Parameter groups (cached once)
         self._policy_params_cached = list(
