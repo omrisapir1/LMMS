@@ -33,6 +33,7 @@ def compute_ppo_losses(
     rewards = batch["rewards"]          # [N] float
     action_kinds = batch["action_kinds"] # List[str], length N
     allowed_ids_per_step = batch.get("allowed_action_ids")  # List[List[int]] length N
+    label_int = batch.get("label_int", None)
 
     if logprob_old.requires_grad:
         raise RuntimeError("logprob_old must not require gradients")
@@ -104,10 +105,15 @@ def compute_ppo_losses(
             neg_large = torch.finfo(logits_i.dtype).min
             mask_i = torch.full((v,), neg_large, dtype=logits_i.dtype, device=logits_i.device)
             mask_i.index_fill_(0, idx, 0.0)
-            masked_logits_i = logits_i + mask_i  # no temperature
+            masked_logits_i = logits_i + mask_i
             log_probs_i = torch.log_softmax(masked_logits_i, dim=-1)
-            # Validate chosen action correctness
             a_i = int(actions[i])
+            # Mask correctness: forbidden ids must be strongly negative
+            if len(allowed_ids_i) < v:
+                forbidden = set(range(v)) - set(int(x) for x in allowed_ids_i)
+                for fid in list(forbidden)[:50]:  # cap to avoid slow checks
+                    assert masked_logits_i[fid].item() < -1e8, "Forbidden token id not sufficiently masked"
+            # Validate chosen action correctness
             if a_i not in allowed_ids_i:
                 raise RuntimeError(
                     f"Chosen action not in allowed ids at step {i} (token): action={a_i}, allowed={allowed_ids_i}"
@@ -116,6 +122,16 @@ def compute_ppo_losses(
             # Entropy only for token steps
             dist_i = torch.distributions.Categorical(logits=masked_logits_i)
             entropy_list.append(dist_i.entropy())
+            # First 3 steps debug
+            if i < 3:
+                print({
+                    "step": i,
+                    "kind": "token",
+                    "action": a_i,
+                    "logprob_old": float(logprob_old[i].item()),
+                    "logprob_new": float(log_probs_i[a_i].item()),
+                    "advantage": float(advantages[i].item()),
+                })
         elif kind == "answer":
             # Use answer logits; apply class mask
             c = logits_answer_new.shape[1]
@@ -135,21 +151,28 @@ def compute_ppo_losses(
             neg_large = torch.finfo(logits_i.dtype).min
             mask_i = torch.full((c,), neg_large, dtype=logits_i.dtype, device=logits_i.device)
             mask_i.index_fill_(0, idx, 0.0)
-            masked_logits_i = logits_i + mask_i  # no temperature
+            masked_logits_i = logits_i + mask_i
             log_probs_i = torch.log_softmax(masked_logits_i, dim=-1)
-            # Validate chosen action correctness
             a_i = int(actions[i].item()) if actions.dtype != torch.long else int(actions[i])
-            if not (0 <= a_i < 10):
-                raise RuntimeError(
-                    f"Chosen action out of range at step {i} (answer): action={a_i}, valid range [0, 10)"
-                )
-            if a_i not in allowed_ids_i:
-                raise RuntimeError(
-                    f"Chosen action not in allowed ids at step {i} (answer): action={a_i}, allowed={allowed_ids_i}"
-                )
-            logprob_new_list.append(log_probs_i[a_i])
-            # Entropy is zero for answer steps
-            entropy_list.append(torch.zeros((), dtype=logits_i.dtype, device=logits_i.device))
+            # Shape assert
+            assert logits_answer_new.shape[1] == 10
+            # Mask correctness: chosen idx should be above mean (heuristic)
+            assert masked_logits_i[a_i].item() >= masked_logits_i.mean().item(), "Answer chosen logit below mean"
+            # p(correct) logging if label known
+            lbl = int(label_int[i].item())
+            if 0 <= lbl < 10:
+                p = torch.softmax(masked_logits_i, dim=-1)
+                print("p(correct) =", float(p[lbl].item()))
+            # First 3 steps debug
+            if i < 3:
+                print({
+                    "step": i,
+                    "kind": "answer",
+                    "action": a_i,
+                    "logprob_old": float(logprob_old[i].item()),
+                    "logprob_new": float(log_probs_i[a_i].item()),
+                    "advantage": float(advantages[i].item()),
+                })
         else:
             raise RuntimeError(f"Unknown action kind at step {i}: {kind}")
 
@@ -189,6 +212,12 @@ def compute_ppo_losses(
     }.items():
         if not torch.isfinite(t).all():
             raise RuntimeError(f"Non-finite values detected in {name}.")
+
+    # Debug: symmetry and temperature assertions
+    assert not logprob_old.requires_grad
+    assert logprob_new.requires_grad
+    assert ratio.mean().item() < 5.0
+    assert ("temperature" not in compute_ppo_losses.__code__.co_names), "Temperature found in PPO loss code"
 
     return {
         "policy_loss": policy_loss,

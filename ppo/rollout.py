@@ -40,6 +40,8 @@ def collect_rollout(
     latent_temperature = float(latent_cfg["temperature"])  # e.g., 1.0
     answer_strategy = str(answer_cfg["strategy"])  # expected "sample"
     answer_temperature = float(answer_cfg["temperature"])  # e.g., 1.0
+    # Debug flag
+    debug_ppo = bool(env.cfg.get("debug", {}).get("ppo", True))
 
     # Reset environment
     env.reset(question, label)
@@ -65,6 +67,9 @@ def collect_rollout(
 
     z_count = 0
     answer_count = 0
+
+    # Debug: per-step rollout logs
+    debug_rollout: List[Dict[str, Any]] = []
 
     while not env.is_done():
         # a) Action space
@@ -99,13 +104,17 @@ def collect_rollout(
             mask = space.logit_mask(vocab_size=logits_t.size(-1), device=logits_t.device, dtype=logits_t.dtype)
             masked_logits = logits_t + mask  # [1, V]
 
-            # d) Select action per phase using config-driven strategies (latent stays token-based)
+            # e) Logprob from unscaled masked token logits
+            log_probs_untempered = torch.log_softmax(masked_logits, dim=-1)
+            # Also compute tempered for sanity
+            log_probs_tempered = torch.log_softmax(masked_logits / latent_temperature, dim=-1)
+            # Select action using TEMPERED distribution (sampling-time)
             if phase == "latent":
                 if latent_strategy != "sample":
                     raise ValueError(f"Unsupported latent decoding strategy: {latent_strategy}")
                 # Apply temperature for sampling (decoding-only; policy unchanged)
                 logits_for_sampling = masked_logits / latent_temperature
-                dist = torch.distributions.Categorical(logits=logits_for_sampling)
+                dist = torch.distributions.Categorical(logits=masked_logits / latent_temperature)
                 action = dist.sample()  # [1]
                 entropy = dist.entropy()  # [1]
             elif phase == "answer":
@@ -114,9 +123,27 @@ def collect_rollout(
             else:
                 raise RuntimeError(f"Unknown env phase '{phase}' during rollout.")
 
-            # e) Logprob from unscaled masked token logits
-            log_probs = torch.log_softmax(masked_logits, dim=-1)
-            logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
+            # Rollout logprob_old MUST use UN-TEMPERED logits
+            logprob_untempered = log_probs_untempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+            logprob_tempered = log_probs_tempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+            logprob = logprob_untempered
+            if debug_ppo:
+                # Assert we are not accidentally using tempered logprobs
+                if abs(float(logprob_untempered.item()) - float(logprob_tempered.item())) < 1e-8:
+                    raise RuntimeError("Rollout logprob_old equals tempered logprob; expected UN-TEMPERED.")
+                debug_rollout.append({
+                    "step_idx": len(actions),
+                    "phase": phase,
+                    "kind": space.kind,
+                    "latent_temperature": latent_temperature,
+                    "masked_logits_min": float(masked_logits.min().item()),
+                    "masked_logits_max": float(masked_logits.max().item()),
+                    "logprob_untempered": float(logprob_untempered.item()),
+                    "logprob_tempered": float(logprob_tempered.item()),
+                    "logprob_old": float(logprob.item()),
+                    "action": int(action.item()),
+                    "allowed_ids_count": int(len(space.allowed_ids)),
+                })
 
             # f) Record step
             actions.append(int(action.item()))
@@ -171,7 +198,10 @@ def collect_rollout(
             mask = space.class_mask(num_classes=num_classes, device=answer_logits.device, dtype=answer_logits.dtype)
             masked_logits = answer_logits + mask  # [1, 10]
 
-            # d) Select classification action using config-driven strategies
+            # e) Logprob from masked classification logits
+            log_probs_untempered = torch.log_softmax(masked_logits, dim=-1)
+            log_probs_tempered = torch.log_softmax(masked_logits / answer_temperature, dim=-1)
+            # Select classification action using TEMPERED distribution
             if phase != "answer":
                 raise RuntimeError("Answer action space used outside answer phase")
             if answer_strategy != "sample":
@@ -183,9 +213,26 @@ def collect_rollout(
             # No entropy bonus by default for answer phase
             entropy = torch.zeros_like(value_t)
 
-            # e) Logprob from masked classification logits
-            log_probs = torch.log_softmax(masked_logits, dim=-1)
-            logprob = log_probs.gather(-1, action.unsqueeze(-1)).squeeze(-1)  # [1]
+            # Rollout logprob_old MUST use UN-TEMPERED logits
+            logprob_untempered = log_probs_untempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+            logprob_tempered = log_probs_tempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+            logprob = logprob_untempered
+            if debug_ppo:
+                if abs(float(logprob_untempered.item()) - float(logprob_tempered.item())) < 1e-8:
+                    raise RuntimeError("Rollout logprob_old equals tempered logprob in answer; expected UN-TEMPERED.")
+                debug_rollout.append({
+                    "step_idx": len(actions),
+                    "phase": phase,
+                    "kind": space.kind,
+                    "answer_temperature": answer_temperature,
+                    "masked_logits_min": float(masked_logits.min().item()),
+                    "masked_logits_max": float(masked_logits.max().item()),
+                    "logprob_untempered": float(logprob_untempered.item()),
+                    "logprob_tempered": float(logprob_tempered.item()),
+                    "logprob_old": float(logprob.item()),
+                    "action": int(action.item()),
+                    "allowed_ids_count": int(len(space.allowed_ids)),
+                })
 
             # f) Record step
             act_int = int(action.item())
@@ -259,4 +306,6 @@ def collect_rollout(
         "inserted_token_ids_steps": inserted_token_ids_steps,
         # include per-step allowed ids (token ids for latent; class indices for answer)
         "allowed_action_ids_steps": allowed_action_ids_steps,
+        # Debug
+        "debug_rollout": debug_rollout,
     }

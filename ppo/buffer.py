@@ -140,6 +140,8 @@ class TrajectoryBuffer:
         }
         if question is not None:
             stored["question"] = str(question)
+        if label_int is not None and not isinstance(label_int, int):
+            raise TypeError("label_int must be int if provided")
         if label_int is not None:
             stored["label_int"] = int(label_int)
         if K is not None:
@@ -178,7 +180,7 @@ class TrajectoryBuffer:
         masks_all: List[List[int]] = []
         allowed_ids_all: List[List[int]] = []
         action_kinds_all: List[Literal["token", "answer"]] = []
-
+        label_int_all: List[int] = []
 
         for epi, ep in enumerate(self._episodes):
             L = len(ep["actions"])
@@ -194,6 +196,11 @@ class TrajectoryBuffer:
             action_kinds_all.extend(ep["action_kinds"])
             # NEW: collect allowed ids per step
             allowed_ids_all.extend(ep["allowed_action_ids_steps"])
+            # Broadcast label_int per step if available
+            if "label_int" in ep and ep["label_int"] is not None:
+                label_int_all.extend([int(ep["label_int"]) ] * L)
+            else:
+                label_int_all.extend([ -1 ] * L)
 
 
 
@@ -229,6 +236,7 @@ class TrajectoryBuffer:
         episode_index_t = torch.tensor(episode_index_all, dtype=torch.long, device=device)
         input_ids_t = torch.tensor(input_ids_padded, dtype=torch.long, device=device)
         attention_mask_t = torch.tensor(attention_mask_padded, dtype=torch.long, device=device)
+        label_int_t = torch.tensor(label_int_all, dtype=torch.long, device=device)
 
         # Final shape checks
         N = total_steps
@@ -244,6 +252,8 @@ class TrajectoryBuffer:
                 raise RuntimeError(f"Batched tensor '{name}' has size {t.numel()} but expected {N}")
         if input_ids_t.shape[0] != N or attention_mask_t.shape[0] != N:
             raise RuntimeError("Sequence batch first dimension mismatch")
+        if label_int_t.numel() != N:
+            raise RuntimeError("Batched tensor 'label_int' has incorrect size")
 
         return {
             "actions": actions_t,
@@ -258,6 +268,8 @@ class TrajectoryBuffer:
             # NEW: pass allowed ids per step as Python lists for loss masking
             "allowed_action_ids": allowed_ids_all,
             "action_kinds": action_kinds_all,
+            # NEW: correct label per step (broadcast from episode)
+            "label_int": label_int_t,
         }
 
     def reconstruct_full_sequence(self, ep: Dict[str, Any]) -> List[int]:
