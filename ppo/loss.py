@@ -33,9 +33,6 @@ def compute_ppo_losses(
     rewards = batch["rewards"]          # [N] float
     action_kinds = batch["action_kinds"] # List[str], length N
     allowed_ids_per_step = batch.get("allowed_action_ids")  # List[List[int]] length N
-    step_uid = batch.get("step_uid", None)  # List[int]
-    global_step = batch.get("global_step", None)
-    episode_index = batch.get("episode_index", None)
 
     if logprob_old.requires_grad:
         raise RuntimeError("logprob_old must not require gradients")
@@ -71,10 +68,6 @@ def compute_ppo_losses(
         raise RuntimeError("batch['action_kinds'] must be a list of length N")
     if allowed_ids_per_step is None or not isinstance(allowed_ids_per_step, list) or len(allowed_ids_per_step) != N:
         raise RuntimeError("batch['allowed_action_ids'] must be a list of length N")
-    if step_uid is None or not isinstance(step_uid, list) or len(step_uid) != N:
-        raise RuntimeError("batch['step_uid'] must be a list of length N")
-    if episode_index is None or not torch.is_tensor(episode_index) or episode_index.ndim != 1 or episode_index.shape[0] != N:
-        raise RuntimeError("batch['episode_index'] must be a 1D tensor of length N")
 
     # Required equality for core shapes
     if not (advantages.shape == rewards.shape == values_new.shape == actions.shape == logprob_old.shape):
@@ -116,9 +109,6 @@ def compute_ppo_losses(
             # Validate chosen action correctness
             a_i = int(actions[i])
             if a_i not in allowed_ids_i:
-                print("[PPO CHECK] action not in allowed ids (token)", {
-                    "i": i, "a": a_i, "allowed": allowed_ids_i, "step_uid": step_uid[i]
-                })
                 raise RuntimeError(
                     f"Chosen action not in allowed ids at step {i} (token): action={a_i}, allowed={allowed_ids_i}"
                 )
@@ -126,33 +116,6 @@ def compute_ppo_losses(
             # Entropy only for token steps
             dist_i = torch.distributions.Categorical(logits=masked_logits_i)
             entropy_list.append(dist_i.entropy())
-            # Debug instrumentation: print first few steps and assert invariant on epoch 0
-            if i < 10:
-                delta = float(log_probs_i[a_i].item() - logprob_old[i].item())
-                ratio_dbg = float(torch.exp(log_probs_i[a_i] - logprob_old[i]).item())
-                print(
-                    "[PPO CHECK] step_uid=" + str(step_uid[i]) +
-                    ", epi=" + str(int(episode_index[i].item())) +
-                    ", kind=token" +
-                    ", action=" + str(a_i) +
-                    ", allowed_ids=" + str(allowed_ids_i) +
-                    ", logprob_old=" + str(float(logprob_old[i].item())) +
-                    ", logprob_new=" + str(float(log_probs_i[a_i].item())) +
-                    ", delta=" + str(delta) +
-                    ", ratio=" + str(ratio_dbg)
-                )
-                if abs(delta) > 1e-3:
-                    print("[PPO CHECK] MISMATCH CONTEXT (token)", {
-                        "i": i,
-                        "epi": int(episode_index[i].item()),
-                        "step_uid": step_uid[i],
-                        "masked_logits": masked_logits_i.detach().cpu().tolist(),
-                        "mask_nonzero_count": int((mask_i != 0).sum().item()),
-                        "idx_used": sorted(set(int(x) for x in allowed_ids_i)),
-                    })
-                if isinstance(global_step, int) and global_step == 0:
-                    if abs(delta) > 1e-3:
-                        print(f"[PPO CHECK] logprob_old/new mismatch at identical policy (answer) dalta is {delta}")
         elif kind == "answer":
             # Use answer logits; apply class mask
             c = logits_answer_new.shape[1]
@@ -181,43 +144,12 @@ def compute_ppo_losses(
                     f"Chosen action out of range at step {i} (answer): action={a_i}, valid range [0, 10)"
                 )
             if a_i not in allowed_ids_i:
-                print("[PPO CHECK] action not in allowed ids (answer)", {
-                    "i": i, "a": a_i, "allowed": allowed_ids_i, "step_uid": step_uid[i]
-                })
                 raise RuntimeError(
                     f"Chosen action not in allowed ids at step {i} (answer): action={a_i}, allowed={allowed_ids_i}"
                 )
             logprob_new_list.append(log_probs_i[a_i])
             # Entropy is zero for answer steps
             entropy_list.append(torch.zeros((), dtype=logits_i.dtype, device=logits_i.device))
-            # Debug instrumentation
-            if i < 10:
-                delta = float(log_probs_i[a_i].item() - logprob_old[i].item())
-                ratio_dbg = float(torch.exp(log_probs_i[a_i] - logprob_old[i]).item())
-                print(
-                    "[PPO CHECK] step_uid=" + str(step_uid[i]) +
-                    ", epi=" + str(int(episode_index[i].item())) +
-                    ", kind=answer" +
-                    ", action=" + str(a_i) +
-                    ", allowed_ids=" + str(allowed_ids_i) +
-                    ", logprob_old=" + str(float(logprob_old[i].item())) +
-                    ", logprob_new=" + str(float(log_probs_i[a_i].item())) +
-                    ", delta=" + str(delta) +
-                    ", ratio=" + str(ratio_dbg)
-                )
-                if abs(delta) > 1e-3:
-                    print("[PPO CHECK] MISMATCH CONTEXT (answer)", {
-                        "i": i,
-                        "epi": int(episode_index[i].item()),
-                        "step_uid": step_uid[i],
-                        "masked_logits": masked_logits_i.detach().cpu().tolist(),
-                        "mask_nonzero_count": int((mask_i != 0).sum().item()),
-                        "idx_used": sorted(set(int(x) for x in allowed_ids_i)),
-                    })
-                if isinstance(global_step, int) and global_step == 0:
-                    if abs(delta) > 1e-3:
-                        print(f"[PPO CHECK] logprob_old/new mismatch at identical policy (answer) dalta is {delta}")
-
         else:
             raise RuntimeError(f"Unknown action kind at step {i}: {kind}")
 

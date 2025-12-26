@@ -12,25 +12,24 @@ from LMMS_logging.episode_logger import log_episode
 
 
 # Minibatch iterator for PPO updates
-# - Slice only per-step fields: tensors with first dimension N or lists length N
-# - Pass through scalar metadata (e.g., global_step) unchanged
+# - Tensors are indexed with a LongTensor of indices
+# - Python lists (e.g., phases, action_kinds, allowed_action_ids) are reassembled by element-wise selection
+# - Advantages must already be attached to the batch for consistent slicing
 
 def iterate_minibatches(batch: Dict[str, Any], minibatch_size: int, shuffle: bool = True):
     N = batch["actions"].shape[0]
-    indices = torch.randperm(N) if shuffle else torch.arange(N)
+    if shuffle:
+        indices = torch.randperm(N)
+    else:
+        indices = torch.arange(N)
 
     for start in range(0, N, minibatch_size):
         idx = indices[start:start + minibatch_size]
         idx_list = idx.tolist()
-        mb = {}
-        for k, v in batch.items():
-            if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == N:
-                mb[k] = v[idx]
-            elif isinstance(v, list) and len(v) == N:
-                mb[k] = [v[i] for i in idx_list]
-            else:
-                mb[k] = v
-        yield mb
+        yield {
+            k: (v[idx] if torch.is_tensor(v) else [v[i] for i in idx_list])
+            for k, v in batch.items()
+        }
 
 
 class PPOTrainer:
@@ -49,9 +48,10 @@ class PPOTrainer:
         # Optimizer settings
         lr_policy = float(cfg["ppo"]["learning_rate"]["policy"])
         lr_value = float(cfg["ppo"]["learning_rate"]["value"])
-        weight_decay = float(cfg["ppo"].get("optimizer", {}).get("weight_decay", 0.0))
-        self.max_grad_norm = float(cfg["ppo"].get("optimizer", {}).get("max_grad_norm", 1.0))
-        self.entropy_coef = float(cfg["ppo"].get("entropy_coefficient", 0.0))
+        weight_decay = float(cfg["ppo"]["optimizer"]["weight_decay"]) if "optimizer" in cfg["ppo"] else 0.0
+        self.max_grad_norm = float(cfg["ppo"]["optimizer"]["max_grad_norm"]) if "optimizer" in cfg["ppo"] else 1.0
+        self.entropy_coef = float(cfg["ppo"]["entropy_coefficient"]) if "entropy_coefficient" in cfg["ppo"] else 0.0
+        self.value_loss_coef = float(cfg["ppo"]["value_loss_coefficient"]) if "value_loss_coefficient" in cfg["ppo"] else 0.5
 
         # Parameter groups (cached once)
         self._policy_params_cached = list(
@@ -72,7 +72,7 @@ class PPOTrainer:
         self.rollout_batch_size = int(cfg["training"]["rollout_batch_size"])
         self.updates_per_epoch = int(cfg["training"]["updates_per_epoch"])
         self.clip_epsilon = float(cfg["ppo"]["clip_epsilon"])  # PPO clipping
-        # Minibatch size for PPO updates
+        # New: minibatch size for PPO updates
         self.ppo_minibatch_size = int(cfg["training"]["ppo_minibatch_size"])
 
     def _sample_datapoint(self, dataset) -> Dict[str, Any]:
@@ -124,15 +124,13 @@ class PPOTrainer:
         # Masking and usage are handled later in the PPO loss.
         # This avoids phase-conditional branching in the forward pass.
         logits_answer_new = self.policy.answer_head(last_hidden)  # [N, 10]
-        values_new = self.policy.value_head(last_hidden.detach()).squeeze(-1)  # [N]
+        values_new = self.policy.value_head(last_hidden).squeeze(-1)  # [N]
 
         return logits_token_new, logits_answer_new, values_new
 
     def train_epoch(self, dataset) -> Dict[str, float]:
         buffer = TrajectoryBuffer()
         episodes_collected = 0
-        # Ensure evaluation mode during rollout collection
-        self.policy.eval()
         for _ in range(self.rollout_batch_size):
             dp = self._sample_datapoint(dataset)
             episode = self._collect_single(dp["question"], dp["label"])  # helper below
@@ -187,27 +185,13 @@ class PPOTrainer:
                     label_int=label_int,
                     reward=reward,
                 )
-                # Debug: print rollout-time probabilities for first 2 episodes per epoch
-                if i < 2 and ep.get("debug_rollout"):
-                    for dr in ep["debug_rollout"]:
-                        print(
-                            "[ROLLOUT] step_uid=" + str(dr.get("step_uid")) +
-                            ", phase=" + str(dr.get("phase")) +
-                            ", kind=" + str(dr.get("action_kind")) +
-                            ", action=" + str(dr.get("action")) +
-                            ", allowed_ids=" + str(dr.get("allowed_action_ids")) +
-                            ", masked_logit[action]=" + str(dr.get("masked_logit_action")) +
-                            ", logprob_old=" + str(dr.get("logprob_old")) +
-                            ", softmax_den=" + str(dr.get("softmax_den"))
-                        )
 
         # 2) Build PPO batch (includes padded input_ids/attention_mask)
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = 0
+        # Store the entire PPO batch on CPU to reduce GPU memory usage
         batch = buffer.get_batch(torch.device("cpu"), pad_token_id=pad_id)
-
-        # Remove redundant manual step_uid attachment; buffer already provides it
 
         # Optional safety assertion: exactly one answer action per episode
         try:
@@ -223,11 +207,8 @@ class PPOTrainer:
             raise RuntimeError("Advantages shape mismatch vs rewards.")
         if not torch.isfinite(advantages).all():
             raise RuntimeError("Advantages contain non-finite values.")
+        # Attach to batch for deterministic minibatch slicing
         batch["advantages"] = advantages
-        batch["global_step"] = self.global_step
-
-        # Switch back to training mode for PPO updates
-        self.policy.train()
 
         # 4) PPO updates (minibatched)
         last_metrics: Dict[str, float] = {}
@@ -238,6 +219,7 @@ class PPOTrainer:
 
                 logits_token_new, logits_answer_new, values_new = self._policy_forward_on_batch(mb)
 
+                # Compute losses with mixed action spaces
                 losses = compute_ppo_losses(
                     logits_token_new=logits_token_new,
                     logits_answer_new=logits_answer_new,
@@ -262,22 +244,27 @@ class PPOTrainer:
                     if not torch.isfinite(t).all():
                         raise RuntimeError(f"Non-finite tensor detected in {name}.")
 
-                # Policy backward pass
                 self.policy_optimizer.zero_grad(set_to_none=True)
-                (policy_loss + self.entropy_coef * entropy_loss).backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self._policy_params_cached, self.max_grad_norm
-                )
-                self.policy_optimizer.step()
-
-                # Value backward pass
                 self.value_optimizer.zero_grad(set_to_none=True)
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self._value_params_cached, self.max_grad_norm
+
+                total_loss = (
+                        policy_loss
+                        + self.entropy_coef * entropy_loss
+                        + self.value_loss_coef * value_loss
                 )
+
+                # Single backward pass
+                total_loss.backward()
+
+                # Optional: clip shared parameters once
+                torch.nn.utils.clip_grad_norm_(self._policy_params_cached, self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self._value_params_cached, self.max_grad_norm)
+
+                # Step optimizers
+                self.policy_optimizer.step()
                 self.value_optimizer.step()
 
+                # Record/aggregate metrics (use last minibatch/update for now)
                 last_metrics = {
                     "mean_reward": float(batch["rewards"].mean().item()),
                     "policy_loss": float(policy_loss.item()),
