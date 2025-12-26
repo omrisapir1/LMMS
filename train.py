@@ -352,7 +352,7 @@ def main():
     print("Starting training..." if phase == 0 else "Starting Phase-1 training...")
     for epoch in range(num_epochs):
         print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
-        metrics = trainer.train_epoch(ds, vocab_size=int(merged["model"]["z_tokens"]["vocab_size"]))
+        metrics = trainer.train_epoch(ds)
         log_kv(
             epoch=epoch + 1,
             mean_reward=metrics.get("mean_reward"),
