@@ -61,7 +61,7 @@ def collect_rollout(
     attention_mask_steps: List[List[int]] = []
     inserted_token_ids_steps: List[List[int]] = []
     # Record allowed ids per step for exact mask replication in loss
-    allowed_ids_steps: List[List[int]] = []
+    allowed_action_ids_steps: List[List[int]] = []
 
     z_count = 0
     answer_count = 0
@@ -93,7 +93,7 @@ def collect_rollout(
             value_t = values_tensor[:, -1]  # [1]
 
             # Record allowed ids for this step (vocab token ids)
-            allowed_ids_steps.append(list(space.allowed_ids))
+            allowed_action_ids_steps.append(list(space.allowed_ids))
 
             # Apply token mask
             mask = space.logit_mask(vocab_size=logits_t.size(-1), device=logits_t.device, dtype=logits_t.dtype)
@@ -162,7 +162,7 @@ def collect_rollout(
             value_t = values_tensor[:, -1]  # [1]
 
             # Record allowed ids for this step (class indices)
-            allowed_ids_steps.append(list(space.allowed_ids))
+            allowed_action_ids_steps.append(list(space.allowed_ids))
 
             # Apply class mask (10 classes)
             num_classes = answer_logits.size(-1)
@@ -258,5 +258,5 @@ def collect_rollout(
         "attention_mask_steps": attention_mask_steps,
         "inserted_token_ids_steps": inserted_token_ids_steps,
         # include per-step allowed ids (token ids for latent; class indices for answer)
-        "allowed_ids_steps": allowed_ids_steps,
+        "allowed_action_ids_steps": allowed_action_ids_steps,
     }
