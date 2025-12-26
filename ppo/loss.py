@@ -35,6 +35,7 @@ def compute_ppo_losses(
     allowed_ids_per_step = batch.get("allowed_action_ids")  # List[List[int]] length N
     step_uid = batch.get("step_uid", None)  # List[int]
     global_step = batch.get("global_step", None)
+    episode_index = batch.get("episode_index", None)
 
     if logprob_old.requires_grad:
         raise RuntimeError("logprob_old must not require gradients")
@@ -72,6 +73,8 @@ def compute_ppo_losses(
         raise RuntimeError("batch['allowed_action_ids'] must be a list of length N")
     if step_uid is None or not isinstance(step_uid, list) or len(step_uid) != N:
         raise RuntimeError("batch['step_uid'] must be a list of length N")
+    if episode_index is None or not torch.is_tensor(episode_index) or episode_index.ndim != 1 or episode_index.shape[0] != N:
+        raise RuntimeError("batch['episode_index'] must be a 1D tensor of length N")
 
     # Required equality for core shapes
     if not (advantages.shape == rewards.shape == values_new.shape == actions.shape == logprob_old.shape):
@@ -129,6 +132,7 @@ def compute_ppo_losses(
                 ratio_dbg = float(torch.exp(log_probs_i[a_i] - logprob_old[i]).item())
                 print(
                     "[PPO CHECK] step_uid=" + str(step_uid[i]) +
+                    ", epi=" + str(int(episode_index[i].item())) +
                     ", kind=token" +
                     ", action=" + str(a_i) +
                     ", allowed_ids=" + str(allowed_ids_i) +
@@ -140,6 +144,7 @@ def compute_ppo_losses(
                 if abs(delta) > 1e-3:
                     print("[PPO CHECK] MISMATCH CONTEXT (token)", {
                         "i": i,
+                        "epi": int(episode_index[i].item()),
                         "step_uid": step_uid[i],
                         "masked_logits": masked_logits_i.detach().cpu().tolist(),
                         "mask_nonzero_count": int((mask_i != 0).sum().item()),
@@ -190,6 +195,7 @@ def compute_ppo_losses(
                 ratio_dbg = float(torch.exp(log_probs_i[a_i] - logprob_old[i]).item())
                 print(
                     "[PPO CHECK] step_uid=" + str(step_uid[i]) +
+                    ", epi=" + str(int(episode_index[i].item())) +
                     ", kind=answer" +
                     ", action=" + str(a_i) +
                     ", allowed_ids=" + str(allowed_ids_i) +
@@ -201,6 +207,7 @@ def compute_ppo_losses(
                 if abs(delta) > 1e-3:
                     print("[PPO CHECK] MISMATCH CONTEXT (answer)", {
                         "i": i,
+                        "epi": int(episode_index[i].item()),
                         "step_uid": step_uid[i],
                         "masked_logits": masked_logits_i.detach().cpu().tolist(),
                         "mask_nonzero_count": int((mask_i != 0).sum().item()),

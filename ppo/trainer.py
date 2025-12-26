@@ -131,6 +131,8 @@ class PPOTrainer:
     def train_epoch(self, dataset) -> Dict[str, float]:
         buffer = TrajectoryBuffer()
         episodes_collected = 0
+        # Ensure evaluation mode during rollout collection
+        self.policy.eval()
         for _ in range(self.rollout_batch_size):
             dp = self._sample_datapoint(dataset)
             episode = self._collect_single(dp["question"], dp["label"])  # helper below
@@ -223,6 +225,9 @@ class PPOTrainer:
             raise RuntimeError("Advantages contain non-finite values.")
         batch["advantages"] = advantages
         batch["global_step"] = self.global_step
+
+        # Switch back to training mode for PPO updates
+        self.policy.train()
 
         # 4) PPO updates (minibatched)
         last_metrics: Dict[str, float] = {}
