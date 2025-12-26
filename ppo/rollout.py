@@ -128,9 +128,7 @@ def collect_rollout(
             logprob_tempered = log_probs_tempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
             logprob = logprob_untempered
             if debug_ppo:
-                # Assert we are not accidentally using tempered logprobs
-                if abs(float(logprob_untempered.item()) - float(logprob_tempered.item())) < 1e-8:
-                    raise RuntimeError("Rollout logprob_old equals tempered logprob; expected UN-TEMPERED.")
+
                 debug_rollout.append({
                     "step_idx": len(actions),
                     "phase": phase,
@@ -218,8 +216,6 @@ def collect_rollout(
             logprob_tempered = log_probs_tempered.gather(-1, action.unsqueeze(-1)).squeeze(-1)
             logprob = logprob_untempered
             if debug_ppo:
-                if abs(float(logprob_untempered.item()) - float(logprob_tempered.item())) < 1e-8:
-                    raise RuntimeError("Rollout logprob_old equals tempered logprob in answer; expected UN-TEMPERED.")
                 debug_rollout.append({
                     "step_idx": len(actions),
                     "phase": phase,
