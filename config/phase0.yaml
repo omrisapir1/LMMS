@@ -69,7 +69,7 @@ ppo:
 
   # Learning rates
   learning_rate:
-    policy: 1e-4
+    policy: 1e-2
     value: 1e-5
 
   # PPO clipping
@@ -77,7 +77,7 @@ ppo:
 
   # Entropy bonus (encourages exploration of z-tokens)
   entropy_coefficient: 0.00
-  value_loss_coef: 1.0
+  value_loss_coef: 0.1
 
   # KL penalty (disabled in Phase 0)
   kl_penalty:
