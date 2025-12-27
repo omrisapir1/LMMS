@@ -17,7 +17,7 @@ dataset:
 # Model
 # ----------------------------
 model:
-  base_model: sshleifer/tiny-gpt2
+  base_model: Qwen/Qwen2.5-Math-1.5B
 
   # Latent action (z-token) configuration
   z_tokens:
@@ -102,8 +102,8 @@ logging:
 # Training Schedule
 # ----------------------------
 training:
-  rollout_batch_size: 1024          # number of episodes per PPO update
-  ppo_minibatch_size: 512
+  rollout_batch_size: 512          # number of episodes per PPO update
+  ppo_minibatch_size: 32
   updates_per_epoch: 1
   num_epochs: 15000                  # keep short by default
 
@@ -121,7 +121,7 @@ trainable:
 
   # Transformer layers
   transformer:
-    train_top_fraction: 0.5      # top ~25% layers are trainable
+    train_top_fraction: 0.25      # top ~25% layers are trainable
 
   # Heads
   heads:
