@@ -151,6 +151,7 @@ def _load_phase0_dataset(local_jsonl_path: str) -> List[Dict[str, Any]]:
     if not os.path.isfile(local_jsonl_path):
         raise FileNotFoundError(f"Phase 0 dataset not found at '{local_jsonl_path}'.")
     rows: List[Dict[str, Any]] = []
+    test_rows: List[Dict[str, Any]] = []
     with open(local_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -172,13 +173,22 @@ def _load_phase0_dataset(local_jsonl_path: str) -> List[Dict[str, Any]]:
             # Single-digit constraint (1..9) per Phase-0 semantics
             if a_int < 0 or a_int > 9:
                 continue
-            rows.append({
-                "question": str(q),
-                "final_ans": a_int,
-                "length_ans": 1,
-            })
+            if random.random() < 0.97:
+
+                rows.append({
+                    "question": str(q),
+                    "final_ans": a_int,
+                    "length_ans": 1,
+                })
+            else:
+                test_rows.append({
+                    "question": str(q),
+                    "final_ans": a_int,
+                    "length_ans": 1,
+                })
     if len(rows) == 0:
         raise ValueError("Phase 0 dataset is empty after parsing. Check JSONL contents.")
+    json.dump(test_rows, open("test_rows.json", "w"))
     return rows
 
 
