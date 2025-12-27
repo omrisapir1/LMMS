@@ -69,8 +69,8 @@ ppo:
 
   # Learning rates
   learning_rate:
-    policy: 1e-4
-    answer_head: 3e-6
+    policy: 3e-4
+    answer_head: 1e-6
     value: 1e-5
 
   # PPO clipping
@@ -106,7 +106,7 @@ training:
   rollout_batch_size: 512          # number of episodes per PPO update
   ppo_minibatch_size: 32
   updates_per_epoch: 1
-  num_epochs: 15000                  # keep short by default
+  num_epochs: 200                  # keep short by default
 
   # Mixed precision / performance
   precision: bf16
