@@ -120,7 +120,7 @@ def compute_ppo_losses(
             entropy_list.append(dist_i.entropy())
 
             # Debug first 3 steps
-            if True:
+            if i<3:
                 print({
                     "step": i,
                     "kind": "token",
@@ -169,7 +169,7 @@ def compute_ppo_losses(
             entropy_list.append(torch.zeros((), device=logits_i.device, dtype=logits_i.dtype))
 
             # Debug first 3 steps
-            if True:
+            if i <3:
                 print({
                     "step": i,
                     "kind": "answer",
