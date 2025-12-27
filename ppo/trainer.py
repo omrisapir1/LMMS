@@ -300,18 +300,14 @@ class PPOTrainer:
         self.global_step += 1
         self.batch_idx += 1
 
-        def grad_norm(params):
-            norms = [p.grad.norm() for p in params if p.grad is not None]
-            return torch.norm(torch.stack(norms)).item() if norms else 0.0
-
-        print(
-            " policy_grad_norm:",
-            {
-                "lm": grad_norm(lm_params),
-                "answer_head": grad_norm(answer_params),
-                "value": grad_norm(self._value_params_cached),
-            }
+        total_norm = torch.norm(
+            torch.stack([
+                p.grad.norm()
+                for p in self._policy_params_cached
+                if p.grad is not None
+            ])
         )
+        print(" policy_grad_norm:", total_norm.item())
 
         return last_metrics
 
