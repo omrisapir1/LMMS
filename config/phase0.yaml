@@ -70,7 +70,7 @@ ppo:
   # Learning rates
   learning_rate:
     policy: 3e-4
-    answer_head: 1e-6
+    answer_head: 3e-6
     value: 1e-5
 
   # PPO clipping
