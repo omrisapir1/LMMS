@@ -47,17 +47,25 @@ class PPOTrainer:
 
         # Optimizer settings
         lr_policy = float(cfg["ppo"]["learning_rate"]["policy"])
+        lr_answer_head = float(cfg["ppo"]["learning_rate"]["answer_head"])
         lr_value = float(cfg["ppo"]["learning_rate"]["value"])
         weight_decay = float(cfg["ppo"]["optimizer"]["weight_decay"]) if "optimizer" in cfg["ppo"] else 0.0
         self.max_grad_norm = float(cfg["ppo"]["optimizer"]["max_grad_norm"]) if "optimizer" in cfg["ppo"] else 1.0
         self.entropy_coef = float(cfg["ppo"]["entropy_coefficient"]) if "entropy_coefficient" in cfg["ppo"] else 0.0
         self.value_loss_coef = float(cfg["ppo"]["value_loss_coefficient"]) if "value_loss_coefficient" in cfg["ppo"] else 0.5
+        lm_params = []
+        answer_params = []
+
+        for name, p in self.policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("lm."):
+                lm_params.append(p)
+            elif name.startswith("answer_head."):
+                answer_params.append(p)
 
         # Parameter groups (cached once)
-        self._policy_params_cached = list(
-            p for n, p in self.policy.named_parameters()
-            if n.startswith("lm.") or n.startswith("answer_head.")
-        )
+        self._policy_params_cached = lm_params + answer_params
         self._value_params_cached = list(self.policy.value_head.parameters())
 
         if len(self._policy_params_cached) == 0:
@@ -65,9 +73,19 @@ class PPOTrainer:
         if len(self._value_params_cached) == 0:
             raise RuntimeError("No parameters found for value optimizer (value_head).")
 
-        self.policy_optimizer = AdamW(self._policy_params_cached, lr=lr_policy, weight_decay=weight_decay)
-        self.value_optimizer = AdamW(self._value_params_cached, lr=lr_value, weight_decay=weight_decay)
+        self.policy_optimizer = AdamW(
+            [
+                {"params": lm_params, "lr": lr_policy},
+                {"params": answer_params, "lr": lr_answer_head},
+            ],
+            weight_decay=weight_decay,
+        )
 
+        self.value_optimizer = AdamW(
+            self._value_params_cached,
+            lr=lr_value,
+            weight_decay=weight_decay,
+        )
         # Training schedule
         self.rollout_batch_size = int(cfg["training"]["rollout_batch_size"])
         self.updates_per_epoch = int(cfg["training"]["updates_per_epoch"])
@@ -282,14 +300,18 @@ class PPOTrainer:
         self.global_step += 1
         self.batch_idx += 1
 
-        total_norm = torch.norm(
-            torch.stack([
-                p.grad.norm()
-                for p in self._policy_params_cached
-                if p.grad is not None
-            ])
+        def grad_norm(params):
+            norms = [p.grad.norm() for p in params if p.grad is not None]
+            return torch.norm(torch.stack(norms)).item() if norms else 0.0
+
+        print(
+            " policy_grad_norm:",
+            {
+                "lm": grad_norm(lm_params),
+                "answer_head": grad_norm(answer_params),
+                "value": grad_norm(self._value_params_cached),
+            }
         )
-        print(" policy_grad_norm:", total_norm.item())
 
         return last_metrics
 

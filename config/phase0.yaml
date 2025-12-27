@@ -69,7 +69,8 @@ ppo:
 
   # Learning rates
   learning_rate:
-    policy: 1e-3
+    policy: 3e-4
+    answer_head: 1e-5
     value: 1e-5
 
   # PPO clipping
@@ -91,7 +92,7 @@ ppo:
   # Optimization details
   optimizer:
     type: adamw
-    weight_decay: 0.01
+    weight_decay: 0.00
     max_grad_norm: 1.0
 
 logging:
