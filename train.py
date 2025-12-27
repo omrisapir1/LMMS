@@ -19,6 +19,7 @@ from ppo.trainer import PPOTrainer
 
 CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 PHASE1_CONFIG_PATH = os.path.join(CONFIG_DIR, "phase1.yaml")
+PHASE0_CONFIG_PATH = os.path.join(CONFIG_DIR, "phase0.yaml")
 DEFAULTS_CONFIG_PATH = os.path.join(CONFIG_DIR, "defaults.yaml")
 CHECKPOINTS_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 PHASE0_CKPT_DIR = os.path.join(CHECKPOINTS_DIR, "phase0")
@@ -107,10 +108,10 @@ def set_seeds(seed: int) -> None:
     random.seed(seed)
     if np is not None:
         np.random.seed(seed)
-    if torch is not None:
-        torch.manual_seed(seed)
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+    # if torch is not None:
+    #     torch.manual_seed(seed)
+    #     if hasattr(torch, "cuda") and torch.cuda.is_available():
+    #         torch.cuda.manual_seed_all(seed)
 
 
 
@@ -256,7 +257,7 @@ def load_dataset_for_phase(merged_cfg: Dict[str, Any]) -> Dataset:
 def main():
     # CLI args: single entrypoint with explicit config
     parser = argparse.ArgumentParser(description="LMMS training entrypoint")
-    parser.add_argument("--config", type=str, default=PHASE1_CONFIG_PATH, help="Path to YAML config (phase0.yaml or phase1.yaml)")
+    parser.add_argument("--config", type=str, default=PHASE0_CONFIG_PATH, help="Path to YAML config (phase0.yaml or phase1.yaml)")
     args = parser.parse_args()
 
     # Load configs and merge defaults -> selected config (selected config overrides defaults)
@@ -331,7 +332,7 @@ def main():
         validate_tokenizer_and_model(merged, tokenizer, policy.lm)
 
     # Move model
-    if precision == "bf16" and torch.cuda.is_available():
+    if precision == "bf16":
         policy = policy.to(device=device, dtype=torch.bfloat16)
     else:
         policy = policy.to(device=device)

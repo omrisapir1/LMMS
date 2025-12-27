@@ -17,7 +17,7 @@ dataset:
 # Model
 # ----------------------------
 model:
-  base_model: Qwen/Qwen2.5-Math-1.5B-Instruct
+  base_model: sshleifer/tiny-gpt2
 
   # Latent action (z-token) configuration
   z_tokens:
@@ -69,7 +69,7 @@ ppo:
 
   # Learning rates
   learning_rate:
-    policy: 1e-5
+    policy: 1e-4
     value: 1e-5
 
   # PPO clipping
@@ -102,8 +102,8 @@ logging:
 # Training Schedule
 # ----------------------------
 training:
-  rollout_batch_size: 3          # number of episodes per PPO update
-  ppo_minibatch_size: 3
+  rollout_batch_size: 1024          # number of episodes per PPO update
+  ppo_minibatch_size: 512
   updates_per_epoch: 1
   num_epochs: 15000                  # keep short by default
 
