@@ -130,7 +130,7 @@ def main():
 
     # ---- Model ----
     model = Phase0Model(model_config)
-    model.base_model.resize_token_embeddings(len(tokenizer))
+    model.model.resize_token_embeddings(len(tokenizer))
     model.to(device)
 
     # ---- Optimizer (only trainable params) ----
