@@ -49,7 +49,7 @@ def replace_box_with_answer_token(text: str) -> Optional[str]:
         return None
 
     # Replace first boxed expression with <ANSWER>
-    text = text[:match.start()] + ANSWER_TOKEN + text[match.end():]
+    text = text[:match.start()] + ANSWER_TOKEN
 
     # Remove any remaining boxed expressions
     text = BOXED_ANY_REGEX.sub("", text)
