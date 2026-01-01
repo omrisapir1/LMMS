@@ -26,6 +26,14 @@ class Phase0Model(PreTrainedModel):
             output_hidden_states=True,
         )
 
+        # Ensure tokenizer-dependent embedding size matches saved config
+        if getattr(config, "vocab_size", None) is not None:
+            try:
+                self.model.resize_token_embeddings(config.vocab_size)
+            except Exception:
+                # If the underlying model doesn't support resizing, skip
+                pass
+
         hidden_size = self.model.config.hidden_size
 
         # ---- Digit heads ----

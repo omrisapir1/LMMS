@@ -14,6 +14,7 @@ class Phase0Config(PretrainedConfig):
         unfrozen_layer_pct: float = 0.0,
         num_digits: int = 5,
         num_classes: int = 10,
+        vocab_size: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -31,6 +32,9 @@ class Phase0Config(PretrainedConfig):
         # --- Classification head ---
         self.num_digits = num_digits
         self.num_classes = num_classes
+
+        # --- Tokenizer / embeddings ---
+        self.vocab_size = vocab_size
 
         # Always needed for Phase-0
         self.output_hidden_states = True
