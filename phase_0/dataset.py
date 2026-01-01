@@ -69,7 +69,7 @@ def build_prompt(tokenizer, question: str, answer: str) -> str:
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=False,
     )
 
 
@@ -109,7 +109,7 @@ class Phase0Dataset(Dataset):
         hf_name: str,
         split: str,
         tokenizer,
-        max_length: int = 512,
+        max_length: int = 1024,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
