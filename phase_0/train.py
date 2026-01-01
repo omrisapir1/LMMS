@@ -185,7 +185,7 @@ def main():
     for epoch in range(cfg["training"]["epochs"]):
         print(f"\n=== Epoch {epoch + 1}/{cfg['training']['epochs']} ===")
 
-        for batch in train_loader:
+        for i, batch in enumerate(train_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             digit_labels = batch["digit_labels"].to(device)
@@ -225,9 +225,11 @@ def main():
                     f"loss={loss.item():.4f} "
                     f"{acc_str}"
                 )
+                print(i)
 
             global_step += 1
-
+        if i==10:
+            break
         # ---- Evaluation after epoch ----
         eval_acc = evaluate(model, eval_loader, device)
 
@@ -237,10 +239,11 @@ def main():
         out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        model.save_pretrained(out_dir)
-        tokenizer.save_pretrained(out_dir)
+
 
         print(f"[EVAL] {eval_acc_str}")
+        model.save_pretrained(out_dir)
+        tokenizer.save_pretrained(out_dir)
 
     # ---- Save (HF-native, single checkpoint) ----
     out_dir = Path(cfg.get("output_dir", "phase0_ckpt"))

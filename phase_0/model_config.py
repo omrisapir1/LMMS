@@ -6,9 +6,9 @@ class Phase0Config(PretrainedConfig):
 
     def __init__(
         self,
-        base_model_name: str,
-        answer_token: str,
-        answer_token_id: int,
+        base_model_name: str | None = None,
+        answer_token: str | None = None,
+        answer_token_id: int | None = None,
         unfrozen_layer_pct: float = 0.0,
         num_digits: int = 5,
         num_classes: int = 10,
