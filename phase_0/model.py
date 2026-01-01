@@ -1,11 +1,8 @@
-# phase_0/model.py
-
 import torch
 import torch.nn as nn
 from typing import Optional, Dict
 
 from transformers import (
-    AutoConfig,
     AutoModel,
     PreTrainedModel,
 )
@@ -19,30 +16,19 @@ class Phase0Model(PreTrainedModel):
     def __init__(self, config: Phase0Config):
         super().__init__(config)
 
-        if config.base_model_name is None:
-            raise ValueError("Phase0Config.base_model_name must be set")
-
-        if config.answer_token_id is None:
-            raise ValueError("Phase0Config.answer_token_id must be set")
-
         self.answer_token_id = config.answer_token_id
 
-        # ─────────────────────────────────────────
-        # Base LM (STRUCTURE ONLY, no weights)
-        # ─────────────────────────────────────────
-        base_cfg = AutoConfig.from_pretrained(
+        # ---- Base LM ----
+        self.model = AutoModel.from_pretrained(
             config.base_model_name,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
+            output_hidden_states=True,
         )
-        base_cfg.output_hidden_states = True
-
-        self.model = AutoModel.from_config(base_cfg)
 
         hidden_size = self.model.config.hidden_size
 
-        # ─────────────────────────────────────────
-        # Digit classification heads
-        # ─────────────────────────────────────────
+        # ---- Digit heads ----
         self.digit_heads = nn.ModuleList(
             [
                 nn.Linear(hidden_size, config.num_classes)
@@ -50,19 +36,18 @@ class Phase0Model(PreTrainedModel):
             ]
         )
 
-        # ─────────────────────────────────────────
-        # Freezing policy
-        # ─────────────────────────────────────────
+        # ---- Freeze policy ----
         self._freeze_all()
         self._unfreeze_answer_embedding()
         self._unfreeze_last_layers(config.unfrozen_layer_pct)
 
-        # HF bookkeeping (ties, init, etc.)
+        # Required by HF (ties weights, etc.)
         self.post_init()
 
-    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # Forward
-    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -78,11 +63,11 @@ class Phase0Model(PreTrainedModel):
 
         hidden = outputs.hidden_states[-1]  # [B, T, H]
 
-        # Locate <ANSWER>
+        # ---- Locate <ANSWER> token ----
         answer_mask = input_ids == self.answer_token_id  # [B, T]
-        counts = answer_mask.sum(dim=1)
 
-        if not torch.all(counts == 1):
+
+        if not torch.all(answer_mask.sum(dim=1) == 1):
             raise RuntimeError(
                 "Each sample must contain exactly one <ANSWER> token"
             )
@@ -92,11 +77,11 @@ class Phase0Model(PreTrainedModel):
 
         answer_hidden = hidden[batch_idx, idx]  # [B, H]
 
-        # Digit logits
+        # ---- Digit logits ----
         logits = torch.stack(
             [head(answer_hidden) for head in self.digit_heads],
             dim=1,
-        )  # [B, num_digits, num_classes]
+        )  # [B, 5, 10]
 
         loss = None
         if digit_labels is not None:
@@ -111,9 +96,10 @@ class Phase0Model(PreTrainedModel):
             "loss": loss,
         }
 
-    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # Freezing utilities
-    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+
     def _freeze_all(self):
         for p in self.model.parameters():
             p.requires_grad = False
@@ -124,15 +110,20 @@ class Phase0Model(PreTrainedModel):
         emb.weight[self.answer_token_id].requires_grad = True
 
     def _unfreeze_last_layers(self, pct: float):
+        """
+        Unfreeze the top pct of transformer layers.
+        pct ∈ [0.0, 1.0]
+        """
         if pct <= 0.0:
             return
 
         if not (0.0 <= pct <= 1.0):
             raise ValueError("unfrozen_layer_pct must be in [0, 1]")
 
-        # Decoder-only assumption (LLaMA/Qwen)
+        # This assumes a decoder-only LM (LLaMA / Qwen style)
         layers = self.model.layers
         total_layers = len(layers)
+
         n_unfreeze = max(1, int(total_layers * pct))
 
         for layer in layers[-n_unfreeze:]:

@@ -169,8 +169,10 @@ def main():
     # ---- Model ----
     model = Phase0Model(model_config)
     model.model.resize_token_embeddings(len(tokenizer))
+    model._freeze_all()
     model._unfreeze_answer_embedding()
-    model.to(device)
+    model._unfreeze_last_layers(0.25)
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     # ---- Optimizer (only trainable params) ----
     trainable_params = [p for p in model.parameters() if p.requires_grad]
