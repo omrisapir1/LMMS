@@ -54,7 +54,7 @@ class Phase0Model(PreTrainedModel):
         digit_labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
-        outputs = self.base_model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
@@ -99,11 +99,11 @@ class Phase0Model(PreTrainedModel):
     # ─────────────────────────────────────────────────────────
 
     def _freeze_all(self):
-        for p in self.base_model.parameters():
+        for p in self.model.parameters():
             p.requires_grad = False
 
     def _unfreeze_answer_embedding(self):
-        emb = self.base_model.get_input_embeddings()
+        emb = self.model.get_input_embeddings()
         emb.weight.requires_grad = False
         emb.weight[self.answer_token_id].requires_grad = True
 
@@ -119,7 +119,7 @@ class Phase0Model(PreTrainedModel):
             raise ValueError("unfrozen_layer_pct must be in [0, 1]")
 
         # This assumes a decoder-only LM (LLaMA / Qwen style)
-        layers = self.base_model.model.layers
+        layers = self.model.model.layers
         total_layers = len(layers)
 
         n_unfreeze = max(1, int(total_layers * pct))
