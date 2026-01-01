@@ -12,8 +12,8 @@ from torch.utils.data import Dataset
 
 ANSWER_TOKEN = "<ANSWER>"
 
-BOXED_INT_REGEX = re.compile(
-    r"\\boxed\{([0-9]{1,5})\}"
+BOXED_ANY_REGEX = re.compile(
+    r"\\boxed\{([^}]*)\}"
 )
 
 
@@ -21,11 +21,17 @@ BOXED_INT_REGEX = re.compile(
 # Utilities
 # ─────────────────────────────────────────────────────────────
 def extract_boxed_int(text: str) -> Optional[int]:
-    match = BOXED_INT_REGEX.search(text)
+    match = BOXED_ANY_REGEX.search(text)
     if match is None:
         return None
 
-    value = int(match.group(1))
+    content = match.group(1).strip()
+
+    # Allow spaces, but digits only
+    if not content.isdigit():
+        return None
+
+    value = int(content)
     if 0 <= value <= 99999:
         return value
 
@@ -33,19 +39,15 @@ def extract_boxed_int(text: str) -> Optional[int]:
 
 
 def replace_box_with_answer_token(text: str) -> Optional[str]:
-    """
-    Replace the FIRST boxed integer with <ANSWER>
-    Remove all remaining boxed integers
-    """
-    match = BOXED_INT_REGEX.search(text)
+    match = BOXED_ANY_REGEX.search(text)
     if match is None:
         return None
 
-    # Replace first boxed value with <ANSWER>
+    # Replace first boxed expression with <ANSWER>
     text = text[:match.start()] + ANSWER_TOKEN + text[match.end():]
 
-    # Remove any remaining boxed values completely
-    text = BOXED_INT_REGEX.sub("", text)
+    # Remove any remaining boxed expressions
+    text = BOXED_ANY_REGEX.sub("", text)
 
     return text
 
