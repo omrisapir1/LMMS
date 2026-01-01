@@ -226,11 +226,9 @@ def main():
                     f"loss={loss.item():.4f} "
                     f"{acc_str}"
                 )
-                print(global_step)
 
             global_step += 1
-            if global_step==500:
-                break
+
         # ---- Evaluation after epoch ----
         eval_acc = evaluate(model, eval_loader, device)
 
