@@ -1,3 +1,5 @@
+# phase_0/model_config.py
+
 from transformers import PretrainedConfig
 
 
@@ -16,11 +18,19 @@ class Phase0Config(PretrainedConfig):
     ):
         super().__init__(**kwargs)
 
+        # --- Base LM ---
         self.base_model_name = base_model_name
+
+        # --- Answer token ---
         self.answer_token = answer_token
         self.answer_token_id = answer_token_id
+
+        # --- Training knobs ---
         self.unfrozen_layer_pct = unfrozen_layer_pct
+
+        # --- Classification head ---
         self.num_digits = num_digits
         self.num_classes = num_classes
-        self.output_hidden_states = True
 
+        # Always needed for Phase-0
+        self.output_hidden_states = True

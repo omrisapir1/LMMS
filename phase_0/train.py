@@ -169,6 +169,7 @@ def main():
     # ---- Model ----
     model = Phase0Model(model_config)
     model.model.resize_token_embeddings(len(tokenizer))
+    model._unfreeze_answer_embedding()
     model.to(device)
 
     # ---- Optimizer (only trainable params) ----
@@ -228,14 +229,15 @@ def main():
                 )
 
             global_step += 1
-
+        if global_step == 500:
+            break
         # ---- Evaluation after epoch ----
-        eval_acc = evaluate(model, eval_loader, device)
+        # eval_acc = evaluate(model, eval_loader, device)
 
         out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[EVAL] acc={eval_acc:.3f}")
+        # print(f"[EVAL] acc={eval_acc:.3f}")
         model.save_pretrained(out_dir)
         tokenizer.save_pretrained(out_dir)
 
