@@ -1,0 +1,164 @@
+import re
+from typing import Optional, Dict, Any
+
+import torch
+from datasets import load_dataset
+from torch.utils.data import Dataset
+
+
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+
+ANSWER_TOKEN = "<ANSWER>"
+
+BOXED_INT_REGEX = re.compile(
+    r"\\boxed\{([0-9]{1,5})\}"
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+
+def extract_boxed_int(text: str) -> Optional[int]:
+    """
+    Extract a single boxed integer in range [0, 99999].
+    Returns None if:
+      - no boxed value
+      - more than one boxed value
+      - not a valid integer in range
+    """
+    matches = BOXED_INT_REGEX.findall(text)
+    if len(matches) != 1:
+        return None
+
+    value = int(matches[0])
+    if 0 <= value <= 99999:
+        return value
+
+    return None
+
+
+def replace_box_with_answer_token(text: str) -> Optional[str]:
+    """
+    Replace the boxed integer with <ANSWER>.
+    Returns None if replacement is ambiguous.
+    """
+    matches = BOXED_INT_REGEX.findall(text)
+    if len(matches) != 1:
+        return None
+
+    return BOXED_INT_REGEX.sub(ANSWER_TOKEN, text, count=1)
+
+
+def int_to_digit_labels(x: int) -> Dict[str, int]:
+    """
+    Map integer to 5 digit labels with zero-padding.
+
+    Example:
+      42 -> d4=0, d3=0, d2=0, d1=4, d0=2
+    """
+    s = f"{x:05d}"
+    return {
+        "d4": int(s[0]),
+        "d3": int(s[1]),
+        "d2": int(s[2]),
+        "d1": int(s[3]),
+        "d0": int(s[4]),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Dataset
+# ─────────────────────────────────────────────────────────────
+
+class Phase0Dataset(Dataset):
+    """
+    Phase 0 dataset:
+      - Loads HF dataset
+      - Filters rows with invalid boxed answers
+      - Replaces boxed answer with <ANSWER>
+      - Produces digit classification labels
+    """
+
+    def __init__(
+        self,
+        hf_name: str,
+        split: str,
+        tokenizer,
+        max_length: int = 512,
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        raw_ds = load_dataset(hf_name, split=split)
+
+        self.samples = []
+        dropped = 0
+
+        for row in raw_ds:
+            text = row.get("generated_answer")
+            if not isinstance(text, str):
+                dropped += 1
+                continue
+
+            answer = extract_boxed_int(text)
+            if answer is None:
+                dropped += 1
+                continue
+
+            replaced = replace_box_with_answer_token(text)
+            if replaced is None:
+                dropped += 1
+                continue
+
+            labels = int_to_digit_labels(answer)
+
+            self.samples.append({
+                "text": replaced,
+                "answer": answer,
+                "labels": labels,
+            })
+
+        if len(self.samples) == 0:
+            raise RuntimeError("Phase0Dataset: no valid samples after filtering.")
+
+        print(
+            f"[Phase0Dataset] Loaded {len(self.samples)} samples "
+            f"(dropped {dropped})"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
+
+        encoded = self.tokenizer(
+            sample["text"],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors="pt",
+        )
+
+        # Flatten batch dimension
+        encoded = {k: v.squeeze(0) for k, v in encoded.items()}
+
+        # Digit labels as tensor (order fixed!)
+        digit_labels = torch.tensor(
+            [
+                sample["labels"]["d4"],
+                sample["labels"]["d3"],
+                sample["labels"]["d2"],
+                sample["labels"]["d1"],
+                sample["labels"]["d0"],
+            ],
+            dtype=torch.long,
+        )
+
+        encoded["digit_labels"] = digit_labels
+        encoded["answer"] = sample["answer"]
+
+        return encoded
