@@ -134,7 +134,11 @@ class Phase0Dataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+
         sample = self.samples[idx]
+        if ANSWER_TOKEN not in sample["text"]:
+            print(f"sample text: {sample['text']}")
+            raise RuntimeError("Dataset sample missing <ANSWER> before tokenization")
 
         encoded = self.tokenizer(
             sample["text"],

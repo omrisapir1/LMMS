@@ -115,6 +115,8 @@ def main():
     answer_token_id = tokenizer.convert_tokens_to_ids(
         cfg["model"]["answer_token"]
     )
+    aid = tokenizer.convert_tokens_to_ids(cfg["model"]["answer_token"])
+    assert aid != tokenizer.unk_token_id, "<ANSWER> is not a real token"
 
     # ---- Dataset ----
     full_ds = Phase0Dataset(
