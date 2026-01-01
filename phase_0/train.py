@@ -231,8 +231,8 @@ def main():
                 )
 
             global_step += 1
-        if global_step >= 500:
-            break
+            if global_step >= 500:
+                break
         # ---- Evaluation after epoch ----
         # eval_acc = evaluate(model, eval_loader, device)
 
