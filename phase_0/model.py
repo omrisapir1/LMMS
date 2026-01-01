@@ -76,6 +76,7 @@ class Phase0Model(PreTrainedModel):
 
             for i in bad.tolist():
                 ids = input_ids[i].tolist()
+                self.tokenizer.convert_ids_to_tokens(ids)
                 print(f"\n--- Sample {i} ---")
                 print("ANSWER count:", counts[i].item())
                 print("Token IDs:", ids)
