@@ -5,6 +5,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from typing import Optional
 
 
 # ─────────────────────────────────────────────────────────────
@@ -55,7 +56,16 @@ class Phase0Model(PreTrainedModel):
         )
 
         # Ensure hidden_size is available both locally and on self.config
-        self.hidden_size = self.base_model.config.hidden_size
+        emb = self.base_model.get_input_embeddings()
+        cfg_hidden = getattr(self.base_model.config, "hidden_size", None)
+        self.hidden_size = (
+            cfg_hidden
+            if cfg_hidden is not None
+            else getattr(emb, "embedding_dim", None)
+            or (emb.weight.shape[1] if hasattr(emb, "weight") else None)
+        )
+        if self.hidden_size is None:
+            raise RuntimeError("Could not determine hidden_size from base model")
         if getattr(self.config, "hidden_size", None) is None:
             self.config.hidden_size = self.hidden_size
 
@@ -113,9 +123,9 @@ class Phase0Model(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.LongTensor,
-        digit_labels: torch.LongTensor | None = None,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        digit_labels: Optional[torch.Tensor] = None,
     ):
         outputs = self.base_model(
             input_ids=input_ids,
