@@ -62,7 +62,7 @@ def evaluate(model, dataloader, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--config", type=str, default='conf.yaml')
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
