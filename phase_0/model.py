@@ -65,6 +65,23 @@ class Phase0Model(PreTrainedModel):
         # ---- Locate <ANSWER> token ----
         answer_mask = input_ids == self.answer_token_id  # [B, T]
 
+        counts = answer_mask.sum(dim=1)
+
+        if not torch.all(counts == 1):
+            bad = (counts != 1).nonzero(as_tuple=False).squeeze(-1)
+
+            print("\n[DEBUG] Invalid <ANSWER> counts detected")
+            print("Counts per sample:", counts.tolist())
+            print("Bad indices in batch:", bad.tolist())
+
+            for i in bad.tolist():
+                ids = input_ids[i].tolist()
+                print(f"\n--- Sample {i} ---")
+                print("ANSWER count:", counts[i].item())
+                print("Token IDs:", ids)
+
+            raise RuntimeError("Invalid <ANSWER> token count")
+
         if not torch.all(answer_mask.sum(dim=1) == 1):
             raise RuntimeError(
                 "Each sample must contain exactly one <ANSWER> token"
