@@ -11,7 +11,7 @@ model:
 dataset:
   hf_name: omrisap/easy_math_by_qwen1.5_instruct   # HF dataset path
   split: train
-  max_length: 1024
+  max_length: 1124
 
 # ─────────────────────────────────────────────────────────────
 # Training
