@@ -12,14 +12,19 @@ from torch.utils.data import Dataset
 
 ANSWER_TOKEN = "<ANSWER>"
 
+SYSTEM_PROMPT = (
+    "Please reason step by step, and put your final answer within \\boxed{}."
+)
+
 BOXED_ANY_REGEX = re.compile(
-    r"\\boxed\{([^}]*)\}"
+    r"\\boxed\{([^}]*)}"
 )
 
 
 # ─────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────
+
 def extract_boxed_int(text: str) -> Optional[int]:
     match = BOXED_ANY_REGEX.search(text)
     if match is None:
@@ -52,6 +57,22 @@ def replace_box_with_answer_token(text: str) -> Optional[str]:
     return text
 
 
+def build_prompt(tokenizer, question: str, answer: str) -> str:
+    # If the answer contains a boxed final value, replace it with the ANSWER token
+    processed_answer = replace_box_with_answer_token(answer) or answer
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": processed_answer},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 
 def int_to_digit_labels(x: int) -> Dict[str, int]:
     """
@@ -72,14 +93,14 @@ def int_to_digit_labels(x: int) -> Dict[str, int]:
 
 # ─────────────────────────────────────────────────────────────
 # Dataset
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 class Phase0Dataset(Dataset):
     """
     Phase 0 dataset:
       - Loads HF dataset
       - Filters rows with invalid boxed answers
-      - Replaces boxed answer with <ANSWER>
+      - Builds chat prompt from question and inserts <ANSWER> where model should output final answer
       - Produces digit classification labels
     """
 
@@ -99,25 +120,26 @@ class Phase0Dataset(Dataset):
         dropped = 0
 
         for row in raw_ds:
-            text = row.get("generated_answer")
-            if not isinstance(text, str):
+            question = row.get("question")
+            gen_answer = row.get("generated_answer")
+
+            if not isinstance(question, str) or not isinstance(gen_answer, str):
                 dropped += 1
                 continue
 
-            answer = extract_boxed_int(text)
+            answer = extract_boxed_int(gen_answer)
             if answer is None:
                 dropped += 1
                 continue
 
-            replaced = replace_box_with_answer_token(text)
-            if replaced is None:
-                dropped += 1
-                continue
+            # Build chat-style prompt, with assistant content containing reasoning
+            # and <ANSWER> token where the final answer should be generated
+            prompt = build_prompt(self.tokenizer, question, gen_answer)
 
             labels = int_to_digit_labels(answer)
 
             self.samples.append({
-                "text": replaced,
+                "text": prompt,
                 "answer": answer,
                 "labels": labels,
             })
