@@ -4,6 +4,7 @@ from typing import Optional, Dict
 
 from transformers import (
     AutoModel,
+    AutoTokenizer,
     PreTrainedModel,
 )
 
@@ -12,6 +13,37 @@ from .model_config import Phase0Config
 
 class Phase0Model(PreTrainedModel):
     config_class = Phase0Config
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """
+        Override to ensure vocab_size in config matches the tokenizer saved in the checkpoint
+        before weights are loaded, preventing embedding size mismatches.
+        """
+        # Load config first
+        try:
+            config = Phase0Config.from_pretrained(pretrained_model_name_or_path)
+        except Exception:
+            config = kwargs.get("config", None)
+
+        # Try to load tokenizer from the same directory and set vocab_size
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=True,
+            )
+            if config is None:
+                config = Phase0Config()
+            config.vocab_size = len(tok)
+            if getattr(config, "answer_token", None) and getattr(config, "answer_token_id", None) is None:
+                config.answer_token_id = tok.convert_tokens_to_ids(config.answer_token)
+        except Exception:
+            pass
+
+        if config is not None:
+            kwargs["config"] = config
+
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     def __init__(self, config: Phase0Config):
         super().__init__(config)
