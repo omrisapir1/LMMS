@@ -65,7 +65,7 @@ def compute_digit_accuracy(logits, labels):
 def evaluate(model, dataloader, device):
     model.eval()
 
-    total_correct = torch.zeros(5, device=device)
+    total_correct = 0
     total_count = 0
 
     for batch in dataloader:
@@ -79,10 +79,11 @@ def evaluate(model, dataloader, device):
         )
 
         preds = out["logits"].argmax(dim=-1)  # [B, 5]
-        total_correct += (preds == digit_labels).sum(dim=0)
+        per_question_correct = (preds == digit_labels).all(dim=1)  # [B]
+        total_correct += per_question_correct.sum().item()
         total_count += digit_labels.size(0)
 
-    acc = total_correct / total_count
+    acc = total_correct / total_count if total_count > 0 else 0.0
     model.train()
     return acc
 
@@ -127,7 +128,7 @@ def main():
     )
 
     # ---- Train / Eval split (95% / 5%) ----
-    eval_frac = 0.05
+    eval_frac = 0.02
     n_total = len(full_ds)
     n_eval = int(n_total * eval_frac)
     n_train = n_total - n_eval
@@ -147,7 +148,7 @@ def main():
 
     eval_loader = DataLoader(
         eval_ds,
-        batch_size=cfg["training"]["batch_size"],
+        batch_size=cfg["eval"]["batch_size"],
         shuffle=False,
         collate_fn=collate_phase0,
     )
@@ -228,20 +229,15 @@ def main():
                 print(global_step)
 
             global_step += 1
-            if global_step==10:
+            if global_step==500:
                 break
         # ---- Evaluation after epoch ----
         eval_acc = evaluate(model, eval_loader, device)
 
-        eval_acc_str = " | ".join(
-            f"d{i}:{eval_acc[i].item():.3f}" for i in range(5)
-        )
         out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
         out_dir.mkdir(parents=True, exist_ok=True)
 
-
-
-        print(f"[EVAL] {eval_acc_str}")
+        print(f"[EVAL] acc={eval_acc:.3f}")
         model.save_pretrained(out_dir)
         tokenizer.save_pretrained(out_dir)
 
