@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, random_split
 from torch.optim import AdamW
+from typing import List, Dict, Any
+
 from transformers import AutoTokenizer
 
 from .dataset import Phase0Dataset
@@ -14,6 +16,35 @@ from .model import Phase0Model, Phase0Config
 # ─────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────
+
+
+def collate_phase0(batch: List[Dict[str, Any]]):
+    """
+    Pads input_ids and attention_mask to max length in batch.
+    """
+    input_ids = [b["input_ids"] for b in batch]
+    attention_mask = [b["attention_mask"] for b in batch]
+    digit_labels = torch.stack([b["digit_labels"] for b in batch])
+
+    # Pad
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        input_ids,
+        batch_first=True,
+        padding_value=0,  # tokenizer.pad_token_id (safe for causal LM)
+    )
+
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        attention_mask,
+        batch_first=True,
+        padding_value=0,
+    )
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "digit_labels": digit_labels,
+    }
+
 
 def load_config(path: str):
     with open(path, "r") as f:
@@ -74,6 +105,8 @@ def main():
         cfg["model"]["name"],
         trust_remote_code=True,
     )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     tokenizer.add_special_tokens(
         {"additional_special_tokens": [cfg["model"]["answer_token"]]}
@@ -107,12 +140,14 @@ def main():
         train_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,
+        collate_fn=collate_phase0,
     )
 
     eval_loader = DataLoader(
         eval_ds,
         batch_size=cfg["training"]["batch_size"],
         shuffle=False,
+        collate_fn=collate_phase0,
     )
 
     print(
