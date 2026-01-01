@@ -20,20 +20,12 @@ BOXED_INT_REGEX = re.compile(
 # ─────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────
-
 def extract_boxed_int(text: str) -> Optional[int]:
-    """
-    Extract a single boxed integer in range [0, 99999].
-    Returns None if:
-      - no boxed value
-      - more than one boxed value
-      - not a valid integer in range
-    """
-    matches = BOXED_INT_REGEX.findall(text)
-    if len(matches) != 1:
+    match = BOXED_INT_REGEX.search(text)
+    if match is None:
         return None
 
-    value = int(matches[0])
+    value = int(match.group(1))
     if 0 <= value <= 99999:
         return value
 
@@ -42,14 +34,21 @@ def extract_boxed_int(text: str) -> Optional[int]:
 
 def replace_box_with_answer_token(text: str) -> Optional[str]:
     """
-    Replace the boxed integer with <ANSWER>.
-    Returns None if replacement is ambiguous.
+    Replace the FIRST boxed integer with <ANSWER>
+    Remove all remaining boxed integers
     """
-    matches = BOXED_INT_REGEX.findall(text)
-    if len(matches) != 1:
+    match = BOXED_INT_REGEX.search(text)
+    if match is None:
         return None
 
-    return BOXED_INT_REGEX.sub(ANSWER_TOKEN, text, count=1)
+    # Replace first boxed value with <ANSWER>
+    text = text[:match.start()] + ANSWER_TOKEN + text[match.end():]
+
+    # Remove any remaining boxed values completely
+    text = BOXED_INT_REGEX.sub("", text)
+
+    return text
+
 
 
 def int_to_digit_labels(x: int) -> Dict[str, int]:
