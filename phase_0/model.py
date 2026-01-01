@@ -119,7 +119,7 @@ class Phase0Model(PreTrainedModel):
             raise ValueError("unfrozen_layer_pct must be in [0, 1]")
 
         # This assumes a decoder-only LM (LLaMA / Qwen style)
-        layers = self.model.model.layers
+        layers = self.model.layers
         total_layers = len(layers)
 
         n_unfreeze = max(1, int(total_layers * pct))
