@@ -20,6 +20,7 @@ class Phase0Config(PretrainedConfig):
         answer_token: str = "<ANSWER>",
         answer_token_id: int | None = None,
         unfrozen_layer_pct: float = 0.0,
+        hidden_size: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -27,6 +28,7 @@ class Phase0Config(PretrainedConfig):
         self.answer_token = answer_token
         self.answer_token_id = answer_token_id
         self.unfrozen_layer_pct = unfrozen_layer_pct
+        self.hidden_size = hidden_size
 
 
 # ─────────────────────────────────────────────────────────────
@@ -52,7 +54,10 @@ class Phase0Model(PreTrainedModel):
             output_hidden_states=True,
         )
 
+        # Ensure hidden_size is available both locally and on self.config
         self.hidden_size = self.base_model.config.hidden_size
+        if getattr(self.config, "hidden_size", None) is None:
+            self.config.hidden_size = self.hidden_size
 
         # ---- Digit heads ----
         self.digit_heads = nn.ModuleList(
