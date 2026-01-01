@@ -7,7 +7,7 @@ from transformers import (
     PreTrainedModel,
 )
 
-from phase_0 import Phase0Config
+from .model_config import Phase0Config
 
 
 class Phase0Model(PreTrainedModel):
