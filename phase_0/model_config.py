@@ -1,5 +1,6 @@
 # phase_0/model_config.py
 
+from typing import Optional
 from transformers import PretrainedConfig
 
 
@@ -8,13 +9,13 @@ class Phase0Config(PretrainedConfig):
 
     def __init__(
         self,
-        base_model_name: str | None = None,
-        answer_token: str | None = None,
-        answer_token_id: int | None = None,
+        base_model_name: Optional[str] = None,
+        answer_token: Optional[str] = None,
+        answer_token_id: Optional[int] = None,
         unfrozen_layer_pct: float = 0.0,
         num_digits: int = 5,
         num_classes: int = 10,
-        vocab_size: int | None = None,
+        vocab_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)

@@ -164,11 +164,11 @@ def main():
         answer_token=cfg["model"]["answer_token"],
         answer_token_id=answer_token_id,
         unfrozen_layer_pct=cfg["training"]["unfrozen_layer_pct"],
-        vocab_size=len(tokenizer),
     )
 
     # ---- Model ----
     model = Phase0Model(model_config)
+    model.model.resize_token_embeddings(len(tokenizer))
     model._freeze_all()
     model._unfreeze_answer_embedding()
     model._unfreeze_last_layers(0.25)

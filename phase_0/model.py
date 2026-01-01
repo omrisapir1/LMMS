@@ -4,8 +4,8 @@ from typing import Optional, Dict
 
 from transformers import (
     AutoModel,
-    AutoTokenizer,
     PreTrainedModel,
+    AutoTokenizer,
 )
 
 from .model_config import Phase0Config
@@ -16,33 +16,23 @@ class Phase0Model(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """
-        Override to ensure vocab_size in config matches the tokenizer saved in the checkpoint
-        before weights are loaded, preventing embedding size mismatches.
-        """
-        # Load config first
+        # Ensure config carries correct vocab_size from tokenizer before model init
         try:
             config = Phase0Config.from_pretrained(pretrained_model_name_or_path)
         except Exception:
-            config = kwargs.get("config", None)
+            config = kwargs.get("config")
 
-        # Try to load tokenizer from the same directory and set vocab_size
         try:
-            tok = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path,
-                trust_remote_code=True,
-            )
+            tok = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
             if config is None:
                 config = Phase0Config()
             config.vocab_size = len(tok)
             if getattr(config, "answer_token", None) and getattr(config, "answer_token_id", None) is None:
                 config.answer_token_id = tok.convert_tokens_to_ids(config.answer_token)
-        except Exception:
-            pass
-
-        if config is not None:
             kwargs["config"] = config
-
+        except Exception:
+            if config is not None:
+                kwargs["config"] = config
         return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     def __init__(self, config: Phase0Config):
@@ -53,17 +43,16 @@ class Phase0Model(PreTrainedModel):
         # ---- Base LM ----
         self.model = AutoModel.from_pretrained(
             config.base_model_name,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             output_hidden_states=True,
         )
 
-        # Ensure tokenizer-dependent embedding size matches saved config
+        # Resize base embeddings to tokenizer vocab size saved in config
         if getattr(config, "vocab_size", None) is not None:
             try:
                 self.model.resize_token_embeddings(config.vocab_size)
             except Exception:
-                # If the underlying model doesn't support resizing, skip
                 pass
 
         hidden_size = self.model.config.hidden_size
