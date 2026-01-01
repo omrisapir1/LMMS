@@ -196,6 +196,11 @@ def main():
         eval_acc_str = " | ".join(
             f"d{i}:{eval_acc[i].item():.3f}" for i in range(5)
         )
+        out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        model.save_pretrained(out_dir)
+        tokenizer.save_pretrained(out_dir)
 
         print(f"[EVAL] {eval_acc_str}")
 

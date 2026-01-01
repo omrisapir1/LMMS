@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_parquet", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
@@ -82,6 +82,8 @@ def main():
         for out in outputs:
             text = out.outputs[0].text
             generated.append(text)
+        if i ==0:
+            json.dump([df['answer'].tolist()[:args.batc_size], generated], open('test.json', "w"))
 
     df["generated_answer"] = generated
 
