@@ -4,7 +4,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, random_split
-from transformers import AutoTokenizer, AdamW
+from torch.optim import AdamW
+from transformers import AutoTokenizer
 
 from dataset import Phase0Dataset
 from model import Phase0Model, Phase0Config
