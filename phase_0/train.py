@@ -127,6 +127,14 @@ def main():
         max_length=cfg["dataset"]["max_length"],
     )
 
+    # ---- Print a single sample with replaced <ANSWER> ----
+
+    sample0 = full_ds[0]
+    decoded = tokenizer.decode(sample0["input_ids"], skip_special_tokens=False)
+    print("\n[Sample] Decoded input (first row):")
+    print(decoded)
+
+
     # ---- Train / Eval split (95% / 5%) ----
     eval_frac = 0.02
     n_total = len(full_ds)
