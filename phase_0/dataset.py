@@ -43,13 +43,15 @@ def extract_boxed_int(text: str) -> Optional[int]:
     return None
 
 
-def replace_box_with_answer_token(text: str) -> Optional[str]:
+def replace_box_or_int_with_answer_token(text: str, gen_final_answer: str) -> Optional[str]:
     match = BOXED_ANY_REGEX.search(text)
     if match is None:
         return None
-
-    # Replace first boxed expression with <ANSWER>
-    text = text[:match.start()] + ANSWER_TOKEN
+    final_answer_index = text.find(gen_final_answer)
+    if final_answer_index == -1 or match.start() < final_answer_index:
+        text = text[:match.start()] + ANSWER_TOKEN
+    else:
+        text = text[:final_answer_index] + ANSWER_TOKEN
 
     # Remove any remaining boxed expressions
     text = BOXED_ANY_REGEX.sub("", text)
@@ -57,9 +59,9 @@ def replace_box_with_answer_token(text: str) -> Optional[str]:
     return text
 
 
-def build_prompt(tokenizer, question: str, answer: str) -> str:
+def build_prompt(tokenizer, question: str, answer: str, gen_final_answer: str) -> str:
     # If the answer contains a boxed final value, replace it with the ANSWER token
-    processed_answer = replace_box_with_answer_token(answer) or answer
+    processed_answer = replace_box_or_int_with_answer_token(answer, gen_final_answer) or answer
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -93,7 +95,7 @@ def int_to_digit_labels(x: int) -> Dict[str, int]:
 
 # ─────────────────────────────────────────────────────────────
 # Dataset
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class Phase0Dataset(Dataset):
     """
@@ -122,6 +124,7 @@ class Phase0Dataset(Dataset):
         for row in raw_ds:
             question = row.get("question")
             gen_answer = row.get("generated_answer")
+            gen_final_answer = str(int(row.get("generated_final_answer")))
 
             if not isinstance(question, str) or not isinstance(gen_answer, str):
                 dropped += 1
@@ -134,7 +137,7 @@ class Phase0Dataset(Dataset):
 
             # Build chat-style prompt, with assistant content containing reasoning
             # and <ANSWER> token where the final answer should be generated
-            prompt = build_prompt(self.tokenizer, question, gen_answer)
+            prompt = build_prompt(self.tokenizer, question, gen_answer, gen_final_answer)
 
             labels = int_to_digit_labels(answer)
 
@@ -142,6 +145,8 @@ class Phase0Dataset(Dataset):
                 "text": prompt,
                 "answer": answer,
                 "labels": labels,
+                "question": question,
+                "generated_final_answer": gen_answer,
             })
 
         if len(self.samples) == 0:
@@ -187,5 +192,9 @@ class Phase0Dataset(Dataset):
 
         encoded["digit_labels"] = digit_labels
         encoded["answer"] = sample["answer"]
+        # Add metadata for evaluation export
+        encoded["question"] = sample["question"]
+        encoded["prompt"] = sample["text"]
+        encoded["generated_final_answer"] = sample["generated_final_answer"]
 
         return encoded

@@ -8,6 +8,7 @@ from torch.optim import AdamW
 from typing import List, Dict, Any
 
 from transformers import AutoTokenizer
+import pandas as pd
 
 from .dataset import Phase0Dataset
 from .model import Phase0Model, Phase0Config
@@ -21,6 +22,7 @@ from .model import Phase0Model, Phase0Config
 def collate_phase0(batch: List[Dict[str, Any]]):
     """
     Pads input_ids and attention_mask to max length in batch.
+    Also carries metadata needed for evaluation export.
     """
     input_ids = [b["input_ids"] for b in batch]
     attention_mask = [b["attention_mask"] for b in batch]
@@ -39,10 +41,21 @@ def collate_phase0(batch: List[Dict[str, Any]]):
         padding_value=0,
     )
 
+    # Carry-through metadata as lists (CPU)
+    questions = [b["question"] for b in batch]
+    prompts = [b["prompt"] for b in batch]
+    gen_final_answers = [b["generated_final_answer"] for b in batch]
+    answers = [int(b["answer"]) for b in batch]
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "digit_labels": digit_labels,
+        # Metadata
+        "question": questions,
+        "prompt": prompts,
+        "generated_final_answer": gen_final_answers,
+        "answer": answers,
     }
 
 
@@ -57,16 +70,18 @@ def compute_digit_accuracy(logits, labels):
     labels: [B, 5]
     """
     preds = logits.argmax(dim=-1)
-    correct = (preds == labels).float()
+    correct = (preds == labels).to(torch.float)
     return correct.mean(dim=0)  # [5]
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, save_path: Path | None = None):
     model.eval()
 
     total_correct = 0
     total_count = 0
+
+    rows = []  # accumulate for dataframe
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -79,11 +94,37 @@ def evaluate(model, dataloader, device):
         )
 
         preds = out["logits"].argmax(dim=-1)  # [B, 5]
-        per_question_correct = (preds == digit_labels).all(dim=1)  # [B]
+        per_question_correct = torch.all(preds == digit_labels, dim=1)  # [B]
         total_correct += per_question_correct.sum().item()
         total_count += digit_labels.size(0)
 
+        # Build export rows
+        B = preds.size(0)
+        for i in range(B):
+            pred_digits = preds[i].tolist()
+            predicted_answer = "".join(str(d) for d in pred_digits)
+            rows.append({
+                "question": batch["question"][i],
+                "answer": int(batch["answer"][i]),
+                "generated_final_answer": batch["generated_final_answer"][i],
+                "prompt": batch["prompt"][i],
+                "predicted_answer": predicted_answer,
+            })
+
     acc = total_correct / total_count if total_count > 0 else 0.0
+
+    # Save pickle if requested
+    if save_path is not None and len(rows) > 0:
+        df = pd.DataFrame(rows, columns=[
+            "question",
+            "answer",
+            "generated_final_answer",
+            "prompt",
+            "predicted_answer",
+        ])
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(save_path)
+
     model.train()
     return acc
 
@@ -130,13 +171,15 @@ def main():
     # ---- Print a single sample with replaced <ANSWER> ----
 
     sample0 = full_ds[0]
+    print("\n[Sample] Raw prompt (first row):")
+    print(sample0["prompt"])  # pre-tokenization prompt with <ANSWER>
     decoded = tokenizer.decode(sample0["input_ids"], skip_special_tokens=False)
     print("\n[Sample] Decoded input (first row):")
     print(decoded)
 
 
     # ---- Train / Eval split (95% / 5%) ----
-    eval_frac = 0.02
+    eval_frac = 0.01
     n_total = len(full_ds)
     n_eval = int(n_total * eval_frac)
     n_train = n_total - n_eval
@@ -239,15 +282,17 @@ def main():
                 )
 
             global_step += 1
-            if global_step >= 500:
+            if global_step > 1000:
                 break
-        # ---- Evaluation after epoch ----
-        # eval_acc = evaluate(model, eval_loader, device)
 
+        # Prepare output dir and run evaluation with export
         out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # print(f"[EVAL] acc={eval_acc:.3f}")
+        eval_pkl = out_dir / f"eval_epoch_{epoch+1}.pkl"
+        eval_acc = evaluate(model, eval_loader, device, save_path=eval_pkl)
+
+        print(f"[EVAL] acc={eval_acc:.3f} | saved: {eval_pkl}")
         model.save_pretrained(out_dir)
         tokenizer.save_pretrained(out_dir)
 
