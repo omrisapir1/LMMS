@@ -139,7 +139,7 @@ class Phase0Dataset(Dataset):
             # and <ANSWER> token where the final answer should be generated
             prompt = build_prompt(self.tokenizer, question, gen_answer, gen_final_answer)
 
-            labels = int_to_digit_labels(gen_final_answer)
+            labels = int_to_digit_labels(int(gen_final_answer))
 
             self.samples.append({
                 "text": prompt,
