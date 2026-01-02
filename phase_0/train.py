@@ -283,8 +283,6 @@ def main():
                 )
 
             global_step += 1
-            if global_step > 1000:
-                break
 
         # Prepare output dir and run evaluation with export
         out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
