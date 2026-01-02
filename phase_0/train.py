@@ -235,66 +235,66 @@ def main():
 
     # ---- Training loop ----
     global_step = 0
-    model.train()
-
-    for epoch in range(cfg["training"]["epochs"]):
-        print(f"\n=== Epoch {epoch + 1}/{cfg['training']['epochs']} ===")
-
-        for i, batch in enumerate(train_loader):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            digit_labels = batch["digit_labels"].to(device)
-
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                digit_labels=digit_labels,
-            )
-
-            loss = out["loss"]
-
-            optimizer.zero_grad()
-            loss.backward()
-
-            if "gradient_clip" in cfg["training"]:
-                torch.nn.utils.clip_grad_norm_(
-                    trainable_params,
-                    cfg["training"]["gradient_clip"],
-                )
-
-            optimizer.step()
-
-            if global_step % cfg["logging"]["log_every"] == 0:
-                with torch.no_grad():
-                    acc = compute_digit_accuracy(
-                        out["logits"],
-                        digit_labels,
-                    )
-
-                acc_str = " | ".join(
-                    f"d{i}:{acc[i].item():.3f}" for i in range(5)
-                )
-
-                print(
-                    f"step={global_step:06d} "
-                    f"loss={loss.item():.4f} "
-                    f"{acc_str}"
-                )
-
-            global_step += 1
-            if global_step > 1000:
-                break
-
-        # Prepare output dir and run evaluation with export
-        out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        eval_pkl = out_dir / f"eval_epoch_{epoch+1}.pkl"
-        eval_acc = evaluate(model, eval_loader, device, save_path=eval_pkl)
-
-        print(f"[EVAL] acc={eval_acc:.3f} | saved: {eval_pkl}")
-        model.save_pretrained(out_dir)
-        tokenizer.save_pretrained(out_dir)
+    # model.train()
+    #
+    # for epoch in range(cfg["training"]["epochs"]):
+    #     print(f"\n=== Epoch {epoch + 1}/{cfg['training']['epochs']} ===")
+    #
+    #     for i, batch in enumerate(train_loader):
+    #         input_ids = batch["input_ids"].to(device)
+    #         attention_mask = batch["attention_mask"].to(device)
+    #         digit_labels = batch["digit_labels"].to(device)
+    #
+    #         out = model(
+    #             input_ids=input_ids,
+    #             attention_mask=attention_mask,
+    #             digit_labels=digit_labels,
+    #         )
+    #
+    #         loss = out["loss"]
+    #
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #
+    #         if "gradient_clip" in cfg["training"]:
+    #             torch.nn.utils.clip_grad_norm_(
+    #                 trainable_params,
+    #                 cfg["training"]["gradient_clip"],
+    #             )
+    #
+    #         optimizer.step()
+    #
+    #         if global_step % cfg["logging"]["log_every"] == 0:
+    #             with torch.no_grad():
+    #                 acc = compute_digit_accuracy(
+    #                     out["logits"],
+    #                     digit_labels,
+    #                 )
+    #
+    #             acc_str = " | ".join(
+    #                 f"d{i}:{acc[i].item():.3f}" for i in range(5)
+    #             )
+    #
+    #             print(
+    #                 f"step={global_step:06d} "
+    #                 f"loss={loss.item():.4f} "
+    #                 f"{acc_str}"
+    #             )
+    #
+    #         global_step += 1
+    #         if global_step > 1000:
+    #             break
+    #
+    #     # Prepare output dir and run evaluation with export
+    #     out_dir = Path(cfg.get("output_dir", f"phase0_ckpt_epoch_{epoch+1}"))
+    #     out_dir.mkdir(parents=True, exist_ok=True)
+    #
+    #     eval_pkl = out_dir / f"eval_epoch_{epoch+1}.pkl"
+    #     eval_acc = evaluate(model, eval_loader, device, save_path=eval_pkl)
+    #
+    #     print(f"[EVAL] acc={eval_acc:.3f} | saved: {eval_pkl}")
+    #     model.save_pretrained(out_dir)
+    #     tokenizer.save_pretrained(out_dir)
 
     # ---- Save (HF-native, single checkpoint) ----
     out_dir = Path(cfg.get("output_dir", "phase0_ckpt"))
