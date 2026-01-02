@@ -66,9 +66,9 @@ class Phase0Model(PreTrainedModel):
         )
 
         # ---- Freeze policy ----
-        self._freeze_all()
-        self._unfreeze_answer_embedding()
-        self._unfreeze_last_layers(config.unfrozen_layer_pct)
+        # self._freeze_all()
+        # self._unfreeze_answer_embedding()
+        # self._unfreeze_last_layers(config.unfrozen_layer_pct)
 
         # Required by HF (ties weights, etc.)
         self.post_init()
