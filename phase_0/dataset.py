@@ -143,7 +143,7 @@ class Phase0Dataset(Dataset):
 
             self.samples.append({
                 "text": prompt,
-                "answer": answer,
+                "answer": row.get("answer"),
                 "labels": labels,
                 "question": question,
                 "generated_final_answer": gen_final_answer,
