@@ -29,24 +29,28 @@ def build_prompt(tokenizer, question: str) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
-    parser.add_argument("--input_jsonl", type=str, required=True)
-    parser.add_argument("--output_parquet", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=512)
+    # parser.add_argument("--input_jsonl", type=str, required=True)
+    parser.add_argument("--output_parquet", type=str, default='results/generated_answers.parquet')
+    parser.add_argument("--batch_size", type=int, default=4000)
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     args = parser.parse_args()
+    from datasets import load_dataset
 
-    # ---- Load dataset ----
-    rows = []
-    with open(args.input_jsonl, "r") as f:
-        for line in f:
-            rows.append(json.loads(line))
+    # Login using e.g. `huggingface-cli login` to access this dataset
+    ds = load_dataset("zen-E/GSM8k-Aug")
 
-    df = pd.DataFrame(rows)
+    # # ---- Load dataset ----
+    # rows = []
+    # with open(args.input_jsonl, "r") as f:
+    #     for line in f:
+    #         rows.append(json.loads(line))
+
+    df = ds['train'].to_pandas()
 
     # We only need the question, but keep answer for comparison
-    df = df[["id", "question", "answer"]].copy()
+    df = df[["question", "answer"]].sample(70000).copy()
 
     # ---- Tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -82,8 +86,6 @@ def main():
         for out in outputs:
             text = out.outputs[0].text
             generated.append(text)
-        if i ==0:
-            json.dump([df['answer'].tolist()[:args.batc_size], generated], open('test.json', "w"))
 
     df["generated_answer"] = generated
 
