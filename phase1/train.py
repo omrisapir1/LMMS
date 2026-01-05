@@ -255,6 +255,7 @@ def train_phase1(config: Phase1Config) -> None:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            del loss, logits, out, batch
             torch.cuda.empty_cache()
 
             # Periodic evaluation on validation data only
