@@ -35,7 +35,7 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
 
 
 
-    with_chat = tokenizer.apply_chat_template(messages,
+    with_chat = tokenizer_q.apply_chat_template(messages,
                                               tokenize=False,
                                               add_generation_prompt=True)
     with_chat += answer
@@ -44,37 +44,52 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
 
 def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
     """
-    Build formatted text with:
-    - first (K - num_latent) thoughts (each on its own line)
-    - num_latent latent tokens appended on a single line
-    - final <ANSWER> token on the last line
-
-    Assumptions:
-    - 0 <= num_latent <= K
-    - No stage logic
-    - No validation or exclusion
-
-    Newline policy:
-    - sections separated by newlines
-    - thoughts are newline-separated
-    - latent tokens are space-separated on their line
-    - <ANSWER> is always last and on its own line
+    New semantics:
+    - num_latent == 0:
+        t0 t1 ... t(K-1)
+    - num_latent == 1:
+        t0 t1 ... t(K-2) <LATENT> <ANSWER>
+    - num_latent >= 2:
+        <LATENT> x (num_latent - 1)
+        t(num_latent - 1) ... t(K - 2)
+        <LATENT>
+        <ANSWER>
     """
-    # Defensive clamp of num_latent to [0, K]
     num_latent = max(0, min(int(num_latent), int(K)))
-    keep_n = max(0, K - num_latent)
     lines: List[str] = []
-    # question first
 
-    # kept thoughts
-    for t in thoughts[:keep_n]:
+    if num_latent == 0:
+        # No latent tokens at all
+        for t in thoughts:
+            lines.append(t)
+        return "\n".join(lines)
+
+    if num_latent == 1:
+        # Replace last thought only
+        for t in thoughts[:-1]:
+            lines.append(t)
+        lines.append(LATENT_TOKEN)
+        lines.append(answer_token)
+        return "\n".join(lines)
+
+    # num_latent >= 2
+    left_latents = num_latent - 1
+    assert left_latents <= K - 1
+
+    # Left latents
+    for _ in range(left_latents):
+        lines.append(LATENT_TOKEN)
+
+    # Middle thoughts
+    for t in thoughts[left_latents:-1]:
         lines.append(t)
-    # latent tokens line, if any
 
-    if num_latent > 0:
-        lines.append("".join([LATENT_TOKEN] * num_latent + [answer_token]))
+    # Final latent + answer
+    lines.append(LATENT_TOKEN)
+    lines.append(answer_token)
 
     return "\n".join(lines)
+
 
 
 
@@ -136,7 +151,7 @@ class Phase1Dataset(torch.utils.data.Dataset):
         question = rec.get("question")
         if question is None:
             raise KeyError("question missing from record")
-        answer_text = format_answer(thoughts, K, num_latent, self.answer_token)
+        answer_text = format_answer(thoughts, K, num_latent,self.answer_token)
         enc = build_prompt(question, answer_text, self.tokenizer)
         input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)

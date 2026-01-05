@@ -14,7 +14,10 @@ class Evaluator:
 
     def compute_accuracy(self, model: Any, tokenizer, preprocessed_items: List[dict], stage: int) -> float:
         from torch.utils.data import DataLoader
-        from .dataset import Phase1Dataset, collate_fn
+        try:
+            from .dataset import Phase1Dataset, collate_fn
+        except ImportError:
+            from dataset import Phase1Dataset, collate_fn
         ANSWER_TOKEN = "<ANSWER>"
         if len(preprocessed_items) == 0:
             return 0.0

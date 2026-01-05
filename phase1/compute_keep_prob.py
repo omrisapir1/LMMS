@@ -123,9 +123,9 @@ def compute_stats(dataset_name: str, split: str, target_p0: float):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True, help="Hugging Face dataset name")
+    parser.add_argument("--dataset", default="omrisap/GSM8k-Aug_qwen_62K_CoTsplitted", help="Hugging Face dataset name")
     parser.add_argument("--split", default="train", help="Dataset split to use (default: train)")
-    parser.add_argument("--output", required=True, help="Path to output JSON with keep_prob")
+    parser.add_argument("--output", required='dataset', help="Path to output JSON with keep_prob")
     parser.add_argument("--target_p0", type=float, default=0.30, help="Target zero fraction per digit")
     args = parser.parse_args()
 

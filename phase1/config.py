@@ -11,14 +11,14 @@ class Phase1Config:
     # Curriculum / stages
     max_thoughts: int = 8
     max_length: int = 2048
-    eval_interval_batches: int = 1000
+    eval_interval_batches: int = 3
     stage_exit_thresholds: tuple = (
         0.7, 0.7, 0.75, 0.75, 0.8, 0.8, 0.80, 0.80
     )
 
     # Downsampling
     target_p0: float = 0.25
-    keep_prob_path: str = "data/keep_prob.json"
+    keep_prob_path: str = "probs.json"
 
     # Dataset (Hugging Face)
     dataset_name: str = "omrisap/GSM8k-Aug_qwen_62K_CoTsplitted"
@@ -26,7 +26,7 @@ class Phase1Config:
     dataset_eval_split: str = "eval"
 
     # Model
-    phase0_repo: str = "omrisap/LMMS_phase0"#"/Users/omri.sapir/learning/LMMS/phase_0/test_phase0_model"
+    phase0_repo: str = "/Users/omri.sapir/learning/LMMS/phase_0/test_phase0_model"
     torch_dtype: str = "bfloat16"
 
     # Logging

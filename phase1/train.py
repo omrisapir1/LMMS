@@ -103,8 +103,7 @@ def _load_keep_prob(path: str) -> List[float]:
                 if isinstance(data, dict) and isinstance(data.get("keep_prob"), list) and len(data["keep_prob"]) == 5:
                     keep_prob = [float(x) for x in data["keep_prob"]]
     except Exception:
-        # Fallback silently to defaults
-        keep_prob = [1.0] * 5
+        raise RuntimeError(f"cannot load keep_prob from {path}")
     return keep_prob
 
 def clear_in_range(items: List[dict]) -> List[dict]:
