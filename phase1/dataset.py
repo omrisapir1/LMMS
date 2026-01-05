@@ -14,6 +14,8 @@ Dataset is stage-agnostic; stage logic is injected via num_latent_fn.
 """
 from typing import List, Optional, Callable
 import re
+from transformers import AutoTokenizer
+
 
 SYSTEM_PROMPT = (
     "Please reason step by step, and put your final answer within \\boxed{}."
@@ -22,7 +24,7 @@ SYSTEM_PROMPT = (
 LATENT_TOKEN = "<|latent|>"
 # ANSWER_TOKEN is documented-only; actual token is provided via dataset constructor
 ANSWER_TOKEN = "<ANSWER>"
-
+tokenizer_q = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
 
 def build_prompt(question: str, answer: str, tokenizer) -> str:
     messages = [
@@ -30,7 +32,10 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
         {"role": "user", "content": question},
         # {"role": "assistant", "content": answer},
     ]
-    with_chat = tokenizer.apply_chat_template(messages,
+
+
+
+    with_chat = tokenizer_q.apply_chat_template(messages,
                                               tokenize=False,
                                               add_generation_prompt=True)
     with_chat += answer
@@ -67,7 +72,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
     # latent tokens line, if any
 
     if num_latent > 0:
-        lines.append(" ".join([LATENT_TOKEN] * num_latent + [answer_token]))
+        lines.append("".join([LATENT_TOKEN] * num_latent + [answer_token]))
 
     return "\n".join(lines)
 

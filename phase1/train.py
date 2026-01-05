@@ -14,13 +14,22 @@ import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
-from .config import Phase1Config
-from .dataset import Phase1Dataset, collate_fn
-from .stage_manager import StageManager
-from .loss import AnswerLoss
-from .eval import Evaluator
-from .model import Phase1CoconutModel
-from .split_logic import split_thoughts
+try:
+    from .config import Phase1Config
+    from .dataset import Phase1Dataset, collate_fn
+    from .stage_manager import StageManager
+    from .loss import AnswerLoss
+    from .eval import Evaluator
+    from .model import Phase1CoconutModel
+    from .split_logic import split_thoughts
+except ImportError:
+    from config import Phase1Config
+    from dataset import Phase1Dataset, collate_fn
+    from stage_manager import StageManager
+    from loss import AnswerLoss
+    from eval import Evaluator
+    from model import Phase1CoconutModel
+    from split_logic import split_thoughts
 
 # Tokenizer/model setup from Phase 0
 from transformers import AutoTokenizer
