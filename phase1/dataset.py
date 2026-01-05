@@ -44,51 +44,58 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
 
 def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
     """
-    New semantics:
-    - num_latent == 0:
-        t0 t1 ... t(K-1)
-    - num_latent == 1:
-        t0 t1 ... t(K-2) <LATENT> <ANSWER>
-    - num_latent >= 2:
-        <LATENT> x (num_latent - 1)
-        t(num_latent - 1) ... t(K - 2)
-        <LATENT>
-        <ANSWER>
+    Formatting rules:
+    - '\\n' separates ONLY textual thoughts
+    - Latent tokens are concatenated (no '\\n' between them)
+    - Final LATENT is concatenated directly with <ANSWER>
     """
+
     num_latent = max(0, min(int(num_latent), int(K)))
-    lines: List[str] = []
 
+    # No latents at all → just thoughts (joined by \n)
     if num_latent == 0:
-        # No latent tokens at all
-        for t in thoughts:
-            lines.append(t)
-        return "\n".join(lines)
+        return "\n".join(thoughts)
 
+    # num_latent == 1 → replace last thought
     if num_latent == 1:
-        # Replace last thought only
-        for t in thoughts[:-1]:
-            lines.append(t)
-        lines.append(LATENT_TOKEN)
-        lines.append(answer_token)
-        return "\n".join(lines)
+        text_part = "\n".join(thoughts[:-1])
+        suffix = f"{LATENT_TOKEN}{answer_token}"
+        if text_part:
+            return f"{text_part}\n{suffix}"
+        return suffix
 
     # num_latent >= 2
+    # left latents replace first (num_latent - 1) thoughts
     left_latents = num_latent - 1
     assert left_latents <= K - 1
 
-    # Left latents
-    for _ in range(left_latents):
-        lines.append(LATENT_TOKEN)
+    # Prefix: concatenated latent tokens
+    prefix = LATENT_TOKEN * left_latents
 
-    # Middle thoughts
-    for t in thoughts[left_latents:-1]:
-        lines.append(t)
+    # Middle: remaining text thoughts (excluding last thought)
+    middle_thoughts = thoughts[left_latents:-1]
+    middle = "\n".join(middle_thoughts)
 
-    # Final latent + answer
-    lines.append(LATENT_TOKEN)
-    lines.append(answer_token)
+    # Final latent + answer (no newline)
+    suffix = f"{LATENT_TOKEN}{answer_token}"
 
-    return "\n".join(lines)
+    # Assemble carefully
+    parts = []
+
+    if prefix:
+        parts.append(prefix)
+
+    if middle:
+        # If prefix exists, prefix and middle are separated by '\n'
+        parts.append(middle)
+
+    body = "\n".join(parts)
+
+    if body:
+        return f"{body}\n{suffix}"
+
+    return suffix
+
 
 
 
