@@ -33,7 +33,8 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
     with_chat = tokenizer.apply_chat_template(messages,
                                               tokenize=False,
                                               add_generation_prompt=False)
-    return tokenizer(with_chat,  add_special_tokens=True, padding=False, return_attention_mask=True)
+
+    return tokenizer(with_chat,  add_special_tokens=False, padding=False, return_attention_mask=True)
 
 
 def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
@@ -131,7 +132,7 @@ class Phase1Dataset(torch.utils.data.Dataset):
         if question is None:
             raise KeyError("question missing from record")
         answer_text = format_answer(thoughts, K, num_latent, self.answer_token)
-        enc = build_prompt(answer_text, question, self.tokenizer)
+        enc = build_prompt(question, answer_text, self.tokenizer)
         input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)
         # Tokenization safety checks
@@ -164,12 +165,18 @@ class Phase1Dataset(torch.utils.data.Dataset):
 
         if self.debug and not self.already_been_called_to_print:
             print(f"[Phase1Dataset] Sample {idx}:")
+            print('\n-----------------------\n')
             print(f"  question: {question}")
+            print('\n-----------------------\n')
             print(f"  answer: {ans}")
+            print('\n-----------------------\n')
             print(f"  thoughts (K={K})")
             print(f"  num_latent: {num_latent}")
+            print('\n-----------------------\n')
             print(f"  formatted answer text:\n{answer_text}")
+            print('\n-----------------------\n')
             print(f"  input_ids tokenized: {self.tokenizer.decode(input_ids.tolist())}")
+            print('\n-----------------------\n')
             print(f"  digit_labels: {digit_labels.tolist()}")
             self.already_been_called_to_print = True
 
