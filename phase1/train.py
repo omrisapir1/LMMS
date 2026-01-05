@@ -275,6 +275,8 @@ def train_phase1(config: Phase1Config) -> None:
             if global_step % config.eval_interval_batches == 0:
                 model.eval()
                 val_acc = evaluator.compute_accuracy(model, tokenizer, val_items, sm.current_stage)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"Val accuracy at step {global_step}: {val_acc:.4f}\n")
                 model.train()
 
                 eval_id = global_step // config.eval_interval_batches
