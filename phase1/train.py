@@ -174,6 +174,7 @@ def train_phase1(config: Phase1Config) -> None:
         f"[Data] After filtering 0 < answer < 100000: "
         f"Train size={len(train_items)}, Eval size={len(val_items)}"
     )
+    val_items = val_items[:1000]  # Limit eval size for speed
 
     # Setup tokenizer and model once
     tokenizer, model = setup_tokenizer_and_model(config)
@@ -220,6 +221,7 @@ def train_phase1(config: Phase1Config) -> None:
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id))
 
+        cur_loss = 0.0
         for batch in loader:
             global_step += 1
             # Move tensors to device
@@ -243,12 +245,17 @@ def train_phase1(config: Phase1Config) -> None:
 
             # Loss (digits only)
             loss = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
-            print(f'[Stage {s}][Step {global_step}] Loss: {loss.item():.4f}')
+            if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
+                loss_to_print = cur_loss / config.logg_loss_interval_batches
+                print(f'[Stage {s}][Step {global_step}] Loss: {loss_to_print:.4f}')
+                cur_loss = 0
+            cur_loss += loss.item()
 
             # Backward + step
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            torch.cuda.empty_cache()
 
             # Periodic evaluation on validation data only
             if global_step % config.eval_interval_batches == 0:
