@@ -4,14 +4,14 @@ from dataclasses import dataclass
 class Phase1Config:
     # Training
     seed: int = 42
-    batch_size: int = 3
+    batch_size: int = 2
     learning_rate: float = 3e-5
     weight_decay: float = 0.0
 
     # Curriculum / stages
     max_thoughts: int = 8
     max_length: int = 2048
-    eval_interval_batches: int = 1300
+    eval_interval_batches: int = 1000
     stage_exit_thresholds: tuple = (
         0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80
     )

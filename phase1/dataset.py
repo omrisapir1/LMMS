@@ -163,22 +163,22 @@ class Phase1Dataset(torch.utils.data.Dataset):
         if rid is not None:
             out["id"] = rid
 
-        if self.debug and not self.already_been_called_to_print:
-            print(f"[Phase1Dataset] Sample {idx}:")
-            print('\n-----------------------\n')
-            print(f"  question: {question}")
-            print('\n-----------------------\n')
-            print(f"  answer: {ans}")
-            print('\n-----------------------\n')
-            print(f"  thoughts (K={K})")
-            print(f"  num_latent: {num_latent}")
-            print('\n-----------------------\n')
-            print(f"  formatted answer text:\n{answer_text}")
-            print('\n-----------------------\n')
-            print(f"  input_ids tokenized: {self.tokenizer.decode(input_ids.tolist())}")
-            print('\n-----------------------\n')
-            print(f"  digit_labels: {digit_labels.tolist()}")
-            self.already_been_called_to_print = True
+        # if self.debug and not self.already_been_called_to_print:
+        #     print(f"[Phase1Dataset] Sample {idx}:")
+        #     print('\n-----------------------\n')
+        #     print(f"  question: {question}")
+        #     print('\n-----------------------\n')
+        #     print(f"  answer: {ans}")
+        #     print('\n-----------------------\n')
+        #     print(f"  thoughts (K={K})")
+        #     print(f"  num_latent: {num_latent}")
+        #     print('\n-----------------------\n')
+        #     print(f"  formatted answer text:\n{answer_text}")
+        #     print('\n-----------------------\n')
+        #     print(f"  input_ids tokenized: {self.tokenizer.decode(input_ids.tolist())}")
+        #     print('\n-----------------------\n')
+        #     print(f"  digit_labels: {digit_labels.tolist()}")
+        #     self.already_been_called_to_print = True
 
         return out
 
