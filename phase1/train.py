@@ -243,6 +243,7 @@ def train_phase1(config: Phase1Config) -> None:
 
             # Loss (digits only)
             loss = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
+            print(f'[Stage {s}][Step {global_step}] Loss: {loss.item():.4f}')
 
             # Backward + step
             optimizer.zero_grad()
