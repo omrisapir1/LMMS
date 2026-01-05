@@ -98,6 +98,22 @@ def _load_keep_prob(path: str) -> List[float]:
         keep_prob = [1.0] * 5
     return keep_prob
 
+def clear_in_range(items: List[dict]) -> List[dict]:
+    """
+    Filter out records where the answer is not in the range [0, 100000).
+    """
+    out = []
+    for rec in items:
+        ans = rec.get("answer")
+        if ans is None:
+            continue
+        try:
+            answer_int = int(ans)
+            if 0 <= answer_int < 100000:
+                out.append(rec)
+        except ValueError:
+            continue
+    return out
 
 def preprocess_items(items, max_thoughts: int):
     """
@@ -149,6 +165,13 @@ def train_phase1(config: Phase1Config) -> None:
     val_items = preprocess_items(val_items, config.max_thoughts)
     print(
         f"[Data] After filtering K > {config.max_thoughts}: "
+        f"Train size={len(train_items)}, Eval size={len(val_items)}"
+    )
+
+    train_items = clear_in_range(train_items)
+    val_items = clear_in_range(val_items)
+    print(
+        f"[Data] After filtering 0 < answer < 100000: "
         f"Train size={len(train_items)}, Eval size={len(val_items)}"
     )
 
