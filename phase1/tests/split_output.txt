@@ -1,0 +1,6 @@
+first_count=6
+first_lens=190,177,226,16,766,61
+second_count=5
+second_lens=207,195,330,120,70
+first_max_ok=False
+second_max_ok=True
