@@ -144,6 +144,7 @@ class Phase1Dataset(torch.utils.data.Dataset):
         assert enc["input_ids"].count(latent_id) == num_latent, "Latent tokens count mismatch"
         # Derive digit labels from answer
         ans = rec.get("answer")
+        print(f'This is ans: {ans}')
         if ans is None:
             raise KeyError("answer missing from record")
         answer_int = int(ans)
