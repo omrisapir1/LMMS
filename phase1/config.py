@@ -26,7 +26,7 @@ class Phase1Config:
     dataset_eval_split: str = "eval"
 
     # Model
-    phase0_repo: str = "/Users/omri.sapir/learning/LMMS/phase_0/test_phase0_model"
+    phase0_repo: str = "omrisap/LMMS_phase0"#"/Users/omri.sapir/learning/LMMS/phase_0/test_phase0_model"
     torch_dtype: str = "bfloat16"
 
     # Logging

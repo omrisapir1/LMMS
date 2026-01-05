@@ -35,7 +35,7 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
 
 
 
-    with_chat = tokenizer_q.apply_chat_template(messages,
+    with_chat = tokenizer.apply_chat_template(messages,
                                               tokenize=False,
                                               add_generation_prompt=True)
     with_chat += answer
