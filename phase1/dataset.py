@@ -28,12 +28,12 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
-        {"role": "assistant", "content": answer},
+        # {"role": "assistant", "content": answer},
     ]
     with_chat = tokenizer.apply_chat_template(messages,
                                               tokenize=False,
-                                              add_generation_prompt=False)
-
+                                              add_generation_prompt=True)
+    with_chat += answer
     return tokenizer(with_chat,  add_special_tokens=False, padding=False, return_attention_mask=True)
 
 
