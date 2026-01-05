@@ -108,21 +108,6 @@ class Phase1Dataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def _extract_integer(self, ans: str) -> int:
-        """Extract integer from answer string, preferring \\boxed{...}. Raise on failure."""
-        if ans is None:
-            raise ValueError("answer is None")
-        s = str(ans)
-        # Prefer boxed{...}
-        m = re.search(r"\\boxed\{\s*([+-]?\d+)\s*\}", s)
-        if m:
-            return int(m.group(1))
-        # Fallback: first integer in string
-        m2 = re.search(r"([+-]?\d+)", s)
-        if m2:
-            return int(m2.group(1))
-        raise ValueError(f"Could not extract integer from answer: {s}")
-
     def __getitem__(self, idx: int) -> dict:
         rec = self.items[idx]
         # Thoughts and K are provided upstream (preprocessed once)
@@ -161,7 +146,7 @@ class Phase1Dataset(torch.utils.data.Dataset):
         ans = rec.get("answer")
         if ans is None:
             raise KeyError("answer missing from record")
-        answer_int = self._extract_integer(ans)
+        answer_int = int(ans)
         if not (0 <= answer_int <= 99999):
             raise ValueError(f"answer out of range [0,99999]: {answer_int}")
         digits = [int(c) for c in f"{answer_int:05d}"]
