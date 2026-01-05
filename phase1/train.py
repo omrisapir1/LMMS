@@ -199,7 +199,8 @@ def train_phase1(config: Phase1Config) -> None:
 
     # Initialize StageManager
     sm = StageManager(config.stage_exit_thresholds)
-
+    log_path = os.path.join(config.log_dir, "training.log")
+    os.makedirs(config.log_dir, exist_ok=True)
     global_step = 0
     # Stage-driven training loop
     while True:
@@ -255,7 +256,11 @@ def train_phase1(config: Phase1Config) -> None:
             loss = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
                 loss_to_print = cur_loss / config.logg_loss_interval_batches
-                print(f'[Stage {s}][Step {global_step}] Loss: {loss_to_print:.4f}')
+                msg = f'[Stage {s}][Step {global_step}] Loss: {loss_to_print:.4f}'
+                print(msg)
+
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
                 cur_loss = 0
             cur_loss += loss.item()
 
