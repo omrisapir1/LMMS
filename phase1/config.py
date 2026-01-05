@@ -5,7 +5,7 @@ class Phase1Config:
     # Training
     seed: int = 42
     batch_size: int = 2
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 0.0
 
     # Curriculum / stages
@@ -13,7 +13,7 @@ class Phase1Config:
     max_length: int = 2048
     eval_interval_batches: int = 2000
     stage_exit_thresholds: tuple = (
-        0.75, 0.75, 0.75, 0.75, 0.8, 0.8, 0.80, 0.80
+        0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.75
     )
 
     # Downsampling
