@@ -4,7 +4,7 @@ from dataclasses import dataclass
 class Phase1Config:
     # Training
     seed: int = 42
-    batch_size: int = 32
+    batch_size: int = 4
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
 
