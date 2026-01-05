@@ -57,6 +57,7 @@ class Evaluator:
             answer_token=ANSWER_TOKEN,
             debug=True,
         )
+        dataset.already_been_called_to_print = True
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id))
 
