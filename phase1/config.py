@@ -26,7 +26,7 @@ class Phase1Config:
     dataset_eval_split: str = "eval"
 
     # Model
-    phase0_repo: str = "/omrisap/LMMS_phase0"
+    phase0_repo: str = "omrisap/LMMS_phase0"
     torch_dtype: str = "bfloat16"
 
     # Logging
