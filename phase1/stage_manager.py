@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 import warnings
 
 class StageManager:
-    def __init__(self, thresholds: List[float], *, consecutive_passes: int = 3):
+    def __init__(self, thresholds: List[float], *, consecutive_passes: int = 1):
         if len(thresholds) != 8:
             raise ValueError("Expected 8 stage thresholds for stages 1..8")
         # Enforce monotonic non-decreasing thresholds to ensure curriculum consistency.
