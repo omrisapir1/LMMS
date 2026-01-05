@@ -11,7 +11,7 @@ class Phase1Config:
     # Curriculum / stages
     max_thoughts: int = 8
     max_length: int = 2048
-    eval_interval_batches: int = 1500
+    eval_interval_batches: int = 1000
     stage_exit_thresholds: tuple = (
         0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80
     )
