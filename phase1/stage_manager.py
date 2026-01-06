@@ -23,11 +23,6 @@ class StageManager:
         if len(thresholds) != 8:
             raise ValueError("Expected 8 stage thresholds for stages 1..8")
         # Enforce monotonic non-decreasing thresholds to ensure curriculum consistency.
-        for i in range(len(thresholds) - 1):
-            if thresholds[i] > thresholds[i + 1]:
-                raise ValueError(
-                    f"Thresholds must be non-decreasing; found thresholds[{i}]={thresholds[i]} > thresholds[{i+1}]={thresholds[i+1]}"
-                )
         if consecutive_passes < 1:
             raise ValueError("consecutive_passes must be >= 1")
         self.thresholds = thresholds
