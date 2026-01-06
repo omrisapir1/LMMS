@@ -13,7 +13,7 @@ class Phase1Config:
     max_length: int = 2048
     eval_interval_batches: int = 2000
     stage_exit_thresholds: tuple = (
-        0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.70
+        0.7, 0.7, 0.65, 0.65, 0.6, 0.6, 0.6, 0.65
     )
 
     # Downsampling
