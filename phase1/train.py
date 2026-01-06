@@ -242,7 +242,7 @@ def train_phase1(config: Phase1Config) -> None:
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
             )
-  
+
             # Debug-only: ensure <ANSWER> is present exactly once per sample after batching
             if global_step == 1:
                 answer_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
