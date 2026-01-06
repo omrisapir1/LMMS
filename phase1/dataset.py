@@ -57,44 +57,48 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
         return "\n".join(thoughts)
 
     # num_latent == 1 → replace last thought
-    if num_latent == 1:
+    elif num_latent == 1:
         text_part = "\n".join(thoughts[:-1])
         suffix = f"{LATENT_TOKEN}{answer_token}"
         if text_part:
             return f"{text_part}\n{suffix}"
         return suffix
 
-    # num_latent >= 2
-    # left latents replace first (num_latent - 1) thoughts
-    left_latents = num_latent - 1
-    assert left_latents <= K - 1
+    elif num_latent==2:
+        # num_latent >= 2
+        # left latents replace first (num_latent - 1) thoughts
+        left_latents = num_latent - 1
+        assert left_latents <= K - 1
 
-    # Prefix: concatenated latent tokens
-    prefix = LATENT_TOKEN * left_latents
+        # Prefix: concatenated latent tokens
+        prefix = LATENT_TOKEN * left_latents
 
-    # Middle: remaining text thoughts (excluding last thought)
-    middle_thoughts = thoughts[left_latents:-1]
-    middle = "\n".join(middle_thoughts)
+        # Middle: remaining text thoughts (excluding last thought)
+        middle_thoughts = thoughts[left_latents:-1]
+        middle = "\n".join(middle_thoughts)
 
-    # Final latent + answer (no newline)
-    suffix = f"{LATENT_TOKEN}{answer_token}"
+        # Final latent + answer (no newline)
+        suffix = f"{LATENT_TOKEN}{answer_token}"
 
-    # Assemble carefully
-    parts = []
+        # Assemble carefully
+        parts = []
 
-    if prefix:
-        parts.append(prefix)
+        if prefix:
+            parts.append(prefix)
 
-    if middle:
-        # If prefix exists, prefix and middle are separated by '\n'
-        parts.append(middle)
+        if middle:
+            # If prefix exists, prefix and middle are separated by '\n'
+            parts.append(middle)
 
-    body = "\n".join(parts)
+        body = "\n".join(parts)
 
-    if body:
-        return f"{body}\n{suffix}"
+        if body:
+            return f"{body}\n{suffix}"
 
-    return suffix
+
+        return suffix
+    return ''.join([LATENT_TOKEN for _ in range(len(thoughts))]) + answer_token
+
 
 
 
