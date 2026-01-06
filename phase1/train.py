@@ -237,10 +237,16 @@ def train_phase1(config: Phase1Config) -> None:
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
             # Forward → logits
-            out = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
+            try:
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+            except Exception as e:
+                print(f"Error during model forward at step {global_step}: {e}")
+                del batch
+                torch.cuda.empty_cache()
+                continue
 
             # Debug-only: ensure <ANSWER> is present exactly once per sample after batching
             if global_step == 1:
