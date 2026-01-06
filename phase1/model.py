@@ -287,6 +287,12 @@ class Phase1CoconutModel(nn.Module):
 
         # Compute latent positions per sample
         latent_lists, max_n_latents = self._latent_lists(input_ids)
+        for b, lst in enumerate(latent_lists):
+            for i, p in enumerate(lst):
+                if p < i:
+                    raise RuntimeError(
+                        f"Invalid latent layout: batch {b}, latent #{i} at pos {p}"
+                    )
 
         T = input_ids.size(1)
 
