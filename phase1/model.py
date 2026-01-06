@@ -71,7 +71,7 @@ class Phase1CoconutModel(nn.Module):
         H = self._embedding.embedding_dim
 
         self.latent_proj = nn.Linear(H, H, bias=True, device=emb_w.device, dtype=emb_w.dtype)
-        self._dbg_once = True
+        self._dbg_once = False
 
         # Identity init (must match dtype/device too)
         with torch.no_grad():
