@@ -71,6 +71,7 @@ class Phase1CoconutModel(nn.Module):
         H = self._embedding.embedding_dim
 
         self.latent_proj = nn.Linear(H, H, bias=True, device=emb_w.device, dtype=emb_w.dtype)
+        self._dbg_once = True
 
         # Identity init (must match dtype/device too)
         with torch.no_grad():
@@ -287,6 +288,18 @@ class Phase1CoconutModel(nn.Module):
 
         # Compute latent positions per sample
         latent_lists, max_n_latents = self._latent_lists(input_ids)
+        if getattr(self, "_dbg_once", False):
+            # show only first 1-2 samples to keep it readable
+            b_show = min(2, len(latent_lists))
+            print(
+                f"[KVDBG] max_n_latents={max_n_latents} first_latent_pos={min([p for lst in latent_lists for p in lst])}")
+            for b in range(b_show):
+                print(f"[KVDBG] b={b} latent_positions={latent_lists[b][:10]} (count={len(latent_lists[b])})")
+                # show where <ANSWER> is
+            ans_id = int(getattr(self.phase0, "answer_token_id"))
+            ans_pos = (input_ids == ans_id).float().argmax(dim=1).tolist()
+            print(f"[KVDBG] answer_pos (first {b_show}) = {ans_pos[:b_show]}")
+
         for b, lst in enumerate(latent_lists):
             for i, p in enumerate(lst):
                 if p < i:
@@ -369,6 +382,23 @@ class Phase1CoconutModel(nn.Module):
                 hidden_offset=hidden_offset,
             )
 
+            if getattr(self, "_dbg_once", False):
+                hidden_T = hidden_slice.size(1)
+                print(
+                    f"[KVDBG][pass={pass_idx}] compute_range=({r0},{r1}) "
+                    f"hidden_slice_covers=[{hidden_offset},{hidden_offset + hidden_T})"
+                )
+
+                # For a couple examples, show required src position for this pass
+                for b in range(min(2, len(latent_lists))):
+                    if len(latent_lists[b]) > pass_idx:
+                        p = latent_lists[b][pass_idx]
+                        abs_src = p - 1
+                        rel_src = abs_src - hidden_offset
+                        print(
+                            f"[KVDBG][pass={pass_idx}] b={b} latent_pos={p} abs_src={abs_src} rel_src={rel_src}"
+                        )
+
             # Advance compute range:
             # - after prefix, we incrementally compute one more token each pass until all latents filled,
             # - on the last latent pass, we jump to the full remainder in the final pass below.
@@ -418,6 +448,16 @@ class Phase1CoconutModel(nn.Module):
                 final_hidden_offset = r0
         else:
             raise RuntimeError("Final compute range is empty; unexpected for sequences with <ANSWER> at end.")
+
+        if getattr(self, "_dbg_once", False):
+            if pass_idx + 1 < max_n_latents:
+                print(
+                    f"[KVDBG][pass={pass_idx}] next_required_abs_pos={required_abs_pos} "
+                    f"setting next_compute_range=({next_compute_range[0]},{next_compute_range[1]})"
+                )
+            else:
+                print(
+                    f"[KVDBG][pass={pass_idx}] last latent pass, next_compute_range=({next_compute_range[0]},{next_compute_range[1]})")
 
         # We need hidden at <ANSWER>. In your data, <ANSWER> is last ⇒ it should be in the final slice.
         answer_token_id = int(getattr(self.phase0, "answer_token_id"))
