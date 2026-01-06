@@ -57,14 +57,14 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
         return "\n".join(thoughts)
 
     # num_latent == 1 → replace last thought
-    elif num_latent == 100:
+    elif num_latent == 1:
         text_part = "\n".join(thoughts[:-1])
         suffix = f"{LATENT_TOKEN}{answer_token}"
         if text_part:
             return f"{text_part}\n{suffix}"
         return suffix
 
-    elif num_latent==200:
+    elif num_latent==2:
         # num_latent >= 2
         # left latents replace first (num_latent - 1) thoughts
         left_latents = num_latent - 1
