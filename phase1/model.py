@@ -74,7 +74,7 @@ class Phase1CoconutModel(nn.Module):
 
         # Identity init (must match dtype/device too)
         with torch.no_grad():
-            self.latent_proj.weight.copy_(torch.eye(H, device=emb_w.device, dtype=emb_w.dtype))
+            self.latent_proj.weight.zero_()
             self.latent_proj.bias.zero_()
 
     # ─────────────────────────────────────────────────────────
@@ -197,7 +197,8 @@ class Phase1CoconutModel(nn.Module):
         fp = torch.tensor(fill_pos, device=inputs_embeds.device, dtype=torch.long)
         sp = torch.tensor(src_pos, device=inputs_embeds.device, dtype=torch.long)
 
-        new_embeds[fb, fp, :] = self.latent_proj(hidden[fb, sp, :])
+        h = hidden[fb, sp, :]
+        new_embeds[fb, fp, :] = h + self.latent_proj(h)
 
 
         return new_embeds
