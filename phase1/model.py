@@ -366,10 +366,20 @@ class Phase1CoconutModel(nn.Module):
             # Advance compute range:
             # - after prefix, we incrementally compute one more token each pass until all latents filled,
             # - on the last latent pass, we jump to the full remainder in the final pass below.
-            if pass_idx + 1 >= max_n_latents:
-                next_compute_range = (r1, T)
+            # Determine how far we must compute to support the NEXT latent fill
+            if pass_idx + 1 < max_n_latents:
+                # next latent absolute positions
+                required_abs_pos = max(
+                    lst[pass_idx + 1]
+                    for lst in latent_lists
+                    if len(lst) > pass_idx + 1
+                )
+                # we must compute up to required_abs_pos - 1
+                next_r1 = max(r1, required_abs_pos)
+                next_compute_range = (r1, min(next_r1, T))
             else:
-                next_compute_range = (r1, min(r1 + 1, T))
+                # last pass → finish sequence
+                next_compute_range = (r1, T)
 
         # Final pass: compute the remainder [next_compute_range[0], T)
         r0, r1 = next_compute_range
