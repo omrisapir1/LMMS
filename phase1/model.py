@@ -65,6 +65,14 @@ class Phase1CoconutModel(nn.Module):
         # Cache embedding handle (for inputs_embeds construction)
         # Phase0Model stores the base model at phase0.model
         self._embedding = self.phase0.model.get_input_embeddings()
+        # Latent projection: identity-initialized linear map
+        # Operates ONLY on latent reinsertion
+        H = self._embedding.embedding_dim
+        self.latent_proj = nn.Linear(H, H)
+
+        # Identity initialization (start with exact previous behavior)
+        nn.init.eye_(self.latent_proj.weight)
+        nn.init.zeros_(self.latent_proj.bias)
 
     # ─────────────────────────────────────────────────────────
     # Convenience passthroughs (helps with training + saving)
@@ -186,7 +194,8 @@ class Phase1CoconutModel(nn.Module):
         fp = torch.tensor(fill_pos, device=inputs_embeds.device, dtype=torch.long)
         sp = torch.tensor(src_pos, device=inputs_embeds.device, dtype=torch.long)
 
-        new_embeds[fb, fp, :] = hidden[fb, sp, :]
+        new_embeds[fb, fp, :] = self.latent_proj(hidden[fb, sp, :])
+
 
         return new_embeds
 
