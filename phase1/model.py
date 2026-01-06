@@ -363,18 +363,15 @@ class Phase1CoconutModel(nn.Module):
                 hidden_offset = 0
             else:
                 # Slice cache to valid prefix length r0
-                past_key_values = [
-                    (k[:, :, :r0, :], v[:, :, :r0, :])
-                    for (k, v) in kv_cache
-                ]
-
+                cache_position = torch.arange(r0, r1, device=inputs_embeds.device)
                 outputs = self.phase0.model(
                     inputs_embeds=inputs_embeds[:, r0:r1, :],
                     attention_mask=attention_mask[:, :r1],  # prefix + current slice
                     position_ids=position_ids[:, r0:r1],
-                    past_key_values=past_key_values,
+                    past_key_values=kv_cache,
                     use_cache=True,
                     output_hidden_states=True,
+                    cache_position=cache_position,
                 )
                 hidden_offset = r0
 
@@ -440,15 +437,14 @@ class Phase1CoconutModel(nn.Module):
                 final_hidden_slice = final_outputs.hidden_states[-1]
                 final_hidden_offset = r0
             else:
-                past_key_values = [
-                    (k[:, :, :r0, :], v[:, :, :r0, :])
-                    for (k, v) in kv_cache
-                ]
+                cache_position = torch.arange(r0, r1, device=inputs_embeds.device)
                 final_outputs = self.phase0.model(
                     inputs_embeds=inputs_embeds[:, r0:r1, :],
                     attention_mask=attention_mask[:, :r1],
                     position_ids=position_ids[:, r0:r1],
-                    past_key_values=past_key_values,
+                    past_key_values=kv_cache,
+                    cache_position=cache_position,
+
                     use_cache=False,  # no need to continue caching
                     output_hidden_states=True,
                 )
