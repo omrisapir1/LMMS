@@ -41,72 +41,72 @@ def build_prompt(question: str, answer: str, tokenizer) -> str:
     with_chat += answer
     return tokenizer(with_chat,  add_special_tokens=False, padding=False, return_attention_mask=True)
 
-#
-# def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
-#     """
-#     New semantics:
-#     - num_latent == 0:
-#         t0 t1 ... t(K-1)
-#     - num_latent == 1:
-#         t0 t1 ... t(K-2) <LATENT> <ANSWER>
-#     - num_latent >= 2:
-#         <LATENT> x (num_latent - 1)
-#         t(num_latent - 1) ... t(K - 2)
-#         <LATENT>
-#         <ANSWER>
-#     """
-#     num_latent = max(0, min(int(num_latent), int(K)))
-#     lines: List[str] = []
-#
-#     if num_latent == 0:
-#         # No latent tokens at all
-#         for t in thoughts:
-#             lines.append(t)
-#         return "\n".join(lines)
-#
-#     if num_latent == 1:
-#         # Replace last thought only
-#         for t in thoughts[:-1]:
-#             lines.append(t)
-#         lines.append(LATENT_TOKEN)
-#         lines.append(answer_token)
-#         return "\n".join(lines)
-#
-#     # num_latent >= 2
-#     left_latents = num_latent - 1
-#     assert left_latents <= K - 1
-#
-#     # Left latents
-#     for _ in range(left_latents):
-#         lines.append(LATENT_TOKEN)
-#
-#     # Middle thoughts
-#     for t in thoughts[left_latents:-1]:
-#         lines.append(t)
-#
-#     # Final latent + answer
-#     lines.append(LATENT_TOKEN)
-#     lines.append(answer_token)
-#
-#     return "\n".join(lines)
 
 def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
     """
-    Coconut-compatible layout:
-    <LATENT> x num_latent
-    remaining thoughts
-    <ANSWER>
+    New semantics:
+    - num_latent == 0:
+        t0 t1 ... t(K-1)
+    - num_latent == 1:
+        t0 t1 ... t(K-2) <LATENT> <ANSWER>
+    - num_latent >= 2:
+        <LATENT> x (num_latent - 1)
+        t(num_latent - 1) ... t(K - 2)
+        <LATENT>
+        <ANSWER>
     """
-    num_latent = max(0, min(num_latent, K))
-    lines = ['\n'.join([LATENT_TOKEN for _ in range(num_latent)])]
+    num_latent = max(0, min(int(num_latent), int(K)))
+    lines: List[str] = []
 
+    if num_latent == 0:
+        # No latent tokens at all
+        for t in thoughts:
+            lines.append(t)
+        return "\n".join(lines)
 
+    if num_latent == 1:
+        # Replace last thought only
+        for t in thoughts[:-1]:
+            lines.append(t)
+        lines.append(LATENT_TOKEN)
+        lines.append(answer_token)
+        return "\n".join(lines)
 
-    for t in thoughts[num_latent:]:
+    # num_latent >= 2
+    left_latents = num_latent - 1
+    assert left_latents <= K - 1
+
+    # Left latents
+    for _ in range(left_latents):
+        lines.append(LATENT_TOKEN)
+
+    # Middle thoughts
+    for t in thoughts[left_latents:-1]:
         lines.append(t)
 
-    return "\n".join(lines) + answer_token
+    # Final latent + answer
+    lines.append(LATENT_TOKEN)
+    lines.append(answer_token)
 
+    return "\n".join(lines)
+
+# def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: str) -> str:
+#     """
+#     Coconut-compatible layout:
+#     <LATENT> x num_latent
+#     remaining thoughts
+#     <ANSWER>
+#     """
+#     num_latent = max(0, min(num_latent, K))
+#     lines = ['\n'.join([LATENT_TOKEN for _ in range(num_latent)])]
+#
+#
+#
+#     for t in thoughts[num_latent:]:
+#         lines.append(t)
+#
+#     return "\n".join(lines) + answer_token
+#
 
 
 
