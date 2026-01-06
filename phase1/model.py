@@ -337,6 +337,14 @@ class Phase1CoconutModel(nn.Module):
 
         # We'll update inputs_embeds by writing the k-th latent embed each pass.
         for pass_idx in range(max_n_latents):
+            required_end = max(
+                lst[pass_idx]
+                for lst in latent_lists
+                if len(lst) > pass_idx
+            )
+            r0, r1 = next_compute_range
+            r1 = max(r1, required_end)  # must be >= latent_pos
+            next_compute_range = (r0, min(r1, T))
             r0, r1 = next_compute_range
 
             if r1 <= r0:
