@@ -98,7 +98,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
     <ANSWER>
     """
     num_latent = max(0, min(num_latent, K))
-    lines = [''.join([LATENT_TOKEN for _ in range(num_latent)])]
+    lines = ['\n'.join([LATENT_TOKEN for _ in range(num_latent)])]
 
 
 
