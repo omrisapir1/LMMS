@@ -151,55 +151,61 @@ class Phase1CoconutModel(nn.Module):
         return latent_lists, max_n_latents
 
     def _replace_latent_embeddings(
-        self,
-        inputs_embeds: torch.Tensor,
-        hidden: torch.Tensor,
-        latent_lists: List[List[int]],
-        pass_idx: int,
+            self,
+            inputs_embeds: torch.Tensor,
+            hidden: torch.Tensor,
+            latent_lists: List[List[int]],
+            pass_idx: int,
+            hidden_offset: int,
     ) -> torch.Tensor:
         """
         Replace the embedding at each instance's pass_idx-th latent position with
-        hidden_state at (latent_pos - 1).
+        hidden_state at (latent_pos - 1), where `hidden` corresponds to the slice
+        [hidden_offset : hidden_offset + hidden.size(1)] of the full sequence.
 
         IMPORTANT:
         - No detach: full gradient flows through hidden -> embed -> next pass.
         - Uses clone() to avoid in-place mutation on a tensor that autograd may reuse.
         """
-        # inputs_embeds: [B, T, H]
-        # hidden:        [B, T, H] (last layer hidden states)
         B, T, H = inputs_embeds.shape
 
-        # Identify which (batch, pos) pairs are active for this pass_idx
         fill_b: List[int] = []
         fill_pos: List[int] = []
-        src_pos: List[int] = []
+        src_pos_in_hidden: List[int] = []
+
+        hidden_T = hidden.size(1)
 
         for b, pos_list in enumerate(latent_lists):
             if len(pos_list) > pass_idx:
                 p = pos_list[pass_idx]
-                # Latent at position 0 would have no preceding token
                 if p <= 0:
                     raise RuntimeError("Found <|latent|> at position 0; cannot use token_idx-1 rule.")
+
+                # We need hidden at absolute position (p-1). Convert to index within hidden slice.
+                abs_src = p - 1
+                rel_src = abs_src - hidden_offset
+
+                if rel_src < 0 or rel_src >= hidden_T:
+                    raise RuntimeError(
+                        f"Latent fill requires hidden at abs pos {abs_src}, "
+                        f"but current hidden slice covers [{hidden_offset}, {hidden_offset + hidden_T})."
+                    )
+
                 fill_b.append(b)
                 fill_pos.append(p)
-                src_pos.append(p - 1)
+                src_pos_in_hidden.append(rel_src)
 
-        # If no fills for this pass, return inputs_embeds unchanged
         if len(fill_b) == 0:
             return inputs_embeds
 
-        # Clone to avoid in-place ops on a tensor that might be needed elsewhere
         new_embeds = inputs_embeds.clone()
 
-        # Advanced indexing assignment:
-        # new_embeds[fill_b, fill_pos, :] = hidden[fill_b, src_pos, :]
         fb = torch.tensor(fill_b, device=inputs_embeds.device, dtype=torch.long)
         fp = torch.tensor(fill_pos, device=inputs_embeds.device, dtype=torch.long)
-        sp = torch.tensor(src_pos, device=inputs_embeds.device, dtype=torch.long)
+        sp = torch.tensor(src_pos_in_hidden, device=inputs_embeds.device, dtype=torch.long)
 
         h = hidden[fb, sp, :]
         new_embeds[fb, fp, :] = h + self.latent_proj(h)
-
 
         return new_embeds
 
@@ -275,54 +281,156 @@ class Phase1CoconutModel(nn.Module):
         # Ensure tensors are on same device
         device = input_ids.device
         attention_mask = attention_mask.to(device)
+        # Build initial embeddings from tokens
+        inputs_embeds = self._embedding(input_ids)  # [B, T, H]
+        position_ids = self._build_position_ids(attention_mask)  # [B, T]
 
         # Compute latent positions per sample
         latent_lists, max_n_latents = self._latent_lists(input_ids)
 
-        # Build initial embeddings from tokens
-        inputs_embeds = self._embedding(input_ids)  # [B, T, H]
+        T = input_ids.size(1)
 
-        # Build position_ids (some models behave better with it)
-        position_ids = self._build_position_ids(attention_mask)  # [B, T]
-
-        # Iteratively fill latent embeddings from left->right
-        # Note: this is the simple (non-KV-cache) version: recompute full forward each iteration.
-        for pass_idx in range(max_n_latents):
-            outputs = self.phase0.model(
+        # If no latents, do a single forward and exit early
+        if max_n_latents == 0:
+            final_outputs = self.phase0.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
                 output_hidden_states=True,
             )
-            hidden = outputs.hidden_states[-1]  # [B, T, H]
+            final_hidden = final_outputs.hidden_states[-1]
+            logits = self._compute_digit_logits_from_hidden(final_hidden, input_ids)
+            out = {"logits": logits}
+            if return_debug:
+                out["debug"] = Phase1ForwardDebug(max_n_latents=0,
+                                                  latent_counts=[len(x) for x in latent_lists])  # type: ignore
+            return out
 
+        # --- KV-cache Coconut-style incremental compute ---
+        # Start by computing up to the earliest latent position (prefix).
+        all_latent_positions = [p for lst in latent_lists for p in lst]
+        first_latent_pos = min(all_latent_positions)  # earliest latent across batch
+
+        # next_compute_range = [start, end) segment to compute this pass
+        next_compute_range = (0, first_latent_pos)  # prefix before earliest latent
+        kv_cache = None
+
+        # We'll update inputs_embeds by writing the k-th latent embed each pass.
+        for pass_idx in range(max_n_latents):
+            r0, r1 = next_compute_range
+
+            if r1 <= r0:
+                # Degenerate range; in practice first_latent_pos could be 0 (should be blocked earlier)
+                raise RuntimeError(f"Invalid compute range: {next_compute_range}")
+
+            if kv_cache is None:
+                # First pass: no cache, compute prefix slice only
+                outputs = self.phase0.model(
+                    inputs_embeds=inputs_embeds[:, r0:r1, :],
+                    attention_mask=attention_mask[:, r0:r1],
+                    position_ids=position_ids[:, r0:r1],
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                hidden_offset = 0
+            else:
+                # Slice cache to valid prefix length r0
+                past_key_values = [
+                    (k[:, :, :r0, :], v[:, :, :r0, :])
+                    for (k, v) in kv_cache
+                ]
+
+                outputs = self.phase0.model(
+                    inputs_embeds=inputs_embeds[:, r0:r1, :],
+                    attention_mask=attention_mask[:, :r1],  # prefix + current slice
+                    position_ids=position_ids[:, r0:r1],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                hidden_offset = r0
+
+            hidden_slice = outputs.hidden_states[-1]  # [B, r1-r0, H]
+            kv_cache = outputs.past_key_values
+
+            # Replace the pass_idx-th latent per sample using hidden(token_idx-1)
             inputs_embeds = self._replace_latent_embeddings(
                 inputs_embeds=inputs_embeds,
-                hidden=hidden,
+                hidden=hidden_slice,
                 latent_lists=latent_lists,
                 pass_idx=pass_idx,
+                hidden_offset=hidden_offset,
             )
 
-        # Final forward after all latent replacements
-        final_outputs = self.phase0.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        final_hidden = final_outputs.hidden_states[-1]  # [B, T, H]
+            # Advance compute range:
+            # - after prefix, we incrementally compute one more token each pass until all latents filled,
+            # - on the last latent pass, we jump to the full remainder in the final pass below.
+            if pass_idx + 1 >= max_n_latents:
+                next_compute_range = (r1, T)
+            else:
+                next_compute_range = (r1, min(r1 + 1, T))
 
-        # Compute digit logits from <ANSWER> hidden state (Phase0 logic)
-        logits = self._compute_digit_logits_from_hidden(final_hidden, input_ids)
+        # Final pass: compute the remainder [next_compute_range[0], T)
+        r0, r1 = next_compute_range
+        if r0 < r1:
+            if kv_cache is None:
+                # Shouldn't happen here, but keep it safe
+                final_outputs = self.phase0.model(
+                    inputs_embeds=inputs_embeds[:, r0:r1, :],
+                    attention_mask=attention_mask[:, r0:r1],
+                    position_ids=position_ids[:, r0:r1],
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+                final_hidden_slice = final_outputs.hidden_states[-1]
+                final_hidden_offset = r0
+            else:
+                past_key_values = [
+                    (k[:, :, :r0, :], v[:, :, :r0, :])
+                    for (k, v) in kv_cache
+                ]
+                final_outputs = self.phase0.model(
+                    inputs_embeds=inputs_embeds[:, r0:r1, :],
+                    attention_mask=attention_mask[:, :r1],
+                    position_ids=position_ids[:, r0:r1],
+                    past_key_values=past_key_values,
+                    use_cache=False,  # no need to continue caching
+                    output_hidden_states=True,
+                )
+                final_hidden_slice = final_outputs.hidden_states[-1]
+                final_hidden_offset = r0
+        else:
+            raise RuntimeError("Final compute range is empty; unexpected for sequences with <ANSWER> at end.")
+
+        # We need hidden at <ANSWER>. In your data, <ANSWER> is last ⇒ it should be in the final slice.
+        answer_token_id = int(getattr(self.phase0, "answer_token_id"))
+        answer_pos = (input_ids == answer_token_id).float().argmax(dim=1)  # [B]
+
+        # Assert answer is inside final slice; if not, fallback (or raise)
+        min_pos = int(answer_pos.min().item())
+        max_pos = int(answer_pos.max().item())
+        if min_pos < final_hidden_offset or max_pos >= final_hidden_offset + final_hidden_slice.size(1):
+            raise RuntimeError(
+                f"<ANSWER> positions [{min_pos},{max_pos}] not covered by final hidden slice "
+                f"[{final_hidden_offset},{final_hidden_offset + final_hidden_slice.size(1)}). "
+                "If this can happen, we need to assemble full hidden states or keep computing ranges longer."
+            )
+
+        # Gather answer hidden from final slice
+        batch_idx = torch.arange(input_ids.size(0), device=input_ids.device)
+        rel_answer_pos = answer_pos - final_hidden_offset  # [B]
+        answer_hidden = final_hidden_slice[batch_idx, rel_answer_pos, :]  # [B, H]
+
+        # Apply digit heads (same as Phase0)
+        digit_heads = getattr(self.phase0, "digit_heads", None)
+        if digit_heads is None:
+            raise RuntimeError("phase0_model must expose digit_heads (nn.ModuleList)")
+        logits = torch.stack([head(answer_hidden) for head in digit_heads], dim=1)  # [B,5,10]
 
         out: Dict[str, torch.Tensor] = {"logits": logits}
-
         if return_debug:
-            latent_counts = [len(x) for x in latent_lists]
-            dbg = Phase1ForwardDebug(max_n_latents=max_n_latents, latent_counts=latent_counts)
-            # Store as a python object (not a tensor); trainer/eval can ignore it safely
-            out["debug"] = dbg  # type: ignore[assignment]
-
+            out["debug"] = Phase1ForwardDebug(max_n_latents=max_n_latents,
+                                              latent_counts=[len(x) for x in latent_lists])  # type: ignore
         return out
+
