@@ -19,6 +19,7 @@ class StageManager:
 
         self._last_eval_id: Optional[int] = None
         self.done = False
+        self.skip_to_stage = {4:8}
 
     def reset(self):
         self.current_stage = 1
@@ -71,7 +72,9 @@ class StageManager:
 
         if self.no_improve_count >= patience:
             if self.current_stage < 8:
-                self.current_stage += 1
+                next_stage = self.skip_to_stage.get(self.current_stage, self.current_stage + 1)
+                self.current_stage = min(8, int(next_stage))
+
                 self.no_improve_count = 0
                 self.best_val_acc = None  # reset baseline for new stage
                 print(f"➡️ Advancing to stage {self.current_stage}")

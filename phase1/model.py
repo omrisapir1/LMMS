@@ -67,15 +67,6 @@ class Phase1CoconutModel(nn.Module):
         self._embedding = self.phase0.model.get_input_embeddings()
         # Latent projection: identity-initialized linear map
         # Operates ONLY on latent reinsertion
-        emb_w = self._embedding.weight
-        H = self._embedding.embedding_dim
-
-        self.latent_proj = nn.Linear(H, H, bias=True, device=emb_w.device, dtype=emb_w.dtype)
-
-        # Identity init (must match dtype/device too)
-        with torch.no_grad():
-            self.latent_proj.weight.zero_()
-            self.latent_proj.bias.zero_()
 
     # ─────────────────────────────────────────────────────────
     # Convenience passthroughs (helps with training + saving)
@@ -197,8 +188,7 @@ class Phase1CoconutModel(nn.Module):
         fp = torch.tensor(fill_pos, device=inputs_embeds.device, dtype=torch.long)
         sp = torch.tensor(src_pos, device=inputs_embeds.device, dtype=torch.long)
 
-        h = hidden[fb, sp, :]
-        new_embeds[fb, fp, :] = h + self.latent_proj(h)
+        new_embeds[fb, fp, :] = hidden[fb, sp, :]
 
 
         return new_embeds
