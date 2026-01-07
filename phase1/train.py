@@ -198,7 +198,8 @@ def train_phase1(config: Phase1Config) -> None:
     evaluator = Evaluator(max_length=config.max_length, batch_size=config.eval_batch_size if hasattr(config, "eval_batch_size") else 64, max_thoughts=config.max_thoughts)
 
     # Initialize StageManager
-    sm = StageManager(config.stage_exit_thresholds)
+    sm = StageManager(stage_patience=config.stage_patience,
+    min_delta=config.min_delta,)
     log_path = os.path.join(config.log_dir, "training.log")
     os.makedirs(config.log_dir, exist_ok=True)
     global_step = 0
