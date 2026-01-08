@@ -67,10 +67,6 @@ class AnswerLoss:
                     include_zero[is_zero] = torch.bernoulli(probs[is_zero]).bool()
             include_mask = (~is_zero) | (is_zero & include_zero)
             if include_mask.any():
-                # Cross-entropy for included examples at this digit
-                print(f'li shape: {li.shape}, yi shape: {yi.shape}, include_mask shape: {include_mask.shape}')
-                print('li with mask:', li[include_mask])
-                print('yi with mask:', yi[include_mask])
                 loss_i = F.cross_entropy(li[include_mask], yi[include_mask], reduction="mean")
                 total_loss = total_loss + loss_i
                 contributed += 1
