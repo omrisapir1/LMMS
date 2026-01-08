@@ -116,40 +116,54 @@ def load_phase1_from_scratch(config):
 # ------------------------
 # Training
 # ------------------------
-
 def train_phase1(config: Phase1Config):
+    # ------------------------
+    # Load + preprocess
+    # ------------------------
     ds = load_dataset(config.dataset_name)
     train_items = list(ds[config.dataset_train_split])
     val_items = list(ds[config.dataset_eval_split])
 
-    # Preprocess
-    train_items = [
-        {
-            **rec,
-            "thoughts": split_thoughts(rec["generated_answer"]),
-            "K": len(split_thoughts(rec["generated_answer"])),
-        }
-        for rec in train_items
-        if rec.get("generated_answer") is not None
-    ]
+    print(f"[Data] Loaded HF dataset. Train={len(train_items)}, Eval={len(val_items)}")
 
-    val_items = train_items[:1000]
+    # These must exist in your file (you already have them in the big train.py)
+    train_items = preprocess_items(train_items, config.max_thoughts)
+    val_items = preprocess_items(val_items, config.max_thoughts)
+    print(f"[Data] After filtering K > {config.max_thoughts}: Train={len(train_items)}, Eval={len(val_items)}")
 
+    train_items = clear_in_range(train_items)
+    val_items = clear_in_range(val_items)
+    print(f"[Data] After filtering 0 <= answer < 100000: Train={len(train_items)}, Eval={len(val_items)}")
+
+    val_items = val_items[:1000]  # keep your speed limit
+
+    # ------------------------
+    # Setup model/tokenizer
+    # ------------------------
     tokenizer, model = setup_tokenizer_and_model(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
 
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
-    loss_fn = AnswerLoss(keep_prob=[1.0] * 5)
+    # ------------------------
+    # Loss / opt / evaluator
+    # ------------------------
+    keep_prob = _load_keep_prob(getattr(config, "keep_prob_path", ""))
+    loss_fn = AnswerLoss(keep_prob=keep_prob)
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
     evaluator = Evaluator(
         max_length=config.max_length,
-        batch_size=64,
+        batch_size=getattr(config, "eval_batch_size", 64),
         max_thoughts=config.max_thoughts,
     )
 
-    def num_latent_fn(K): return K
+    # ------------------------
+    # Build ONE training loader (stage=8 behavior)
+    # ------------------------
+    # stage=8 => use K latent tokens (your evaluator uses K at stage 8)
+    def num_latent_fn(K: int) -> int:
+        return int(K)
 
     dataset = Phase1Dataset(
         items=train_items,
@@ -158,31 +172,37 @@ def train_phase1(config: Phase1Config):
         num_latent_fn=num_latent_fn,
         max_thoughts=config.max_thoughts,
         answer_token=ANSWER_TOKEN,
+        debug=False,
     )
 
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id),
     )
 
     # ------------------------
     # Train EXACTLY 1000 batches
     # ------------------------
-
     for step, batch in enumerate(loader, start=1):
         if step > MAX_BATCHES:
             break
 
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
         out = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
         )
 
-        loss = loss_fn.compute(out["logits"], batch["digit_labels"])
-        optimizer.zero_grad()
+        logits = out.get("logits")
+        if logits is None:
+            continue
+
+        loss = loss_fn.compute(logits, batch["digit_labels"])
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
@@ -192,7 +212,6 @@ def train_phase1(config: Phase1Config):
     # ------------------------
     # Eval BEFORE save
     # ------------------------
-
     model.eval()
     acc_before = evaluator.compute_accuracy(model, tokenizer, val_items, stage=8)
     print(f"VAL ACC (before save): {acc_before:.6f}")
@@ -200,19 +219,14 @@ def train_phase1(config: Phase1Config):
     # ------------------------
     # Save
     # ------------------------
-
-    save_phase1_checkpoint(
-        model=model,
-        tokenizer=tokenizer,
-        config=config,
-    )
+    save_phase1_checkpoint(model=model, tokenizer=tokenizer, config=config)
 
     # ------------------------
-    # Reload + Eval
+    # Reload from scratch + Eval again
     # ------------------------
-
     tokenizer2, model2 = load_phase1_from_scratch(config)
     model2.to(device)
+    model2.eval()
 
     acc_after = evaluator.compute_accuracy(model2, tokenizer2, val_items, stage=8)
     print(f"VAL ACC (after reload): {acc_after:.6f}")
@@ -220,11 +234,11 @@ def train_phase1(config: Phase1Config):
     # ------------------------
     # Invariant check
     # ------------------------
-
-    assert abs(acc_before - acc_after) < 1e-6, \
-        "❌ Accuracy mismatch after reload!"
+    if abs(acc_before - acc_after) >= 1e-6:
+        raise RuntimeError(f"❌ Accuracy mismatch after reload! before={acc_before} after={acc_after}")
 
     print("✅ SAVE / LOAD INVARIANT PASSED")
+
 
 
 if __name__ == "__main__":
