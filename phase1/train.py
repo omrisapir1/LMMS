@@ -11,7 +11,7 @@ from typing import List
 import os
 import json
 import torch
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 try:
@@ -194,7 +194,7 @@ def train_phase1(config: Phase1Config) -> None:
     # Initialize loss, optimizer, evaluator once
     keep_prob = _load_keep_prob(getattr(config, "keep_prob_path", ""))
     loss_fn = AnswerLoss(keep_prob=keep_prob)
-    optimizer = Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     evaluator = Evaluator(max_length=config.max_length, batch_size=config.eval_batch_size if hasattr(config, "eval_batch_size") else 64, max_thoughts=config.max_thoughts)
 
     # Initialize StageManager
@@ -287,7 +287,6 @@ def train_phase1(config: Phase1Config) -> None:
                 if advanced:
                     dataset.already_been_called_to_print = False
                     # Reset optimizer on stage advance
-                    optimizer = Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     break  # rebuild dataset for next stage
 
                 if done:

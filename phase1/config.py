@@ -14,7 +14,7 @@ class Phase1Config:
     eval_interval_batches: int = 2000
 
     min_delta: float = 0.01  # 1% improvement threshold
-    stage_patience: tuple = (3, 3, 3, 3, 3, 3, 3, 5)
+    stage_patience: tuple = (3, 3, 3, 3, 3, 3, 3, 3)
 
     # Downsampling
     target_p0: float = 0.25
