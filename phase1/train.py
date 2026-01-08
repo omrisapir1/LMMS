@@ -333,6 +333,16 @@ def train_phase1(config: Phase1Config) -> None:
                 val_acc = evaluator.compute_accuracy(model, tokenizer, val_items, sm.current_stage)
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(f"Val accuracy at step {global_step}: {val_acc:.4f}\n")
+                print(f"Val accuracy at step {global_step}: {val_acc:.4f}\n")
+                save_phase1_checkpoint(
+                    model=model,
+                    tokenizer=tokenizer,
+                    config=config,
+                    phase0_repo=config.phase0_repo,
+                    latent_token=LATENT_TOKEN,
+                    answer_token=ANSWER_TOKEN,
+                )
+                raise
                 model.train()
 
                 eval_id = global_step // config.eval_interval_batches
