@@ -1,0 +1,16 @@
+{
+  "answer_token": "<ANSWER>",
+  "answer_token_id": 50257,
+  "architectures": [
+    "Phase0Model"
+  ],
+  "base_model_name": "calum/tinystories-gpt2-3M",
+  "model_type": "phase0",
+  "num_classes": 10,
+  "num_digits": 5,
+  "output_hidden_states": true,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.51.3",
+  "unfrozen_layer_pct": 0.25,
+  "vocab_size": null
+}
