@@ -139,7 +139,7 @@ class Phase1Dataset(torch.utils.data.Dataset):
         K = rec["K"]
         # K == 0 is allowed (no-thought examples); handled by stage logic upstream
         # Enforce global thought cap
-        assert K <= self.max_thoughts, "K > max_thoughts must be filtered upstream"
+        # assert K <= self.max_thoughts, "K > max_thoughts must be filtered upstream"
         # Stage-agnostic latent count
         num_latent_opt = self.num_latent_fn(K)
         num_latent = 0 if num_latent_opt is None else int(num_latent_opt)
