@@ -151,6 +151,60 @@ def preprocess_items(items, max_thoughts: int):
 
     return out
 
+import os
+import json
+import torch
+
+
+def save_phase1_checkpoint(
+    *,
+    model,
+    tokenizer,
+    config,
+    phase0_repo: str,
+    latent_token: str,
+    answer_token: str,
+):
+    """
+    Correct Phase-1 checkpoint saving.
+
+    Saves:
+    - Phase-1 weights ONLY (delta on top of Phase-0)
+    - Tokenizer (with latent + answer tokens)
+    - Explicit metadata contract for reconstruction
+    """
+    os.makedirs(config.log_dir, exist_ok=True)
+
+    # 1) Save Phase-1 weights ONLY
+    weights_path = os.path.join(config.log_dir, "phase1_weights.pt")
+    torch.save(model.state_dict(), weights_path)
+
+    # 2) Save tokenizer
+    tokenizer.save_pretrained(config.log_dir)
+
+    # 3) Save explicit metadata contract
+    meta = {
+        "phase": 1,
+        "architecture": "Phase1CoconutModel",
+        "phase0_repo": phase0_repo,
+        "latent_token": latent_token,
+        "answer_token": answer_token,
+        "max_thoughts": config.max_thoughts,
+        "embedding_resized_at_training": True,
+    }
+
+    meta_path = os.path.join(config.log_dir, "phase1_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(
+        f"[Checkpoint] Phase-1 saved:\n"
+        f"  weights: {weights_path}\n"
+        f"  tokenizer: {config.log_dir}\n"
+        f"  meta: {meta_path}"
+    )
+
+
 
 def train_phase1(config: Phase1Config) -> None:
     # Load HF dataset splits once and preprocess
@@ -292,20 +346,16 @@ def train_phase1(config: Phase1Config) -> None:
                 if done:
                     # Terminal behavior: save final model and report
                     try:
-                        # Prefer save_pretrained if available
-                        if hasattr(model, "save_pretrained"):
-                            model.save_pretrained(config.log_dir)
-                        else:
-                            # Torch save as fallback
-                            os.makedirs(config.log_dir, exist_ok=True)
-                            torch.save(model.state_dict(), os.path.join(config.log_dir, "phase1_final.pt"))
-                        # Always save tokenizer for reproducibility
-                        try:
-                            tokenizer.save_pretrained(config.log_dir)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                        save_phase1_checkpoint(
+                            model=model,
+                            tokenizer=tokenizer,
+                            config=config,
+                            phase0_repo=config.phase0_repo,
+                            latent_token=LATENT_TOKEN,
+                            answer_token=ANSWER_TOKEN,
+                        )
+                    except Exception as e:
+                        print(f"[Checkpoint] Failed to save Phase-1: {e}")
                     print(f"Final validation accuracy: {val_acc:.4f}")
                     return
         # Continue loop; if advanced, we rebuild dataset in next iteration

@@ -68,8 +68,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
         # Replace last thought only
         for t in thoughts[:-1]:
             lines.append(t)
-        lines.append(LATENT_TOKEN)
-        lines.append(answer_token)
+        lines.append(LATENT_TOKEN + answer_token)
         return "\n".join(lines)
 
     # num_latent >= 2
@@ -77,18 +76,18 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
     assert left_latents <= K - 1
 
     # Left latents
-    for _ in range(left_latents):
-        lines.append(LATENT_TOKEN)
+    lines.append(''.join([LATENT_TOKEN for _ in range(left_latents)]))
 
     # Middle thoughts
     for t in thoughts[left_latents:-1]:
         lines.append(t)
 
     # Final latent + answer
-    lines.append(LATENT_TOKEN)
-    lines.append(answer_token)
-
-    return "\n".join(lines)
+    lines.append(LATENT_TOKEN + answer_token)
+    if num_latent < 8:
+        return "\n".join(lines)
+    else:
+        return "".join(lines)
 
 
 
