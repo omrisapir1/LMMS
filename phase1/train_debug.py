@@ -113,6 +113,64 @@ def load_phase1_from_scratch(config):
     return tokenizer, model
 
 
+def clear_in_range(items: List[dict]) -> List[dict]:
+    """
+    Filter out records where the answer is not in the range [0, 100000).
+    """
+    out = []
+    for rec in items:
+        ans = rec.get("answer")
+        if ans is None:
+            continue
+        try:
+            answer_int = int(ans)
+            if 0 <= answer_int < 100000:
+                out.append(rec)
+        except ValueError:
+            continue
+    return out
+
+def preprocess_items(items, max_thoughts: int):
+    """
+    Derive thoughts and K once:
+    - thoughts = split_thoughts(generated_answer)
+    - K = len(thoughts)
+    - filter out K > max_thoughts
+
+    Debug safety: raise if generated_answer is missing to surface upstream issues early.
+    """
+    out = []
+    for rec in items:
+        gen = rec.get("generated_answer")
+        if gen is None:
+            raise KeyError("generated_answer missing during preprocessing")
+
+        thoughts = split_thoughts(gen)
+        K = len(thoughts)
+
+        if K > max_thoughts:
+            continue
+
+        rec2 = dict(rec)
+        rec2["thoughts"] = thoughts
+        rec2["K"] = K
+        out.append(rec2)
+
+    return out
+
+
+def _load_keep_prob(path: str) -> List[float]:
+    # Load keep_prob list of length 5; default to [1.0]*5 if missing/invalid
+    keep_prob = [1.0] * 5
+    try:
+        if path and os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("keep_prob"), list) and len(data["keep_prob"]) == 5:
+                    keep_prob = [float(x) for x in data["keep_prob"]]
+    except Exception:
+        raise RuntimeError(f"cannot load keep_prob from {path}")
+    return keep_prob
 # ------------------------
 # Training
 # ------------------------
