@@ -83,11 +83,9 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
         lines.append(t)
 
     # Final latent + answer
-    lines.append(LATENT_TOKEN + answer_token)
-    if num_latent < 8:
-        return "\n".join(lines)
-    else:
-        return "".join(lines)
+
+    return "\n".join(lines) + LATENT_TOKEN + answer_token
+
 
 
 
