@@ -80,7 +80,13 @@ class Phase1CoconutModel(nn.Module):
             H = int(self._embedding.embedding_dim)
 
         if self.use_latent_gate:
-            self.latent_gate = nn.Linear(H, H, bias=True)
+            param_dtype = next(self.phase0.model.parameters()).dtype
+            param_device = next(self.phase0.model.parameters()).device
+
+            self.latent_gate = nn.Linear(H, H, bias=True).to(
+                dtype=param_dtype,
+                device=param_device,
+            )
 
             # Optional: initialize to zero so gate starts closed (Phase0-equivalent).
             if latent_gate_init_zero:
