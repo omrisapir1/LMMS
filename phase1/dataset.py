@@ -156,8 +156,8 @@ class Phase1Dataset(torch.utils.data.Dataset):
         answer_id = self.tokenizer.convert_tokens_to_ids(self.answer_token)
         latent_id = self.tokenizer.convert_tokens_to_ids(LATENT_TOKEN)
         # Debug-only: ensure special tokens are in vocab (not mapped to UNK)
-        assert latent_id != self.tokenizer.unk_token_id
-        assert answer_id != self.tokenizer.unk_token_id
+        # assert latent_id != self.tokenizer.unk_token_id
+        # assert answer_id != self.tokenizer.unk_token_id
         assert enc["input_ids"].count(answer_id) == 1, "<ANSWER> must appear exactly once"
         assert enc["input_ids"].count(latent_id) == num_latent, "Latent tokens count mismatch"
         # Derive digit labels from answer

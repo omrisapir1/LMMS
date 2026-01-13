@@ -281,6 +281,15 @@ def train_phase1(config: Phase1Config) -> None:
             f"Using samples with K > {s}. "
             f"Train size={len(stage_items)}"
         )
+        save_phase1_checkpoint(
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            phase0_repo=config.phase0_repo,
+            latent_token=LATENT_TOKEN,
+            answer_token=ANSWER_TOKEN,
+        )
+        raise 
         dataset = Phase1Dataset(items=stage_items, tokenizer=tokenizer, max_length=config.max_length, num_latent_fn=num_latent_fn, max_thoughts=config.max_thoughts, answer_token=ANSWER_TOKEN)
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id))
