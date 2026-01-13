@@ -85,3 +85,9 @@ class StageManager:
                 return True, True
 
         return False, False
+
+    def move_to_next_stage(self) -> None:
+        self.current_stage += 1
+        self.no_improve_count = 0
+        self.best_val_acc = None
+
