@@ -200,6 +200,7 @@ class Phase1CoconutModel(nn.Module):
         logits = run_coconut(latent_order=None)
         print('---------- THIS IS NORMAL ORDER ----------')
         print(logits)
+        print(logits.shape)
         out = {"logits": logits}
 
         if return_debug:
@@ -221,10 +222,12 @@ class Phase1CoconutModel(nn.Module):
                 perm = torch.randperm(n).tolist()
                 latent_order_perm.append(perm)
 
-        print('---------- THIS IS SHUFFLEED ORDER ----------')
-        print(logits)
+
 
         logits_perm = run_coconut(latent_order=latent_order_perm)
+        print('---------- THIS IS SHUFFLEED ORDER ----------')
+        print(logits_perm)
+        print(logits_perm.shape)
         out_perm = {"logits": logits_perm}
 
         if return_debug:
