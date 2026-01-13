@@ -324,7 +324,7 @@ def train_phase1(config: Phase1Config) -> None:
             )
 
             # Total loss
-            loss = loss_ans + 1 * loss_perm
+            loss = 0.25 * loss_ans + 1 * loss_perm
 
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
                 loss_ans_to_print = cur_answer_loss / config.logg_loss_interval_batches
@@ -363,9 +363,8 @@ def train_phase1(config: Phase1Config) -> None:
                     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
-                    # if sm.current_stage ==2:
-                    #     print('Resetting optimizer at stage 1 advance')
-                    #     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+                    print('Resetting optimizer at advance')
+                    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     dataset.already_been_called_to_print = False
                     # Reset optimizer on stage advance
                     break  # rebuild dataset for next stage
