@@ -353,7 +353,7 @@ def train_phase1(config: Phase1Config) -> None:
                 model.eval()
                 val_acc, val_acc_perm = evaluator.compute_accuracy(model, tokenizer, val_items, sm.current_stage)
                 with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"Val accuracy at step {global_step}: {val_acc:.4f}\ Val perm Accuracy {val_acc_perm:.4f}\n")
+                    f.write(f"Val accuracy at step {global_step}: {val_acc:.4f} Val perm Accuracy {val_acc_perm:.4f}\n")
                 model.train()
 
                 eval_id = global_step // config.eval_interval_batches
@@ -365,6 +365,9 @@ def train_phase1(config: Phase1Config) -> None:
                     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
+                    if sm.current_stage ==1:
+                        print('Resetting optimizer at stage 1 advance')
+                        optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     dataset.already_been_called_to_print = False
                     # Reset optimizer on stage advance
                     break  # rebuild dataset for next stage

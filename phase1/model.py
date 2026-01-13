@@ -212,15 +212,17 @@ class Phase1CoconutModel(nn.Module):
 
         # ── permuted latent order ──
         latent_order_perm: List[List[int]] = []
+
         for pos_list in latent_lists:
             n = len(pos_list)
+
             if n <= 1:
                 latent_order_perm.append(list(range(n)))
+            elif n == 2:
+                latent_order_perm.append([1, 0])
             else:
-                perm = torch.randperm(n).tolist()
-                latent_order_perm.append(perm)
-
-
+                # reverse order
+                latent_order_perm.append(list(reversed(range(n))))
 
         logits_perm = run_coconut(latent_order=latent_order_perm)
 
