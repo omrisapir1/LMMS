@@ -317,11 +317,14 @@ def train_phase1(config: Phase1Config) -> None:
             loss_ans = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
 
             # Permutation perturbation loss
-            loss_perm = permutation_perturbation_loss(
-                logits_orig=logits,
-                logits_perm=logits_perm,
-                conf_threshold=0.7,
-            )
+            if sm.current_stage ==1:
+                loss_perm =0
+            else:
+                loss_perm = permutation_perturbation_loss(
+                    logits_orig=logits,
+                    logits_perm=logits_perm,
+                    conf_threshold=0.7,
+                )
 
             # Total loss
             loss = loss_ans + 0.2 * loss_perm
