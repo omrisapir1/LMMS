@@ -194,10 +194,12 @@ class Phase1CoconutModel(nn.Module):
                 output_hidden_states=True,
             )
             final_hidden = final_outputs.hidden_states[-1]
-            return self._compute_digit_logits_from_hidden(final_hidden, input_ids)
+            return final_hidden#self._compute_digit_logits_from_hidden(final_hidden, input_ids)
 
         # ── normal run ──
         logits = run_coconut(latent_order=None)
+        print('---------- THIS IS NORMAL ORDER ----------')
+        print(logits)
         out = {"logits": logits}
 
         if return_debug:
@@ -218,6 +220,9 @@ class Phase1CoconutModel(nn.Module):
             else:
                 perm = torch.randperm(n).tolist()
                 latent_order_perm.append(perm)
+
+        print('---------- THIS IS SHUFFLEED ORDER ----------')
+        print(logits)
 
         logits_perm = run_coconut(latent_order=latent_order_perm)
         out_perm = {"logits": logits_perm}
