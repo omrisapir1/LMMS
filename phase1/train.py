@@ -356,11 +356,11 @@ def train_phase1(config: Phase1Config) -> None:
 
                 eval_id = global_step // config.eval_interval_batches
                 advanced, done = sm.update_on_evaluation(eval_id=eval_id, val_acc=val_acc)
-                # if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
-                #     sm.move_to_next_stage()
-                #     advanced = True
-                #     done = False
-                #     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
+                if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
+                    sm.move_to_next_stage()
+                    advanced = True
+                    done = False
+                    print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
                     # if sm.current_stage ==2:
