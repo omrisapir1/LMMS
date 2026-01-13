@@ -326,7 +326,7 @@ def train_phase1(config: Phase1Config) -> None:
                 )
 
             # Total loss
-            loss = loss_ans + 0.2 * loss_perm
+            loss = loss_ans + 0.4 * loss_perm
 
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
                 loss_ans_to_print = cur_answer_loss / config.logg_loss_interval_batches
