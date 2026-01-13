@@ -19,7 +19,7 @@ class StageManager:
 
         self._last_eval_id: Optional[int] = None
         self.done = False
-        self.skip_to_stage = {4:8}
+        self.skip_to_stage = {7:8}
 
     def reset(self):
         self.current_stage = 1

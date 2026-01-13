@@ -11,10 +11,10 @@ class Phase1Config:
     # Curriculum / stages
     max_thoughts: int = 8
     max_length: int = 2048
-    eval_interval_batches: int = 500
+    eval_interval_batches: int = 2000
 
     min_delta: float = 0.01  # 1% improvement threshold
-    stage_patience: tuple = (1, 1, 1, 1, 1, 3, 3, 5)
+    stage_patience: tuple = (3, 3, 3, 3, 3, 3, 3, 5)
     max_steps_first_stage: int = 4
 
     # Downsampling
