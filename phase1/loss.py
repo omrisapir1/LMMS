@@ -88,26 +88,31 @@ class AnswerLoss:
         # Final loss = mean CE over contributing digit positions (not samples)
         return total_loss / float(contributed)
 
-
-def permutation_perturbation_loss(
-    logits_orig: torch.Tensor,  # [B,5,10]
-    logits_perm: torch.Tensor,  # [B,5,10]
-    conf_threshold: float = 0.7,
+def permutation_sensitivity_loss(
+    logits_orig: torch.Tensor,  # [B, 5, 10]
+    logits_perm: torch.Tensor,  # [B, 5, 10]
 ):
     """
-    If the original prediction is low-confidence,
-    the permuted version should become less confident (higher entropy).
+    Encourage permutation sensitivity:
+    - HIGH loss when permuted output ≈ original output
+    - LOW loss when permuted output differs from original
+
+    Valid only for K >= 2.
     """
-    # Probabilities
+    # Convert to probabilities
     p_orig = F.softmax(logits_orig, dim=-1)
     p_perm = F.softmax(logits_perm, dim=-1)
 
-    # Confidence = mean max prob over digits
-    conf_orig = p_orig.max(dim=-1).values.mean(dim=-1)  # [B]
+    # Symmetric KL per digit
+    kl_op = F.kl_div(p_orig.log(), p_perm, reduction="none").sum(-1)
+    kl_po = F.kl_div(p_perm.log(), p_orig, reduction="none").sum(-1)
 
-    # KL to uniform (encourage uncertainty)
-    uniform = torch.full_like(p_perm, 1.0 / p_perm.size(-1))
-    kl = F.kl_div(p_perm.log(), uniform, reduction="none").sum(-1).mean(-1)  # [B]
+    # Average over digits → [B]
+    sym_kl = (kl_op + kl_po).mean(dim=1)
 
-    mask = (conf_orig < conf_threshold).float()
-    return (mask * kl).mean()
+    # We want:
+    # - large loss when sym_kl is small (outputs identical)
+    # - small loss when sym_kl is large (outputs differ)
+    loss = torch.exp(-sym_kl)
+
+    return loss.mean()

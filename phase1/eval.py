@@ -12,7 +12,7 @@ class Evaluator:
         self.batch_size = batch_size
         self.max_thoughts = max_thoughts
 
-    def compute_accuracy(self, model: Any, tokenizer, preprocessed_items: List[dict], stage: int) -> float:
+    def compute_accuracy(self, model: Any, tokenizer, preprocessed_items: List[dict], stage: int) -> tuple[float, float]:
         from torch.utils.data import DataLoader
         try:
             from .dataset import Phase1Dataset, collate_fn
@@ -63,8 +63,9 @@ class Evaluator:
 
         # Prepare model for evaluation
         model.eval()
-        correct = 0
-        total = 0
+        correct,correct_perm  = 0, 0
+        total, total_perm = 0, 0
+
         answer_id = tokenizer.convert_tokens_to_ids(ANSWER_TOKEN)
         device = next(model.parameters()).device if hasattr(model, "parameters") else torch.device("cpu")
         with torch.no_grad():
@@ -75,7 +76,11 @@ class Evaluator:
                 per_row_answer_count = (batch["input_ids"] == answer_id).sum(dim=1)
                 assert per_row_answer_count.eq(1).all().item(), "<ANSWER> token truncated or duplicated in evaluation inputs"
 
-                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])  # no digit_labels in eval forward
+                out, out_perm = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    return_perm_out=True,
+                )
                 logits = out.get("logits")  # [B,5,10]
                 if logits is None:
                     continue
@@ -85,7 +90,15 @@ class Evaluator:
                 match = (preds == labels).all(dim=1)  # [B]
                 correct += int(match.sum().item())
                 total += preds.shape[0]
+                logits_perm = out_perm.get("logits")  # [B,5,10]
+                if logits_perm is not None:
+                    preds_perm = torch.argmax(logits_perm, dim=-1)  # [B,5]
+                    match_perm = (preds_perm == labels).all(dim=1)
+                    correct_perm += int(match_perm.sum().item())
+                    total_perm += preds_perm.shape[0]
         if total == 0:
             print("Warning: evaluation produced zero samples")
             return 0.0
-        return correct / float(total)
+        acc = correct / float(total) if total > 0 else 0.0
+        acc_perm = correct_perm / float(total_perm) if total_perm > 0 else 0.0
+        return acc, acc_perm

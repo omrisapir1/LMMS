@@ -18,7 +18,7 @@ try:
     from .config import Phase1Config
     from .dataset import Phase1Dataset, collate_fn
     from .stage_manager import StageManager
-    from .loss import AnswerLoss, permutation_perturbation_loss
+    from .loss import AnswerLoss, permutation_sensitivity_loss
     from .eval import Evaluator
     from .model import Phase1CoconutModel
     from .split_logic import split_thoughts
@@ -26,7 +26,7 @@ except ImportError:
     from config import Phase1Config
     from dataset import Phase1Dataset, collate_fn
     from stage_manager import StageManager
-    from loss import AnswerLoss, permutation_perturbation_loss
+    from loss import AnswerLoss, permutation_sensitivity_loss
     from eval import Evaluator
     from model import Phase1CoconutModel
     from split_logic import split_thoughts
@@ -320,10 +320,9 @@ def train_phase1(config: Phase1Config) -> None:
             if sm.current_stage ==1:
                 loss_perm = torch.tensor(0.0, device=device)
             else:
-                loss_perm = permutation_perturbation_loss(
+                loss_perm = permutation_sensitivity_loss(
                     logits_orig=logits,
                     logits_perm=logits_perm,
-                    conf_threshold=0.7,
                 )
 
             # Total loss
@@ -352,9 +351,9 @@ def train_phase1(config: Phase1Config) -> None:
             # Periodic evaluation on validation data only
             if global_step % config.eval_interval_batches == 0:
                 model.eval()
-                val_acc = evaluator.compute_accuracy(model, tokenizer, val_items, sm.current_stage)
+                val_acc, val_acc_perm = evaluator.compute_accuracy(model, tokenizer, val_items, sm.current_stage)
                 with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"Val accuracy at step {global_step}: {val_acc:.4f}\n")
+                    f.write(f"Val accuracy at step {global_step}: {val_acc:.4f}\ Val perm Accuracy {val_acc_perm:.4f}\n")
                 model.train()
 
                 eval_id = global_step // config.eval_interval_batches
