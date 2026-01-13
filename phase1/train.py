@@ -18,7 +18,7 @@ try:
     from .config import Phase1Config
     from .dataset import Phase1Dataset, collate_fn
     from .stage_manager import StageManager
-    from .loss import AnswerLoss
+    from .loss import AnswerLoss, permutation_perturbation_loss
     from .eval import Evaluator
     from .model import Phase1CoconutModel
     from .split_logic import split_thoughts
@@ -26,7 +26,7 @@ except ImportError:
     from config import Phase1Config
     from dataset import Phase1Dataset, collate_fn
     from stage_manager import StageManager
-    from loss import AnswerLoss
+    from loss import AnswerLoss, permutation_perturbation_loss
     from eval import Evaluator
     from model import Phase1CoconutModel
     from split_logic import split_thoughts
@@ -281,20 +281,13 @@ def train_phase1(config: Phase1Config) -> None:
             f"Using samples with K > {s}. "
             f"Train size={len(stage_items)}"
         )
-        save_phase1_checkpoint(
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            phase0_repo=config.phase0_repo,
-            latent_token=LATENT_TOKEN,
-            answer_token=ANSWER_TOKEN,
-        )
-        raise 
+
         dataset = Phase1Dataset(items=stage_items, tokenizer=tokenizer, max_length=config.max_length, num_latent_fn=num_latent_fn, max_thoughts=config.max_thoughts, answer_token=ANSWER_TOKEN)
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id))
 
-        cur_loss = 0.0
+        cur_answer_loss = 0.0
+        cur_perm_loss = 0.0
         for batch in loader:
             global_step += 1
             # Move tensors to device
@@ -302,9 +295,10 @@ def train_phase1(config: Phase1Config) -> None:
 
             # Forward → logits
 
-            out = model(
+            out, out_perm = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
+                return_perm_out=True,
             )
 
             # Debug-only: ensure <ANSWER> is present exactly once per sample after batching
@@ -314,20 +308,35 @@ def train_phase1(config: Phase1Config) -> None:
                     "<ANSWER> missing or duplicated after batching"
 
             logits = out.get("logits")  # [B,5,10]
+            logits_perm = out_perm["logits"]
             if logits is None:
                 continue
 
             # Loss (digits only)
-            loss = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
+            loss_ans = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
+
+            # Permutation perturbation loss
+            loss_perm = permutation_perturbation_loss(
+                logits_orig=logits,
+                logits_perm=logits_perm,
+                conf_threshold=0.7,
+            )
+
+            # Total loss
+            loss = loss_ans + 0.2 * loss_perm
+
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
-                loss_to_print = cur_loss / config.logg_loss_interval_batches
-                msg = f'[Stage {s}][Step {global_step}] Loss: {loss_to_print:.4f}'
+                loss_ans_to_print = cur_answer_loss / config.logg_loss_interval_batches
+                loss_perm_to_print = cur_perm_loss / config.logg_loss_interval_batches
+                msg = f'[Stage {s}][Step {global_step}] Answer Loss: {loss_ans_to_print:.4f} Perm Loss: {loss_perm_to_print:.4f}'
                 print(msg)
 
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(msg + "\n")
-                cur_loss = 0
-            cur_loss += loss.item()
+                cur_answer_loss = 0
+                cur_perm_loss = 0
+            cur_answer_loss += loss_ans.item()
+            cur_perm_loss += loss_perm.item()
 
             # Backward + step
             optimizer.zero_grad()
