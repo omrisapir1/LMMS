@@ -15,6 +15,7 @@ class Phase1Config:
 
     min_delta: float = 0.01  # 1% improvement threshold
     stage_patience: tuple = (5, 3, 3, 3, 3, 3, 3, 5)
+    max_steps_first_stage: int = 1
 
     # Downsampling
     target_p0: float = 0.25

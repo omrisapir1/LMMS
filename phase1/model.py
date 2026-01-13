@@ -194,13 +194,11 @@ class Phase1CoconutModel(nn.Module):
                 output_hidden_states=True,
             )
             final_hidden = final_outputs.hidden_states[-1]
-            return final_hidden#self._compute_digit_logits_from_hidden(final_hidden, input_ids)
+            return self._compute_digit_logits_from_hidden(final_hidden, input_ids)
 
         # ── normal run ──
         logits = run_coconut(latent_order=None)
-        print('---------- THIS IS NORMAL ORDER ----------')
-        print(logits)
-        print(logits.shape)
+
         out = {"logits": logits}
 
         if return_debug:
@@ -225,9 +223,7 @@ class Phase1CoconutModel(nn.Module):
 
 
         logits_perm = run_coconut(latent_order=latent_order_perm)
-        print('---------- THIS IS SHUFFLEED ORDER ----------')
-        print(logits_perm)
-        print(logits_perm.shape)
+
         out_perm = {"logits": logits_perm}
 
         if return_debug:

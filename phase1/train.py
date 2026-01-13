@@ -247,6 +247,7 @@ def train_phase1(config: Phase1Config) -> None:
 
     # Initialize loss, optimizer, evaluator once
     keep_prob = _load_keep_prob(getattr(config, "keep_prob_path", ""))
+    max_steps_first_stage = config.max_steps_first_stage
     loss_fn = AnswerLoss(keep_prob=keep_prob)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     evaluator = Evaluator(max_length=config.max_length, batch_size=config.eval_batch_size if hasattr(config, "eval_batch_size") else 64, max_thoughts=config.max_thoughts)
@@ -355,6 +356,10 @@ def train_phase1(config: Phase1Config) -> None:
 
                 eval_id = global_step // config.eval_interval_batches
                 advanced, done = sm.update_on_evaluation(eval_id=eval_id, val_acc=val_acc)
+                if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
+                    advanced = True
+                    done = False
+                    print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
                     dataset.already_been_called_to_print = False
