@@ -317,13 +317,11 @@ def train_phase1(config: Phase1Config) -> None:
             loss_ans = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
 
             # Permutation perturbation loss
-            if sm.current_stage ==1:
-                loss_perm = torch.tensor(0.0, device=device)
-            else:
-                loss_perm = permutation_sensitivity_loss(
-                    logits_orig=logits,
-                    logits_perm=logits_perm,
-                )
+
+            loss_perm = permutation_sensitivity_loss(
+                logits_orig=logits,
+                logits_perm=logits_perm,
+            )
 
             # Total loss
             loss = loss_ans + 1 * loss_perm
@@ -358,16 +356,16 @@ def train_phase1(config: Phase1Config) -> None:
 
                 eval_id = global_step // config.eval_interval_batches
                 advanced, done = sm.update_on_evaluation(eval_id=eval_id, val_acc=val_acc)
-                if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
-                    sm.move_to_next_stage()
-                    advanced = True
-                    done = False
-                    print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
+                # if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
+                #     sm.move_to_next_stage()
+                #     advanced = True
+                #     done = False
+                #     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
-                    if sm.current_stage ==2:
-                        print('Resetting optimizer at stage 1 advance')
-                        optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+                    # if sm.current_stage ==2:
+                    #     print('Resetting optimizer at stage 1 advance')
+                    #     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     dataset.already_been_called_to_print = False
                     # Reset optimizer on stage advance
                     break  # rebuild dataset for next stage

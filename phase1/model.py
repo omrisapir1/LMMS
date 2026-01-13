@@ -217,7 +217,7 @@ class Phase1CoconutModel(nn.Module):
             n = len(pos_list)
 
             if n <= 1:
-                latent_order_perm.append(list(range(n)))
+                latent_order_perm.append([])
             elif n == 2:
                 latent_order_perm.append([1, 0])
             else:
