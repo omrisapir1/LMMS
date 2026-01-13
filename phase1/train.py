@@ -318,7 +318,7 @@ def train_phase1(config: Phase1Config) -> None:
 
             # Permutation perturbation loss
             if sm.current_stage ==1:
-                loss_perm =0
+                loss_perm = torch.tensor(0.0, device=device)
             else:
                 loss_perm = permutation_perturbation_loss(
                     logits_orig=logits,
