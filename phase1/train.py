@@ -295,12 +295,17 @@ def train_phase1(config: Phase1Config) -> None:
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
             # Forward → logits
-
-            out, out_perm = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                return_perm_out=True,
-            )
+            if global_step % config.permutation_loss_interval_batches == 0:
+                out, out_perm = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    return_perm_out=True,
+                )
+            else:
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
 
             # Debug-only: ensure <ANSWER> is present exactly once per sample after batching
             if global_step == 1:
@@ -309,7 +314,7 @@ def train_phase1(config: Phase1Config) -> None:
                     "<ANSWER> missing or duplicated after batching"
 
             logits = out.get("logits")  # [B,5,10]
-            logits_perm = out_perm["logits"]
+
             if logits is None:
                 continue
 
@@ -317,14 +322,17 @@ def train_phase1(config: Phase1Config) -> None:
             loss_ans = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
 
             # Permutation perturbation loss
-
-            loss_perm = permutation_sensitivity_loss(
-                logits_orig=logits,
-                logits_perm=logits_perm,
-            )
+            if global_step % config.permutation_loss_interval_batches == 0:
+                logits_perm = out_perm["logits"]
+                loss_perm = permutation_sensitivity_loss(
+                    logits_orig=logits,
+                    logits_perm=logits_perm,
+                )
+            else:
+                loss_perm = torch.tensor(0.0, device=device)
 
             # Total loss
-            loss = 1 * loss_ans + 4 * loss_perm
+            loss = 1 * loss_ans + 16 * loss_perm
 
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
                 loss_ans_to_print = cur_answer_loss / config.logg_loss_interval_batches
