@@ -363,8 +363,8 @@ def train_phase1(config: Phase1Config) -> None:
                 #     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
-                    print('Resetting optimizer at advance')
-                    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+                    # print('Resetting optimizer at advance')
+                    # optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     dataset.already_been_called_to_print = False
                     # Reset optimizer on stage advance
                     break  # rebuild dataset for next stage
