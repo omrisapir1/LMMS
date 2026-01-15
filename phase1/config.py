@@ -7,7 +7,7 @@ class Phase1Config:
     batch_size: int = 8
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
 
     # Curriculum / stages
     max_thoughts: int = 8
