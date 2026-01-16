@@ -7,7 +7,7 @@ from huggingface_hub import HfApi
 from phase_0.model import Phase0Model
 from phase1.model import Phase1CoconutModel
 
-LOCAL_DIR = "/path/to/your/log_dir"   # where save_phase1_checkpoint wrote files
+LOCAL_DIR = "/workspace/LMMS/runs/phase1/"   # where save_phase1_checkpoint wrote files
 HF_REPO = "omrisap/LMMS_phase1"       # target HF repo
 TORCH_DTYPE = torch.bfloat16
 
