@@ -7,13 +7,13 @@ from huggingface_hub import HfApi
 from phase_0.model import Phase0Model
 from phase1.model import Phase1CoconutModel
 
-LOCAL_DIR = "/workspace/runs/phase1/phase1_meta.json"   # where save_phase1_checkpoint wrote files
+LOCAL_DIR = "/path/to/your/log_dir"   # where save_phase1_checkpoint wrote files
 HF_REPO = "omrisap/LMMS_phase1"       # target HF repo
 TORCH_DTYPE = torch.bfloat16
 
 
 def push_phase1_checkpoint(local_dir: str, hf_repo: str):
-    api = HfApi(token=)
+    api = HfApi(token="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")
 
     # ─────────────────────────────────────
     # 1) Load tokenizer (defines vocab!)
