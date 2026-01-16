@@ -250,7 +250,9 @@ def train_phase1(config: Phase1Config) -> None:
     max_steps_first_stage = config.max_steps_first_stage
     loss_fn = AnswerLoss(keep_prob=keep_prob)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer.zero_grad(set_to_none=True)
     evaluator = Evaluator(max_length=config.max_length, batch_size=config.eval_batch_size if hasattr(config, "eval_batch_size") else 64, max_thoughts=config.max_thoughts)
+    gradient_accum_steps = config.gradient_accumulation_steps
 
     # Initialize StageManager
     sm = StageManager(stage_patience=config.stage_patience,
@@ -295,12 +297,17 @@ def train_phase1(config: Phase1Config) -> None:
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
             # Forward → logits
-
-            out, out_perm = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                return_perm_out=True,
-            )
+            if global_step % config.permutation_loss_interval_batches == 0:
+                out, out_perm = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    return_perm_out=True,
+                )
+            else:
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
 
             # Debug-only: ensure <ANSWER> is present exactly once per sample after batching
             if global_step == 1:
@@ -309,7 +316,7 @@ def train_phase1(config: Phase1Config) -> None:
                     "<ANSWER> missing or duplicated after batching"
 
             logits = out.get("logits")  # [B,5,10]
-            logits_perm = out_perm["logits"]
+
             if logits is None:
                 continue
 
@@ -317,20 +324,24 @@ def train_phase1(config: Phase1Config) -> None:
             loss_ans = loss_fn.compute(logits, batch["digit_labels"])  # scalar tensor
 
             # Permutation perturbation loss
-
-            loss_perm = permutation_sensitivity_loss(
-                logits_orig=logits,
-                logits_perm=logits_perm,
-            )
+            if global_step % config.permutation_loss_interval_batches == 0:
+                logits_perm = out_perm["logits"]
+                loss_perm = permutation_sensitivity_loss(
+                    logits_orig=logits,
+                    logits_perm=logits_perm,
+                )
+            else:
+                loss_perm = torch.tensor(0.0, device=device)
 
             # Total loss
-            loss = 1 * loss_ans + 4 * loss_perm
+            loss = (1 * loss_ans + 16 * loss_perm) / gradient_accum_steps
 
             if config.logg_loss_interval_batches > 0 and global_step % config.logg_loss_interval_batches == 0:
                 loss_ans_to_print = cur_answer_loss / config.logg_loss_interval_batches
                 loss_perm_to_print = cur_perm_loss / config.logg_loss_interval_batches
                 msg = f'[Stage {s}][Step {global_step}] Answer Loss: {loss_ans_to_print:.4f} Perm Loss: {loss_perm_to_print:.4f}'
                 print(msg)
+                torch.cuda.empty_cache()
 
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(msg + "\n")
@@ -339,12 +350,17 @@ def train_phase1(config: Phase1Config) -> None:
             cur_answer_loss += loss_ans.item()
             cur_perm_loss += loss_perm.item()
 
-            # Backward + step
-            optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
-            del loss, logits, out, batch
-            torch.cuda.empty_cache()
+            # Backward + step
+            if global_step % gradient_accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                del loss
+
+            del logits, out, batch
+
 
             # Periodic evaluation on validation data only
             if global_step % config.eval_interval_batches == 0:
@@ -356,13 +372,21 @@ def train_phase1(config: Phase1Config) -> None:
 
                 eval_id = global_step // config.eval_interval_batches
                 advanced, done = sm.update_on_evaluation(eval_id=eval_id, val_acc=val_acc)
-                # if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
-                #     sm.move_to_next_stage()
-                #     advanced = True
-                #     done = False
-                #     print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
+                if max_steps_first_stage == global_step / config.eval_interval_batches and sm.current_stage == 1:
+                    sm.move_to_next_stage()
+                    advanced = True
+                    done = False
+                    print(f"[Stage Manager] Forcing stage advance at max steps for stage 1")
 
                 if advanced:
+                    save_phase1_checkpoint(
+                        model=model,
+                        tokenizer=tokenizer,
+                        config=config,
+                        phase0_repo=config.phase0_repo,
+                        latent_token=LATENT_TOKEN,
+                        answer_token=ANSWER_TOKEN,
+                    )
                     # print('Resetting optimizer at advance')
                     # optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     dataset.already_been_called_to_print = False
