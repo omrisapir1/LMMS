@@ -67,7 +67,7 @@ def write_parquet_shard(
     num_latents_arr = pa.array([r["num_latents"] for r in rows], pa.int32())
     kmax_arr = pa.array([r["k_max"] for r in rows], pa.int32())
     kstar_arr = pa.array([r["K_star"] for r in rows], pa.int32())
-    model_id_arr = pa.array([r["model_id"] for r in rows], pa.string())
+
 
     # answer_digits: list<int32>[5]
     answer_digits_arr = pa.array([r["answer_digits"] for r in rows], pa.list_(pa.int32()))
@@ -88,7 +88,6 @@ def write_parquet_shard(
             num_latents_arr,
             kmax_arr,
             kstar_arr,
-            model_id_arr,
         ],
         names=[
             "qid",
@@ -98,7 +97,6 @@ def write_parquet_shard(
             "num_latents",
             "k_max",
             "K_star",
-            "model_id",
         ],
     )
     pq.write_table(table, out_path)
@@ -130,6 +128,9 @@ def make_latent_token_embedding(embedding_layer, device: torch.device) -> torch.
 
 def main():
     ap = argparse.ArgumentParser()
+    from datasets import load_dataset
+
+    ds = load_dataset("omrisap/LMMS_numina_250K")
     ap.add_argument("--dataset_name", type=str, default="omrisap/LMMS_numina_250K")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--output_dir", type=str, required=True)
@@ -418,7 +419,7 @@ def main():
                 "num_latents": int(K_star),
                 "k_max": int(args.k_max),
                 "K_star": int(K_star),
-                "model_id": args.model_id,
+                
             }
             buf.append(row)
             solved_qids.add(qids[bi])
