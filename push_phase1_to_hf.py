@@ -13,7 +13,7 @@ TORCH_DTYPE = torch.bfloat16
 
 
 def push_phase1_checkpoint(local_dir: str, hf_repo: str):
-    api = HfApi(token="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")
+    api = HfApi()
 
     # ─────────────────────────────────────
     # 1) Load tokenizer (defines vocab!)
