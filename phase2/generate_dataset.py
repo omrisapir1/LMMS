@@ -1,67 +1,24 @@
-#!/usr/bin/env python
-# phase2/make_latent_states_dataset.py
-#
-# Creates a dataset for Phase-2:
-# For each question, find the minimal K* in [0..k_max] for which the model predicts
-# the correct integer answer (from digit-head 5 digits). Save decision-point states:
-#
-#   h0: hidden state at the token just before the first latent insertion point
-#       (i.e., position answer_pos-1 in the k=0 sequence)
-#   h1..hK*: hidden states at each <LATENT> token position at the time it existed
-#            (captured BEFORE replacing that latent token embedding with hidden[p-1])
-#
-# Saved latent_states shape per row: [(K*+1), H] in float32
-#
-# Output schema (parquet shards):
-# {
-#   "qid": str,
-#   "question": str,
-#   "latent_states": list[list[float32]]  # (K*+1) x H
-#   "answer_digits": list[int]           # length 5
-#   "num_latents": int                   # K*
-#   "k_max": int
-#   "K_star": int
-#   "model_id": str
-# }
-#
-# Notes:
-# - Streaming/sharded write (no full RAM accumulation).
-# - Uses Phase0 forward directly + digit_heads for evaluation.
-# - Uses the same latent execution rule as Phase1: latent_embed[p] = hidden[p-1].
-# - Captures hi at the latent position BEFORE replacement.
-#
-# Usage example:
-#   python phase2/make_latent_states_dataset.py \
-#       --model_dir /path/to/phase1_ckpt \
-#       --output_dir /path/to/out_parquet \
-#       --k_max 20 --batch_size 64 --shard_size 10000 \
-#       --dataset_name omrisap/LMMS_numina_250K --split train \
-#       --model_id phase1_qwen25math_15b
-#
-# You must set start_tokens and end_tokens below (token-id lists).
+# DEBUG_GIT_CHANGE_DO_NOT_REMOVE
 
 from __future__ import annotations
-
 import argparse
-import math
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
-import numpy as np
 import torch
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import load_dataset
-from transformers import AutoTokenizer
+
 
 # --------------------------------------------------------------------
 # User-provided token-id lists (fill these in)
 # --------------------------------------------------------------------
 # start_tokens: question framing + question tokens (NO <LATENT>, NO <ANSWER>)
 # end_tokens: includes exactly one <ANSWER> token id, nothing after it
-START_TOKENS: List[int] = []  # <-- FILL ME
-END_TOKENS: List[int] = []    # <-- FILL ME
+START_TOKENS: List[int] = [151644, 8948, 198, 5501, 2874, 3019, 553, 3019, 11, 323, 2182, 697, 1590, 4226, 2878, 1124, 79075, 46391, 151645, 198, 151644, 872, 198]  # <-- FILL ME
+MID_TOKENS: List[int] = [151645, 198, 151644, 77091, 198]    # <-- FILL ME
+END_TOKENS: List[int] = [151665, 151643]    # <-- FILL ME
 
 # --------------------------------------------------------------------
 # Hard IDs (you used these already; keep consistent)
@@ -86,8 +43,8 @@ def ensure_dir(path: str) -> None:
 
 
 def build_input_ids(problem: str, tokenizer) -> List[int]:
-    # You said you will provide START_TOKENS and END_TOKENS (already token IDs).
-    return START_TOKENS + tokenizer.encode(problem) + END_TOKENS
+    # START + Question + MID + END  (no latents here; those are added dynamically by k)
+    return START_TOKENS + tokenizer.encode(problem) + MID_TOKENS + END_TOKENS
 
 
 def build_attention_mask_from_pad(input_ids: torch.Tensor, pad_id: int) -> torch.Tensor:
@@ -99,7 +56,7 @@ def write_parquet_shard(
     out_path: str,
 ) -> None:
     """
-    rows: list of dicts; latent_states must be list-of-list of float32
+    rows: list of dicts; latent_states must be list-of-list of float32 
     """
     if not rows:
         return
@@ -175,13 +132,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset_name", type=str, default="omrisap/LMMS_numina_250K")
     ap.add_argument("--split", type=str, default="train")
-    ap.add_argument("--model_dir", type=str, required=True, help="Path to your Phase-1 checkpoint dir or Phase-0 base dir")
     ap.add_argument("--output_dir", type=str, required=True)
     ap.add_argument("--k_max", type=int, default=20)
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--shard_size", type=int, default=10_000)
-    ap.add_argument("--model_id", type=str, default="")
-    ap.add_argument("--hf_tokenizer_repo", type=str, default="", help="Optional tokenizer repo/name; if empty, loads from model_dir")
+    ap.add_argument("--shard_size", type=int, default=2_000)
     ap.add_argument("--max_rows", type=int, default=-1, help="Debug: limit number of rows processed")
     args = ap.parse_args()
 
@@ -193,22 +147,11 @@ def main():
     # Load dataset
     ds = load_dataset(args.dataset_name, split=args.split)
 
-    # Load tokenizer
-    tok_src = args.hf_tokenizer_repo if args.hf_tokenizer_repo else args.model_dir
-    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
-
-    # You must have your trained Phase1 model object load here.
-    # If you already have a loader in your repo, import & use it.
-    #
-    # Example placeholder:
-    # from phase1.load_model_phase1 import load_phase1_model
-    # model = load_phase1_model(args.model_dir).to(device)
-    #
-    # For this script, we assume you will provide `load_phase1_model` that returns Phase1CoconutModel.
-    from phase1.load_model_phase1 import load_phase1_model  # <-- adjust import to your repo
+    # Load tokenizer + model via loader
+    from load_model_phase1 import load_phase1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_phase1_model(args.model_dir).to(device)
+    tokenizer, model, _meta = load_phase1(device=str(device))
     model.eval()
 
     # Phase0 components
@@ -240,9 +183,32 @@ def main():
     if args.max_rows > 0:
         n_rows = min(n_rows, args.max_rows)
 
-    # Track solved qids to avoid reprocessing across batches (you asked for this).
-    # Here qid is just the dataset index as string.
+    # Track solved qids to avoid reprocessing across batches
     solved_qids: set[str] = set()
+
+    # Helper to get fields from dataset row robustly
+    def get_question_and_answer(ex: Dict[str, Any]) -> Tuple[str, int]:
+        # Prefer common keys, with fallbacks
+        q = ex.get("question") or ex.get("problem") or ex.get("prompt")
+        if not isinstance(q, str):
+            # Try to coerce if it's a list of strings
+            if isinstance(q, list):
+                q = " ".join(map(str, q))
+            else:
+                q = str(q)
+        ans_raw = ex.get("generated_final_answer") or ex.get("final_answer") or ex.get("answer")
+        # Convert to int safely
+        if isinstance(ans_raw, int):
+            ans_int = ans_raw
+        elif isinstance(ans_raw, str):
+            ans_int = int("".join(ch for ch in ans_raw if ch.isdigit()) or 0)
+        else:
+            try:
+                ans_int = int(ans_raw)
+            except Exception:
+                ans_int = 0
+        ans_int = max(0, min(ans_int, 99999))
+        return q, ans_int
 
     for start in range(0, n_rows, args.batch_size):
         end = min(start + args.batch_size, n_rows)
@@ -260,20 +226,15 @@ def main():
                 continue
 
             ex = ds[i]
-            question = ex["problem"]
-            final_answer = ex["final_answer"]
+            question, lab_int = get_question_and_answer(ex)
 
-            # label as int (handles leading zeros by digit-compare)
-            lab_int = int(final_answer)
             lab_digits = int_to_5digits(lab_int)
 
             ids = build_input_ids(question, tokenizer)
 
             # sanity: ensure exactly one ANSWER_ID at end
-            if ids[-1] != ANSWER_ID:
-                raise RuntimeError(f"Expected <ANSWER> as last token. Got last token {ids[-1]} for qid={qid}")
             if ids.count(ANSWER_ID) != 1:
-                raise RuntimeError(f"Expected exactly one <ANSWER>. Found {ids.count(ANSWER_ID)} for qid={qid}")
+                raise RuntimeError("input sequence must contain exactly one <ANSWER> token id")
 
             qids.append(qid)
             questions.append(question)
@@ -292,20 +253,23 @@ def main():
         # decision states to save per sample once solved: list of tensors [K*+1, H]
         saved_states: Dict[int, torch.Tensor] = {}
         saved_kstar: Dict[int, int] = {}
+        # rolling latent history per sample (initialize when needed)
+        hist_states: Dict[int, List[torch.Tensor]] = {}
 
         # ------------------------------------------------------------------
         # Build k=0 base: remove all existing latent tokens and keep only ... + <ANSWER>
-        # (Your get_k_thoughts_per_row logic, but for k=0)
         # ------------------------------------------------------------------
         base_ids_per_sample: List[List[int]] = []
         answer_pos_per_sample: List[int] = []  # answer position index in base sequence
 
         for ids in input_ids_list:
-            answer_idx = ids.index(ANSWER_ID)
-            prefix = [t for t in ids[:answer_idx] if t != LATENT_ID]
-            base_ids = prefix + [ANSWER_ID]
-            base_ids_per_sample.append(base_ids)
-            answer_pos_per_sample.append(len(prefix))  # answer index
+            # Remove any latent placeholders that might already exist (stage-8 style)
+            ids_no_latents = [t for t in ids if t != LATENT_ID]
+            # Recompute answer_idx after removal (because indices shift)
+            answer_idx = ids_no_latents.index(ANSWER_ID)
+
+            base_ids_per_sample.append(ids_no_latents)
+            answer_pos_per_sample.append(answer_idx)  # position of <ANSWER> in k=0 sequence
 
         # Pad base batch
         max_len0 = max(len(x) for x in base_ids_per_sample)
@@ -318,21 +282,14 @@ def main():
             embeds = embedding_layer(input_ids0)  # [B, T0, H]
 
         # We'll maintain per-sample current embeddings + attention masks + answer positions
-        # as Python lists of tensors because length changes as we insert latents.
         cur_embeds: List[torch.Tensor] = [embeds[b, :attn0[b].sum().item(), :].contiguous() for b in range(B)]
         cur_masks: List[torch.Tensor] = [torch.ones(cur_embeds[b].shape[0], device=device, dtype=torch.long) for b in range(B)]
         cur_answer_pos: List[int] = answer_pos_per_sample[:]  # shifts as we insert latents
 
         # ------------------------------------------------------------------
         # Evaluate k=0 and capture h0 (decision point before first latent insertion)
-        # h0 is hidden at position (answer_pos - 1) in the k=0 sequence.
         # ------------------------------------------------------------------
         def run_eval_on_active(active: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            Returns:
-              logits_digits: [len(active), 5, 10]
-              hidden_last: [len(active), T, H]
-            """
             # pad active
             maxL = max(cur_embeds[i].shape[0] for i in active)
             H = cur_embeds[active[0]].shape[1]
@@ -370,14 +327,10 @@ def main():
         logits0, hidden0 = run_eval_on_active(active_idx)
         pred_digits0 = torch.argmax(logits0, dim=-1).tolist()
 
-        # Capture h0 for each sample from k=0 hidden:
-        # h0 position is (answer_pos - 1). If answer_pos==0, that's invalid (shouldn't happen).
-        # We'll store later only for solved ones, but we need to compute it now.
         h0_all: Dict[int, torch.Tensor] = {}
         for j, bi in enumerate(active_idx):
             ap0 = cur_answer_pos[bi]
             if ap0 <= 0:
-                # This would mean answer is at position 0; not expected given your framing.
                 raise RuntimeError(f"Answer position <=0 at k=0 for qid={qids[bi]}")
             h0_all[bi] = hidden0[j, ap0 - 1, :].detach()
 
@@ -393,10 +346,7 @@ def main():
         active_idx = still_active
 
         # ------------------------------------------------------------------
-        # For k = 1..k_max: insert one latent token before <ANSWER>,
-        # capture h_k at the latent token position BEFORE replacement,
-        # then replace embedding with hidden[p-1] (Phase1 rule),
-        # then evaluate answer and early-stop those solved.
+        # For k = 1..k_max: insert one latent token before <ANSWER>, capture h_k, replace, eval
         # ------------------------------------------------------------------
         for k in range(1, args.k_max + 1):
             if not active_idx:
@@ -408,7 +358,6 @@ def main():
                 emb = cur_embeds[bi]
                 H = emb.shape[1]
 
-                # Insert a latent token embedding (NOT zeros)
                 latent_row = latent_token_emb.view(1, H).to(dtype=emb.dtype)
                 cur_embeds[bi] = torch.cat([emb[:p], latent_row, emb[p:]], dim=0)
                 cur_masks[bi] = torch.ones(cur_embeds[bi].shape[0], device=device, dtype=torch.long)
@@ -419,63 +368,25 @@ def main():
             # Run forward to get hidden states for current sequences (with latent token present)
             logits_k, hidden_k = run_eval_on_active(active_idx)
 
-            # For each active sample, capture h_k at latent position (p),
-            # and compute replacement z_k = hidden[p-1], then write it into embedding at p.
-            # Need to know latent position p for each active sample in THIS step: it's answer_pos-1.
-            # Because we inserted latent right before answer.
-            # So latent position = cur_answer_pos - 1.
+            # Capture h_k at latent position and replace embedding with hidden at latent_pos-1
             h_k_captured: Dict[int, torch.Tensor] = {}
             for j, bi in enumerate(active_idx):
                 latent_pos = cur_answer_pos[bi] - 1
                 h_k_captured[bi] = hidden_k[j, latent_pos, :].detach()
-
-                # Replace latent embedding with hidden at latent_pos-1
                 z = hidden_k[j, latent_pos - 1, :].detach()
-                # Write into cur_embeds
                 cur_embeds[bi][latent_pos, :] = z
 
-            # Re-evaluate answer AFTER replacement (because answer depends on the new latent embedding).
+            # Maintain rolling history
+            for bi in active_idx:
+                if bi not in hist_states:
+                    hist_states[bi] = [h0_all[bi]]
+                hist_states[bi].append(h_k_captured[bi])
+
+            # Re-evaluate answer AFTER replacement
             logits_k2, _hidden_k2 = run_eval_on_active(active_idx)
             pred_digits = torch.argmax(logits_k2, dim=-1).tolist()
 
             # Early-stop solved
-            still_active = []
-            for j, bi in enumerate(active_idx):
-                pred_int = digits_to_int(pred_digits[j])
-                if pred_int == labels_int[bi]:
-                    # Build states: [h0, h1..hk]
-                    # h0 from k=0; h1..hk captured during each step; we have only hk now.
-                    # So we must accumulate hk across steps.
-                    #
-                    # We'll store per-sample rolling list in a dict of tensors.
-                    # Initialize if first time we reach here:
-                    if bi not in saved_states:
-                        # not solved earlier; start with h0
-                        rolling = [h0_all[bi]]
-                    else:
-                        # shouldn't happen: if bi in saved_states it's already solved
-                        rolling = [h0_all[bi]]
-
-                    # To avoid keeping per-step history for all actives, we reconstruct by
-                    # storing rolling history in a dict during the loop:
-                    pass
-                else:
-                    still_active.append(bi)
-
-            # We need to actually maintain rolling h1..hK for active samples.
-            # We'll do it via a dict: hist_states[bi] = [h0, h1, ... current]
-            # Initialize it after k=0 for those still active.
-            if k == 1:
-                hist_states: Dict[int, List[torch.Tensor]] = {bi: [h0_all[bi]] for bi in active_idx}
-            # Append hk for everyone active in this k
-            for bi in active_idx:
-                if bi in hist_states:
-                    hist_states[bi].append(h_k_captured[bi])
-                else:
-                    # should not happen, but be safe
-                    hist_states[bi] = [h0_all[bi], h_k_captured[bi]]
-
-            # Now evaluate solved based on logits_k2
             active_idx_next: List[int] = []
             for j, bi in enumerate(active_idx):
                 pred_int = digits_to_int(pred_digits[j])
@@ -483,7 +394,6 @@ def main():
                     states = torch.stack(hist_states[bi], dim=0)  # [(k+1), H]
                     saved_states[bi] = states
                     saved_kstar[bi] = k
-                    # remove from hist_states to free memory
                     hist_states.pop(bi, None)
                 else:
                     active_idx_next.append(bi)
