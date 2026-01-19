@@ -225,7 +225,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     )
     print(5)
     # Losses
-    keep_prob = compute_keep_prob_from_dataset(train_ds)
+    keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
     z_kl_loss_fn = ZUsageKLLoss(vocab_size=cfg.z_vocab_size)
     print(f"AnswerLoss keep_prob: {keep_prob}")
@@ -268,7 +268,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             batch = next(loader_iter)
 
         new_temp = compute_temperature(global_step, cfg)
-        if temp is not None and new_temp != temp:
+        if new_temp != temp:
             print(f"Changing temperature from {temp} to {new_temp}")
             temp = new_temp
 
