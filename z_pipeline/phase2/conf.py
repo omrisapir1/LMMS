@@ -140,7 +140,7 @@ class Phase2EvalConfig:
 # Top-level Phase-2 config
 # ─────────────────────────────────────────────────────────────
 
-@dataclass
+
 class Phase2Config:
     """
     Full Phase-2 configuration.
