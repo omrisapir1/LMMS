@@ -139,6 +139,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     if answer_token_id is None or answer_token_id < 0:
         raise RuntimeError("Could not resolve answer token id '<ANSWER>' from tokenizer")
 
+    print(1)
     # Write back to cfg for downstream consumers, and set default data config
     cfg.latent_token_id = int(latent_token_id)
     cfg.answer_token_id = int(answer_token_id)
@@ -152,7 +153,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     phase0 = phase1_model.phase0
     base_lm = phase0.model
     digit_heads = phase0.digit_heads
-
+    print(2)
     # Expand tokenizer with Z tokens
     z_tokens = [z_token_str(i) for i in range(cfg.z_vocab_size)]
     existing = set(tokenizer.get_vocab().keys())
@@ -170,7 +171,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         if tid is None or tid < 0:
             raise RuntimeError(f"Failed to convert token to id: {z_token_str(i)}")
         z_token_ids.append(int(tid))
-
+    print(3)
     # Build Phase-2 model
     model = Phase2ZModel(
         base_lm=base_lm,
@@ -199,7 +200,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     torch.nn.init.xavier_uniform_(model.z_selector.weight)
     if model.z_selector.bias is not None:
         torch.nn.init.zeros_(model.z_selector.bias)
-
+    print(4)
     # Dataset
     train_ds = Phase2Dataset(
         tokenizer=tokenizer,
@@ -222,7 +223,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         pin_memory=cfg.data.pin_memory and torch.cuda.is_available(),
         collate_fn=phase2_collate_fn,
     )
-
+    print(5)
     # Losses
     keep_prob = compute_keep_prob_from_dataset(train_ds, alpha=0.3, min_k=0.05)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
@@ -253,7 +254,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     no_improve = 0
     global_step = 0
     model.train()
-
+    print(6)
     # Loop
     loader_iter = iter(train_loader)
     while global_step < max_steps:
@@ -271,7 +272,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         latent_states = batch["latent_states"].to(device, non_blocking=True)
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
-        print(f'First batch {input_ids.sahpe}')
+        print(f'First batch {input_ids.shape}, temp {temp:.2f}')
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
