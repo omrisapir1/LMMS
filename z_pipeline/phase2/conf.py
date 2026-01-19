@@ -68,7 +68,7 @@ class Phase2LossConfig:
 
 @dataclass
 class Phase2DataConfig:
-    dataset_name: str
+    dataset_name: str = "omrisap/phaseZ"
 
     train_split: str = "train"
     eval_split: str = "eval"
