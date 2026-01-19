@@ -271,7 +271,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         latent_states = batch["latent_states"].to(device, non_blocking=True)
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
-
+        print(f'First batch {input_ids.sahpe}')
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
