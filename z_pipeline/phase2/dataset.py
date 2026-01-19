@@ -259,7 +259,7 @@ def phase2_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.T
         "digit_labels": digit_labels,
     }
 
-def compute_keep_prob_from_dataset(dataset, alpha=0.3, min_k=0.05):
+def compute_keep_prob_from_dataset(dataset, alpha=0.05, min_k=0.05):
     zero_counts = [0] * 5
     total = 0
 
