@@ -77,7 +77,7 @@ class Phase2ZModel(nn.Module):
 
         # Re-enable embedding grads + mask to Z rows only
         self._emb.weight.requires_grad = True
-        z_row_mask = torch.zeros(self._emb.weight.shape[0], dtype=torch.float32)
+        z_row_mask = torch.zeros(self._emb.weight.shape[0], dtype=torch.bfloat16)
         z_row_mask[self.z_token_ids] = 1.0
         self.register_buffer("_z_row_grad_mask", z_row_mask, persistent=False)
 

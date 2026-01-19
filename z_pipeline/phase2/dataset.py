@@ -178,8 +178,8 @@ class Phase2Dataset(Dataset):
 
         # latent_states padding
         H = len(latent_states_list[0])
-        latent_states = torch.zeros((self.k_max, H), dtype=torch.float32)
-        latent_states[:K] = torch.tensor(latent_states_list, dtype=torch.float32)
+        latent_states = torch.zeros((self.k_max, H), dtype=torch.bfloat16)
+        latent_states[:K] = torch.tensor(latent_states_list, dtype=torch.bfloat16)
 
         z_mask = torch.zeros(self.k_max, dtype=torch.bool)
         z_mask[:K] = True
