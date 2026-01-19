@@ -148,6 +148,7 @@ class Phase2Config:
     # Identity / logging
     run_name: str = "phase2_z_learning"
     seed: int = 42
+    print_every: int = 10
 
     # Z vocabulary
     z_vocab_size: int = 1024

@@ -245,6 +245,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
     # Training control
     eval_every = int(cfg.eval.eval_every_steps)
+    print_every = int(cfg.print_every)
     min_steps = int(cfg.eval.min_steps or 0)
     patience = int(cfg.eval.patience)
     min_delta = float(cfg.eval.min_delta)
@@ -256,6 +257,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     model.train()
     print(6)
     # Loop
+    cur_answer_loss, cur_kl_loss = 0.0, 0.0
     loader_iter = iter(train_loader)
     while global_step < max_steps:
         try:
@@ -287,7 +289,15 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl
-        print(f"Step {global_step}: loss_answer={loss_answer:.4f} loss_kl={loss_kl:.4f} loss={loss:.4f}")
+        if global_step % print_every == 0:
+            loss_ans_to_print = cur_answer_loss / cfg.print_every
+            loss_kl_to_print = cur_kl_loss / cfg.print_every
+            print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f}")
+            cur_answer_loss = 0
+            cur_kl_loss = 0
+        cur_answer_loss += loss_answer.item()
+        cur_kl_loss += loss_kl.item()
+
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

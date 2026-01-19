@@ -14,7 +14,7 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 
-from .dataset import Phase2Dataset
+from .dataset import Phase2Dataset, phase2_collate_fn
 
 
 @torch.no_grad()
@@ -62,6 +62,7 @@ def evaluate_phase2(
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
+        collate_fn=phase2_collate_fn,
     )
 
     # ------------------------------------------------------------------
