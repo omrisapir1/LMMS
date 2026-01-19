@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Dict
 
 import math
 import random
@@ -33,7 +33,7 @@ from .dataset import Phase2Dataset, phase2_collate_fn, compute_keep_prob_from_da
 from .loss import AnswerLoss, ZUsageKLLoss
 from .eval import evaluate_phase2
 from .model import Phase2ZModel
-
+from .conf import Phase2DataConfig
 
 # -----------------------------
 # Utils
@@ -114,64 +114,64 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     """
     Returns phase2_ckpt dict (in-memory handoff).
     """
-    cfg = cfg.finalize()
-
+    # Do not finalize yet; we need tokenizer-derived IDs first.
     set_seed_best_effort(cfg.seed)
 
-    # -----------------------------
-    # Load Phase-1 model (for base LM + digit heads)
-    # -----------------------------
-    # Expected to exist in your repo; signature matches your earlier usage.
-    from load_model_phase1 import load_phase1  # type: ignore
-
+    # Load Phase-1 tokenizer + model
+    from z_pipeline.shared.load_model_phase1 import load_phase1, LATENT_TOKEN  # type: ignore
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer, phase1_model, _meta = load_phase1(device=device_str)
+    tokenizer, phase1_model, meta = load_phase1(device=device_str)
 
-    # Phase-2 bypasses Coconut execution; we only need phase0 components.
+    # Ensure pad token id exists
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise RuntimeError("Tokenizer has no pad or eos token; set pad token explicitly.")
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Resolve token IDs directly from tokenizer
+    latent_token_str = LATENT_TOKEN
+    latent_token_id = tokenizer.convert_tokens_to_ids(latent_token_str)
+    if latent_token_id is None or latent_token_id < 0:
+        raise RuntimeError(f"Could not resolve latent token id for '{latent_token_str}' from tokenizer")
+
+    answer_token_str = "<ANSWER>"
+    answer_token_id = tokenizer.convert_tokens_to_ids(answer_token_str)
+    if answer_token_id is None or answer_token_id < 0:
+        raise RuntimeError("Could not resolve answer token id '<ANSWER>' from tokenizer")
+
+    # Write back to cfg for downstream consumers, and set default data config
+    cfg.latent_token_id = int(latent_token_id)
+    cfg.answer_token_id = int(answer_token_id)
+    if cfg.data is None:
+        cfg.data = Phase2DataConfig()
+
+    # Finalize once now that IDs are set
+    cfg = cfg.finalize()
+
+    # Pull phase-0 components from phase-1
     phase0 = phase1_model.phase0
     base_lm = phase0.model
     digit_heads = phase0.digit_heads
 
-    # Ensure pad token exists (DataLoader padding relies on it being stable)
-    if tokenizer.pad_token_id is None:
-        # best effort: reuse EOS as PAD
-        if tokenizer.eos_token_id is None:
-            raise RuntimeError("Tokenizer has no pad_token_id and no eos_token_id; set pad token explicitly.")
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Resolve token ids
-    latent_token_id = int(cfg.latent_token_id)
-    answer_token_id = int(cfg.answer_token_id)
-
-    # -----------------------------
     # Expand tokenizer with Z tokens
-    # -----------------------------
     z_tokens = [z_token_str(i) for i in range(cfg.z_vocab_size)]
-
-    # Add only those not present (idempotent)
     existing = set(tokenizer.get_vocab().keys())
     to_add = [t for t in z_tokens if t not in existing]
-
     if to_add:
         tokenizer.add_tokens(to_add, special_tokens=False)
 
-    # Resize base model embeddings to new vocab size
-    try:
-        base_lm.resize_token_embeddings(len(tokenizer))
-    except Exception as e:
-        raise RuntimeError(f"Failed to resize_token_embeddings to {len(tokenizer)}: {e}")
+    # Resize base model embeddings to tokenizer size
+    base_lm.resize_token_embeddings(len(tokenizer))
 
-    # Map <Z_i> -> token ids in order 0..V-1
-    z_token_ids: List[int] = []
+    # Map Z tokens to ids
+    z_token_ids: list[int] = []
     for i in range(cfg.z_vocab_size):
         tid = tokenizer.convert_tokens_to_ids(z_token_str(i))
         if tid is None or tid < 0:
             raise RuntimeError(f"Failed to convert token to id: {z_token_str(i)}")
         z_token_ids.append(int(tid))
 
-    # -----------------------------
-    # Build Phase-2 model wrapper
-    # -----------------------------
+    # Build Phase-2 model
     model = Phase2ZModel(
         base_lm=base_lm,
         digit_heads=digit_heads,
@@ -185,15 +185,10 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
     device = get_device_from_model(model)
 
-    # -----------------------------
-    # Initialize Z embeddings (best-effort)
-    # -----------------------------
-    # You didn't specify a special init. We'll:
-    # - initialize each Z row with N(0, std) matching existing embedding stats.
+    # Initialize Z embeddings
     emb = model.base.get_input_embeddings()
     with torch.no_grad():
         w = emb.weight
-        # embedding stats
         std = float(w.std().item()) if w.numel() > 0 else 0.02
         for tid in z_token_ids:
             w[tid].normal_(mean=0.0, std=max(std, 1e-4))
@@ -203,9 +198,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     if model.z_selector.bias is not None:
         torch.nn.init.zeros_(model.z_selector.bias)
 
-    # -----------------------------
-    # Data
-    # -----------------------------
+    # Dataset
     train_ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=cfg.data.dataset_name,
@@ -228,18 +221,13 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         collate_fn=phase2_collate_fn,
     )
 
-    # -----------------------------
     # Losses
-    # -----------------------------
     keep_prob = compute_keep_prob_from_dataset(train_ds, alpha=0.3, min_k=0.05)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
     z_kl_loss_fn = ZUsageKLLoss(vocab_size=cfg.z_vocab_size)
-    print(f'AnswerLoss keep_prob: {keep_prob}')
+    print(f"AnswerLoss keep_prob: {keep_prob}")
 
-    # -----------------------------
-    # Optimizer (ONLY selector + embedding weight)
-    # -----------------------------
-    # Note: embedding weight is a single Parameter; gradients are masked inside the model.
+    # Optimizer
     optim_params = [
         {"params": list(model.z_selector.parameters()), "weight_decay": cfg.optim.weight_decay},
         {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
@@ -252,29 +240,20 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         weight_decay=cfg.optim.weight_decay,
     )
 
-    # -----------------------------
-    # Training loop control
-    # -----------------------------
+    # Training control
     eval_every = int(cfg.eval.eval_every_steps)
     min_steps = int(cfg.eval.min_steps or 0)
     patience = int(cfg.eval.patience)
     min_delta = float(cfg.eval.min_delta)
-
-    # Hard max steps so runs terminate even without early stop:
-    # finish temp schedule + patience eval windows
     max_steps = min_steps + patience * eval_every
 
     best_em = -1.0
     no_improve = 0
-
     global_step = 0
     model.train()
 
-    # -----------------------------
-    # Training loop
-    # -----------------------------
+    # Loop
     loader_iter = iter(train_loader)
-
     while global_step < max_steps:
         try:
             batch = next(loader_iter)
@@ -283,8 +262,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             batch = next(loader_iter)
 
         global_step += 1
-
-        # Temperature schedule (selector logits only)
         temp = compute_temperature(global_step, cfg)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -293,7 +270,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
 
-        # Forward (need z_probs for KL loss)
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -308,23 +284,16 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
         loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
-
         loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-
         if cfg.optim.max_grad_norm is not None and cfg.optim.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.optim.max_grad_norm))
-
         optimizer.step()
 
-        # -------------------------
-        # Periodic eval
-        # -------------------------
         if global_step % eval_every == 0:
             eval_model = _EvalTemperatureProxy(model, eval_temp=1e-6)
-
             metrics = evaluate_phase2(
                 model=eval_model,
                 tokenizer=tokenizer,
@@ -335,27 +304,17 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 k_max=cfg.data.k_max,
                 device=device,
             )
-
             digit_em = float(metrics["digit_em"])
-
-            # Early stopping gate
             if global_step >= min_steps:
                 if digit_em > best_em + min_delta:
                     best_em = digit_em
                     no_improve = 0
                 else:
                     no_improve += 1
-
                 if no_improve >= patience:
-                    # As requested: do NOT restore best; continue with current weights to Phase-3.
                     break
-
-            # Back to train mode (base may remain eval if cfg.force_base_eval)
             model.train()
 
-    # -----------------------------
-    # Return in-memory handoff
-    # -----------------------------
     phase2_ckpt = {
         "model": model,
         "tokenizer": tokenizer,
@@ -365,6 +324,5 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         "phase2_cfg": asdict(cfg),
     }
     return phase2_ckpt
-
 
 __all__ = ["run_phase2"]
