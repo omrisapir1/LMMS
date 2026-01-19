@@ -263,10 +263,19 @@ def compute_keep_prob_from_dataset(dataset, alpha=0.3, min_k=0.05):
     zero_counts = [0] * 5
     total = 0
 
-    for ex in dataset:
-        digits = ex["answer_digits"]
+    # If a Phase2Dataset was passed, iterate underlying HF dataset to avoid heavy __getitem__
+    source_iter = getattr(dataset, "ds", None)
+    if source_iter is None:
+        source_iter = dataset
+
+    for ex in source_iter:
+        # HF dataset rows have 'answer_digits'; batched items have 'digit_labels'
+        digits = ex.get("answer_digits")
+
         for i in range(5):
-            if digits[i] == 0:
+            val = int(digits[i])
+
+            if val == 0:
                 zero_counts[i] += 1
         total += 1
 
