@@ -259,6 +259,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     # Loop
     cur_answer_loss, cur_kl_loss = 0.0, 0.0
     loader_iter = iter(train_loader)
+    temp = None
     while global_step < max_steps:
         try:
             batch = next(loader_iter)
@@ -266,8 +267,11 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
 
+        new_temp = compute_temperature(global_step, cfg)
+        if temp is not None and new_temp != temp:
+            print(f"Changing temperature from {temp} to {new_temp}")
+            temp = new_temp
 
-        temp = compute_temperature(global_step, cfg)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
@@ -289,7 +293,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl
-        if global_step % print_every == 0:
+        if global_step % print_every == 0 and global_step > 0:
             loss_ans_to_print = cur_answer_loss / cfg.print_every
             loss_kl_to_print = cur_kl_loss / cfg.print_every
             print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f}")
@@ -317,6 +321,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 k_max=cfg.data.k_max,
                 device=device,
             )
+            print(f"Eval metrics: {metrics}")
             digit_em = float(metrics["digit_em"])
             if global_step >= min_steps:
                 if digit_em > best_em + min_delta:
