@@ -59,6 +59,7 @@ class Phase2LossConfig:
     """
     lambda_answer: float = 1.0
     lambda_kl: float = 0.05
+    keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
 
 
