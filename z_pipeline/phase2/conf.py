@@ -75,7 +75,7 @@ class Phase2DataConfig:
 
     k_max: int = 20
 
-    batch_size: int = 4
+    batch_size: int = 8
     eval_batch_size: int = 64
 
     num_workers: int = 4
