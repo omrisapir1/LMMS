@@ -62,7 +62,7 @@ class Phase2ZModel(nn.Module):
         self.hidden_size = int(hidden_size)
 
         # Trainable selector
-        self.z_selector = nn.Linear(self.hidden_size, self.z_vocab_size, bias=True)
+        self.z_selector = nn.Linear(self.hidden_size, self.z_vocab_size, bias=True, dtype=torch.bfloat16)
 
         # Embedding module (Z rows live here)
         self._emb = self.base.get_input_embeddings()
