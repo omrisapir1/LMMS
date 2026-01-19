@@ -205,7 +205,7 @@ class Phase2ZModel(nn.Module):
         inputs_embeds = self._emb(input_ids)  # [B,T,H]
 
         # selector logits only for active steps (mask others to -inf so probs ~0)
-        h = latent_states.to(device=device, dtype=inputs_embeds.dtype)  # [B,Kmax,H]
+        h = latent_states.to(device=device, dtype=torch.bfloat16, )  # [B,Kmax,H]
         z_logits = self.z_selector(h)  # [B,Kmax,V]
 
         # mask inactive positions so they don't contribute to z_probs / KL
