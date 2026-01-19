@@ -266,7 +266,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
 
-        global_step += 1
+
         temp = compute_temperature(global_step, cfg)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -327,6 +327,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 if no_improve >= patience:
                     break
             model.train()
+        global_step += 1
 
     phase2_ckpt = {
         "model": model,
