@@ -225,7 +225,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     )
     print(5)
     # Losses
-    keep_prob = compute_keep_prob_from_dataset(train_ds, alpha=0.3, min_k=0.05)
+    keep_prob = compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
     z_kl_loss_fn = ZUsageKLLoss(vocab_size=cfg.z_vocab_size)
     print(f"AnswerLoss keep_prob: {keep_prob}")
@@ -272,7 +272,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         latent_states = batch["latent_states"].to(device, non_blocking=True)
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
-        print(f'First batch {input_ids.shape}, temp {temp:.2f}')
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -288,6 +287,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl
+        print(f"Step {global_step}: loss_answer={loss_answer:.4f} loss_kl={loss_kl:.4f} loss={loss:.4f}")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -329,3 +329,4 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     return phase2_ckpt
 
 __all__ = ["run_phase2"]
+
