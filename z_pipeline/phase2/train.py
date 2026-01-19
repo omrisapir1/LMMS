@@ -183,7 +183,9 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         force_base_eval=cfg.force_base_eval,
     )
 
-    device = get_device_from_model(model)
+    # Ensure all submodules (especially new Phase-2 heads) live on the same device as Phase-1
+    device = next(base_lm.parameters()).device
+    model.to(device)
 
     # Initialize Z embeddings
     emb = model.base.get_input_embeddings()
