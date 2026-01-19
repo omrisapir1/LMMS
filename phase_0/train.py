@@ -75,7 +75,7 @@ def compute_digit_accuracy(logits, labels):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, save_path: Path | None = None):
+def evaluate(model, dataloader, device, save_path=None):
     model.eval()
 
     total_correct = 0
