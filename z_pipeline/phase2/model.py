@@ -71,9 +71,8 @@ class Phase2ZModel(nn.Module):
         if freeze_base:
             for p in self.base.parameters():
                 p.requires_grad = False
-        if freeze_digit_heads:
-            for p in self.digit_heads.parameters():
-                p.requires_grad = False
+        for p in self.digit_heads.parameters():
+            p.requires_grad = True
 
         # Re-enable embedding grads + mask to Z rows only
         self._emb.weight.requires_grad = True
