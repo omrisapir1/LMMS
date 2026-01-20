@@ -34,4 +34,4 @@ class Phase1Config:
 
     # Logging
     log_dir: str = "runs/phase1"
-    logg_loss_interval_batches: int = 25
+    logg_loss_interval_batches: int = 10
