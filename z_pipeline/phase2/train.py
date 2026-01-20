@@ -340,6 +340,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             print_top_z(metrics["z_distribution"], topk=15, title="Global Z usage")
             print_top_z(metrics["z_distribution_k1"], topk=15, title="Z usage when K=1")
             print("\nDominant Z ratio by K:")
+            print(f'Current temperature: {temp:.2f}')
             for K in sorted(metrics["dominant_z_ratio_by_k"]):
                 v = metrics["dominant_z_ratio_by_k"][K]
                 print(f"  K={K:2d}: {v:.3f}")
