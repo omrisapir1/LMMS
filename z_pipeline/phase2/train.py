@@ -265,6 +265,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     # Loop
     cur_answer_loss, cur_kl_loss = 0.0, 0.0
     loader_iter = iter(train_loader)
+    temp = 0.0
     while global_step < max_steps:
         try:
             batch = next(loader_iter)
