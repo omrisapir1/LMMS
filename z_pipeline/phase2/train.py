@@ -261,7 +261,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     no_improve = 0
     global_step = 0
     model.train()
-    print(6)
+
     # Loop
     cur_answer_loss, cur_kl_loss = 0.0, 0.0
     loader_iter = iter(train_loader)
@@ -271,8 +271,10 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         except StopIteration:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
-
-        temp = compute_temperature(global_step, cfg)
+        new_temp = compute_temperature(global_step, cfg)
+        if (int(abs(new_temp) * 10) % 10) != (int(abs(temp) * 10) % 10):
+            print(f"Step {global_step}: new temperature: {new_temp:.2f}")
+        temp = new_temp
 
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
