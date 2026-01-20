@@ -160,7 +160,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     phase0 = phase1_model.phase0
     base_lm = phase0.model
     digit_heads = phase0.digit_heads
-    print(2)
+
     # Expand tokenizer with Z tokens
     z_tokens = [z_token_str(i) for i in range(cfg.z_vocab_size)]
     existing = set(tokenizer.get_vocab().keys())
@@ -178,7 +178,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         if tid is None or tid < 0:
             raise RuntimeError(f"Failed to convert token to id: {z_token_str(i)}")
         z_token_ids.append(int(tid))
-    print(3)
+
     # Build Phase-2 model
     model = Phase2ZModel(
         base_lm=base_lm,
@@ -207,7 +207,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     torch.nn.init.xavier_uniform_(model.z_selector.weight)
     if model.z_selector.bias is not None:
         torch.nn.init.zeros_(model.z_selector.bias)
-    print(4)
+
     # Dataset
     train_ds = Phase2Dataset(
         tokenizer=tokenizer,
@@ -280,14 +280,19 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         latent_states = batch["latent_states"].to(device, non_blocking=True)
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            latent_states=latent_states,
-            z_mask=z_mask,
-            temperature=float(temp),
-            return_z_probs=True,
-        )
+        try:
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                latent_states=latent_states,
+                z_mask=z_mask,
+                temperature=float(temp),
+                return_z_probs=True,
+            )
+        except Exception as e:
+            print(f"Error at step {global_step}: {e}")
+            torch.cuda.empty_cache()
+            continue
 
         digit_logits = out["digit_logits"]
         z_probs = out["z_probs"]
@@ -331,7 +336,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 v = metrics["dominant_z_ratio_by_k"][K]
                 print(f"  K={K:2d}: {v:.3f}")
 
-                
+
             digit_em = float(metrics["digit_em"])
             if global_step >= min_steps:
                 if digit_em > best_em + min_delta:
