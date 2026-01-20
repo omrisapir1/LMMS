@@ -110,6 +110,14 @@ class _EvalTemperatureProxy:
 # Main entry point
 # -----------------------------
 
+
+def print_top_z(dist, topk=10, title="Z distribution"):
+    idx = np.argsort(dist)[::-1][:topk]
+    print(f"\n{title} (top {topk}):")
+    for i in idx:
+        if dist[i] > 0:
+            print(f"  Z_{i:4d}: {dist[i]:.4f}")
+
 def run_phase2(cfg: Phase2Config) -> Dict:
     """
     Returns phase2_ckpt dict (in-memory handoff).
@@ -139,7 +147,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     if answer_token_id is None or answer_token_id < 0:
         raise RuntimeError("Could not resolve answer token id '<ANSWER>' from tokenizer")
 
-    print(1)
     # Write back to cfg for downstream consumers, and set default data config
     cfg.latent_token_id = int(latent_token_id)
     cfg.answer_token_id = int(answer_token_id)
@@ -223,7 +230,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         pin_memory=cfg.data.pin_memory and torch.cuda.is_available(),
         collate_fn=phase2_collate_fn,
     )
-    print(5)
     # Losses
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
@@ -259,7 +265,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     # Loop
     cur_answer_loss, cur_kl_loss = 0.0, 0.0
     loader_iter = iter(train_loader)
-    temp = None
     while global_step < max_steps:
         try:
             batch = next(loader_iter)
@@ -267,10 +272,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
 
-        new_temp = compute_temperature(global_step, cfg)
-        if new_temp != temp:
-            print(f"Changing temperature from {temp} to {new_temp}")
-            temp = new_temp
+        temp = compute_temperature(global_step, cfg)
 
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -321,7 +323,15 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 k_max=cfg.data.k_max,
                 device=device,
             )
-            print(f"Eval metrics: {metrics}")
+            print(f"Digit EM: {metrics['digit_em'] * 100:.2f}%")
+            print_top_z(metrics["z_distribution"], topk=15, title="Global Z usage")
+            print_top_z(metrics["z_distribution_k1"], topk=15, title="Z usage when K=1")
+            print("\nDominant Z ratio by K:")
+            for K in sorted(metrics["dominant_z_ratio_by_k"]):
+                v = metrics["dominant_z_ratio_by_k"][K]
+                print(f"  K={K:2d}: {v:.3f}")
+
+                
             digit_em = float(metrics["digit_em"])
             if global_step >= min_steps:
                 if digit_em > best_em + min_delta:
