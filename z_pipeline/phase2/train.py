@@ -313,7 +313,12 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        try:
+            loss.backward()
+        except Exception as e:
+            print(f"Error at step {global_step}: {e}")
+            torch.cuda.empty_cache()
+            continue
         if cfg.optim.max_grad_norm is not None and cfg.optim.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.optim.max_grad_norm))
         optimizer.step()
