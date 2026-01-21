@@ -58,7 +58,7 @@ class Phase2LossConfig:
          + lambda_kl     * ZUsageKLLoss
     """
     lambda_answer: float = 1.0
-    lambda_kl: float = 0.25
+    lambda_kl: float = 0.05
     keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
 
@@ -76,7 +76,7 @@ class Phase2DataConfig:
 
     k_max: int = 20
 
-    batch_size: int = 8
+    batch_size: int = 16
     eval_batch_size: int = 64
 
     num_workers: int = 4
@@ -136,6 +136,11 @@ class Phase2EvalConfig:
     max_entropy: Optional[float] = None
     min_mean_max_prob: Optional[float] = None
 
+@dataclass
+class Phase2ClusterConfig:
+
+    n_iter: int = 25
+
 
 # ─────────────────────────────────────────────────────────────
 # Top-level Phase-2 config
@@ -164,6 +169,7 @@ class Phase2Config:
     loss: Phase2LossConfig = Phase2LossConfig()
     temp: TemperatureSchedule = TemperatureSchedule()
     eval: Phase2EvalConfig = Phase2EvalConfig()
+    cluster: Phase2ClusterConfig = Phase2ClusterConfig()
 
     # Misc
     force_base_eval: bool = True

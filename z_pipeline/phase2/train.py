@@ -34,6 +34,7 @@ from .loss import AnswerLoss, ZUsageKLLoss
 from .eval import evaluate_phase2
 from .model import Phase2ZModel
 from .conf import Phase2DataConfig
+from .clustering import collect_latents_for_kmeans, kmeans_pp_deterministic
 
 # -----------------------------
 # Utils
@@ -195,19 +196,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     device = next(base_lm.parameters()).device
     model.to(device)
 
-    # Initialize Z embeddings
-    emb = model.base.get_input_embeddings()
-    with torch.no_grad():
-        w = emb.weight
-        std = float(w.std().item()) if w.numel() > 0 else 0.02
-        for tid in z_token_ids:
-            w[tid].normal_(mean=0.0, std=max(std, 1e-4))
-
-    # Initialize selector weights
-    torch.nn.init.xavier_uniform_(model.z_selector.weight)
-    if model.z_selector.bias is not None:
-        torch.nn.init.zeros_(model.z_selector.bias)
-
     # Dataset
     train_ds = Phase2Dataset(
         tokenizer=tokenizer,
@@ -220,6 +208,10 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         rebalance_train=cfg.data.rebalance_train,
         max_length=cfg.data.max_length,
     )
+
+    X = collect_latents_for_kmeans(train_ds)
+    centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.n_iter, seed=42)
+    model.initialize_from_centroids(centroids)
 
     train_loader = DataLoader(
         train_ds,

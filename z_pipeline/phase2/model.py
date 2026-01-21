@@ -250,3 +250,71 @@ class Phase2ZModel(nn.Module):
             return {'digit_logits': digit_logits, 'z_probs': z_probs}
 
         return {"digit_logits": digit_logits}
+
+
+    def initialize_from_centroids(
+        self,
+        centroids: torch.Tensor,  # [V, H]
+        *,
+        normalize: bool = True,
+        bias_zero: bool = True,
+        selector_dtype: Optional[torch.dtype] = None,
+        eps: float = 1e-8,
+    ) -> None:
+        """
+        Initialize BOTH:
+          1) Z embedding rows inside the base LM embedding table (at self.z_token_ids)
+          2) z_selector weights (Linear(H -> V)) so logits ~ dot(h, centroid_j)
+
+        centroids: Tensor[V, H] where row j is the centroid for Z_j.
+
+        Notes:
+        - If normalize=True, rows are L2-normalized before being written.
+          This makes selection behave like cosine-sim (assuming h is similarly normalized).
+        - selector_dtype controls the dtype written into z_selector weights.
+          If None, uses self.z_selector.weight.dtype.
+        """
+        if not torch.is_tensor(centroids):
+            raise TypeError("centroids must be a torch.Tensor")
+
+        if centroids.ndim != 2:
+            raise ValueError(f"centroids must be 2D [V,H], got shape={tuple(centroids.shape)}")
+
+        V, H = centroids.shape
+        if V != self.z_vocab_size:
+            raise ValueError(
+                f"centroids V mismatch: got V={V}, expected z_vocab_size={self.z_vocab_size}"
+            )
+        if H != self.hidden_size:
+            raise ValueError(
+                f"centroids H mismatch: got H={H}, expected hidden_size={self.hidden_size}"
+            )
+
+        # Optionally normalize on a safe dtype (float32) to avoid bf16 norm artifacts.
+        c = centroids
+        if normalize:
+            c_fp32 = c.detach().to(dtype=torch.float32)
+            norms = torch.linalg.norm(c_fp32, dim=1, keepdim=True).clamp_min(eps)
+            c = (c_fp32 / norms).to(dtype=centroids.dtype, device=centroids.device)
+
+        z_ids = torch.tensor(self.z_token_ids, device=c.device, dtype=torch.long)
+
+        # ---- 1) Write centroids into the LM embedding table rows for Z tokens ----
+        emb_w = self._emb.weight
+        c_for_emb = c.to(device=emb_w.device, dtype=emb_w.dtype)
+
+        with torch.no_grad():
+            # emb_w[z_token_ids] = centroids
+            emb_w.index_copy_(0, z_ids.to(device=emb_w.device), c_for_emb)
+
+        # ---- 2) Write centroids into selector weights ----
+        sel_w = self.z_selector.weight
+        target_dtype = selector_dtype if selector_dtype is not None else sel_w.dtype
+        c_for_sel = c.to(device=sel_w.device, dtype=target_dtype)
+
+        with torch.no_grad():
+            # selector.weight is [V,H]; each row corresponds to a Z token.
+            sel_w.copy_(c_for_sel)
+
+            if bias_zero and getattr(self.z_selector, "bias", None) is not None:
+                self.z_selector.bias.zero_()
