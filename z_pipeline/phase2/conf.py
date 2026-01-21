@@ -76,7 +76,7 @@ class Phase2DataConfig:
 
     k_max: int = 20
 
-    batch_size: int = 16
+    batch_size: int = 24
     eval_batch_size: int = 64
 
     num_workers: int = 4
@@ -100,7 +100,7 @@ class Phase2OptimConfig:
       - Z-selector parameters
       - Z-token embedding rows (masked inside model)
     """
-    lr: float = 3e-5
+    lr: float = 3e-4
     weight_decay: float = 0.0
 
     betas: tuple[float, float] = (0.9, 0.999)
@@ -123,7 +123,7 @@ class Phase2EvalConfig:
       - temperature annealing finished
       - cooldown_steps completed
     """
-    eval_every_steps: int = 2000
+    eval_every_steps: int = 1000
 
     # Early stopping criteria (checked on eval metric)
     patience: int = 5
