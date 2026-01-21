@@ -70,9 +70,6 @@ def collect_latents_for_kmeans(
 
     return X
 
-import torch
-from typing import Optional
-
 
 @torch.no_grad()
 def kmeans_pp_deterministic(
@@ -123,6 +120,9 @@ def kmeans_pp_deterministic(
     d2 = torch.sum((X - centroids[0]) ** 2, dim=1)  # [N]
 
     for k in range(1, V):
+        print(f"k-means++ init: selecting centroid {k+1} / {V}")
+
+         # 2) Subsequent centroids: weighted random by d^2
         if torch.all(d2 == 0):
             # Degenerate case: all points identical
             centroids[k:] = centroids[0]
@@ -140,6 +140,7 @@ def kmeans_pp_deterministic(
     # Lloyd iterations
     # ------------------------------------------------------------
     for it in range(n_iters):
+        print(f"k-means Lloyd iteration {it+1} / {n_iters}")
         # Assign points to nearest centroid
         # distances: [N, V]
         distances = torch.cdist(X, centroids, p=2.0)

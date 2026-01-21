@@ -210,7 +210,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     )
 
     X = collect_latents_for_kmeans(train_ds)
-    centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.n_iter, seed=42)
+    centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
     model.initialize_from_centroids(centroids)
 
     train_loader = DataLoader(
