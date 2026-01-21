@@ -143,8 +143,7 @@ def kmeans_pp_deterministic(
         print(f"k-means Lloyd iteration {it+1} / {n_iters}")
         # Assign points to nearest centroid
         # distances: [N, V]
-        distances = torch.cdist(X, centroids, p=2.0)
-        assignments = torch.argmin(distances, dim=1)  # [N]
+        assignments = balanced_assign(X, centroids, topk=3)
 
         # Recompute centroids
         new_centroids = torch.zeros_like(centroids)
@@ -173,3 +172,78 @@ def kmeans_pp_deterministic(
         d2 = torch.min(torch.cdist(X, centroids) ** 2, dim=1).values
 
     return centroids
+
+
+@torch.no_grad()
+def balanced_assign(
+    X: torch.Tensor,          # [N, H]
+    centroids: torch.Tensor,  # [V, H]
+    topk: int = 3,
+):
+    """
+    Capacity-constrained assignment:
+    assigns exactly N//V points to each centroid.
+
+    Deterministic, scalable, greedy.
+
+    Returns:
+        assignments: LongTensor [N] in [0, V-1]
+    """
+    assert X.ndim == 2 and centroids.ndim == 2
+    assert X.size(1) == centroids.size(1)
+
+    device = X.device
+    N = X.size(0)
+    V = centroids.size(0)
+
+    capacity = N // V
+    if capacity * V != N:
+        raise ValueError("N must be divisible by V for exact balancing")
+
+    # ------------------------------------------------------------
+    # Compute distances (dominant cost)
+    # ------------------------------------------------------------
+    distances = torch.cdist(X, centroids)  # [N, V]
+
+    # ------------------------------------------------------------
+    # Top-k nearest centroids per point
+    # ------------------------------------------------------------
+    dists_k, idx_k = torch.topk(
+        distances, k=topk, dim=1, largest=False
+    )  # [N, topk]
+
+    # ------------------------------------------------------------
+    # Greedy assignment with capacity
+    # ------------------------------------------------------------
+    assignments = torch.full((N,), -1, device=device, dtype=torch.long)
+    counts = torch.zeros(V, device=device, dtype=torch.long)
+
+    # Process points in order of increasing best distance
+    order = torch.argsort(dists_k[:, 0])
+
+    for i in order.tolist():
+        for j in idx_k[i].tolist():
+            if counts[j] < capacity:
+                assignments[i] = j
+                counts[j] += 1
+                break
+
+    # ------------------------------------------------------------
+    # Deterministic repair (rare)
+    # ------------------------------------------------------------
+    unassigned = (assignments == -1).nonzero(as_tuple=True)[0]
+    if unassigned.numel() > 0:
+        # find centroids with remaining capacity
+        free = (counts < capacity).nonzero(as_tuple=True)[0]
+        assert free.numel() >= unassigned.numel()
+
+        # assign leftover points deterministically
+        for i, j in zip(unassigned.tolist(), free.tolist()):
+            assignments[i] = j
+            counts[j] += 1
+
+    # Final sanity check
+    if not torch.all(counts == capacity):
+        raise RuntimeError("Balanced assignment failed")
+
+    return assignments
