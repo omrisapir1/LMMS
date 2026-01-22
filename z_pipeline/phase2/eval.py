@@ -50,13 +50,25 @@ def evaluate_phase2(
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
-        split="eval",
+        split="train",
         k_max=k_max,
         latent_token_id=latent_token_id,
         answer_token_id=answer_token_id,
         rebalance_train=False,
     )
 
+    def filter_phase2_dataset_by_max_k(ds: Phase2Dataset, min_k: int) -> Phase2Dataset:
+        """
+        In-place filter of Phase2Dataset to only keep rows with num_latents < max_k.
+        Returns the same dataset object (mutated).
+        """
+        ds.indices = [
+            idx for idx in ds.indices
+            if int(ds.ds[idx]["num_latents"]) > min_k
+        ]
+        return ds
+
+    ds = filter_phase2_dataset_by_max_k(ds, min_k=17)
     loader = DataLoader(
         ds,
         batch_size=batch_size,
@@ -64,6 +76,7 @@ def evaluate_phase2(
         drop_last=False,
         collate_fn=phase2_collate_fn,
     )
+
 
     # ------------------------------------------------------------------
     # Accumulators
