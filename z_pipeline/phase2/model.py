@@ -251,6 +251,33 @@ class Phase2ZModel(nn.Module):
 
         return {"digit_logits": digit_logits}
 
+    @torch.no_grad()
+    def z_autoencoder_forward(
+            self,
+            *,
+            latent_states: torch.Tensor,  # [B, Kmax, H]
+            z_mask: torch.Tensor,  # [B, Kmax]
+            temperature: float,
+    ) -> torch.Tensor:
+        """
+        Z-only forward pass:
+        returns z_probs [B, Kmax, V]
+        """
+        if latent_states.ndim != 3:
+            raise ValueError("latent_states must be [B, Kmax, H]")
+        if z_mask.ndim != 2:
+            raise ValueError("z_mask must be [B, Kmax]")
+
+        z_mask_bool = z_mask.bool()
+        h = latent_states.to(dtype=self.z_selector.weight.dtype)
+
+        z_logits = self.z_selector(h)  # [B, Kmax, V]
+
+        neg_inf = torch.finfo(z_logits.dtype).min
+        z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
+
+        z_probs = F.softmax(z_logits / temperature, dim=-1)
+        return z_probs
 
     def initialize_from_centroids(
         self,
