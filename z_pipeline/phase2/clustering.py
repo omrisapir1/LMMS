@@ -30,8 +30,6 @@ def collect_latents_for_kmeans(
     for i, ex in enumerate(hf_ds):
         latent_states = ex.get("latent_states", None)
         K = ex.get("num_latents", None)
-        if K<20:
-            continue
 
         if latent_states is None or K is None:
             raise RuntimeError(f"Row {i} missing latent_states or num_latents")
@@ -265,3 +263,134 @@ def balanced_assign(
 
     return assignments
 
+
+
+@torch.no_grad()
+def collect_row_representatives(
+    train_ds,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Collect exactly one representative latent per row (mean over K latents).
+
+    Returns:
+        X_rows: Tensor[R, H]
+    """
+    hf_ds = getattr(train_ds, "ds", None)
+    if hf_ds is None:
+        raise RuntimeError("train_ds has no underlying HF dataset (.ds)")
+
+    reps = []
+    H: Optional[int] = None
+
+    for i, ex in enumerate(hf_ds):
+        latent_states = ex.get("latent_states", None)
+        K = ex.get("num_latents", None)
+
+        if latent_states is None or K is None:
+            raise RuntimeError(f"Row {i} missing latent_states or num_latents")
+
+        if K <= 0 or K > len(latent_states):
+            raise RuntimeError(f"Row {i}: invalid num_latents={K}")
+
+        row_latents = latent_states[:K]
+
+        if H is None:
+            H = len(row_latents[0])
+        else:
+            for h in row_latents:
+                if len(h) != H:
+                    raise RuntimeError(f"Row {i}: inconsistent latent dim")
+
+        # Mean latent for this row
+        h_mean = torch.tensor(row_latents, dtype=dtype).mean(dim=0)
+        reps.append(h_mean)
+
+    if not reps:
+        raise RuntimeError("No row representatives collected")
+
+    X_rows = torch.stack(reps)
+
+    if device is not None:
+        X_rows = X_rows.to(device)
+
+    return X_rows
+
+
+@torch.no_grad()
+def kmeans_pp_row_aware(
+    X: torch.Tensor,          # [N, H] all latents
+    X_rows: torch.Tensor,     # [R, H] one per row
+    V: int,
+    n_iters: int,
+    seed: int,
+) -> torch.Tensor:
+    """
+    KMeans with row-aware KMeans++ seeding.
+    """
+    if X.ndim != 2 or X_rows.ndim != 2:
+        raise ValueError("X and X_rows must be 2D")
+    if X.size(1) != X_rows.size(1):
+        raise ValueError("Dim mismatch between X and X_rows")
+    if X_rows.size(0) < V:
+        raise ValueError("Need at least V rows for row-aware seeding")
+
+    device = X.device
+    dtype = X.dtype
+    R, H = X_rows.shape
+
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+
+    # ------------------------------------------------------------
+    # Row-aware KMeans++ seeding
+    # ------------------------------------------------------------
+    centroids = torch.empty((V, H), device=device, dtype=dtype)
+
+    # First centroid
+    first_idx = torch.randint(0, R, (1,), generator=g, device=device).item()
+    centroids[0] = X_rows[first_idx]
+
+    d2 = torch.sum((X_rows - centroids[0]) ** 2, dim=1)
+
+    for k in range(1, V):
+        if torch.all(d2 == 0):
+            centroids[k:] = centroids[0]
+            break
+
+        probs = d2 / d2.sum()
+        idx = torch.multinomial(probs, 1, generator=g).item()
+        centroids[k] = X_rows[idx]
+
+        new_d2 = torch.sum((X_rows - centroids[k]) ** 2, dim=1)
+        d2 = torch.minimum(d2, new_d2)
+
+    # ------------------------------------------------------------
+    # Lloyd iterations (UNCHANGED)
+    # ------------------------------------------------------------
+    for it in range(n_iters):
+        assignments = balanced_assign(X, centroids, topk=3)
+
+        new_centroids = torch.zeros_like(centroids)
+        counts = torch.zeros(V, device=device, dtype=torch.long)
+
+        new_centroids.index_add_(0, assignments, X)
+        counts.index_add_(0, assignments, torch.ones_like(assignments))
+
+        for k in range(V):
+            if counts[k] == 0:
+                farthest_idx = torch.argmax(
+                    torch.min(torch.cdist(X, centroids) ** 2, dim=1).values
+                ).item()
+                new_centroids[k] = X[farthest_idx]
+            else:
+                new_centroids[k] /= counts[k]
+
+        if torch.allclose(centroids, new_centroids, atol=1e-6):
+            break
+
+        centroids = new_centroids
+
+    return centroids
