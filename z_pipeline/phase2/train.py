@@ -160,8 +160,9 @@ def pretrain_z_autoencoder(
     loader_iter = iter(train_loader)
     for i in range(2):
         temp = cfg.temperature /(i+1)
+        print(f"[Z-AE pretrain] step={i} temp={temp:.2f}")
         for step in range(cfg.steps):
-            print(f"[Z-AE pretrain] step={step} temp={temp:.2f}")
+
             try:
                 batch = next(loader_iter)
             except StopIteration:
