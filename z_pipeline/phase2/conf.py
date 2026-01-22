@@ -92,6 +92,13 @@ class Phase2DataConfig:
 # ─────────────────────────────────────────────────────────────
 # Optimization
 # ─────────────────────────────────────────────────────────────
+@dataclass
+class Phase2PretrainConfig:
+    enable: bool = True
+    steps: int = 1000
+    lr: float = 1e-3
+    temperature: float = 0.5
+
 
 @dataclass
 class Phase2OptimConfig:
@@ -170,6 +177,7 @@ class Phase2Config:
     temp: TemperatureSchedule = TemperatureSchedule()
     eval: Phase2EvalConfig = Phase2EvalConfig()
     cluster: Phase2ClusterConfig = Phase2ClusterConfig()
+    pretrain: Phase2PretrainConfig = Phase2PretrainConfig()
 
     # Misc
     force_base_eval: bool = True
