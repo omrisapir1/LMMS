@@ -316,7 +316,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         collate_fn=phase2_collate_fn,
     )
 
-    X = collect_latents_for_kmeans(train_ds)
+    X, _ = collect_latents_for_kmeans(train_ds)
     centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
     model.initialize_from_centroids(centroids)
     if cfg.pretrain.enable:
