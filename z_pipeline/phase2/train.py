@@ -213,7 +213,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     # centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
     # model.initialize_from_centroids(centroids)
 
-    X = collect_latents_for_kmeans(train_ds)
+    X, row_ptr = collect_latents_for_kmeans(train_ds)
     X_rows = collect_row_representatives(train_ds)
 
     centroids = kmeans_pp_row_aware(
@@ -221,6 +221,8 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         X_rows,
         cfg.z_vocab_size,
         n_iters=cfg.cluster.n_iter,
+        row_ptr=row_ptr,                 # <-- add this
+        assign_mode="row_exclusive",     # <-- add this (diagnostic)
         seed=42,
     )
 
