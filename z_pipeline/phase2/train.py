@@ -34,7 +34,7 @@ from .loss import AnswerLoss, ZUsageKLLoss
 from .eval import evaluate_phase2
 from .model import Phase2ZModel
 from .conf import Phase2DataConfig
-from .clustering import collect_latents_for_kmeans, kmeans_pp_deterministic
+from .clustering import collect_latents_for_kmeans, kmeans_pp_deterministic, collect_row_representatives, kmeans_pp_row_aware
 
 # -----------------------------
 # Utils
@@ -209,9 +209,24 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         max_length=cfg.data.max_length,
     )
 
+    # X = collect_latents_for_kmeans(train_ds)
+    # centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
+    # model.initialize_from_centroids(centroids)
+
     X = collect_latents_for_kmeans(train_ds)
-    centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
+    X_rows = collect_row_representatives(train_ds)
+
+    centroids = kmeans_pp_row_aware(
+        X,
+        X_rows,
+        cfg.z_vocab_size,
+        n_iters=cfg.cluster.n_iter,
+        seed=42,
+    )
+
     model.initialize_from_centroids(centroids)
+
+
 
     train_loader = DataLoader(
         train_ds,
