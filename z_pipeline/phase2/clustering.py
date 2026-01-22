@@ -1,76 +1,48 @@
 import torch
 from typing import Optional
 
-
 def collect_latents_for_kmeans(
     train_ds,
     *,
-    device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Collect all latent vectors h for k-means clustering.
-
-    Reads directly from the underlying HF dataset (train_ds.ds),
-    NOT via __getitem__, to avoid tokenization / padding overhead.
-
-    Returns:
-        X: Tensor[N, H] in float32 (default), on CPU unless device is specified.
-
-    Hard-fails on malformed data.
-    """
+    device=None,
+    dtype=torch.float32,
+):
     hf_ds = getattr(train_ds, "ds", None)
     if hf_ds is None:
         raise RuntimeError("train_ds has no underlying HF dataset (.ds)")
 
     latents = []
-    H: Optional[int] = None
-    total = 0
+    row_ptr = []
+    offset = 0
+    H = None
 
     for i, ex in enumerate(hf_ds):
-        latent_states = ex.get("latent_states", None)
-        K = ex.get("num_latents", None)
-        if K<20:
+        latent_states = ex["latent_states"]
+        K = ex["num_latents"]
+
+        if K <= 0:
             continue
 
-        if latent_states is None or K is None:
-            raise RuntimeError(f"Row {i} missing latent_states or num_latents")
+        if H is None:
+            H = len(latent_states[0])
 
-        if not isinstance(latent_states, (list, tuple)):
-            raise RuntimeError(f"Row {i}: latent_states must be list-like")
-
-        if K <= 0 or K > len(latent_states):
-            raise RuntimeError(f"Row {i}: invalid num_latents={K}")
-
-        # Take only active latent states
+        start = offset
         for j in range(K):
-            h = latent_states[j]
+            latents.append(latent_states[j])
+            offset += 1
+        end = offset
 
-            if not isinstance(h, (list, tuple)):
-                raise RuntimeError(f"Row {i}, latent {j}: expected list[float]")
+        row_ptr.append((start, end))
 
-            if H is None:
-                H = len(h)
-                if H <= 0:
-                    raise RuntimeError("Latent dimension H must be > 0")
-            elif len(h) != H:
-                raise RuntimeError(
-                    f"Row {i}, latent {j}: inconsistent H={len(h)} (expected {H})"
-                )
+    if not latents:
+        raise RuntimeError("No latents collected")
 
-            latents.append(h)
-            total += 1
-
-    if total == 0:
-        raise RuntimeError("No latent vectors collected for k-means")
-
-    # Convert to tensor
     X = torch.tensor(latents, dtype=dtype)
-
     if device is not None:
         X = X.to(device)
 
-    return X
+    return X, row_ptr
+
 
 
 @torch.no_grad()
@@ -290,8 +262,6 @@ def collect_row_representatives(
     for i, ex in enumerate(hf_ds):
         latent_states = ex.get("latent_states", None)
         K = ex.get("num_latents", None)
-        if K<20:
-            continue
 
         if latent_states is None or K is None:
             raise RuntimeError(f"Row {i} missing latent_states or num_latents")
@@ -329,6 +299,8 @@ def kmeans_pp_row_aware(
     X_rows: torch.Tensor,     # [R, H] one per row
     V: int,
     n_iters: int,
+    row_ptr,
+    assign_mode,
     seed: int,
 ) -> torch.Tensor:
     """
@@ -375,7 +347,12 @@ def kmeans_pp_row_aware(
     # Lloyd iterations (UNCHANGED)
     # ------------------------------------------------------------
     for it in range(n_iters):
-        assignments = balanced_assign(X, centroids, topk=3)
+        if assign_mode == 'row_exclusive':
+            assignments = row_exclusive_assign(X, centroids, row_ptr)
+        else:
+
+
+            assignments = balanced_assign(X, centroids, topk=3)
 
         new_centroids = torch.zeros_like(centroids)
         counts = torch.zeros(V, device=device, dtype=torch.long)
@@ -398,3 +375,86 @@ def kmeans_pp_row_aware(
         centroids = new_centroids
 
     return centroids
+
+@torch.no_grad()
+def row_exclusive_assign(
+    X: torch.Tensor,              # [N, H]
+    centroids: torch.Tensor,      # [V, H]
+    row_ptr: list[tuple[int, int]],
+) -> torch.Tensor:
+    """
+    Row-exclusive assignment:
+    - Within each row, each centroid can be used at most once
+    - Deterministic, greedy
+    - For diagnostics / clustering ONLY
+
+    Returns:
+        assignments: LongTensor[N]
+    """
+    assert X.ndim == 2
+    assert centroids.ndim == 2
+    assert X.size(1) == centroids.size(1)
+
+    device = X.device
+    N = X.size(0)
+    V = centroids.size(0)
+
+    assignments = torch.full((N,), -1, device=device, dtype=torch.long)
+
+    # Precompute all distances once
+    # distances[n, v] = ||X[n] - centroids[v]||
+    distances = torch.cdist(X, centroids)  # [N, V]
+
+    for row_idx, (start, end) in enumerate(row_ptr):
+        K = end - start
+        if K <= 0:
+            continue
+        if K > V:
+            raise RuntimeError(
+                f"Row {row_idx}: K={K} > V={V}, row-exclusive assignment impossible"
+            )
+
+        row_indices = torch.arange(start, end, device=device)
+
+        # Distances for this row: [K, V]
+        row_dists = distances[row_indices]
+
+        # Sort latents by confidence (margin between best and 2nd best)
+        top2 = torch.topk(row_dists, k=2, dim=1, largest=False).values
+        margins = top2[:, 1] - top2[:, 0]  # larger = more confident
+        order = torch.argsort(margins, descending=True)
+
+        used_centroids = set()
+
+        for idx in order.tolist():
+            n = row_indices[idx].item()
+
+            # Try centroids in increasing distance order
+            cand_centroids = torch.argsort(row_dists[idx])
+
+            assigned = False
+            for c in cand_centroids.tolist():
+                if c not in used_centroids:
+                    assignments[n] = c
+                    used_centroids.add(c)
+                    assigned = True
+                    break
+
+            if not assigned:
+                # This should be extremely rare if K <= V
+                raise RuntimeError(
+                    f"Row {row_idx}: failed to find unused centroid"
+                )
+
+        # Final sanity for the row
+        if len(used_centroids) != K:
+            raise RuntimeError(
+                f"Row {row_idx}: assigned {len(used_centroids)} centroids for K={K}"
+            )
+
+    # Global sanity
+    if (assignments < 0).any():
+        bad = (assignments < 0).nonzero(as_tuple=True)[0][:10].tolist()
+        raise RuntimeError(f"Unassigned latents at indices {bad}")
+
+    return assignments
