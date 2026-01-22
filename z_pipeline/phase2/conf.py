@@ -100,7 +100,7 @@ class Phase2OptimConfig:
       - Z-selector parameters
       - Z-token embedding rows (masked inside model)
     """
-    lr: float = 3e-4
+    lr: float = 3e-3
     weight_decay: float = 0.0
 
     betas: tuple[float, float] = (0.9, 0.999)
