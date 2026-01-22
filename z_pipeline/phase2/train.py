@@ -158,43 +158,45 @@ def pretrain_z_autoencoder(
     )
 
     loader_iter = iter(train_loader)
+    for i in range(2):
+        temp = cfg.temperature /(i+1)
+        for step in range(cfg.steps):
+            print(f"[Z-AE pretrain] step={step} temp={temp:.2f}")
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(train_loader)
+                batch = next(loader_iter)
 
-    for step in range(cfg.steps):
-        try:
-            batch = next(loader_iter)
-        except StopIteration:
-            loader_iter = iter(train_loader)
-            batch = next(loader_iter)
+            latent_states = batch["latent_states"].to(device)   # [B, Kmax, H]
+            z_mask = batch["z_mask"].to(device)                 # [B, Kmax]
 
-        latent_states = batch["latent_states"].to(device)   # [B, Kmax, H]
-        z_mask = batch["z_mask"].to(device)                 # [B, Kmax]
+            z_probs = model.z_autoencoder_forward(
+                latent_states=latent_states,
+                z_mask=z_mask,
+                temperature=temp,
+            )
+            st_assign = straight_through_argmax(z_probs)         # [B, K, V]
 
-        z_probs = model.z_autoencoder_forward(
-            latent_states=latent_states,
-            z_mask=z_mask,
-            temperature=cfg.temperature,
-        )
-        st_assign = straight_through_argmax(z_probs)         # [B, K, V]
+            # reconstruct h
+            z_emb_table = model.base.get_input_embeddings().weight[
+                torch.tensor(model.z_token_ids, device=device)
+            ]                                                    # [V, H]
 
-        # reconstruct h
-        z_emb_table = model.base.get_input_embeddings().weight[
-            torch.tensor(model.z_token_ids, device=device)
-        ]                                                    # [V, H]
+            h_recon = torch.einsum("bkv,vh->bkh", st_assign, z_emb_table)
 
-        h_recon = torch.einsum("bkv,vh->bkh", st_assign, z_emb_table)
+            # masked MSE
+            diff = h_recon - latent_states
+            loss = (diff[z_mask] ** 2).mean()
 
-        # masked MSE
-        diff = h_recon - latent_states
-        loss = (diff[z_mask] ** 2).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+            if step % 100 == 0:
+                print(f"[Z-AE pretrain] step={step} loss={loss.item():.6f}")
 
-        if step % 100 == 0:
-            print(f"[Z-AE pretrain] step={step} loss={loss.item():.6f}")
-
-    print("Z autoencoder pretraining complete.")
+        print("Z autoencoder pretraining complete.")
 
 
 
