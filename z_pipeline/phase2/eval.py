@@ -15,6 +15,81 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from .dataset import Phase2Dataset, phase2_collate_fn
+@torch.no_grad()
+def row_exclusive_assign_from_logits(
+    z_probs: torch.Tensor,   # [B, Kmax, V]
+    z_mask: torch.Tensor,    # [B, Kmax] (bool)
+) -> torch.Tensor:
+    """
+    Row-exclusive Z assignment from logits / probabilities.
+
+    - Within each row, each Z can be used at most once
+    - Greedy, deterministic
+    - Eval / diagnostic ONLY
+
+    Returns:
+        z_ids: LongTensor[B, Kmax], with -1 for masked positions
+    """
+    assert z_probs.ndim == 3
+    assert z_mask.ndim == 2
+    assert z_probs.shape[:2] == z_mask.shape
+
+    device = z_probs.device
+    B, Kmax, V = z_probs.shape
+
+    # Output
+    z_ids = torch.full((B, Kmax), -1, device=device, dtype=torch.long)
+
+    # Convert probs → costs (numerically safe)
+    eps = 1e-12
+    costs = -torch.log(z_probs.clamp_min(eps))  # [B, Kmax, V]
+
+    for b in range(B):
+        K = int(z_mask[b].sum().item())
+        if K <= 0:
+            continue
+        if K > V:
+            raise RuntimeError(
+                f"Row {b}: K={K} > V={V}, row-exclusive assignment impossible"
+            )
+
+        active_idx = torch.nonzero(z_mask[b], as_tuple=False).squeeze(1)  # [K]
+        row_costs = costs[b, active_idx]                                  # [K, V]
+
+        # Confidence = gap between best and 2nd best Z
+        top2 = torch.topk(row_costs, k=2, dim=1, largest=False).values
+        margins = top2[:, 1] - top2[:, 0]   # larger = more confident
+
+        # Assign confident latents first
+        order = torch.argsort(margins, descending=True)
+
+        used_z = set()
+
+        for idx in order.tolist():
+            pos = active_idx[idx].item()
+            z_costs = row_costs[idx]
+
+            # Z candidates in increasing cost order
+            z_candidates = torch.argsort(z_costs)
+
+            assigned = False
+            for z in z_candidates.tolist():
+                if z not in used_z:
+                    z_ids[b, pos] = z
+                    used_z.add(z)
+                    assigned = True
+                    break
+
+            if not assigned:
+                raise RuntimeError(f"Row {b}: failed to assign unique Z")
+
+        if len(used_z) != K:
+            raise RuntimeError(
+                f"Row {b}: assigned {len(used_z)} Zs for K={K}"
+            )
+
+    return z_ids
+
 
 
 @torch.no_grad()
@@ -141,7 +216,8 @@ def evaluate_phase2(
         # --------------------------------------------------------------
         # Argmax Z selection
         # --------------------------------------------------------------
-        z_ids = torch.argmax(z_probs, dim=-1)  # [B, Kmax]
+        # z_ids = torch.argmax(z_probs, dim=-1)  # [B, Kmax]
+        z_ids = row_exclusive_assign_from_logits(z_probs, z_mask)
 
         # --------------------------------------------------------------
         # Digit exact match
