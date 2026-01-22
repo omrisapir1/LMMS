@@ -19,7 +19,7 @@ def collect_latents_for_kmeans(
     for i, ex in enumerate(hf_ds):
         latent_states = ex["latent_states"]
         K = ex["num_latents"]
-        if K<19:
+        if K<17:
             continue
 
         if K <= 0:
@@ -264,7 +264,7 @@ def collect_row_representatives(
     for i, ex in enumerate(hf_ds):
         latent_states = ex.get("latent_states", None)
         K = ex.get("num_latents", None)
-        if K<19:
+        if K<17:
             continue
 
         if latent_states is None or K is None:
