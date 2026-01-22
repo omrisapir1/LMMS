@@ -159,7 +159,19 @@ def pretrain_z_autoencoder(
 
     loader_iter = iter(train_loader)
     for i in range(2):
-        temp = cfg.temperature /(i+1)
+        if i:
+            temp = 1.0
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": model.z_selector.parameters()},
+                    {"params": model.base.get_input_embeddings().weight},
+                ],
+                lr=cfg.lr * 0.001,
+                weight_decay=0.0,
+            )
+        else:
+            temp = cfg.temperature
+
         print(f"[Z-AE pretrain] step={i} temp={temp:.2f}")
         for step in range(cfg.steps):
 
