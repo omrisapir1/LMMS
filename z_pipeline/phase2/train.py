@@ -169,16 +169,11 @@ def pretrain_z_autoencoder(
         latent_states = batch["latent_states"].to(device)   # [B, Kmax, H]
         z_mask = batch["z_mask"].to(device)                 # [B, Kmax]
 
-        out = model(
+        z_probs = model.z_autoencoder_forward(
             latent_states=latent_states,
             z_mask=z_mask,
             temperature=cfg.temperature,
-            return_z_probs=True,
-            input_ids=None,
-            attention_mask=None,
         )
-
-        z_probs = out["z_probs"]                             # [B, K, V]
         st_assign = straight_through_argmax(z_probs)         # [B, K, V]
 
         # reconstruct h
