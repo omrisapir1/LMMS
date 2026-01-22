@@ -172,7 +172,6 @@ def kmeans_pp_deterministic(
         d2 = torch.min(torch.cdist(X, centroids) ** 2, dim=1).values
 
     return centroids
-
 @torch.no_grad()
 def balanced_assign(
     X: torch.Tensor,          # [N, H]
