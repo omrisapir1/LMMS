@@ -96,7 +96,7 @@ class Phase2DataConfig:
 class Phase2PretrainConfig:
     enable: bool = True
     steps: int = 1000
-    lr: float = 1e-3
+    lr: float = 1e-4
     temperature: float = 0.5
 
 
