@@ -272,6 +272,7 @@ class Phase2ZModel(nn.Module):
         h = latent_states.to(dtype=self.z_selector.weight.dtype)
 
         z_logits = self.z_selector(h)  # [B, Kmax, V]
+        z_logits = torch.clamp(z_logits, -30, 30)
 
         neg_inf = torch.finfo(z_logits.dtype).min
         z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
