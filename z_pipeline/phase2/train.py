@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 
-from .conf import Phase2Config
+from .conf import Phase2Config, Phase2PretrainConfig
 from .dataset import Phase2Dataset, phase2_collate_fn, compute_keep_prob_from_dataset
 from .loss import AnswerLoss, ZUsageKLLoss
 from .eval import evaluate_phase2
@@ -118,6 +118,91 @@ def print_top_z(dist, topk=10, title="Z distribution"):
     for i in idx:
         if dist[i] > 0:
             print(f"  Z_{i:4d}: {dist[i]:.4f}")
+
+def straight_through_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: [B, K, V]
+    returns: LongTensor[B, K] with straight-through gradient
+    """
+    with torch.no_grad():
+        hard = torch.argmax(logits, dim=-1)
+
+    one_hot = torch.zeros_like(logits).scatter_(-1, hard.unsqueeze(-1), 1.0)
+    probs = torch.softmax(logits, dim=-1)
+
+    # straight-through estimator
+    st = one_hot + probs - probs.detach()
+    return st
+
+
+def pretrain_z_autoencoder(
+    *,
+    model: Phase2ZModel,
+    train_loader: DataLoader,
+    cfg: Phase2PretrainConfig,
+    device: torch.device,
+) -> None:
+    """
+    Phase-2a: Z auto-encoder warmup.
+    Learns z_selector + Z embeddings to reconstruct latent_states.
+    """
+    model.train()
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.z_selector.parameters()},
+            {"params": model.base.get_input_embeddings().weight},
+        ],
+        lr=cfg.lr,
+        weight_decay=0.0,
+    )
+
+    loader_iter = iter(train_loader)
+
+    for step in range(cfg.steps):
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            batch = next(loader_iter)
+
+        latent_states = batch["latent_states"].to(device)   # [B, Kmax, H]
+        z_mask = batch["z_mask"].to(device)                 # [B, Kmax]
+
+        out = model(
+            latent_states=latent_states,
+            z_mask=z_mask,
+            temperature=cfg.temperature,
+            return_z_probs=True,
+            input_ids=None,
+            attention_mask=None,
+        )
+
+        z_probs = out["z_probs"]                             # [B, K, V]
+        st_assign = straight_through_argmax(z_probs)         # [B, K, V]
+
+        # reconstruct h
+        z_emb_table = model.base.get_input_embeddings().weight[
+            torch.tensor(model.z_token_ids, device=device)
+        ]                                                    # [V, H]
+
+        h_recon = torch.einsum("bkv,vh->bkh", st_assign, z_emb_table)
+
+        # masked MSE
+        diff = h_recon - latent_states
+        loss = (diff[z_mask] ** 2).mean()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0:
+            print(f"[Z-AE pretrain] step={step} loss={loss.item():.6f}")
+
+    print("Z autoencoder pretraining complete.")
+
+
+
 
 def run_phase2(cfg: Phase2Config) -> Dict:
     """
@@ -209,25 +294,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         max_length=cfg.data.max_length,
     )
 
-    # X = collect_latents_for_kmeans(train_ds)
-    # centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
-    # model.initialize_from_centroids(centroids)
-
-    X, row_ptr = collect_latents_for_kmeans(train_ds)
-    X_rows = collect_row_representatives(train_ds)
-
-    centroids = kmeans_pp_row_aware(
-        X,
-        X_rows,
-        cfg.z_vocab_size,
-        n_iters=cfg.cluster.n_iter,
-        row_ptr=row_ptr,                 # <-- add this
-        assign_mode="row_exclusive",     # <-- add this (diagnostic)
-        seed=42,
-    )
-
-    model.initialize_from_centroids(centroids)
-
 
 
     train_loader = DataLoader(
@@ -239,6 +305,15 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         pin_memory=cfg.data.pin_memory and torch.cuda.is_available(),
         collate_fn=phase2_collate_fn,
     )
+
+    if cfg.pretrain.enable:
+        pretrain_z_autoencoder(
+            model=model,
+            train_loader=train_loader,
+            cfg=cfg.pretrain,
+            device=device,
+        )
+
     # Losses
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
