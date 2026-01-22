@@ -173,7 +173,6 @@ def kmeans_pp_deterministic(
 
     return centroids
 
-
 @torch.no_grad()
 def balanced_assign(
     X: torch.Tensor,          # [N, H]
@@ -181,10 +180,10 @@ def balanced_assign(
     topk: int = 3,
 ):
     """
-    Capacity-constrained assignment:
-    assigns exactly N//V points to each centroid.
+    Capacity-constrained assignment with remainder handling.
 
-    Deterministic, scalable, greedy.
+    Cluster sizes differ by at most 1.
+    Deterministic and scalable.
 
     Returns:
         assignments: LongTensor [N] in [0, V-1]
@@ -196,12 +195,16 @@ def balanced_assign(
     N = X.size(0)
     V = centroids.size(0)
 
-    capacity = N // V
-    if capacity * V != N:
-        raise ValueError("N must be divisible by V for exact balancing")
+    base = N // V
+    remainder = N % V
+
+    # First `remainder` clusters get +1 capacity (deterministic order)
+    capacities = torch.full((V,), base, device=device, dtype=torch.long)
+    if remainder > 0:
+        capacities[:remainder] += 1
 
     # ------------------------------------------------------------
-    # Compute distances (dominant cost)
+    # Compute distances
     # ------------------------------------------------------------
     distances = torch.cdist(X, centroids)  # [N, V]
 
@@ -213,37 +216,34 @@ def balanced_assign(
     )  # [N, topk]
 
     # ------------------------------------------------------------
-    # Greedy assignment with capacity
+    # Greedy assignment
     # ------------------------------------------------------------
     assignments = torch.full((N,), -1, device=device, dtype=torch.long)
     counts = torch.zeros(V, device=device, dtype=torch.long)
 
-    # Process points in order of increasing best distance
     order = torch.argsort(dists_k[:, 0])
 
     for i in order.tolist():
         for j in idx_k[i].tolist():
-            if counts[j] < capacity:
+            if counts[j] < capacities[j]:
                 assignments[i] = j
                 counts[j] += 1
                 break
 
     # ------------------------------------------------------------
-    # Deterministic repair (rare)
+    # Deterministic repair (very rare)
     # ------------------------------------------------------------
     unassigned = (assignments == -1).nonzero(as_tuple=True)[0]
     if unassigned.numel() > 0:
-        # find centroids with remaining capacity
-        free = (counts < capacity).nonzero(as_tuple=True)[0]
+        free = (counts < capacities).nonzero(as_tuple=True)[0]
         assert free.numel() >= unassigned.numel()
 
-        # assign leftover points deterministically
         for i, j in zip(unassigned.tolist(), free.tolist()):
             assignments[i] = j
             counts[j] += 1
 
-    # Final sanity check
-    if not torch.all(counts == capacity):
+    # Final sanity
+    if not torch.all(counts == capacities):
         raise RuntimeError("Balanced assignment failed")
 
     return assignments

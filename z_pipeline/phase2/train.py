@@ -329,8 +329,13 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 device=device,
             )
             print(f"Digit EM: {metrics['digit_em'] * 100:.2f}%")
-            print_top_z(metrics["z_distribution"], topk=15, title="Global Z usage")
-            print_top_z(metrics["z_distribution_k1"], topk=15, title="Z usage when K=1")
+            per_k_str = ", ".join(
+                f"K={k}: {v * 100:.2f}%"
+                for k, v in sorted(metrics["digit_em_by_k"].items())
+            )
+            print(f"Digit EM per K: {per_k_str}")
+            print_top_z(metrics["z_distribution"], topk=5, title="Global Z usage")
+            print_top_z(metrics["z_distribution_k1"], topk=5, title="Z usage when K=1")
             print("\nDominant Z ratio by K:")
             print(f'Current temperature: {temp:.2f}')
             for K in sorted(metrics["dominant_z_ratio_by_k"]):

@@ -75,6 +75,8 @@ def evaluate_phase2(
     z_counts_k1: Counter = Counter()
 
     dominant_ratios_by_k: Dict[int, List[float]] = defaultdict(list)
+    total_rows_by_k: Dict[int, int] = defaultdict(int)
+    correct_rows_by_k: Dict[int, int] = defaultdict(int)
 
     V: Optional[int] = None  # Z vocab size (inferred once)
 
@@ -144,6 +146,10 @@ def evaluate_phase2(
             if K <= 0:
                 continue
 
+            total_rows_by_k[K] += 1
+            if em[b].item():
+                correct_rows_by_k[K] += 1
+
             row_z = z_ids[b, :K].tolist()
 
             # Global distribution
@@ -189,9 +195,16 @@ def evaluate_phase2(
             continue
         dominant_z_ratio_by_k[K] = float(np.mean(vals))
 
+    digit_em_by_k: Dict[int, float] = {}
+    for K, total in total_rows_by_k.items():
+        if total == 0:
+            continue
+        digit_em_by_k[K] = correct_rows_by_k[K] / total
+
     # ------------------------------------------------------------------
     return {
         "digit_em": float(digit_em),
+        "digit_em_by_k": digit_em_by_k,
         "z_distribution": z_distribution,
         "z_distribution_k1": z_distribution_k1,
         "dominant_z_ratio_by_k": dominant_z_ratio_by_k,
