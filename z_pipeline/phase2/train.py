@@ -30,7 +30,7 @@ from torch.optim import AdamW
 
 from .conf import Phase2Config, Phase2PretrainConfig
 from .dataset import Phase2Dataset, phase2_collate_fn, compute_keep_prob_from_dataset
-from .loss import AnswerLoss, ZUsageKLLoss
+from .loss import AnswerLoss, ZUsageKLLoss, RowZDiversityLoss
 from .eval import evaluate_phase2
 from .model import Phase2ZModel
 from .conf import Phase2DataConfig
@@ -325,6 +325,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
     z_kl_loss_fn = ZUsageKLLoss(vocab_size=cfg.z_vocab_size)
+    row_z_loss_fn = RowZDiversityLoss()
     print(f"AnswerLoss keep_prob: {keep_prob}")
 
     # Optimizer
@@ -393,7 +394,8 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
         loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
-        loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl
+        loss_row = row_z_loss_fn.compute(z_probs, z_mask)
+        loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl + cfg.loss.lambda_row * loss_row
         if global_step % print_every == 0 and global_step > 0:
             loss_ans_to_print = cur_answer_loss / cfg.print_every
             loss_kl_to_print = cur_kl_loss / cfg.print_every

@@ -37,11 +37,11 @@ class TemperatureSchedule:
     temp_end: float = 1
 
     # Number of optimizer steps over which annealing happens
-    anneal_steps: int = 30_000
+    anneal_steps: int = 30_00
 
     # After anneal_steps, temperature is held at temp_end
     # for additional stabilization before early stopping
-    cooldown_steps: int = 5_000
+    cooldown_steps: int = 5_00
 
     def total_steps(self) -> int:
         return self.anneal_steps + self.cooldown_steps
@@ -58,7 +58,8 @@ class Phase2LossConfig:
          + lambda_kl     * ZUsageKLLoss
     """
     lambda_answer: float = 1.0
-    lambda_kl: float = 0.05
+    lambda_kl: float = 0.2
+    lambda_row: float = 0.01
     keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
 
@@ -130,7 +131,7 @@ class Phase2EvalConfig:
       - temperature annealing finished
       - cooldown_steps completed
     """
-    eval_every_steps: int = 1000
+    eval_every_steps: int = 500
 
     # Early stopping criteria (checked on eval metric)
     patience: int = 5
