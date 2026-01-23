@@ -33,7 +33,7 @@ class TemperatureSchedule:
     """
     type: Literal["linear", "cosine", "exponential"] = "cosine"
 
-    temp_start: float = 4
+    temp_start: float = 2
     temp_end: float = 1
 
     # Number of optimizer steps over which annealing happens
