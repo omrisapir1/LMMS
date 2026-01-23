@@ -123,7 +123,7 @@ def evaluate_phase2(
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
-        split="train",
+        split="eval",
         k_max=k_max,
         latent_token_id=latent_token_id,
         answer_token_id=answer_token_id,
