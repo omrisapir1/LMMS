@@ -320,6 +320,30 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
     model.initialize_from_centroids(centroids)
 
+    eval_model = _EvalTemperatureProxy(model, eval_temp=1e-6)
+    metrics = evaluate_phase2(
+        model=eval_model,
+        tokenizer=tokenizer,
+        dataset_name=cfg.data.dataset_name,
+        batch_size=cfg.data.eval_batch_size,
+        latent_token_id=latent_token_id,
+        answer_token_id=answer_token_id,
+        k_max=cfg.data.k_max,
+        device=device,
+    )
+    print(f"Digit EM: {metrics['digit_em'] * 100:.2f}%")
+    per_k_str = ", ".join(
+        f"K={k}: {v * 100:.2f}%"
+        for k, v in sorted(metrics["digit_em_by_k"].items())
+    )
+    print(f"Digit EM per K: {per_k_str}")
+    print_top_z(metrics["z_distribution"], topk=5, title="Global Z usage")
+    print_top_z(metrics["z_distribution_k1"], topk=5, title="Z usage when K=1")
+    print("\nDominant Z ratio by K:")
+    # print(f'Current temperature: {temp:.2f}')
+    for K in sorted(metrics["dominant_z_ratio_by_k"]):
+        v = metrics["dominant_z_ratio_by_k"][K]
+        print(f"  K={K:2d}: {v:.3f}")
 
     if cfg.pretrain.enable:
         pretrain_z_autoencoder(
