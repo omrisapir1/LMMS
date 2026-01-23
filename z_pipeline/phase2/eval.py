@@ -76,10 +76,14 @@ def evaluate_phase2(
     z_counts_k1: Counter = Counter()
 
     dominant_ratios_by_k: Dict[int, List[float]] = defaultdict(list)
+    unique_ratios_by_k: Dict[int, List[float]] = defaultdict(list)
+    adjacent_repeat_by_k: Dict[int, List[float]] = defaultdict(list)
+
     total_rows_by_k: Dict[int, int] = defaultdict(int)
     correct_rows_by_k: Dict[int, int] = defaultdict(int)
 
-    V: Optional[int] = None  # Z vocab size (inferred once)
+    V: Optional[int] = None
+
 
     # ------------------------------------------------------------------
     # Evaluation loop
@@ -160,11 +164,25 @@ def evaluate_phase2(
             if K == 1:
                 z_counts_k1[row_z[0]] += 1
 
-            # Dominant-Z ratio for K >= 2
+            # -------------------------------
+            # Row-level Z diagnostics
+            # -------------------------------
+
+            # Dominant-Z ratio
             if K >= 2:
                 freq = Counter(row_z)
-                m = max(freq.values())
-                dominant_ratios_by_k[K].append(m / K)
+                dominant_ratios_by_k[K].append(max(freq.values()) / K)
+
+            # Unique ratio
+            unique_ratios_by_k[K].append(len(set(row_z)) / K)
+
+            # Adjacent repeat rate
+            if K >= 2:
+                repeats = sum(
+                    1 for i in range(K - 1) if row_z[i] == row_z[i + 1]
+                )
+                adjacent_repeat_by_k[K].append(repeats / (K - 1))
+
 
     # ------------------------------------------------------------------
     # Final metrics
@@ -188,13 +206,15 @@ def evaluate_phase2(
         for z, c in z_counts_k1.items():
             z_distribution_k1[z] = c / total_z_k1
 
-    # Dominant-Z ratios by K
-    dominant_z_ratio_by_k: Dict[int, float] = {}
-    for K in range(2, k_max + 1):
-        vals = dominant_ratios_by_k.get(K, [])
-        if not vals:
-            continue
-        dominant_z_ratio_by_k[K] = float(np.mean(vals))
+    # ------------------------------------------------------------------
+    # Global effective vocab size
+    # ------------------------------------------------------------------
+    eps = 1e-12
+    entropy = -np.sum(
+        z_distribution * np.log(z_distribution + eps)
+    )
+    effective_vocab_size = float(np.exp(entropy))
+
 
     digit_em_by_k: Dict[int, float] = {}
     for K, total in total_rows_by_k.items():
@@ -202,11 +222,25 @@ def evaluate_phase2(
             continue
         digit_em_by_k[K] = correct_rows_by_k[K] / total
 
-    # ------------------------------------------------------------------
+    # Row metrics by K
+    unique_ratio_by_k = {
+        K: float(np.mean(v))
+        for K, v in unique_ratios_by_k.items()
+        if v
+    }
+
+    adjacent_repeat_rate_by_k = {
+        K: float(np.mean(v))
+        for K, v in adjacent_repeat_by_k.items()
+        if v
+    }
+
     return {
         "digit_em": float(digit_em),
         "digit_em_by_k": digit_em_by_k,
-        "z_distribution": z_distribution,
-        "z_distribution_k1": z_distribution_k1,
-        "dominant_z_ratio_by_k": dominant_z_ratio_by_k,
+
+        "effective_vocab_size": effective_vocab_size,
+
+        "unique_ratio_by_k": unique_ratio_by_k,
+        "adjacent_repeat_rate_by_k": adjacent_repeat_rate_by_k,
     }
