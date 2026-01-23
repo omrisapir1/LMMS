@@ -50,12 +50,22 @@ def evaluate_phase2(
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
-        split="eval",
+        split="train",
         k_max=k_max,
         latent_token_id=latent_token_id,
         answer_token_id=answer_token_id,
         rebalance_train=False,
     )
+
+    def iter_rows_with_min_k(train_ds: Phase2Dataset, min_k: int):
+        hf_ds = train_ds.ds
+
+        for i, ex in enumerate(hf_ds):
+            K = int(ex["num_latents"])
+            if K >= min_k:
+                yield ex  # raw HF row
+
+    ds = iter_rows_with_min_k(ds, min_k=17)
 
     loader = DataLoader(
         ds,
