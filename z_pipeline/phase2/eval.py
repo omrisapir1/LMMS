@@ -136,7 +136,7 @@ def evaluate_phase2(
             if int(ex["num_latents"]) >= min_k
         ]
 
-    ds.indices = filter_indices_by_min_k(ds, min_k=17)
+    # ds.indices = filter_indices_by_min_k(ds, min_k=17)
 
     loader = DataLoader(
         ds,
