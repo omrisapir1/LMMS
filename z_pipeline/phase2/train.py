@@ -321,14 +321,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     model.initialize_from_centroids(centroids)
 
 
-    if cfg.pretrain.enable:
-        pretrain_z_autoencoder(
-            model=model,
-            train_loader=train_loader,
-            cfg=cfg.pretrain,
-            device=device,
-        )
-
     # Losses
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
