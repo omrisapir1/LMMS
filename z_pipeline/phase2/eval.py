@@ -57,15 +57,13 @@ def evaluate_phase2(
         rebalance_train=False,
     )
 
-    def iter_rows_with_min_k(train_ds: Phase2Dataset, min_k: int):
-        hf_ds = train_ds.ds
+    def filter_indices_by_min_k(ds: Phase2Dataset, min_k: int):
+        return [
+            i for i, ex in enumerate(ds.ds)
+            if int(ex["num_latents"]) >= min_k
+        ]
 
-        for i, ex in enumerate(hf_ds):
-            K = int(ex["num_latents"])
-            if K >= min_k:
-                yield ex  # raw HF row
-
-    ds = iter_rows_with_min_k(ds, min_k=17)
+    ds.indices = filter_indices_by_min_k(ds, min_k=17)
 
     loader = DataLoader(
         ds,
