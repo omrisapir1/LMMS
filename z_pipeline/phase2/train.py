@@ -427,20 +427,46 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 k_max=cfg.data.k_max,
                 device=device,
             )
-            print(f"Digit EM: {metrics['digit_em'] * 100:.2f}%")
-            per_k_str = ", ".join(
-                f"K={k}: {v * 100:.2f}%"
-                for k, v in sorted(metrics["digit_em_by_k"].items())
-            )
-            print(f"Digit EM per K: {per_k_str}")
-            print_top_z(metrics["z_distribution"], topk=5, title="Global Z usage")
-            print_top_z(metrics["z_distribution_k1"], topk=5, title="Z usage when K=1")
-            print("\nDominant Z ratio by K:")
-            print(f'Current temperature: {temp:.2f}')
-            for K in sorted(metrics["dominant_z_ratio_by_k"]):
-                v = metrics["dominant_z_ratio_by_k"][K]
-                print(f"  K={K:2d}: {v:.3f}")
+            print("\n================ Phase-2 Evaluation =================")
 
+            # -----------------------------------------------------
+            # Global metrics
+            # -----------------------------------------------------
+            print(f"Digit EM (overall): {metrics['digit_em'] * 100:.2f}%")
+            print(
+                f"Effective Z vocab size: "
+                f"{metrics['effective_vocab_size']:.1f} / {cfg.z_vocab_size}"
+            )
+            print_top_z(metrics['z_distribution_k1'],5, title="Z distribution for K=1 rows")
+
+            print(f"Current temperature: {temp:.3f}")
+
+            # -----------------------------------------------------
+            # Per-K diagnostics
+            # -----------------------------------------------------
+            print("\nPer-K diagnostics:")
+            print("-" * 60)
+
+            # Collect all Ks that appear in any metric
+            all_Ks = sorted(
+                set(metrics["digit_em_by_k"].keys())
+                | set(metrics["unique_ratio_by_k"].keys())
+                | set(metrics["adjacent_repeat_rate_by_k"].keys())
+            )
+
+            for K in all_Ks:
+                em = metrics["digit_em_by_k"].get(K, None)
+                uniq = metrics["unique_ratio_by_k"].get(K, None)
+                adj = metrics["adjacent_repeat_rate_by_k"].get(K, None)
+
+                print(f"K={K:2d}:")
+                if em is not None:
+                    print(f"  EM              : {em * 100:6.2f}%")
+                if uniq is not None:
+                    print(f"  Unique ratio    : {uniq:6.3f}")
+                if adj is not None:
+                    print(f"  Adj repeat rate : {adj:6.3f}")
+                print()
 
             digit_em = float(metrics["digit_em"])
             if global_step >= min_steps:
