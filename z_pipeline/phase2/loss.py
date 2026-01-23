@@ -138,3 +138,38 @@ class ZUsageKLLoss:
         kl = torch.sum(q * (torch.log(q + self.eps) - torch.log(uniform)))
 
         return kl
+
+class RowZDiversityLoss:
+    """
+    Encourages diverse Z usage *within each row*.
+    Penalizes rows where multiple latents pick the same Z.
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        self.eps = eps
+
+    def compute(
+        self,
+        z_probs: torch.Tensor,  # [B, K, V]
+        z_mask: torch.Tensor,   # [B, K]
+    ) -> torch.Tensor:
+        """
+        Returns scalar loss.
+        """
+        B, K, V = z_probs.shape
+
+        mask = z_mask.float()                      # [B, K]
+        K_per_row = mask.sum(dim=1, keepdim=True) # [B, 1]
+
+        # Avoid division by zero
+        valid = K_per_row.squeeze(-1) > 0
+        if not valid.any():
+            return z_probs.new_zeros(())
+
+        # Row-level Z distribution
+        q = (z_probs * mask.unsqueeze(-1)).sum(dim=1) / (K_per_row + self.eps)  # [B, V]
+
+        # Concentration penalty (L2 norm squared)
+        row_loss = torch.sum(q * q, dim=1)  # [B]
+
+        return row_loss[valid].mean()
