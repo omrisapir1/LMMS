@@ -10,22 +10,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------
+# Output container
+# ---------------------------------------------------------------------
+
 @dataclass
 class Phase2Output:
     digit_logits: torch.Tensor                 # [B, 5, 10]
-    z_probs: Optional[torch.Tensor] = None     # [B, Kmax, V]
-    latent_positions: Optional[torch.Tensor] = None  # [B, Kmax] (debug)
+    z_probs: Optional[torch.Tensor] = None     # [B, Kmax, V] (one-hot)
+    latent_positions: Optional[torch.Tensor] = None
 
+
+# ---------------------------------------------------------------------
+# Phase-2 Z Model (hard VQ-style)
+# ---------------------------------------------------------------------
 
 class Phase2ZModel(nn.Module):
     """
-    Phase-2: Learn Z-token embeddings (inside LM embedding table) + Z-selector from digit loss ONLY.
+    Phase-2 (hard Z version):
 
-    Batch contract (after collate/pad):
-      - input_ids:      [B, T]  (suffix pad only, after <ANSWER>)
-      - attention_mask: [B, T]
-      - latent_states:  [B, Kmax, H]  (padded to Kmax; inactive rows can be zeros)
-      - z_mask:         [B, Kmax] bool (True for active steps)
+    latent_state → nearest centroid → Z embedding → inject → LM → digit heads
+
+    No selector, no temperature, no softmax.
     """
 
     def __init__(
@@ -35,140 +41,155 @@ class Phase2ZModel(nn.Module):
         digit_heads: nn.ModuleList,
         answer_token_id: int,
         latent_token_id: int,
-        z_token_ids: List[int],          # token ids for <Z_0>.. <Z_{V-1}> in order
+        z_token_ids: List[int],
         freeze_base: bool = True,
         freeze_digit_heads: bool = True,
         force_base_eval: bool = True,
     ):
         super().__init__()
 
-        if not isinstance(z_token_ids, list) or len(z_token_ids) == 0:
-            raise ValueError("z_token_ids must be a non-empty List[int]")
+        if not z_token_ids:
+            raise ValueError("z_token_ids must be non-empty")
 
         self.base = base_lm
         self.digit_heads = digit_heads
 
         self.answer_token_id = int(answer_token_id)
         self.latent_token_id = int(latent_token_id)
-
-        self.z_token_ids = [int(x) for x in z_token_ids]
+        self.z_token_ids = list(map(int, z_token_ids))
         self.z_vocab_size = len(self.z_token_ids)
 
         # Infer hidden size
         hidden_size = getattr(getattr(self.base, "config", None), "hidden_size", None)
         if hidden_size is None:
-            emb = self.base.get_input_embeddings()
-            hidden_size = emb.embedding_dim
+            hidden_size = self.base.get_input_embeddings().embedding_dim
         self.hidden_size = int(hidden_size)
 
-        # Trainable selector
-        self.z_selector = nn.Linear(self.hidden_size, self.z_vocab_size, bias=True, dtype=torch.bfloat16)
-
-        # Embedding module (Z rows live here)
+        # Embedding table (Z rows live here)
         self._emb = self.base.get_input_embeddings()
 
-        # Freeze
+        # Freeze base LM
         if freeze_base:
             for p in self.base.parameters():
                 p.requires_grad = False
+
+        # Digit heads
         for p in self.digit_heads.parameters():
-            p.requires_grad = True
+            p.requires_grad = not freeze_digit_heads
 
-        # Re-enable embedding grads + mask to Z rows only
+        # Allow grads only on Z embedding rows
         self._emb.weight.requires_grad = True
-        z_row_mask = torch.zeros(self._emb.weight.shape[0], dtype=torch.bfloat16)
-        z_row_mask[self.z_token_ids] = 1.0
-        self.register_buffer("_z_row_grad_mask", z_row_mask, persistent=False)
+        z_mask = torch.zeros(self._emb.weight.size(0), dtype=torch.float32)
+        z_mask[self.z_token_ids] = 1.0
+        self.register_buffer("_z_row_grad_mask", z_mask, persistent=False)
 
-        def _mask_embedding_grads(grad: torch.Tensor) -> torch.Tensor:
+        def _mask_grads(grad: torch.Tensor) -> torch.Tensor:
             return grad * self._z_row_grad_mask.unsqueeze(-1).to(grad.dtype)
 
-        self._emb.weight.register_hook(_mask_embedding_grads)
+        self._emb.weight.register_hook(_mask_grads)
 
         self.force_base_eval = bool(force_base_eval)
         if self.force_base_eval:
             self.base.eval()
 
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
     # Helpers
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     def _build_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
         pos = torch.cumsum(attention_mask.to(torch.long), dim=1) - 1
         return torch.clamp(pos, min=0)
 
+    def _get_z_embedding_matrix(self) -> torch.Tensor:
+        return self._emb.weight[self.z_token_ids]  # [V, H]
+
     def _infer_latent_positions(
         self,
-        input_ids: torch.Tensor,   # [B,T]
-        z_mask: torch.Tensor,      # [B,Kmax] bool
+        input_ids: torch.Tensor,
+        z_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Variable-K safe:
-          - each sample must have exactly K occurrences of <|latent|>, where K = sum(z_mask[b])
-          - returns positions padded with -1 to Kmax
+        Locate <|latent|> placeholders per row.
+        Returns [B, Kmax] padded with -1.
         """
-        if input_ids.ndim != 2:
-            raise ValueError("input_ids must be [B, T]")
-        if z_mask.ndim != 2:
-            raise ValueError("z_mask must be [B, Kmax]")
-
-        B, _T = input_ids.shape
+        B, T = input_ids.shape
         Kmax = z_mask.shape[1]
         device = input_ids.device
 
-        positions_out = torch.full((B, Kmax), -1, device=device, dtype=torch.long)
+        out = torch.full((B, Kmax), -1, device=device, dtype=torch.long)
 
-        # per-sample scan (B is small; K is small)
         for b in range(B):
             k = int(z_mask[b].sum().item())
             pos = (input_ids[b] == self.latent_token_id).nonzero(as_tuple=False).view(-1)
             if pos.numel() != k:
                 raise RuntimeError(
-                    f"Phase2 error: sample {b} has {pos.numel()} '<|latent|>' placeholders "
-                    f"but z_mask indicates K={k}. "
-                    f"(Check batch construction: must include exactly K placeholders.)"
+                    f"Row {b}: found {pos.numel()} <|latent|> but z_mask says {k}"
                 )
             if k > 0:
-                pos_sorted, _ = torch.sort(pos)
-                positions_out[b, :k] = pos_sorted[:k]
-        return positions_out
+                out[b, :k] = pos.sort().values[:k]
 
-    def _get_z_embedding_matrix(self) -> torch.Tensor:
-        # [V, H] from LM embedding table
-        return self._emb.weight[self.z_token_ids]
+        return out
 
     def _compute_digit_logits_from_hidden(
         self,
-        hidden_last: torch.Tensor,   # [B,T,H]
-        input_ids: torch.Tensor,     # [B,T]
+        hidden_last: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> torch.Tensor:
         answer_mask = (input_ids == self.answer_token_id)
         if not torch.all(answer_mask.sum(dim=1) == 1):
-            raise RuntimeError("Each sample must contain exactly one <ANSWER> token")
+            raise RuntimeError("Each row must contain exactly one <ANSWER> token")
 
         idx = answer_mask.float().argmax(dim=1)
         bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
-        answer_hidden = hidden_last[bidx, idx]  # [B,H]
-        return torch.stack([head(answer_hidden) for head in self.digit_heads], dim=1)  # [B,5,10]
+        h = hidden_last[bidx, idx]  # [B, H]
+        return torch.stack([head(h) for head in self.digit_heads], dim=1)
 
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Hard Z assignment
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def assign_z_by_nearest(
+        self,
+        latent_states: torch.Tensor,  # [B, Kmax, H]
+        z_mask: torch.Tensor,         # [B, Kmax]
+    ) -> torch.Tensor:
+        """
+        Nearest-centroid assignment.
+        Returns z_ids [B, Kmax].
+        """
+        z_mask = z_mask.bool()
+        h = latent_states.to(self._emb.weight.dtype)
+        Ez = self._get_z_embedding_matrix()
+
+        # cosine distance works best here
+        h = F.normalize(h, dim=-1)
+        Ez = F.normalize(Ez, dim=-1)
+
+        dists = torch.cdist(h, Ez)  # [B, K, V]
+        z_ids = torch.argmin(dists, dim=-1)
+
+        z_ids = torch.where(z_mask, z_ids, torch.zeros_like(z_ids))
+        return z_ids
+
+    # ------------------------------------------------------------------
     # Forward
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     def forward(
         self,
         *,
-        input_ids: torch.Tensor,          # [B,T]
-        attention_mask: torch.Tensor,     # [B,T]
-        latent_states: torch.Tensor,      # [B,Kmax,H]  (already states[:-1], padded)
-        z_mask: torch.Tensor,             # [B,Kmax] bool or 0/1
-        temperature: float,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        latent_states: torch.Tensor,
+        z_mask: torch.Tensor,
+        temperature: Optional[float] = None,  # ignored (kept for API compat)
         return_z_probs: bool = False,
         return_debug: bool = False,
     ) -> Union[Dict[str, torch.Tensor], Phase2Output]:
 
         if input_ids.ndim != 2 or attention_mask.ndim != 2:
-            raise ValueError("input_ids and attention_mask must be [B, T]")
+            raise ValueError("input_ids / attention_mask must be [B, T]")
         if latent_states.ndim != 3:
             raise ValueError("latent_states must be [B, Kmax, H]")
         if z_mask.ndim != 2:
@@ -177,56 +198,29 @@ class Phase2ZModel(nn.Module):
         B, T = input_ids.shape
         Kmax = z_mask.shape[1]
 
-        if latent_states.shape[0] != B:
-            raise ValueError("latent_states batch size mismatch")
-        if latent_states.shape[1] != Kmax:
-            raise ValueError(f"latent_states second dim must be Kmax={Kmax}, got {latent_states.shape[1]}")
-        if latent_states.shape[2] != self.hidden_size:
-            raise ValueError(f"latent_states hidden size mismatch: expected H={self.hidden_size}")
-
-        # normalize mask to bool
-        z_mask_bool = z_mask.bool() if z_mask.dtype != torch.bool else z_mask
-
-        temp = float(temperature)
-        if temp <= 0.0:
-            raise ValueError("temperature must be > 0")
-
-        device = input_ids.device
-        attention_mask = attention_mask.to(device)
-
         if self.force_base_eval:
             self.base.eval()
 
-        # infer placeholder positions for *active* steps
-        latent_positions = self._infer_latent_positions(input_ids, z_mask_bool)  # [B,Kmax]
+        z_mask_bool = z_mask.bool()
+        latent_positions = self._infer_latent_positions(input_ids, z_mask_bool)
 
-        # base embeddings
-        inputs_embeds = self._emb(input_ids)  # [B,T,H]
+        # Base embeddings
+        inputs_embeds = self._emb(input_ids)
 
-        # selector logits only for active steps (mask others to -inf so probs ~0)
-        h = latent_states.to(device=device, dtype=torch.bfloat16, )  # [B,Kmax,H]
-        z_logits = self.z_selector(h)  # [B,Kmax,V]
+        # ---- HARD Z PATH ----
+        z_ids = self.assign_z_by_nearest(latent_states, z_mask_bool)
+        Ez = self._get_z_embedding_matrix().to(
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        z_emb = Ez[z_ids]  # [B, Kmax, H]
 
-        # mask inactive positions so they don't contribute to z_probs / KL
-        neg_inf = torch.finfo(z_logits.dtype).min
-        z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
-
-        z_probs = F.softmax(z_logits / temp, dim=-1)  # [B,Kmax,V]
-
-        # soft embeddings: [B,Kmax,H] = z_probs @ Ez
-        Ez = self._get_z_embedding_matrix().to(device=device, dtype=inputs_embeds.dtype)  # [V,H]
-        soft_z = torch.matmul(z_probs, Ez)  # [B,Kmax,H]
-
-        # inject only active positions (vectorized)
-        # gather (b,k) where active
-        active_bk = z_mask_bool.nonzero(as_tuple=False)  # [N,2] with columns [b,k]
-        if active_bk.numel() > 0:
-            b_idx = active_bk[:, 0]
-            k_idx = active_bk[:, 1]
-            p_idx = latent_positions[b_idx, k_idx]  # [N]
-            if (p_idx < 0).any():
-                raise RuntimeError("Found active z_mask but latent_positions == -1 (batch construction bug).")
-            inputs_embeds[b_idx, p_idx, :] = soft_z[b_idx, k_idx, :]
+        # Inject
+        active = z_mask_bool.nonzero(as_tuple=False)
+        if active.numel() > 0:
+            b_idx, k_idx = active[:, 0], active[:, 1]
+            p_idx = latent_positions[b_idx, k_idx]
+            inputs_embeds[b_idx, p_idx] = z_emb[b_idx, k_idx]
 
         # LM forward
         position_ids = self._build_position_ids(attention_mask)
@@ -237,112 +231,59 @@ class Phase2ZModel(nn.Module):
             use_cache=False,
             output_hidden_states=True,
         )
+
         hidden_last = out.hidden_states[-1]
         digit_logits = self._compute_digit_logits_from_hidden(hidden_last, input_ids)
+
+        z_probs = None
+        if return_z_probs:
+            z_probs = torch.zeros(
+                B, Kmax, self.z_vocab_size,
+                device=z_ids.device,
+                dtype=inputs_embeds.dtype,
+            )
+            z_probs.scatter_(-1, z_ids.unsqueeze(-1), 1.0)
 
         if return_debug:
             return Phase2Output(
                 digit_logits=digit_logits,
-                z_probs=z_probs if return_z_probs else None,
-                latent_positions=latent_positions if return_debug else None,
+                z_probs=z_probs,
+                latent_positions=latent_positions,
             )
+
         if return_z_probs:
-            return {'digit_logits': digit_logits, 'z_probs': z_probs}
+            return {"digit_logits": digit_logits, "z_probs": z_probs}
 
         return {"digit_logits": digit_logits}
 
+    # ------------------------------------------------------------------
+    # Centroid initialization (unchanged)
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
-    def z_autoencoder_forward(
-            self,
-            *,
-            latent_states: torch.Tensor,  # [B, Kmax, H]
-            z_mask: torch.Tensor,  # [B, Kmax]
-            temperature: float,
-    ) -> torch.Tensor:
-        """
-        Z-only forward pass:
-        returns z_probs [B, Kmax, V]
-        """
-        if latent_states.ndim != 3:
-            raise ValueError("latent_states must be [B, Kmax, H]")
-        if z_mask.ndim != 2:
-            raise ValueError("z_mask must be [B, Kmax]")
-
-        z_mask_bool = z_mask.bool()
-        h = latent_states.to(dtype=self.z_selector.weight.dtype)
-
-        z_logits = self.z_selector(h)  # [B, Kmax, V]
-        z_logits = torch.clamp(z_logits, -30, 30)
-
-        neg_inf = torch.finfo(z_logits.dtype).min
-        z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
-
-        z_probs = F.softmax(z_logits / temperature, dim=-1)
-        return z_probs
-
     def initialize_from_centroids(
         self,
         centroids: torch.Tensor,  # [V, H]
         *,
         normalize: bool = True,
-        bias_zero: bool = True,
-        selector_dtype: Optional[torch.dtype] = None,
         eps: float = 1e-8,
     ) -> None:
-        """
-        Initialize BOTH:
-          1) Z embedding rows inside the base LM embedding table (at self.z_token_ids)
-          2) z_selector weights (Linear(H -> V)) so logits ~ dot(h, centroid_j)
-
-        centroids: Tensor[V, H] where row j is the centroid for Z_j.
-
-        Notes:
-        - If normalize=True, rows are L2-normalized before being written.
-          This makes selection behave like cosine-sim (assuming h is similarly normalized).
-        - selector_dtype controls the dtype written into z_selector weights.
-          If None, uses self.z_selector.weight.dtype.
-        """
-        if not torch.is_tensor(centroids):
-            raise TypeError("centroids must be a torch.Tensor")
-
         if centroids.ndim != 2:
-            raise ValueError(f"centroids must be 2D [V,H], got shape={tuple(centroids.shape)}")
+            raise ValueError("centroids must be [V, H]")
 
         V, H = centroids.shape
         if V != self.z_vocab_size:
-            raise ValueError(
-                f"centroids V mismatch: got V={V}, expected z_vocab_size={self.z_vocab_size}"
-            )
+            raise ValueError("V mismatch")
         if H != self.hidden_size:
-            raise ValueError(
-                f"centroids H mismatch: got H={H}, expected hidden_size={self.hidden_size}"
-            )
+            raise ValueError("H mismatch")
 
-        # Optionally normalize on a safe dtype (float32) to avoid bf16 norm artifacts.
         c = centroids
         if normalize:
-            c_fp32 = c.detach().to(dtype=torch.float32)
-            norms = torch.linalg.norm(c_fp32, dim=1, keepdim=True).clamp_min(eps)
-            c = (c_fp32 / norms).to(dtype=centroids.dtype, device=centroids.device)
+            c = F.normalize(c.float(), dim=1).to(centroids.dtype)
 
-        z_ids = torch.tensor(self.z_token_ids, device=c.device, dtype=torch.long)
-
-        # ---- 1) Write centroids into the LM embedding table rows for Z tokens ----
-        emb_w = self._emb.weight
-        c_for_emb = c.to(device=emb_w.device, dtype=emb_w.dtype)
-
-        with torch.no_grad():
-            # emb_w[z_token_ids] = centroids
-            emb_w.index_copy_(0, z_ids.to(device=emb_w.device), c_for_emb)
-
-        # ---- 2) Write centroids into selector weights ----
-        sel_w = self.z_selector.weight
-        target_dtype = selector_dtype if selector_dtype is not None else sel_w.dtype
-        c_for_sel = c.to(device=sel_w.device, dtype=target_dtype)
-
-        with torch.no_grad():
-            # selector.weight is [V,H]; each row corresponds to a Z token.
-            sel_w.copy_(c_for_sel)
-
-            if bias_zero and getattr(self.z_selector, "bias", None) is not None:
-                self.z_selector.bias.zero_()
+        z_ids = torch.tensor(self.z_token_ids, device=c.device)
+        self._emb.weight.index_copy_(
+            0,
+            z_ids.to(self._emb.weight.device),
+            c.to(self._emb.weight.dtype),
+        )
