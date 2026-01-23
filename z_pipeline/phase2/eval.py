@@ -216,6 +216,14 @@ def evaluate_phase2(
     effective_vocab_size = float(np.exp(entropy))
 
 
+    # Dominant-Z ratios by K
+    dominant_z_ratio_by_k: Dict[int, float] = {}
+    for K in range(2, k_max + 1):
+        vals = dominant_ratios_by_k.get(K, [])
+        if not vals:
+            continue
+        dominant_z_ratio_by_k[K] = float(np.mean(vals))
+
     digit_em_by_k: Dict[int, float] = {}
     for K, total in total_rows_by_k.items():
         if total == 0:
@@ -239,6 +247,8 @@ def evaluate_phase2(
         "digit_em": float(digit_em),
         "digit_em_by_k": digit_em_by_k,
 
+        "z_distribution": z_distribution,
+        "z_distribution_k1": z_distribution_k1,
         "effective_vocab_size": effective_vocab_size,
 
         "unique_ratio_by_k": unique_ratio_by_k,
