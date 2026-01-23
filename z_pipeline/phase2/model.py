@@ -259,15 +259,15 @@ class Phase2ZModel(nn.Module):
     # ------------------------------------------------------------------
     # Centroid initialization (unchanged)
     # ------------------------------------------------------------------
-
     @torch.no_grad()
     def initialize_from_centroids(
-        self,
-        centroids: torch.Tensor,  # [V, H]
-        *,
-        normalize: bool = True,
-        eps: float = 1e-8,
+            self,
+            centroids: torch.Tensor,  # [V, H]
+            *,
+            normalize: bool = True,
+            eps: float = 1e-8,
     ) -> None:
+
         if centroids.ndim != 2:
             raise ValueError("centroids must be [V, H]")
 
@@ -277,13 +277,22 @@ class Phase2ZModel(nn.Module):
         if H != self.hidden_size:
             raise ValueError("H mismatch")
 
+        # normalize on CPU or GPU safely
         c = centroids
         if normalize:
-            c = F.normalize(c.float(), dim=1).to(centroids.dtype)
+            c = c.float()
+            c = c / torch.linalg.norm(c, dim=1, keepdim=True).clamp_min(eps)
 
-        z_ids = torch.tensor(self.z_token_ids, device=c.device)
-        self._emb.weight.index_copy_(
-            0,
-            z_ids.to(self._emb.weight.device),
-            c.to(self._emb.weight.dtype),
+        emb_device = self._emb.weight.device
+
+        # move centroids to embedding device
+        c = c.to(device=emb_device, dtype=self._emb.weight.dtype)
+
+        z_ids = torch.tensor(
+            self.z_token_ids,
+            device=emb_device,
+            dtype=torch.long,
         )
+
+        # write Z embeddings
+        self._emb.weight.index_copy_(0, z_ids, c)
