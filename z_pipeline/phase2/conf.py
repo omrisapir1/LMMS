@@ -37,11 +37,11 @@ class TemperatureSchedule:
     temp_end: float = 1
 
     # Number of optimizer steps over which annealing happens
-    anneal_steps: int = 30_00
+    anneal_steps: int = 3000
 
     # After anneal_steps, temperature is held at temp_end
     # for additional stabilization before early stopping
-    cooldown_steps: int = 5_00
+    cooldown_steps: int = 500
 
     def total_steps(self) -> int:
         return self.anneal_steps + self.cooldown_steps
