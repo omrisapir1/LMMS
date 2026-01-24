@@ -1,3 +1,20 @@
+# phase2/eval.py
+#
+# Phase-2 evaluation:
+# 1) Digit exact-match accuracy (all 5 digits correct)
+# 2) Overall Zi distribution (argmax) + Zi distribution for K==1 rows
+# 3) For K=2..20: average dominant-Z ratio per row
+#
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+from collections import Counter, defaultdict
+
+import torch
+import numpy as np
+from torch.utils.data import DataLoader
+
+from .dataset import Phase2Dataset, phase2_collate_fn
 @torch.no_grad()
 def evaluate_phase2(
     *,
