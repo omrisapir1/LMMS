@@ -160,9 +160,9 @@ class Phase2ZModel(nn.Module):
             input_ids: torch.Tensor,  # [B,T]
             attention_mask: torch.Tensor,  # [B,T]
             latent_states: torch.Tensor,  # [B,Kmax,H]
-            z_mask: torch.Tensor,  # [B,Kmax]
+            z_mask: torch.Tensor,  # [B,Kmax] bool or 0/1
             temperature: float,
-            z_mode: str = "soft",  # NEW
+            z_mode: str = "soft",
             return_z_probs: bool = False,
             return_debug: bool = False,
     ) -> Dict[str, torch.Tensor]:
@@ -181,7 +181,7 @@ class Phase2ZModel(nn.Module):
         Kmax = z_mask.shape[1]
         device = input_ids.device
 
-        z_mask_bool = z_mask.bool()
+        z_mask_bool = z_mask.bool() if z_mask.dtype != torch.bool else z_mask
 
         if self.force_base_eval:
             self.base.eval()
@@ -197,42 +197,65 @@ class Phase2ZModel(nn.Module):
         inputs_embeds = self._emb(input_ids)  # [B,T,H]
 
         # --------------------------------------------------
-        # Z selector logits
+        # Z selector logits (sanitize latents first!)
         # --------------------------------------------------
-        h = latent_states.to(device=device, dtype=self.z_selector.weight.dtype)  # [B,Kmax,H]
-        z_logits = self.z_selector(h)  # [B,Kmax,V]
+        h = latent_states.to(device=device, dtype=self.z_selector.weight.dtype)  # [B,K,H]
+        # kill NaN/Inf anywhere (padding or buggy rows) so Linear can't produce NaNs
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Mask inactive slots
-        neg_inf = torch.finfo(z_logits.dtype).min
-        z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
+        # (Optional but highly recommended) hard fail if ACTIVE positions are non-finite
+        # If this triggers, you have a real dataset/collate bug.
+        if not torch.isfinite(h[z_mask_bool]).all():
+            raise RuntimeError("latent_states contains NaN/Inf in ACTIVE positions")
+
+        z_logits = self.z_selector(h)  # [B,K,V]
+
+        # --------------------------------------------------
+        # Build a *finite* masked logits tensor (critical for sampling)
+        # --------------------------------------------------
+        # Use float32 for stable softmax/sampling even if model is bf16.
+        z_logits_f32 = z_logits.to(torch.float32)
+        z_logits_f32 = torch.where(
+            z_mask_bool.unsqueeze(-1),
+            z_logits_f32,
+            torch.full_like(z_logits_f32, -1e4),  # finite "almost -inf"
+        )
+        z_logits_f32 = torch.nan_to_num(z_logits_f32, nan=-1e4, posinf=-1e4, neginf=-1e4)
+        z_logits_f32 = torch.clamp(z_logits_f32, -50.0, 50.0)
 
         # --------------------------------------------------
         # Z selection + embedding
         # --------------------------------------------------
-        Ez = self._get_z_embedding_matrix().to(
-            device=device, dtype=inputs_embeds.dtype
-        )  # [V,H]
+        Ez = self._get_z_embedding_matrix().to(device=device, dtype=inputs_embeds.dtype)  # [V,H]
 
         z_probs = None
         z_ids = None
 
         if z_mode == "soft":
-            if temperature is None or temperature <= 0:
+            temp = float(temperature)
+            if temp <= 0.0:
                 raise ValueError("temperature must be >0 for soft mode")
 
-            z_probs = F.softmax(z_logits / temperature, dim=-1)  # [B,K,V]
+            # softmax in fp32, then cast to embed dtype
+            z_probs = F.softmax(z_logits_f32 / temp, dim=-1).to(inputs_embeds.dtype)  # [B,K,V]
+            # ensure inactive positions are exactly 0 prob mass (nice for KL code)
+            z_probs = z_probs * z_mask_bool.unsqueeze(-1).to(z_probs.dtype)
+
             z_emb = torch.matmul(z_probs, Ez)  # [B,K,H]
 
         elif z_mode == "hard_argmax":
-            z_ids = torch.argmax(z_logits, dim=-1)  # [B,K]
+            z_ids = torch.argmax(z_logits_f32, dim=-1)  # [B,K]
+            z_ids = torch.where(z_mask_bool, z_ids, torch.zeros_like(z_ids))
             z_emb = Ez[z_ids]  # [B,K,H]
 
         elif z_mode == "hard_sample":
-            if temperature is None or temperature <= 0:
+            temp = float(temperature)
+            if temp <= 0.0:
                 raise ValueError("temperature must be >0 for hard_sample mode")
 
-            dist = torch.distributions.Categorical(logits=z_logits / temperature)
+            dist = torch.distributions.Categorical(logits=z_logits_f32 / temp)
             z_ids = dist.sample()  # [B,K]
+            z_ids = torch.where(z_mask_bool, z_ids, torch.zeros_like(z_ids))
             z_emb = Ez[z_ids]  # [B,K,H]
 
         # --------------------------------------------------
@@ -243,16 +266,17 @@ class Phase2ZModel(nn.Module):
             b_idx = active_bk[:, 0]
             k_idx = active_bk[:, 1]
             p_idx = latent_positions[b_idx, k_idx]
+            if (p_idx < 0).any():
+                raise RuntimeError("Active z_mask but latent_positions == -1 (batch construction bug).")
             inputs_embeds[b_idx, p_idx] = z_emb[b_idx, k_idx]
 
         # --------------------------------------------------
         # LM forward
         # --------------------------------------------------
-        position_ids = self._build_position_ids(attention_mask)
-
+        position_ids = self._build_position_ids(attention_mask.to(device))
         out = self.base(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask.to(device),
             position_ids=position_ids,
             use_cache=False,
             output_hidden_states=True,
@@ -264,20 +288,20 @@ class Phase2ZModel(nn.Module):
         # --------------------------------------------------
         # Outputs
         # --------------------------------------------------
-        result = {
-            "digit_logits": digit_logits,
-        }
+        result: Dict[str, torch.Tensor] = {"digit_logits": digit_logits}
 
+        # return_z_probs is only meaningful for soft (KL loss). For hard modes, z_probs=None.
         if return_z_probs:
-            result["z_probs"] = z_probs
-            result["z_logits"] = z_logits
+            if z_probs is not None:
+                result["z_probs"] = z_probs
+            # Keep logits for debugging/analysis (masked fp32 is safest)
+            result["z_logits"] = z_logits_f32
 
         if z_ids is not None:
             result["z_ids"] = z_ids
 
         if return_debug:
             result["latent_positions"] = latent_positions
-
 
         return result
 
