@@ -472,15 +472,15 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                         print(f"  Adj repeat rate : {adj:6.3f}")
                     print()
 
-            digit_em = float(metrics["argmax"]["digit_em"])
-            if global_step >= min_steps:
-                if digit_em > best_em + min_delta:
-                    best_em = digit_em
-                    no_improve = 0
-                else:
-                    no_improve += 1
-                if no_improve >= patience:
-                    break
+            # digit_em = float(metrics["argmax"]["digit_em"])
+            # if global_step >= min_steps:
+            #     if digit_em > best_em + min_delta:
+            #         best_em = digit_em
+            #         no_improve = 0
+            #     else:
+            #         no_improve += 1
+            #     if no_improve >= patience:
+            #         break
             model.train()
         global_step += 1
 
