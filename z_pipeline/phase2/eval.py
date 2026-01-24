@@ -16,6 +16,71 @@ from torch.utils.data import DataLoader
 
 from .dataset import Phase2Dataset, phase2_collate_fn
 
+def sample_z_ids(
+    z_probs: torch.Tensor,   # [B, K, V]
+    z_mask: torch.Tensor,    # [B, K]
+    temperature: float,
+) -> torch.Tensor:
+    """
+    Returns z_ids [B, K] using temperature sampling.
+    temperature = 0 → argmax
+    """
+    if temperature == 0.0:
+        return torch.argmax(z_probs, dim=-1)
+
+    B, K, V = z_probs.shape
+    z_ids = torch.zeros(B, K, device=z_probs.device, dtype=torch.long)
+
+    logits = torch.log(z_probs + 1e-12) / temperature
+
+    for b in range(B):
+        k = int(z_mask[b].sum().item())
+        if k == 0:
+            continue
+        probs = torch.softmax(logits[b, :k], dim=-1)  # [k, V]
+        z_ids[b, :k] = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    return z_ids
+
+
+def _accumulate_metrics_for_z_ids(
+    *,
+    z_ids: torch.Tensor,        # [B, Kmax]
+    z_mask: torch.Tensor,       # [B, Kmax]
+    digit_logits: torch.Tensor, # [B, 5, 10]
+    digit_labels: torch.Tensor,
+    accum,
+):
+    B, Kmax = z_mask.shape
+
+    pred_digits = torch.argmax(digit_logits, dim=-1)
+    em = (pred_digits == digit_labels).all(dim=1)
+
+    accum["total_rows"] += B
+    accum["correct_rows"] += int(em.sum().item())
+
+    for b in range(B):
+        K = int(z_mask[b].sum().item())
+        if K <= 0:
+            continue
+
+        row_z = z_ids[b, :K].tolist()
+
+        accum["total_rows_by_k"][K] += 1
+        if em[b].item():
+            accum["correct_rows_by_k"][K] += 1
+
+        accum["z_counts"].update(row_z)
+
+        # Unique ratio
+        accum["unique_ratios_by_k"][K].append(len(set(row_z)) / K)
+
+        # Adjacent repeat rate
+        if K >= 2:
+            repeats = sum(row_z[i] == row_z[i + 1] for i in range(K - 1))
+            accum["adjacent_repeat_by_k"][K].append(repeats / (K - 1))
+
+
 @torch.no_grad()
 def evaluate_phase2(
     *,
