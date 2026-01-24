@@ -1,21 +1,3 @@
-# phase2/eval.py
-#
-# Phase-2 evaluation:
-# 1) Digit exact-match accuracy (all 5 digits correct)
-# 2) Overall Zi distribution (argmax) + Zi distribution for K==1 rows
-# 3) For K=2..20: average dominant-Z ratio per row
-#
-from __future__ import annotations
-
-from typing import Dict, List, Optional
-from collections import Counter, defaultdict
-
-import torch
-import numpy as np
-from torch.utils.data import DataLoader
-
-from .dataset import Phase2Dataset, phase2_collate_fn
-
 @torch.no_grad()
 def evaluate_phase2(
     *,
@@ -27,7 +9,7 @@ def evaluate_phase2(
     answer_token_id: int,
     k_max: int = 20,
     device: Optional[torch.device] = None,
-) -> Dict:
+) -> Dict[str, Dict]:
 
     if device is None:
         device = next(model.parameters()).device
@@ -38,10 +20,10 @@ def evaluate_phase2(
     # Evaluation modes
     # ---------------------------------------------------------
     eval_modes = {
-        "argmax": None,
-        "temp_0.3": 0.3,
-        "temp_0.7": 0.7,
-        "temp_1.0": 1.0,
+        "argmax": dict(z_mode="hard_argmax", temperature=None),
+        "sample_0.3": dict(z_mode="hard_sample", temperature=0.3),
+        "sample_0.7": dict(z_mode="hard_sample", temperature=0.7),
+        "sample_1.0": dict(z_mode="hard_sample", temperature=1.0),
     }
 
     # ---------------------------------------------------------
@@ -68,9 +50,12 @@ def evaluate_phase2(
     all_results = {}
 
     # =========================================================
-    # Loop over decoding modes
+    # Loop over modes
     # =========================================================
-    for mode, temperature in eval_modes.items():
+    for mode_name, cfg in eval_modes.items():
+
+        z_mode = cfg["z_mode"]
+        temperature = cfg["temperature"]
 
         total_rows = 0
         correct_rows = 0
@@ -100,26 +85,16 @@ def evaluate_phase2(
                 attention_mask=attention_mask,
                 latent_states=latent_states,
                 z_mask=z_mask,
-                temperature=None,   # model already outputs probs
-                return_z_probs=True,
+                z_mode=z_mode,
+                temperature=temperature if temperature is not None else 1.0,
+                return_z_probs=False,
             )
 
-            z_probs = out["z_probs"]          # [B, K, V]
-            z_logits = out["z_logits"]       
             digit_logits = out["digit_logits"]
+            z_ids = out["z_ids"]           # [B,K]
 
-            _, _, V_batch = z_probs.shape
-            if V is None:
-                V = V_batch
-
-            # --------------------------------------------------
-            # Z selection per mode
-            # --------------------------------------------------
-            if temperature is None:
-                z_ids = torch.argmax(z_probs, dim=-1)
-            else:
-                dist = torch.distributions.Categorical(logits=z_logits)
-                z_ids = dist.sample()
+            _, _, V_batch = z_ids.shape[0], z_ids.shape[1], model.z_vocab_size
+            V = model.z_vocab_size
 
             # --------------------------------------------------
             # Digit EM
@@ -139,7 +114,7 @@ def evaluate_phase2(
                     continue
 
                 total_rows_by_k[K] += 1
-                if em[b].item():
+                if em[b]:
                     correct_rows_by_k[K] += 1
 
                 row_z = z_ids[b, :K].tolist()
@@ -152,8 +127,8 @@ def evaluate_phase2(
 
                 if K >= 2:
                     repeats = sum(
-                        1 for i in range(K - 1)
-                        if row_z[i] == row_z[i + 1]
+                        row_z[i] == row_z[i + 1]
+                        for i in range(K - 1)
                     )
                     adjacent_repeat_by_k[K].append(repeats / (K - 1))
 
@@ -190,7 +165,7 @@ def evaluate_phase2(
             K: float(np.mean(v)) for K, v in adjacent_repeat_by_k.items()
         }
 
-        all_results[mode] = {
+        all_results[mode_name] = {
             "digit_em": digit_em,
             "digit_em_by_k": digit_em_by_k,
             "z_distribution": z_distribution,
@@ -200,5 +175,4 @@ def evaluate_phase2(
             "adjacent_repeat_rate_by_k": adjacent_repeat_rate_by_k,
         }
 
-    return all_results
-
+    return {"modes": all_results}

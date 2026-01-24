@@ -154,82 +154,102 @@ class Phase2ZModel(nn.Module):
     # ─────────────────────────────────────────────
     # Forward
     # ─────────────────────────────────────────────
-
     def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,          # [B,T]
-        attention_mask: torch.Tensor,     # [B,T]
-        latent_states: torch.Tensor,      # [B,Kmax,H]  (already states[:-1], padded)
-        z_mask: torch.Tensor,             # [B,Kmax] bool or 0/1
-        temperature: float,
-        return_z_probs: bool = False,
-        return_debug: bool = False,
-    ) -> Union[Dict[str, torch.Tensor], Phase2Output]:
+            self,
+            *,
+            input_ids: torch.Tensor,  # [B,T]
+            attention_mask: torch.Tensor,  # [B,T]
+            latent_states: torch.Tensor,  # [B,Kmax,H]
+            z_mask: torch.Tensor,  # [B,Kmax]
+            temperature: float,
+            z_mode: str = "soft",  # NEW
+            return_z_probs: bool = False,
+            return_debug: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+
+        if z_mode not in {"soft", "hard_argmax", "hard_sample"}:
+            raise ValueError(f"Invalid z_mode: {z_mode}")
 
         if input_ids.ndim != 2 or attention_mask.ndim != 2:
-            raise ValueError("input_ids and attention_mask must be [B, T]")
+            raise ValueError("input_ids and attention_mask must be [B,T]")
         if latent_states.ndim != 3:
-            raise ValueError("latent_states must be [B, Kmax, H]")
+            raise ValueError("latent_states must be [B,Kmax,H]")
         if z_mask.ndim != 2:
-            raise ValueError("z_mask must be [B, Kmax]")
+            raise ValueError("z_mask must be [B,Kmax]")
 
         B, T = input_ids.shape
         Kmax = z_mask.shape[1]
-
-        if latent_states.shape[0] != B:
-            raise ValueError("latent_states batch size mismatch")
-        if latent_states.shape[1] != Kmax:
-            raise ValueError(f"latent_states second dim must be Kmax={Kmax}, got {latent_states.shape[1]}")
-        if latent_states.shape[2] != self.hidden_size:
-            raise ValueError(f"latent_states hidden size mismatch: expected H={self.hidden_size}")
-
-        # normalize mask to bool
-        z_mask_bool = z_mask.bool() if z_mask.dtype != torch.bool else z_mask
-
-        temp = float(temperature)
-        if temp <= 0.0:
-            raise ValueError("temperature must be > 0")
-
         device = input_ids.device
-        attention_mask = attention_mask.to(device)
+
+        z_mask_bool = z_mask.bool()
 
         if self.force_base_eval:
             self.base.eval()
 
-        # infer placeholder positions for *active* steps
+        # --------------------------------------------------
+        # Infer latent placeholder positions
+        # --------------------------------------------------
         latent_positions = self._infer_latent_positions(input_ids, z_mask_bool)  # [B,Kmax]
 
-        # base embeddings
+        # --------------------------------------------------
+        # Base embeddings
+        # --------------------------------------------------
         inputs_embeds = self._emb(input_ids)  # [B,T,H]
 
-        # selector logits only for active steps (mask others to -inf so probs ~0)
-        h = latent_states.to(device=device, dtype=torch.bfloat16, )  # [B,Kmax,H]
+        # --------------------------------------------------
+        # Z selector logits
+        # --------------------------------------------------
+        h = latent_states.to(device=device, dtype=self.z_selector.weight.dtype)  # [B,Kmax,H]
         z_logits = self.z_selector(h)  # [B,Kmax,V]
 
-        # mask inactive positions so they don't contribute to z_probs / KL
+        # Mask inactive slots
         neg_inf = torch.finfo(z_logits.dtype).min
         z_logits = torch.where(z_mask_bool.unsqueeze(-1), z_logits, neg_inf)
 
-        z_probs = F.softmax(z_logits / temp, dim=-1)  # [B,Kmax,V]
+        # --------------------------------------------------
+        # Z selection + embedding
+        # --------------------------------------------------
+        Ez = self._get_z_embedding_matrix().to(
+            device=device, dtype=inputs_embeds.dtype
+        )  # [V,H]
 
-        # soft embeddings: [B,Kmax,H] = z_probs @ Ez
-        Ez = self._get_z_embedding_matrix().to(device=device, dtype=inputs_embeds.dtype)  # [V,H]
-        soft_z = torch.matmul(z_probs, Ez)  # [B,Kmax,H]
+        z_probs = None
+        z_ids = None
 
-        # inject only active positions (vectorized)
-        # gather (b,k) where active
-        active_bk = z_mask_bool.nonzero(as_tuple=False)  # [N,2] with columns [b,k]
+        if z_mode == "soft":
+            if temperature is None or temperature <= 0:
+                raise ValueError("temperature must be >0 for soft mode")
+
+            z_probs = F.softmax(z_logits / temperature, dim=-1)  # [B,K,V]
+            z_emb = torch.matmul(z_probs, Ez)  # [B,K,H]
+
+        elif z_mode == "hard_argmax":
+            z_ids = torch.argmax(z_logits, dim=-1)  # [B,K]
+            z_emb = Ez[z_ids]  # [B,K,H]
+
+        elif z_mode == "hard_sample":
+            if temperature is None or temperature <= 0:
+                raise ValueError("temperature must be >0 for hard_sample mode")
+
+            dist = torch.distributions.Categorical(logits=z_logits / temperature)
+            z_ids = dist.sample()  # [B,K]
+            z_emb = Ez[z_ids]  # [B,K,H]
+
+        # --------------------------------------------------
+        # Inject Z embeddings into latent positions
+        # --------------------------------------------------
+        active_bk = z_mask_bool.nonzero(as_tuple=False)  # [N,2]
         if active_bk.numel() > 0:
             b_idx = active_bk[:, 0]
             k_idx = active_bk[:, 1]
-            p_idx = latent_positions[b_idx, k_idx]  # [N]
-            if (p_idx < 0).any():
-                raise RuntimeError("Found active z_mask but latent_positions == -1 (batch construction bug).")
-            inputs_embeds[b_idx, p_idx, :] = soft_z[b_idx, k_idx, :]
+            p_idx = latent_positions[b_idx, k_idx]
+            inputs_embeds[b_idx, p_idx] = z_emb[b_idx, k_idx]
 
+        # --------------------------------------------------
         # LM forward
+        # --------------------------------------------------
         position_ids = self._build_position_ids(attention_mask)
+
         out = self.base(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -237,19 +257,29 @@ class Phase2ZModel(nn.Module):
             use_cache=False,
             output_hidden_states=True,
         )
+
         hidden_last = out.hidden_states[-1]
         digit_logits = self._compute_digit_logits_from_hidden(hidden_last, input_ids)
 
-        if return_debug:
-            return Phase2Output(
-                digit_logits=digit_logits,
-                z_probs=z_probs if return_z_probs else None,
-                latent_positions=latent_positions if return_debug else None,
-            )
-        if return_z_probs:
-            return {'digit_logits': digit_logits, 'z_probs': z_probs, 'z_logits':z_logits}
+        # --------------------------------------------------
+        # Outputs
+        # --------------------------------------------------
+        result = {
+            "digit_logits": digit_logits,
+        }
 
-        return {"digit_logits": digit_logits}
+        if return_z_probs:
+            result["z_probs"] = z_probs
+            result["z_logits"] = z_logits
+
+        if z_ids is not None:
+            result["z_ids"] = z_ids
+
+        if return_debug:
+            result["latent_positions"] = latent_positions
+
+
+        return result
 
     @torch.no_grad()
     def z_autoencoder_forward(
