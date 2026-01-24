@@ -445,6 +445,11 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                     f"Effective Z vocab size: "
                     f"{m['effective_vocab_size']:.1f} / {cfg.z_vocab_size}"
                 )
+                print_top_z(
+                    m["z_distribution_k1"],
+                    topk=5,
+                    title="Z distribution for K=1 rows (top 5):"
+                )
 
                 # -----------------------------------------------------
                 # Per-K diagnostics
