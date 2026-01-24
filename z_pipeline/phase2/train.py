@@ -332,6 +332,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     optim_params = [
         {"params": list(model.z_selector.parameters()), "weight_decay": cfg.optim.weight_decay},
         {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
+        {"params": list(model.digit_heads.parameters()), "weight_decay": cfg.optim.weight_decay},
     ]
     optimizer = AdamW(
         optim_params,
