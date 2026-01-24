@@ -58,7 +58,7 @@ class Phase2LossConfig:
          + lambda_kl     * ZUsageKLLoss
     """
     lambda_answer: float = 1
-    lambda_kl: float = 0.05
+    lambda_kl: float = 0.15
     lambda_row: float = 0.05
     keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
@@ -108,7 +108,7 @@ class Phase2OptimConfig:
       - Z-selector parameters
       - Z-token embedding rows (masked inside model)
     """
-    lr: float = 1e-3
+    lr: float = 3e-4
     weight_decay: float = 0.0
 
     betas: tuple[float, float] = (0.9, 0.999)
