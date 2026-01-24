@@ -105,6 +105,7 @@ def evaluate_phase2(
             )
 
             z_probs = out["z_probs"]          # [B, K, V]
+            z_logits = out["z_logits"]       
             digit_logits = out["digit_logits"]
 
             _, _, V_batch = z_probs.shape
@@ -117,7 +118,7 @@ def evaluate_phase2(
             if temperature is None:
                 z_ids = torch.argmax(z_probs, dim=-1)
             else:
-                dist = torch.distributions.Categorical(probs=z_probs)
+                dist = torch.distributions.Categorical(logits=z_logits)
                 z_ids = dist.sample()
 
             # --------------------------------------------------
