@@ -16,7 +16,6 @@ from torch.utils.data import DataLoader
 
 from .dataset import Phase2Dataset, phase2_collate_fn
 
-
 @torch.no_grad()
 def evaluate_phase2(
     *,
@@ -29,24 +28,12 @@ def evaluate_phase2(
     k_max: int = 20,
     device: Optional[torch.device] = None,
 ) -> Dict:
-    """
-    Returns:
-    {
-      "digit_em": float,
-      "z_distribution": np.ndarray [V],
-      "z_distribution_k1": np.ndarray [V],
-      "dominant_z_ratio_by_k": { K: float }
-    }
-    """
 
     if device is None:
         device = next(model.parameters()).device
 
     model.eval()
 
-    # ------------------------------------------------------------------
-    # Dataset (eval split, no rebalance, deterministic)
-    # ------------------------------------------------------------------
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
@@ -65,192 +52,92 @@ def evaluate_phase2(
         collate_fn=phase2_collate_fn,
     )
 
+    temps = {
+        "argmax": 0.0,
+        "t0.5": 0.5,
+        "t1.0": 1.0,
+        "t2.0": 2.0,
+    }
 
-    # ------------------------------------------------------------------
-    # Accumulators
-    # ------------------------------------------------------------------
-    total_rows = 0
-    correct_rows = 0
+    modes = {}
 
-    z_counts_global: Counter = Counter()
-    z_counts_k1: Counter = Counter()
-
-    dominant_ratios_by_k: Dict[int, List[float]] = defaultdict(list)
-    unique_ratios_by_k: Dict[int, List[float]] = defaultdict(list)
-    adjacent_repeat_by_k: Dict[int, List[float]] = defaultdict(list)
-
-    total_rows_by_k: Dict[int, int] = defaultdict(int)
-    correct_rows_by_k: Dict[int, int] = defaultdict(int)
-
-    V: Optional[int] = None
-
-
-    # ------------------------------------------------------------------
-    # Evaluation loop
-    # ------------------------------------------------------------------
-    for batch in loader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        latent_states = batch["latent_states"].to(device)
-        z_mask = batch["z_mask"].to(device)
-        digit_labels = batch["digit_labels"].to(device)
-
-        B, Kmax = z_mask.shape
-
-        # --------------------------------------------------------------
-        # Forward pass
-        # --------------------------------------------------------------
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            latent_states=latent_states,
-            z_mask=z_mask,
-            temperature=None,              # ignored in eval
-            return_z_probs=True,
+    for mode_name, temp in temps.items():
+        accum = dict(
+            total_rows=0,
+            correct_rows=0,
+            z_counts=Counter(),
+            total_rows_by_k=defaultdict(int),
+            correct_rows_by_k=defaultdict(int),
+            unique_ratios_by_k=defaultdict(list),
+            adjacent_repeat_by_k=defaultdict(list),
         )
 
-        if "z_probs" not in out:
-            raise RuntimeError("Phase2Model must return z_probs during eval")
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            latent_states = batch["latent_states"].to(device)
+            z_mask = batch["z_mask"].to(device)
+            digit_labels = batch["digit_labels"].to(device)
 
-        if "digit_logits" not in out:
-            raise RuntimeError("Phase2Model must return digit_logits during eval")
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                latent_states=latent_states,
+                z_mask=z_mask,
+                temperature=None,
+                return_z_probs=True,
+            )
 
-        z_probs = out["z_probs"]          # [B, Kmax, V]
-        digit_logits = out["digit_logits"]  # [B, 5, 10]
+            z_probs = out["z_probs"]
+            digit_logits = out["digit_logits"]
 
-        if z_probs.ndim != 3:
-            raise RuntimeError("z_probs must be [B, K, V]")
+            z_ids = sample_z_ids(z_probs, z_mask, temp)
 
-        if digit_logits.shape != (B, 5, 10):
-            raise RuntimeError("digit_logits must be [B, 5, 10]")
+            _accumulate_metrics_for_z_ids(
+                z_ids=z_ids,
+                z_mask=z_mask,
+                digit_logits=digit_logits,
+                digit_labels=digit_labels,
+                accum=accum,
+            )
 
-        _, _, V_batch = z_probs.shape
-        if V is None:
-            V = V_batch
-        elif V != V_batch:
-            raise RuntimeError("Z vocab size mismatch across batches")
+        # ---- finalize metrics ----
+        V = model.z_vocab_size
+        z_distribution = np.zeros(V, dtype=np.float64)
+        total_z = sum(accum["z_counts"].values())
+        for z, c in accum["z_counts"].items():
+            z_distribution[z] = c / max(total_z, 1)
 
-        # --------------------------------------------------------------
-        # Argmax Z selection
-        # --------------------------------------------------------------
-        z_ids = torch.argmax(z_probs, dim=-1)  # [B, Kmax]
+        entropy = -np.sum(z_distribution * np.log(z_distribution + 1e-12))
+        effective_vocab_size = float(np.exp(entropy))
 
-        # --------------------------------------------------------------
-        # Digit exact match
-        # --------------------------------------------------------------
-        pred_digits = torch.argmax(digit_logits, dim=-1)  # [B, 5]
-        em = (pred_digits == digit_labels).all(dim=1)     # [B]
-        correct_rows += int(em.sum().item())
-        total_rows += B
+        digit_em = accum["correct_rows"] / max(accum["total_rows"], 1)
 
-        # --------------------------------------------------------------
-        # Z statistics
-        # --------------------------------------------------------------
-        for b in range(B):
-            K = int(z_mask[b].sum().item())
-            if K <= 0:
-                continue
+        digit_em_by_k = {
+            K: accum["correct_rows_by_k"][K] / accum["total_rows_by_k"][K]
+            for K in accum["total_rows_by_k"]
+            if accum["total_rows_by_k"][K] > 0
+        }
 
-            total_rows_by_k[K] += 1
-            if em[b].item():
-                correct_rows_by_k[K] += 1
+        unique_ratio_by_k = {
+            K: float(np.mean(v))
+            for K, v in accum["unique_ratios_by_k"].items()
+            if v
+        }
 
-            row_z = z_ids[b, :K].tolist()
+        adjacent_repeat_rate_by_k = {
+            K: float(np.mean(v))
+            for K, v in accum["adjacent_repeat_by_k"].items()
+            if v
+        }
 
-            # Global distribution
-            z_counts_global.update(row_z)
+        modes[mode_name] = dict(
+            digit_em=digit_em,
+            digit_em_by_k=digit_em_by_k,
+            effective_vocab_size=effective_vocab_size,
+            unique_ratio_by_k=unique_ratio_by_k,
+            adjacent_repeat_rate_by_k=adjacent_repeat_rate_by_k,
+        )
 
-            # K == 1 distribution
-            if K == 1:
-                z_counts_k1[row_z[0]] += 1
+    return {"modes": modes}
 
-            # -------------------------------
-            # Row-level Z diagnostics
-            # -------------------------------
-
-            # Dominant-Z ratio
-            if K >= 2:
-                freq = Counter(row_z)
-                dominant_ratios_by_k[K].append(max(freq.values()) / K)
-
-            # Unique ratio
-            unique_ratios_by_k[K].append(len(set(row_z)) / K)
-
-            # Adjacent repeat rate
-            if K >= 2:
-                repeats = sum(
-                    1 for i in range(K - 1) if row_z[i] == row_z[i + 1]
-                )
-                adjacent_repeat_by_k[K].append(repeats / (K - 1))
-
-
-    # ------------------------------------------------------------------
-    # Final metrics
-    # ------------------------------------------------------------------
-    if total_rows == 0:
-        raise RuntimeError("Evaluation dataset is empty")
-
-    digit_em = correct_rows / total_rows
-
-    # Z distributions
-    z_distribution = np.zeros(V, dtype=np.float64)
-    z_distribution_k1 = np.zeros(V, dtype=np.float64)
-
-    total_z = sum(z_counts_global.values())
-    if total_z > 0:
-        for z, c in z_counts_global.items():
-            z_distribution[z] = c / total_z
-
-    total_z_k1 = sum(z_counts_k1.values())
-    if total_z_k1 > 0:
-        for z, c in z_counts_k1.items():
-            z_distribution_k1[z] = c / total_z_k1
-
-    # ------------------------------------------------------------------
-    # Global effective vocab size
-    # ------------------------------------------------------------------
-    eps = 1e-12
-    entropy = -np.sum(
-        z_distribution * np.log(z_distribution + eps)
-    )
-    effective_vocab_size = float(np.exp(entropy))
-
-
-    # Dominant-Z ratios by K
-    dominant_z_ratio_by_k: Dict[int, float] = {}
-    for K in range(2, k_max + 1):
-        vals = dominant_ratios_by_k.get(K, [])
-        if not vals:
-            continue
-        dominant_z_ratio_by_k[K] = float(np.mean(vals))
-
-    digit_em_by_k: Dict[int, float] = {}
-    for K, total in total_rows_by_k.items():
-        if total == 0:
-            continue
-        digit_em_by_k[K] = correct_rows_by_k[K] / total
-
-    # Row metrics by K
-    unique_ratio_by_k = {
-        K: float(np.mean(v))
-        for K, v in unique_ratios_by_k.items()
-        if v
-    }
-
-    adjacent_repeat_rate_by_k = {
-        K: float(np.mean(v))
-        for K, v in adjacent_repeat_by_k.items()
-        if v
-    }
-
-    return {
-        "digit_em": float(digit_em),
-        "digit_em_by_k": digit_em_by_k,
-
-        "z_distribution": z_distribution,
-        "z_distribution_k1": z_distribution_k1,
-        "effective_vocab_size": effective_vocab_size,
-
-        "unique_ratio_by_k": unique_ratio_by_k,
-        "adjacent_repeat_rate_by_k": adjacent_repeat_rate_by_k,
-    }
