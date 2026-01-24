@@ -396,7 +396,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss_row = row_z_loss_fn.compute(z_probs, z_mask)
         loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl + cfg.loss.lambda_row * loss_row
-        if global_step % print_every == 0 and global_step > 0:
+        if global_step % print_every == 0:
             loss_ans_to_print = cur_answer_loss / cfg.print_every
             loss_kl_to_print = cur_kl_loss / cfg.print_every
             print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f}")
