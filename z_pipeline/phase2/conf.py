@@ -58,8 +58,8 @@ class Phase2LossConfig:
          + lambda_kl     * ZUsageKLLoss
     """
     lambda_answer: float = 1
-    lambda_kl: float = 0.5
-    lambda_row: float = 0.00
+    lambda_kl: float = 0.05
+    lambda_row: float = 0.05
     keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
 
