@@ -247,7 +247,7 @@ class Phase2ZModel(nn.Module):
                 latent_positions=latent_positions if return_debug else None,
             )
         if return_z_probs:
-            return {'digit_logits': digit_logits, 'z_probs': z_probs}
+            return {'digit_logits': digit_logits, 'z_probs': z_probs, 'z_logits':z_logits}
 
         return {"digit_logits": digit_logits}
 
