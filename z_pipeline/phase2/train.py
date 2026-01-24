@@ -355,7 +355,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     model.train()
 
     # Loop
-    cur_answer_loss, cur_kl_loss = 0.0, 0.0
+    cur_answer_loss, cur_kl_loss, cur_row_loss = 0.0, 0.0, 0.0
     loader_iter = iter(train_loader)
     temp = 0.0
     while global_step < max_steps:
@@ -399,11 +399,14 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         if global_step % print_every == 0:
             loss_ans_to_print = cur_answer_loss / cfg.print_every
             loss_kl_to_print = cur_kl_loss / cfg.print_every
-            print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f}")
+            loss_row_to_print = cur_row_loss / cfg.print_every
+            print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f} loss_row={loss_row_to_print:.4f}")
             cur_answer_loss = 0
             cur_kl_loss = 0
+            cur_row_loss = 0
         cur_answer_loss += loss_answer.item()
         cur_kl_loss += loss_kl.item()
+        cur_row_loss += loss_row.item()
 
 
         optimizer.zero_grad(set_to_none=True)
