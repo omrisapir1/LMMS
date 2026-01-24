@@ -434,7 +434,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             )
             print("\n================ Phase-2 Evaluation =================")
 
-            for mode_name, m in metrics.items():
+            for mode_name, m in metrics["modes"].items():
                 print(f"\n--- Z selection mode: {mode_name} ---")
 
                 # -----------------------------------------------------
