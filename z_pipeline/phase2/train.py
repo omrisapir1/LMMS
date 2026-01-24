@@ -434,9 +434,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
             )
             print("\n================ Phase-2 Evaluation =================")
 
-            modes = metrics["modes"]
-
-            for mode_name, m in modes.items():
+            for mode_name, m in metrics.items():
                 print(f"\n--- Z selection mode: {mode_name} ---")
 
                 # -----------------------------------------------------
@@ -474,7 +472,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                         print(f"  Adj repeat rate : {adj:6.3f}")
                     print()
 
-            digit_em = float(metrics["digit_em"])
+            digit_em = float(metrics["argmax"]["digit_em"])
             if global_step >= min_steps:
                 if digit_em > best_em + min_delta:
                     best_em = digit_em
