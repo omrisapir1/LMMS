@@ -33,15 +33,15 @@ class TemperatureSchedule:
     """
     type: Literal["linear", "cosine", "exponential"] = "cosine"
 
-    temp_start: float = 2
+    temp_start: float = 1.5
     temp_end: float = 1
 
     # Number of optimizer steps over which annealing happens
-    anneal_steps: int = 3000
+    anneal_steps: int = 2500
 
     # After anneal_steps, temperature is held at temp_end
     # for additional stabilization before early stopping
-    cooldown_steps: int = 500
+    cooldown_steps: int = 1000
 
     def total_steps(self) -> int:
         return self.anneal_steps + self.cooldown_steps
