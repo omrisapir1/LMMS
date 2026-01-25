@@ -523,12 +523,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         "tokenizer": tokenizer,
         "z_token_ids": z_token_ids,
         "z_vocab_size": int(cfg.z_vocab_size),
-        "phase2_steps": int(global_step),
-        # "phase2_cfg": asdict(cfg),
-        # "phase2_stage_steps": {
-        #     "anneal_steps": int(anneal_steps),
-        #     "cooldown_steps": int(cooldown_steps),
-        # },
     }
     return phase2_ckpt
 
