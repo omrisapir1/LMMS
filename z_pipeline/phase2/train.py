@@ -333,7 +333,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     optim_params = [
         {"params": list(model.z_selector.parameters()), "weight_decay": cfg.optim.weight_decay},
         {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
-        {"params": list(model.digit_heads.parameters()), "weight_decay": cfg.optim.weight_decay},
+        # {"params": list(model.digit_heads.parameters()), "weight_decay": cfg.optim.weight_decay},
     ]
     optimizer = AdamW(
         optim_params,
@@ -464,7 +464,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         optimizer.step()
 
         # Eval is diagnostic only
-        if global_step % eval_every == 0:
+        if global_step % eval_every == 0 or global_step == max_steps - 1:
             eval_model = _EvalTemperatureProxy(model, eval_temp=1e-6)
             metrics = evaluate_phase2(
                 model=eval_model,
@@ -524,11 +524,11 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         "z_token_ids": z_token_ids,
         "z_vocab_size": int(cfg.z_vocab_size),
         "phase2_steps": int(global_step),
-        "phase2_cfg": asdict(cfg),
-        "phase2_stage_steps": {
-            "anneal_steps": int(anneal_steps),
-            "cooldown_steps": int(cooldown_steps),
-        },
+        # "phase2_cfg": asdict(cfg),
+        # "phase2_stage_steps": {
+        #     "anneal_steps": int(anneal_steps),
+        #     "cooldown_steps": int(cooldown_steps),
+        # },
     }
     return phase2_ckpt
 

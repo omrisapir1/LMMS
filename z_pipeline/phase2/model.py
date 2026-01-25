@@ -72,7 +72,7 @@ class Phase2ZModel(nn.Module):
             for p in self.base.parameters():
                 p.requires_grad = False
         for p in self.digit_heads.parameters():
-            p.requires_grad = True
+            p.requires_grad = False
 
         # Re-enable embedding grads + mask to Z rows only
         self._emb.weight.requires_grad = True
