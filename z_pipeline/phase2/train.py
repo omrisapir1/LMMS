@@ -213,16 +213,20 @@ def pretrain_z_autoencoder(
 
 
 
-
 def run_phase2(cfg: Phase2Config) -> Dict:
     """
     Returns phase2_ckpt dict (in-memory handoff).
+
+    Two-stage training:
+      Stage 1 (anneal): temp from cfg.temp.temp_start -> cfg.temp.temp_end, NO digit loss, digit heads frozen
+      Stage 2 (cooldown): temp fixed at cfg.temp.temp_end (should be 1), digit loss ON, digit heads trainable
     """
     # Do not finalize yet; we need tokenizer-derived IDs first.
     set_seed_best_effort(cfg.seed)
 
     # Load Phase-1 tokenizer + model
     from z_pipeline.shared.load_model_phase1 import load_phase1, LATENT_TOKEN  # type: ignore
+
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer, phase1_model, meta = load_phase1(device=device_str)
 
@@ -283,11 +287,11 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         latent_token_id=latent_token_id,
         z_token_ids=z_token_ids,
         freeze_base=True,
-        freeze_digit_heads=True,
+        freeze_digit_heads=True,  # we will explicitly enable later for stage 2
         force_base_eval=cfg.force_base_eval,
     )
 
-    # Ensure all submodules (especially new Phase-2 heads) live on the same device as Phase-1
+    # Ensure all submodules live on the same device as Phase-1
     device = next(base_lm.parameters()).device
     model.to(device)
 
@@ -304,8 +308,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         max_length=cfg.data.max_length,
     )
 
-
-
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.data.batch_size,
@@ -320,7 +322,6 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
     model.initialize_from_centroids(centroids)
 
-
     # Losses
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
     answer_loss_fn = AnswerLoss(keep_prob=keep_prob)
@@ -328,7 +329,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     row_z_loss_fn = RowZDiversityLoss()
     print(f"AnswerLoss keep_prob: {keep_prob}")
 
-    # Optimizer
+    # Optimizer (we keep digit-head params in the optimizer, but gate training via requires_grad)
     optim_params = [
         {"params": list(model.z_selector.parameters()), "weight_decay": cfg.optim.weight_decay},
         {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
@@ -345,37 +346,58 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     # Training control
     eval_every = int(cfg.eval.eval_every_steps)
     print_every = int(cfg.print_every)
-    min_steps = int(cfg.eval.min_steps or 0)
-    patience = int(cfg.eval.patience)
-    min_delta = float(cfg.eval.min_delta)
-    max_steps = min_steps + patience * eval_every
 
-    best_em = -1.0
-    no_improve = 0
+    anneal_steps = int(cfg.temp.anneal_steps)
+    cooldown_steps = int(cfg.temp.cooldown_steps)
+    max_steps = anneal_steps + cooldown_steps
+
+    print("\n================ Phase-2 Schedule =================")
+    print(f"Stage 1 (anneal):   steps [0 .. {max(0, anneal_steps - 1)}], temp {cfg.temp.temp_start} -> {cfg.temp.temp_end}, digit loss OFF")
+    print(f"Stage 2 (cooldown): steps [{anneal_steps} .. {max_steps - 1}], temp = {cfg.temp.temp_end}, digit loss ON")
+    print("===================================================\n")
+
+    # Stage 1: ensure digit heads are frozen (even though model was built with freeze_digit_heads=True)
+    for p in model.digit_heads.parameters():
+        p.requires_grad = False
+
     global_step = 0
     model.train()
 
     # Loop
     cur_answer_loss, cur_kl_loss, cur_row_loss = 0.0, 0.0, 0.0
     loader_iter = iter(train_loader)
-    temp = 0.0
+    temp = float("nan")
+
     while global_step < max_steps:
+        # Stage transition at boundary
+        if global_step == anneal_steps:
+            print("\n=== Entering Stage 2 (cooldown): enabling digit heads + digit loss ===")
+            for p in model.digit_heads.parameters():
+                p.requires_grad = True
+
         try:
             batch = next(loader_iter)
         except StopIteration:
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
-        new_temp = compute_temperature(global_step, cfg)
-        if (int(abs(new_temp) * 10) % 10) != (int(abs(temp) * 10) % 10):
-            print(f"Step {global_step}: new temperature: {new_temp:.2f}")
-        temp = new_temp
 
+        # Temperature schedule (explicit two-stage semantics)
+        if global_step < anneal_steps:
+            new_temp = compute_temperature(global_step, cfg)
+        else:
+            new_temp = float(cfg.temp.temp_end)
+
+        # Print when temp changes by ~0.1 to avoid spam
+        if not np.isfinite(temp) or (int(abs(new_temp) * 10) % 10) != (int(abs(temp) * 10) % 10):
+            print(f"Step {global_step}: temperature={new_temp:.2f}")
+        temp = float(new_temp)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         latent_states = batch["latent_states"].to(device, non_blocking=True)
         z_mask = batch["z_mask"].to(device, non_blocking=True)
         digit_labels = batch["digit_labels"].to(device, non_blocking=True)
+
         try:
             out = model(
                 input_ids=input_ids,
@@ -388,39 +410,66 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         except Exception as e:
             print(f"Error at step {global_step}: {e}")
             torch.cuda.empty_cache()
+            global_step += 1
             continue
 
         digit_logits = out["digit_logits"]
         z_probs = out["z_probs"]
 
-        loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
+        # Always compute these
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss_row = row_z_loss_fn.compute(z_probs, z_mask)
-        loss = cfg.loss.lambda_answer * loss_answer + cfg.loss.lambda_kl * loss_kl + cfg.loss.lambda_row * loss_row
-        if global_step % print_every == 0:
-            loss_ans_to_print = cur_answer_loss / cfg.print_every
-            loss_kl_to_print = cur_kl_loss / cfg.print_every
-            loss_row_to_print = cur_row_loss / cfg.print_every
-            print(f"Step {global_step}: loss_answer={loss_ans_to_print:.4f} loss_kl={loss_kl_to_print:.4f} loss_row={loss_row_to_print:.4f}")
-            cur_answer_loss = 0
-            cur_kl_loss = 0
-            cur_row_loss = 0
-        cur_answer_loss += loss_answer.item()
-        cur_kl_loss += loss_kl.item()
-        cur_row_loss += loss_row.item()
 
+        # Stage-gated digit loss
+        if global_step < anneal_steps:
+            loss_answer = None
+            loss = cfg.loss.lambda_kl * loss_kl + cfg.loss.lambda_row * loss_row
+            loss_answer_val = 0.0
+        else:
+            loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
+            loss = (
+                cfg.loss.lambda_answer * loss_answer
+                + cfg.loss.lambda_kl * loss_kl
+                + cfg.loss.lambda_row * loss_row
+            )
+            loss_answer_val = float(loss_answer.item())
+
+        # Accumulate for printing
+        cur_answer_loss += loss_answer_val
+        cur_kl_loss += float(loss_kl.item())
+        cur_row_loss += float(loss_row.item())
+
+        if global_step % print_every == 0:
+            denom = max(1, print_every)
+            loss_ans_to_print = cur_answer_loss / denom
+            loss_kl_to_print = cur_kl_loss / denom
+            loss_row_to_print = cur_row_loss / denom
+            stage = "anneal" if global_step < anneal_steps else "cooldown"
+            print(
+                f"Step {global_step} [{stage}] : "
+                f"loss_answer={loss_ans_to_print:.4f} "
+                f"loss_kl={loss_kl_to_print:.4f} "
+                f"loss_row={loss_row_to_print:.4f}"
+            )
+            cur_answer_loss = 0.0
+            cur_kl_loss = 0.0
+            cur_row_loss = 0.0
 
         optimizer.zero_grad(set_to_none=True)
         try:
             loss.backward()
         except Exception as e:
-            print(f"Error at step {global_step}: {e}")
+            print(f"Backward error at step {global_step}: {e}")
             torch.cuda.empty_cache()
+            global_step += 1
             continue
+
         if cfg.optim.max_grad_norm is not None and cfg.optim.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.optim.max_grad_norm))
+
         optimizer.step()
 
+        # Eval is diagnostic only
         if global_step % eval_every == 0:
             eval_model = _EvalTemperatureProxy(model, eval_temp=1e-6)
             metrics = evaluate_phase2(
@@ -433,28 +482,21 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                 k_max=cfg.data.k_max,
                 device=device,
             )
-            print("\n================ Phase-2 Evaluation =================")
+            print("\n================ Phase-2 Evaluation (diagnostic) ================")
 
             for mode_name, m in metrics["modes"].items():
                 print(f"\n--- Z selection mode: {mode_name} ---")
 
-                # -----------------------------------------------------
                 # Global metrics
-                # -----------------------------------------------------
                 print(f"Digit EM (overall): {m['digit_em'] * 100:.2f}%")
-                print(
-                    f"Effective Z vocab size: "
-                    f"{m['effective_vocab_size']:.1f} / {cfg.z_vocab_size}"
-                )
+                print(f"Effective Z vocab size: {m['effective_vocab_size']:.1f} / {cfg.z_vocab_size}")
                 print_top_z(
                     m["z_distribution_k1"],
                     topk=5,
-                    title="Z distribution for K=1 rows (top 5):"
+                    title="Z distribution for K=1 rows (top 5):",
                 )
 
-                # -----------------------------------------------------
                 # Per-K diagnostics
-                # -----------------------------------------------------
                 print("\nPer-K diagnostics:")
                 print("-" * 60)
 
@@ -478,16 +520,8 @@ def run_phase2(cfg: Phase2Config) -> Dict:
                         print(f"  Adj repeat rate : {adj:6.3f}")
                     print()
 
-            # digit_em = float(metrics["argmax"]["digit_em"])
-            # if global_step >= min_steps:
-            #     if digit_em > best_em + min_delta:
-            #         best_em = digit_em
-            #         no_improve = 0
-            #     else:
-            #         no_improve += 1
-            #     if no_improve >= patience:
-            #         break
             model.train()
+
         global_step += 1
 
     phase2_ckpt = {
@@ -497,8 +531,12 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         "z_vocab_size": int(cfg.z_vocab_size),
         "phase2_steps": int(global_step),
         "phase2_cfg": asdict(cfg),
+        "phase2_stage_steps": {
+            "anneal_steps": int(anneal_steps),
+            "cooldown_steps": int(cooldown_steps),
+        },
     }
     return phase2_ckpt
 
-__all__ = ["run_phase2"]
 
+__all__ = ["run_phase2"]
