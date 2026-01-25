@@ -420,19 +420,13 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         loss_kl = z_kl_loss_fn.compute(z_probs, z_mask)
         loss_row = row_z_loss_fn.compute(z_probs, z_mask)
 
-        # Stage-gated digit loss
-        if global_step < anneal_steps:
-            loss_answer = None
-            loss = cfg.loss.lambda_kl * loss_kl + cfg.loss.lambda_row * loss_row
-            loss_answer_val = 0.0
-        else:
-            loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
-            loss = (
-                cfg.loss.lambda_answer * loss_answer
-                + cfg.loss.lambda_kl * loss_kl
-                + cfg.loss.lambda_row * loss_row
-            )
-            loss_answer_val = float(loss_answer.item())
+        loss_answer = answer_loss_fn.compute(digit_logits, digit_labels)
+        loss = (
+            cfg.loss.lambda_answer * loss_answer
+            + cfg.loss.lambda_kl * loss_kl
+            + cfg.loss.lambda_row * loss_row
+        )
+        loss_answer_val = float(loss_answer.item())
 
         # Accumulate for printing
         cur_answer_loss += loss_answer_val
