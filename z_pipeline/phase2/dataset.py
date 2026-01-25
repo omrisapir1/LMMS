@@ -29,12 +29,12 @@ from datasets import load_dataset
 SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 TARGET_DIST = {
-    "K1": 0.225,
-    "K2": 0.175,
-    "K3": 0.100,
-    "K4_7": 0.200,
-    "K8_12": 0.150,
-    "K13_20": 0.150,
+    # "K1": 0.225,
+    # "K2": 0.175,
+    # "K3": 0.100,
+    # "K4_7": 0.200,
+    "K8_12": 0.50,
+    "K13_20": 0.50,
 }
 
 
