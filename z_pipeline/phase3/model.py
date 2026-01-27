@@ -285,6 +285,7 @@ class Phase3ZModel(nn.Module):
 
         gen = self.base.generate(
             input_ids=input_ids,
+            eos_token_id=self.answer_token_id,
             attention_mask=attention_mask,
             **generate_kwargs,
         )
