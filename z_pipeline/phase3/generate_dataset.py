@@ -1,54 +1,66 @@
 # phase3/generate_dataset.py
 #
 # Phase-3 dataset generation:
-#   Convert Phase-2 latent placeholders into discrete Z tokens
-#
-# Input:
-#   Phase-2 checkpoint (in-memory)
-#   Phase-2 dataset
-#
-# Output:
-#   HF dataset with:
-#     - input_ids: Question + Zs + <ANSWER>
-#     - attention_mask
-#     - num_latents
-#     - answer_digits
+# - Uses trained Phase-2 model to convert latent states -> Z tokens
+# - Materializes explicit Z-token sequences
+# - Saves dataset compatible with phase3/dataset.py
 #
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Iterable
 
 import torch
-from torch.utils.data import DataLoader
-from datasets import Dataset
+import numpy as np
+from datasets import Dataset, DatasetDict
 
 from z_pipeline.phase2.dataset import Phase2Dataset, phase2_collate_fn
+from z_pipeline.phase2.model import Phase2ZModel
 
+
+# ------------------------------------------------------------
+# K bucket logic (EXACTLY aligned with Phase-2 / Phase-3)
+# ------------------------------------------------------------
+
+def k_to_bucket(K: int) -> str:
+    if K == 1:
+        return "K1"
+    if K == 2:
+        return "K2"
+    if K == 3:
+        return "K3"
+    if 4 <= K <= 7:
+        return "K4_7"
+    if 8 <= K <= 12:
+        return "K8_12"
+    if 13 <= K <= 20:
+        return "K13_20"
+    raise ValueError(f"Unsupported num_latents K={K}")
+
+
+# ------------------------------------------------------------
+# Core generation
+# ------------------------------------------------------------
 
 @torch.no_grad()
 def generate_phase3_dataset(
     *,
     phase2_ckpt: Dict,
     dataset_name: str,
-    split: str,                     # "train" | "eval"
+    split: str,
     batch_size: int,
-    latent_token_id: int,
-    answer_token_id: int,
-    k_max: int,
-    z_mode: str = "hard_argmax",     # or "hard_sample"
+    z_mode: str = "hard_argmax",      # "hard_argmax" | "hard_sample"
     temperature: float = 1.0,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> Dataset:
     """
-    Generate Phase-3 dataset by replacing <LATENT> placeholders with Z tokens.
+    Generates a Phase-3 dataset split.
 
-    Returns:
-        HuggingFace Dataset
+    Returns a HuggingFace Dataset with fields:
+      input_ids, attention_mask, digit_labels, num_latents, K_bucket
     """
 
-    model = phase2_ckpt["model"]
+    model: Phase2ZModel = phase2_ckpt["model"]
     tokenizer = phase2_ckpt["tokenizer"]
-    z_token_ids: List[int] = phase2_ckpt["z_token_ids"]
 
     if device is None:
         device = next(model.parameters()).device
@@ -56,33 +68,29 @@ def generate_phase3_dataset(
     model.eval()
 
     # --------------------------------------------------
-    # Phase-2 dataset (source)
+    # Build Phase-2 dataset (source of latent_states)
     # --------------------------------------------------
+    latent_token_id = model.latent_token_id
+    answer_token_id = model.answer_token_id
+
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
         split=split,
-        k_max=k_max,
+        k_max=max(len(model.z_token_ids), 20),  # safe upper bound
         latent_token_id=latent_token_id,
         answer_token_id=answer_token_id,
         rebalance_train=False,
     )
 
-    loader = DataLoader(
+    loader = torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=False,
         collate_fn=phase2_collate_fn,
     )
 
-    # --------------------------------------------------
-    # Output buffers
-    # --------------------------------------------------
-    out_input_ids: List[List[int]] = []
-    out_attention_mask: List[List[int]] = []
-    out_num_latents: List[int] = []
-    out_answer_digits: List[List[int]] = []
+    rows: List[Dict] = []
 
     # --------------------------------------------------
     # Main loop
@@ -94,60 +102,85 @@ def generate_phase3_dataset(
         z_mask = batch["z_mask"].to(device)
         digit_labels = batch["digit_labels"]
 
-        B, T = input_ids.shape
-
         out = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             latent_states=latent_states,
             z_mask=z_mask,
             z_mode=z_mode,
-            temperature=float(temperature),
+            temperature=temperature,
             return_z_probs=False,
         )
 
         z_ids = out["z_ids"]  # [B, Kmax]
+        B, Kmax = z_ids.shape
 
         for b in range(B):
             K = int(z_mask[b].sum().item())
-            assert K > 0
+            if K <= 0:
+                continue
 
             # --------------------------------------------------
-            # Build new input_ids
+            # Rebuild input_ids: prompt + Zs + <ANSWER>
             # --------------------------------------------------
-            row_ids = input_ids[b].tolist()
+            original_ids = input_ids[b].tolist()
+            answer_pos = original_ids.index(answer_token_id)
 
-            # Find latent placeholder positions
-            latent_positions = [
-                i for i, t in enumerate(row_ids) if t == latent_token_id
-            ]
-            assert len(latent_positions) == K
+            prefix = original_ids[:answer_pos]
+            z_seq = z_ids[b, :K].tolist()
+            new_ids = prefix + [model.z_token_ids[z] for z in z_seq] + [answer_token_id]
 
-            # Replace <LATENT> with Z token ids
-            for k in range(K):
-                z_idx = int(z_ids[b, k].item())
-                row_ids[latent_positions[k]] = z_token_ids[z_idx]
+            attn = [1] * len(new_ids)
 
-            # Trim suffix padding (attention_mask==0)
-            attn = attention_mask[b].tolist()
-            if 0 in attn:
-                first_pad = attn.index(0)
-                row_ids = row_ids[:first_pad]
-                attn = attn[:first_pad]
+            rows.append({
+                "input_ids": new_ids,
+                "attention_mask": attn,
+                "digit_labels": digit_labels[b].tolist(),
+                "num_latents": K,
+                "K_bucket": k_to_bucket(K),
+            })
 
-            out_input_ids.append(row_ids)
-            out_attention_mask.append(attn)
-            out_num_latents.append(K)
-            out_answer_digits.append(digit_labels[b].tolist())
+    return Dataset.from_list(rows)
 
-    # --------------------------------------------------
-    # Build HF dataset
-    # --------------------------------------------------
-    return Dataset.from_dict(
-        {
-            "input_ids": out_input_ids,
-            "attention_mask": out_attention_mask,
-            "num_latents": out_num_latents,
-            "answer_digits": out_answer_digits,
-        }
+
+# ------------------------------------------------------------
+# Convenience wrapper (train + eval)
+# ------------------------------------------------------------
+
+def generate_phase3_dataset_dict(
+    *,
+    phase2_ckpt: Dict,
+    dataset_name: str,
+    batch_size: int,
+    z_mode: str = "hard_argmax",
+    temperature: float = 1.0,
+) -> DatasetDict:
+
+    train_ds = generate_phase3_dataset(
+        phase2_ckpt=phase2_ckpt,
+        dataset_name=dataset_name,
+        split="train",
+        batch_size=batch_size,
+        z_mode=z_mode,
+        temperature=temperature,
     )
+
+    eval_ds = generate_phase3_dataset(
+        phase2_ckpt=phase2_ckpt,
+        dataset_name=dataset_name,
+        split="eval",
+        batch_size=batch_size,
+        z_mode=z_mode,
+        temperature=temperature,
+    )
+
+    return DatasetDict({
+        "train": train_ds,
+        "eval": eval_ds,
+    })
+
+
+__all__ = [
+    "generate_phase3_dataset",
+    "generate_phase3_dataset_dict",
+]
