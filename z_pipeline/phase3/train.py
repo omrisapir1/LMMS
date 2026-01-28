@@ -244,7 +244,6 @@ def run_phase3(
     # BUT here ds_dict is already materialized with needed columns; easiest is to use it directly.
     # We'll use DataLoader over ds_dict["train"] and ds_dict["eval"].
     train_hf = ds_dict["train"]
-    eval_hf = ds_dict["eval"]
 
     train_loader = DataLoader(
         train_hf,
@@ -256,7 +255,7 @@ def run_phase3(
     # -------------------------
     # Losses
     # -------------------------
-    answer_loss = AnswerLoss(keep_prob=None)
+    answer_loss = AnswerLoss(keep_prob=cfg.loss.keep_prob)
     sft_loss = SFTLoss(ignore_index=-100)
     kl_loss = DigitKLDiversityLoss(
         z_token_ids=list(z_token_ids),
@@ -307,7 +306,6 @@ def run_phase3(
         tokenizer=tokenizer,
         batch_size=cfg.eval.batch_size,
         answer_token_id=answer_token_id,
-        z_token_ids=list(z_token_ids),
         device=device,
     )
 
