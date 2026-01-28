@@ -229,7 +229,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    
+
     tokenizer, phase1_model, meta = load_phase1(device=device_str)
 
     # Ensure pad token id exists
