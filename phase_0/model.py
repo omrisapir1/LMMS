@@ -46,7 +46,7 @@ class Phase0Model(PreTrainedModel):
             dtype=torch.bfloat16,
             trust_remote_code=True,
             output_hidden_states=True,
-            device_map='cuda',
+            device_map=None,
             low_cpu_mem_usage=False,
         )
 
