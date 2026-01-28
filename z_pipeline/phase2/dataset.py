@@ -27,6 +27,8 @@ from datasets import load_dataset
 
 
 SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+FIRST_PART_PROMPT = '''<|im_start|>system\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>user\n'''
+SECOND_PART_PROMPT = '''<|im_end|>\n<|im_start|>assistant\n'''
 #
 # TARGET_DIST = {
 #     "K1": 0.225,
@@ -49,11 +51,15 @@ TARGET_DIST = {
 
 
 def build_prompt(tokenizer, question: str) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    return FIRST_PART_PROMPT + question + SECOND_PART_PROMPT
 
 
 @dataclass

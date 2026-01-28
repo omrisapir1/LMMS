@@ -48,7 +48,7 @@ def generate_phase3_dataset(
     dataset_name: str,
     split: str,
     batch_size: int,
-    z_mode: str = "hard_argmax",      # "hard_argmax" | "hard_sample"
+    z_mode: str = "hard_sample",      # "hard_argmax" | "hard_sample"
     temperature: float = 1.0,
     device: torch.device | None = None,
 ) -> Dataset:
