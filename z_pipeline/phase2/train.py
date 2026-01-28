@@ -228,7 +228,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     from z_pipeline.shared.load_model_phase1 import load_phase1, LATENT_TOKEN  # type: ignore
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.set_default_device("cpu")   # <-- not None
+    
     print("default device:", torch.get_default_device())
     tokenizer, phase1_model, meta = load_phase1(device=device_str)
 
