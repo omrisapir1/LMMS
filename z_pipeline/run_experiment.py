@@ -23,6 +23,8 @@ from phase2.train import run_phase2
 from phase3.generate_dataset import generate_phase3_dataset
 from phase3.train import run_phase3
 from phase3.model import Phase3ZModel
+from z_pipeline.phase2.conf import Phase2Config
+from z_pipeline.phase3.conf import Phase3Config
 
 
 # -----------------------------
@@ -31,19 +33,18 @@ from phase3.model import Phase3ZModel
 
 @dataclass
 class ExperimentConfig:
-    phase2: object  # Phase2Config
-    phase3: object  # Phase3Config
+    phase2 = Phase2Config()  # Phase2Config
+    phase3 = Phase3Config()  # Phase3Config
 
     # Dataset generation inputs (for phase3.generate_dataset)
     # We intentionally keep these here (pipeline-level), not inside phase3.data,
     # because phase3.data is about already-generated sequences.
-    dataset_name: str
+    dataset_name: str = phase2.data.dataset_name
     train_split: str = "train"
-    eval_split: str = "eval"
 
     # Generation mode for dataset creation (using Phase-2 model)
     gen_batch_size: int = 16
-    gen_z_mode: str = "hard_argmax"   # "hard_argmax" | "hard_sample"
+    gen_z_mode: str = "hard_sample"   # "hard_argmax" | "hard_sample"
     gen_temperature: float = 1.0
 
 
@@ -161,18 +162,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         device=device,
     )
 
-    print("[run_experiment] Generating Phase-3 dataset (eval split)...")
-    eval_ds = generate_phase3_dataset(
-        phase2_ckpt=phase2_ckpt,
-        dataset_name=cfg.dataset_name,
-        split=cfg.eval_split,
-        batch_size=int(cfg.gen_batch_size),
-        z_mode=str(cfg.gen_z_mode),
-        temperature=float(cfg.gen_temperature),
-        device=device,
-    )
-
-    ds_dict = DatasetDict({"train": train_ds, "eval": eval_ds})
+    ds_dict = DatasetDict({"train": train_ds})
 
     # Persist dataset to disk (always)
     save_dir = str(getattr(cfg.phase3.ckpt, "save_dir", "./phase3_ckpts"))
