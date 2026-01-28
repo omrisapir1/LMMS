@@ -46,10 +46,9 @@ class Phase0Model(PreTrainedModel):
             dtype=torch.bfloat16,
             trust_remote_code=True,
             output_hidden_states=True,
-            device_map='cpu',
+            device_map='cuda',
             low_cpu_mem_usage=False,
         )
-        self.model.to("cuda")
 
         # Resize base embeddings to tokenizer vocab size saved in config
         if getattr(config, "vocab_size", None) is not None:
