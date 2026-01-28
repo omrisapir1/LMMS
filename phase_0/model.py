@@ -43,7 +43,7 @@ class Phase0Model(PreTrainedModel):
         # ---- Base LM ----
         self.model = AutoModel.from_pretrained(
             config.base_model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
             output_hidden_states=True,
         )
