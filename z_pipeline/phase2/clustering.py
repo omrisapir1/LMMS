@@ -333,6 +333,7 @@ def kmeans_pp_row_aware(
     d2 = torch.sum((X_rows - centroids[0]) ** 2, dim=1)
 
     for k in range(1, V):
+        print(f"k-means++ init: selecting centroid {k+1} / {V}")
         if torch.all(d2 == 0):
             centroids[k:] = centroids[0]
             break
