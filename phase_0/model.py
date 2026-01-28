@@ -39,7 +39,7 @@ class Phase0Model(PreTrainedModel):
         super().__init__(config)
 
         self.answer_token_id = config.answer_token_id
-
+        torch.set_default_device("cpu")
         # ---- Base LM ----
         self.model = AutoModel.from_pretrained(
             config.base_model_name,
