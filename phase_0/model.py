@@ -49,6 +49,7 @@ class Phase0Model(PreTrainedModel):
             device_map='cpu',
             low_cpu_mem_usage=False,
         )
+        self.model.to("cuda")
 
         # Resize base embeddings to tokenizer vocab size saved in config
         if getattr(config, "vocab_size", None) is not None:
