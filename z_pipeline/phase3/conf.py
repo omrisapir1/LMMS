@@ -50,6 +50,7 @@ class Phase3LossConfig:
 
     # KL on digit distributions temperature
     digit_temperature: float = 1.0
+    keep_prob: Optional[Dict[int, float]] = (0.02, 0.05, 0.1, 0.5, 1)
 
     # Probability of choosing "reverse" vs "random"
     # based on number of Z tokens in the sequence
