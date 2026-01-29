@@ -249,11 +249,22 @@ def run_phase3(
     # We'll use DataLoader over ds_dict["train"] and ds_dict["eval"].
     train_hf = ds_dict["train"]
 
+    train_ds = Phase3Dataset(
+        dataset_name=None,  # not used
+        split="train",
+        z_token_ids=phase2_ckpt["z_token_ids"],
+        answer_token_id=answer_token_id,
+        max_length=cfg.data.max_length,
+    )
+
+    # 👇 overwrite internal HF dataset
+    train_ds.ds = ds_dict["train"]
+    train_ds.indices = list(range(len(train_ds.ds)))
+
     train_loader = DataLoader(
-        train_hf,
-        batch_size=cfg.data.batch_size,
+        train_ds,
+        batch_size=cfg.train.batch_size,
         shuffle=True,
-        drop_last=False,
         collate_fn=phase3_collate_fn,
     )
     # -------------------------

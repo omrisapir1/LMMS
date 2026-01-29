@@ -103,6 +103,7 @@ class Phase3OptimConfig:
 class Phase3TrainConfig:
     num_epochs: int = 3
     eval_every_steps: int = 1000
+    batch_size: int = 24
 
 
 # ------------------------------------------------------------
@@ -111,7 +112,7 @@ class Phase3TrainConfig:
 
 @dataclass
 class Phase3EvalConfig:
-    batch_size: int = 8
+    batch_size: int = 64
 
     # Generation control
     max_generation_tokens: int = 32
