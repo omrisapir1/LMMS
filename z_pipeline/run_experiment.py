@@ -31,7 +31,8 @@ except ImportError:
     from .phase3.train import run_phase3, Phase3Config
     from .phase3.model import Phase3ZModel
 
-
+from dataclasses import dataclass, field
+from typing import Optional
 
 # -----------------------------
 # Top-level config wrapper
@@ -39,18 +40,14 @@ except ImportError:
 
 @dataclass
 class ExperimentConfig:
-    phase2 = Phase2Config()  # Phase2Config
-    phase3 = Phase3Config()  # Phase3Config
+    phase2: Phase2Config = field(default_factory=Phase2Config)
+    phase3: Phase3Config = field(default_factory=Phase3Config)
 
-    # Dataset generation inputs (for phase3.generate_dataset)
-    # We intentionally keep these here (pipeline-level), not inside phase3.data,
-    # because phase3.data is about already-generated sequences.
-    dataset_name: str = phase2.data.dataset_name
+    dataset_name: Optional[str] = None
     train_split: str = "train"
 
-    # Generation mode for dataset creation (using Phase-2 model)
     gen_batch_size: int = 16
-    gen_z_mode: str = "hard_sample"   # "hard_argmax" | "hard_sample"
+    gen_z_mode: str = "hard_sample"
     gen_temperature: float = 1.0
 
 
