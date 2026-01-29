@@ -323,7 +323,7 @@ def run_phase2(cfg: Phase2Config) -> Dict:
     X, row_ptr = collect_latents_for_kmeans(train_ds)
     X_rows = collect_row_representatives(train_ds)
     # centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
-    centroids = kmeans_pp_row_aware(X, X_rows,  cfg.z_vocab_size, n_iters=cfg.cluster.n_iter,row_ptr=row_ptr,assign_mode='row_exclusive', seed=42)
+    centroids = kmeans_pp_row_aware(X, X_rows,  cfg.z_vocab_size, n_iters=cfg.cluster.n_iter,row_ptr=row_ptr,assign_mode='balanced_assign', seed=42)
     model.initialize_from_centroids(centroids)
 
     # Losses
