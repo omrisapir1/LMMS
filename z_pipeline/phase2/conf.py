@@ -172,7 +172,7 @@ class Phase2Config:
     answer_token_id: int | None = None
 
     # Sub-configs
-    data: Phase2DataConfig | None = None
+    data: Phase2DataConfig = Phase2DataConfig()
     optim: Phase2OptimConfig = Phase2OptimConfig()
     loss: Phase2LossConfig = Phase2LossConfig()
     temp: TemperatureSchedule = TemperatureSchedule()
