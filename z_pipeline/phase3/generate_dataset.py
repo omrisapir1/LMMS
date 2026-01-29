@@ -120,15 +120,52 @@ def generate_phase3_dataset(
             if K <= 0:
                 continue
 
-            # --------------------------------------------------
-            # Rebuild input_ids: prompt + Zs + <ANSWER>
-            # --------------------------------------------------
-            original_ids = input_ids[b].tolist()
-            answer_pos = original_ids.index(answer_token_id)
+                # --------------------------------------------------
+                # Rebuild input_ids: prompt + Zs + <ANSWER>
+                # Contract: prompt + <LATENT>*K (contiguous) + <ANSWER>
+                # --------------------------------------------------
 
-            prefix = original_ids[:answer_pos]
+            # Trim to true length (remove suffix padding)
+            T = int(attention_mask[b].sum().item())
+            original_ids = input_ids[b, :T].tolist()
+
+            # Find answer
+            try:
+                answer_pos = original_ids.index(answer_token_id)
+            except ValueError:
+                raise RuntimeError("Phase3 dataset gen: <ANSWER> not found (contract violation)")
+
+            # Find first latent
+            try:
+                first_latent_pos = original_ids.index(latent_token_id)
+            except ValueError:
+                raise RuntimeError("Phase3 dataset gen: <LATENT> not found (contract violation)")
+
+            if not (first_latent_pos < answer_pos):
+                raise RuntimeError("Phase3 dataset gen: <LATENT> must appear before <ANSWER>")
+
+            # The region [first_latent_pos : answer_pos) must be exactly K latent tokens
+            latent_region = original_ids[first_latent_pos:answer_pos]
+            if len(latent_region) != K:
+                raise RuntimeError(
+                    f"Phase3 dataset gen: latent region length != K "
+                    f"(len={len(latent_region)} vs K={K})"
+                )
+            if any(t != latent_token_id for t in latent_region):
+                raise RuntimeError("Phase3 dataset gen: non-latent token inside latent block (not contiguous)")
+
+            # Prompt prefix is everything before the first latent
+            prefix = original_ids[:first_latent_pos]
+
+            # z_ids are indices into model.z_token_ids; map to actual token ids
             z_seq = z_ids[b, :K].tolist()
-            new_ids = prefix + [model.z_token_ids[z] for z in z_seq] + [answer_token_id]
+            z_token_seq = [model.z_token_ids[int(z)] for z in z_seq]
+
+            new_ids = prefix + z_token_seq + [answer_token_id]
+
+            # Safety: ensure latent tokens are gone
+            if latent_token_id in new_ids:
+                raise RuntimeError("Phase3 dataset gen: latent token leaked into new_ids (bug)")
 
             attn = [1] * len(new_ids)
 
