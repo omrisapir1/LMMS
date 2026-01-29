@@ -44,6 +44,7 @@ class Phase3DataConfig:
 @dataclass
 class Phase3LossConfig:
     # Main weights
+    print_every: int = 20
     lambda_answer: float = 1.0
     lambda_sft: float = 0.1
     lambda_kl: float = 0.1

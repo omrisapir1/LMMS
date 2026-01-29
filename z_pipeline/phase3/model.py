@@ -132,7 +132,7 @@ class Phase3ZModel(nn.Module):
 
         # Freeze digit heads by default (Phase-3 semantics)
         for p in self.digit_heads.parameters():
-            p.requires_grad = False
+            p.requires_grad = True
 
         self.answer_token_id = int(answer_token_id)
         self.z_token_ids = list(map(int, z_token_ids))
