@@ -51,6 +51,10 @@ class ExperimentConfig:
     gen_temperature: float = 1.0
 
 
+    def __post_init__(self):
+        if self.dataset_name is None:
+            self.dataset_name = self.phase2.data.dataset_name
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -150,7 +154,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
     # -------------------------
     print("[run_experiment] Running Phase-2...")
     phase2_ckpt = run_phase2(cfg.phase2)  # in-memory handoff dict
-
+    
     # -------------------------
     # Phase 3 dataset generation
     # -------------------------
