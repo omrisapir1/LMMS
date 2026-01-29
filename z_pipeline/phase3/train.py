@@ -231,6 +231,7 @@ def run_phase3(
             )
 
     device = _get_device_from_model(model)
+    print(f"[phase3/train] Device: {device}")
     model.to(device)
 
     # Now that model exists, ensure we have z_token_ids + answer_token_id

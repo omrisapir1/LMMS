@@ -103,7 +103,9 @@ def _save_start_ckpt_if_needed(
     ckpt_path = os.path.join(save_dir, "ckpt_step_0.pt")
 
     # Build phase3 model initialized from phase2
-    phase3_model = Phase3ZModel.from_phase2(phase2_model=phase2_ckpt["model"])
+    phase3_model = Phase3ZModel.from_phase2_ckpt(
+        phase2_ckpt=phase2_ckpt
+    )
     phase3_model.to(device)
 
     # Optimizer must match phase3/train.py optimizer settings
