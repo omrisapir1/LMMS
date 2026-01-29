@@ -250,16 +250,12 @@ def run_phase3(
     train_hf = ds_dict["train"]
 
     train_ds = Phase3Dataset(
-        dataset_name=None,  # not used
-        split="train",
-        z_token_ids=phase2_ckpt["z_token_ids"],
+        hf_dataset=ds_dict["train"],  # ✅ correct
+        z_token_ids=list(z_token_ids),
         answer_token_id=answer_token_id,
         max_length=cfg.data.max_length,
+        rebalance_train=True,
     )
-
-    # 👇 overwrite internal HF dataset
-    train_ds.ds = ds_dict["train"]
-    train_ds.indices = list(range(len(train_ds.ds)))
 
     train_loader = DataLoader(
         train_ds,
