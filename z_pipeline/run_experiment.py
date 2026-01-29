@@ -154,7 +154,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
     # -------------------------
     print("[run_experiment] Running Phase-2...")
     phase2_ckpt = run_phase2(cfg.phase2)  # in-memory handoff dict
-    
+
     # -------------------------
     # Phase 3 dataset generation
     # -------------------------
