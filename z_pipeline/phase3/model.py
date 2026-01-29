@@ -155,8 +155,17 @@ class Phase3ZModel(nn.Module):
             device=device,
         )
 
-        assert hasattr(self.base, "lm_head"), "Expected HF CausalLM with lm_head"
-        self.base.lm_head = restricted_head
+        # HF CausalLMs usually expose either lm_head OR get_output_embeddings/set_output_embeddings
+        if hasattr(self.base, "lm_head"):
+            self.base.lm_head = restricted_head
+        elif hasattr(self.base, "set_output_embeddings"):
+            self.base.set_output_embeddings(restricted_head)
+        else:
+            raise AssertionError(
+                "Base model has no lm_head and no set_output_embeddings(). "
+                f"type(base)={type(self.base)}"
+            )
+
         self.restricted_lm_head = restricted_head
 
         # Default init (overwritten for Z rows later)
