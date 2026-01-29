@@ -102,6 +102,18 @@ def _save_start_ckpt_if_needed(
     _ensure_dir(save_dir)
     ckpt_path = os.path.join(save_dir, "ckpt_step_0.pt")
 
+    # --------------------------------------------------
+    # Save tokenizer (once, alongside ckpt_step_0)
+    # --------------------------------------------------
+    tokenizer = phase2_ckpt.get("tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("phase2_ckpt missing tokenizer")
+
+    tokenizer_dir = os.path.join(save_dir, "tokenizer")
+    if not os.path.exists(tokenizer_dir):
+        tokenizer.save_pretrained(tokenizer_dir)
+
+
     # Build phase3 model initialized from phase2
     phase3_model = Phase3ZModel.from_phase2_ckpt(
         phase2_ckpt=phase2_ckpt
