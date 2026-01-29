@@ -130,6 +130,7 @@ class Phase3CheckpointConfig:
     save_dir: str = "./phase3_ckpts"
     save_every_steps: int = 1000
     save_best: bool = True
+    save_at_start: bool = True
 
 
 # ------------------------------------------------------------

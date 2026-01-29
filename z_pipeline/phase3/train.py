@@ -247,7 +247,7 @@ def run_phase3(
     # We wrap HF Dataset splits with Phase3Dataset-style contract checks by using dataset_name path.
     # BUT here ds_dict is already materialized with needed columns; easiest is to use it directly.
     # We'll use DataLoader over ds_dict["train"] and ds_dict["eval"].
-    train_hf = ds_dict["train"]
+
 
     train_ds = Phase3Dataset(
         hf_dataset=ds_dict["train"],  # ✅ correct
