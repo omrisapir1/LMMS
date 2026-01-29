@@ -43,7 +43,7 @@ class ExperimentConfig:
     phase2: Phase2Config = field(default_factory=Phase2Config)
     phase3: Phase3Config = field(default_factory=Phase3Config)
 
-    dataset_name: Optional[str] = None
+    dataset_name: Optional[str] = phase2.data.dataset_name
     train_split: str = "train"
 
     gen_batch_size: int = 16
