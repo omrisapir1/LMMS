@@ -57,13 +57,13 @@ class Phase3Item:
 # ---------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------
-
 class Phase3Dataset(Dataset):
     def __init__(
         self,
         *,
-        dataset_name: str,
-        split: str,                       # "train" | "eval"
+        dataset_name: Optional[str] = None,
+        split: Optional[str] = None,
+        hf_dataset=None,                      # 👈 NEW
         z_token_ids: List[int],
         answer_token_id: int,
         seed: int = 42,
@@ -71,31 +71,36 @@ class Phase3Dataset(Dataset):
         target_dist: Optional[Dict[str, float]] = None,
         max_length: Optional[int] = None,
     ):
-        if split not in ("train", "eval"):
-            raise ValueError("split must be 'train' or 'eval'")
-
-        self.dataset_name = dataset_name
-        self.split = split
-        self.seed = int(seed)
-
         self.z_token_ids = set(int(x) for x in z_token_ids)
         self.answer_token_id = int(answer_token_id)
-
-        self.ds = load_dataset(dataset_name, split=split)
+        self.seed = int(seed)
 
         self.rebalance_train = bool(rebalance_train)
         self.target_dist = dict(target_dist) if target_dist is not None else dict(TARGET_DIST)
+        self.max_length = max_length
 
-        # max_length handling
-        if max_length is not None:
-            self.max_length = int(max_length)
+        # -------------------------
+        # Dataset source
+        # -------------------------
+        if hf_dataset is not None:
+            self.ds = hf_dataset
+            self.split = "train" if rebalance_train else "eval"
         else:
-            self.max_length = None  # no implicit truncation
+            if dataset_name is None or split is None:
+                raise ValueError(
+                    "Phase3Dataset: either hf_dataset OR (dataset_name + split) must be provided"
+                )
+            self.ds = load_dataset(dataset_name, split=split)
+            self.split = split
 
+        # -------------------------
+        # Indices / rebalancing
+        # -------------------------
         if self.split == "train" and self.rebalance_train:
             self.indices = self._build_rebalanced_indices()
         else:
             self.indices = list(range(len(self.ds)))
+
 
     def __len__(self) -> int:
         return len(self.indices)
