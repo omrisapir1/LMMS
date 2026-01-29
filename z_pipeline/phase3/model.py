@@ -190,6 +190,9 @@ class Phase3ZModel(nn.Module):
         z_token_ids = phase2_ckpt["z_token_ids"]
 
         base = phase2_model.base
+        if base.__class__.__name__ == "Qwen2Model":
+            from .model import wrap_qwen2_body_as_causallm
+            base = wrap_qwen2_body_as_causallm(base)
         z_selector = phase2_model.z_selector
         answer_token_id = phase2_model.answer_token_id
 
@@ -321,3 +324,25 @@ class Phase3ZModel(nn.Module):
             "digit_logits": digit_logits,
             "digit_preds": digit_logits.argmax(dim=-1),
         }
+
+from transformers import Qwen2ForCausalLM
+
+def wrap_qwen2_body_as_causallm(
+    body: torch.nn.Module,
+) -> Qwen2ForCausalLM:
+    """
+    Takes a Qwen2Model and wraps it into Qwen2ForCausalLM,
+    transplanting weights exactly.
+    """
+    assert body.__class__.__name__ == "Qwen2Model"
+
+    config = body.config
+    causal_lm = Qwen2ForCausalLM(config)
+
+    # transplant transformer weights
+    causal_lm.model.load_state_dict(
+        body.state_dict(),
+        strict=True,
+    )
+
+    return causal_lm
