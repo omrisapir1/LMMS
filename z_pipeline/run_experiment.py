@@ -29,6 +29,10 @@ try:
 
 except ImportError:
     from .phase2.train import run_phase2
+    from .phase3.generate_dataset import generate_phase3_dataset
+    from .phase3.train import run_phase3
+    from .phase3.model import Phase3ZModel
+    
 
 
 # -----------------------------
