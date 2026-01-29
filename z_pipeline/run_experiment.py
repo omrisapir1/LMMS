@@ -19,12 +19,16 @@ import torch
 from datasets import DatasetDict
 from torch.optim import AdamW
 
-from phase2.train import run_phase2
-from phase3.generate_dataset import generate_phase3_dataset
-from phase3.train import run_phase3
-from phase3.model import Phase3ZModel
-from z_pipeline.phase2.conf import Phase2Config
-from z_pipeline.phase3.conf import Phase3Config
+try:
+    from phase2.train import run_phase2
+    from phase3.generate_dataset import generate_phase3_dataset
+    from phase3.train import run_phase3
+    from phase3.model import Phase3ZModel
+    from z_pipeline.phase2.conf import Phase2Config
+    from z_pipeline.phase3.conf import Phase3Config
+
+except ImportError:
+    from .phase2.train import run_phase2
 
 
 # -----------------------------
