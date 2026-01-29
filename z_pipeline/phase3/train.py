@@ -213,13 +213,17 @@ def run_phase3(
         # Pipeline path: construct from in-memory Phase2 model
         assert phase2_ckpt is not None
         phase2_model = phase2_ckpt["model"]
-        model = Phase3ZModel.from_phase2(phase2_model=phase2_model)
+        model = Phase3ZModel.from_phase2_ckpt(
+            phase2_ckpt=phase2_ckpt
+        )
     else:
         # Resume path: need a Phase3ZModel skeleton first
         # If phase2_ckpt provided, build skeleton from phase2; else assume it was saved after init
         if phase2_ckpt is not None:
             phase2_model = phase2_ckpt["model"]
-            model = Phase3ZModel.from_phase2(phase2_model=phase2_model)
+            model = Phase3ZModel.from_phase2_ckpt(
+                phase2_ckpt=phase2_ckpt
+            )
         else:
             raise ValueError(
                 "Resume mode without phase2_ckpt is not supported in this minimal implementation. "
