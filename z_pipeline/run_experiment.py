@@ -49,6 +49,7 @@ class ExperimentConfig:
     gen_batch_size: int = 16
     gen_z_mode: str = "hard_sample"
     gen_temperature: float = 1.0
+    resume_phase3: bool = False
 
 
     def __post_init__(self):
@@ -105,9 +106,7 @@ def _save_start_ckpt_if_needed(
     # --------------------------------------------------
     # Save tokenizer (once, alongside ckpt_step_0)
     # --------------------------------------------------
-    tokenizer = phase2_ckpt.get("tokenizer", None)
-    if tokenizer is None:
-        raise RuntimeError("phase2_ckpt missing tokenizer")
+    tokenizer = phase2_ckpt["tokenizer"]
 
     tokenizer_dir = os.path.join(save_dir, "tokenizer")
     if not os.path.exists(tokenizer_dir):
@@ -145,21 +144,47 @@ def _save_start_ckpt_if_needed(
 # -----------------------------
 # Main entry point
 # -----------------------------
-
 def run_experiment(cfg: ExperimentConfig) -> None:
-    """
-    Runs Phase-2 then Phase-3 end-to-end.
-
-    Side effects:
-      - Saves generated DatasetDict to: <cfg.phase3.ckpt.save_dir>/dataset
-      - Saves optional start checkpoint: <cfg.phase3.ckpt.save_dir>/ckpt_step_0.pt
-      - Saves training checkpoints per cfg.phase3.ckpt.save_every_steps (inside run_phase3)
-
-    Returns:
-      None (per your requirement).
-    """
     device = _default_device()
     print(f"[run_experiment] device={device}")
+
+    save_dir = str(getattr(cfg.phase3.ckpt, "save_dir", "./phase3_ckpts"))
+    ds_path = os.path.join(save_dir, "dataset")
+    ckpt_path = os.path.join(save_dir, "ckpt_step_0.pt")
+    tokenizer_path = os.path.join(save_dir, "tokenizer")
+
+    # ==================================================
+    # RESUME PHASE-3 MODE
+    # ==================================================
+    if cfg.resume_phase3:
+        print("[run_experiment] Resume Phase-3 mode enabled")
+
+        # --- sanity checks ---
+        if not os.path.exists(ds_path):
+            raise RuntimeError(f"Phase-3 dataset not found at {ds_path}")
+        if not os.path.exists(ckpt_path):
+            raise RuntimeError(f"Phase-3 checkpoint not found at {ckpt_path}")
+        if not os.path.exists(tokenizer_path):
+            raise RuntimeError(f"Tokenizer not found at {tokenizer_path}")
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+        print("[run_experiment] Loading Phase-3 dataset from disk")
+        ds_dict = DatasetDict.load_from_disk(ds_path)
+
+        print("[run_experiment] Running Phase-3 training (resume)")
+        with _autocast_ctx(device):
+            run_phase3(
+                cfg.phase3,
+                phase2_ckpt=None,      # 👈 IMPORTANT
+                ds_dict=ds_dict,
+                ckpt_path=ckpt_path,
+            )
+
+        print("[run_experiment] Done (resume).")
+        return
+
 
     # -------------------------
     # Phase 2
