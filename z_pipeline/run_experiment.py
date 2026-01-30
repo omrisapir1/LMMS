@@ -137,8 +137,6 @@ def _save_start_ckpt_if_needed(
         "step": 0,
         "model_state": phase3_model.state_dict(),
         "optim_state": optimizer.state_dict(),
-        # cfg is optional; run_phase3 will also embed cfg in later ckpts
-        "cfg": getattr(cfg_phase3, "__dict__", None),
     }
     torch.save(payload, ckpt_path)
     return ckpt_path

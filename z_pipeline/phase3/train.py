@@ -118,7 +118,6 @@ def _save_ckpt(
         "step": int(step),
         "model_state": model.state_dict(),
         "optim_state": optimizer.state_dict(),
-        "cfg": asdict(cfg),
     }
     torch.save(payload, path)
     return path
