@@ -212,11 +212,54 @@ def pretrain_z_autoencoder(
         print("Z autoencoder pretraining complete.")
 
 
-
-def run_phase2(cfg: Phase2Config) -> Dict:
+def push_phase2_to_hf(
+    phase2_ckpt: dict,
+    cfg: Phase2Config,
+    repo_id: str,
+    hf_token: str,
+):
     """
-    Returns phase2_ckpt dict (in-memory handoff).
+    Push Phase-2 artifact to HuggingFace.
+    """
+    from huggingface_hub import HfApi
+    import json
+    import tempfile
+    import os
 
+    model = phase2_ckpt["model"]
+    tokenizer = phase2_ckpt["tokenizer"]
+
+    z_meta = {
+        "z_token_ids": phase2_ckpt["z_token_ids"],
+        "z_vocab_size": phase2_ckpt["z_vocab_size"],
+        "latent_token_id": cfg.latent_token_id,
+        "answer_token_id": cfg.answer_token_id,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        model.save_pretrained(tmp)
+        tokenizer.save_pretrained(os.path.join(tmp, "tokenizer"))
+
+        with open(os.path.join(tmp, "z_meta.json"), "w") as f:
+            json.dump(z_meta, f, indent=2)
+
+        with open(os.path.join(tmp, "config.json"), "w") as f:
+            json.dump(cfg.to_dict(), f, indent=2)
+
+        api = HfApi(token=hf_token)
+        api.create_repo(repo_id, exist_ok=True, repo_type="model")
+        api.upload_folder(
+            folder_path=tmp,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+
+
+
+
+def run_phase2(cfg: Phase2Config, hf_token: str):
+    """
+    
     Two-stage training:
       Stage 1 (anneal): temp from cfg.temp.temp_start -> cfg.temp.temp_end, NO digit loss, digit heads frozen
       Stage 2 (cooldown): temp fixed at cfg.temp.temp_end (should be 1), digit loss ON, digit heads trainable
@@ -320,11 +363,10 @@ def run_phase2(cfg: Phase2Config) -> Dict:
         collate_fn=phase2_collate_fn,
     )
 
-    # X, row_ptr = collect_latents_for_kmeans(train_ds)
-    # X_rows = collect_row_representatives(train_ds)
-    # centroids = kmeans_pp_deterministic(X, cfg.z_vocab_size, n_iters=cfg.cluster.n_iter, seed=42)
-    # centroids = kmeans_pp_row_aware(X, X_rows,  cfg.z_vocab_size, n_iters=cfg.cluster.n_iter,row_ptr=row_ptr,assign_mode='balanced_assign', seed=42)
-    # model.initialize_from_centroids(centroids)
+    X, row_ptr = collect_latents_for_kmeans(train_ds)
+    X_rows = collect_row_representatives(train_ds)
+    centroids = kmeans_pp_row_aware(X, X_rows,  cfg.z_vocab_size, n_iters=cfg.cluster.n_iter,row_ptr=row_ptr,assign_mode='balanced_assign', seed=42)
+    model.initialize_from_centroids(centroids)
 
     # Losses
     keep_prob = cfg.loss.keep_prob or compute_keep_prob_from_dataset(train_ds)
@@ -522,13 +564,18 @@ def run_phase2(cfg: Phase2Config) -> Dict:
 
         global_step += 1
 
-    phase2_ckpt = {
-        "model": model,
-        "tokenizer": tokenizer,
-        "z_token_ids": z_token_ids,
-        "z_vocab_size": int(cfg.z_vocab_size),
-    }
-    return phase2_ckpt
+
+    push_phase2_to_hf(
+        phase2_ckpt={
+            "model": model,
+            "tokenizer": tokenizer,
+            "z_token_ids": z_token_ids,
+            "z_vocab_size": int(cfg.z_vocab_size),
+        },
+        cfg=cfg,
+        repo_id=cfg.hf_repo,
+        hf_token=hf_token,
+    )
 
 
 __all__ = ["run_phase2"]
