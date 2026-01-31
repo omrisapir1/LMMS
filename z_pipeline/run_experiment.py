@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 from datasets import DatasetDict
 from torch.optim import AdamW
+import datasets as dataset
 
 try:
     from phase2.train import run_phase2, Phase2Config
@@ -171,7 +172,10 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         print("[run_experiment] Loading Phase-3 dataset from disk")
-        ds_dict = DatasetDict.load_from_disk(ds_path)
+        try:
+            ds_dict = DatasetDict.load_from_disk(ds_path)
+        except Exception as e:
+            ds_dict = dataset.load_from_disk(ds_path)
 
         print("[run_experiment] Running Phase-3 training (resume)")
         with _autocast_ctx(device):
