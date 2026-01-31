@@ -243,8 +243,6 @@ def push_phase2_to_hf(
         with open(os.path.join(tmp, "z_meta.json"), "w") as f:
             json.dump(z_meta, f, indent=2)
 
-        with open(os.path.join(tmp, "config.json"), "w") as f:
-            json.dump(cfg.to_dict(), f, indent=2)
 
         api = HfApi(token=hf_token)
         api.create_repo(repo_id, exist_ok=True, repo_type="model")
