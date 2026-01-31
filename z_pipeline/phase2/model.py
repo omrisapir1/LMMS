@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
+import os
 
 import torch
 import torch.nn as nn
@@ -88,6 +89,27 @@ class Phase2ZModel(nn.Module):
         self.force_base_eval = bool(force_base_eval)
         if self.force_base_eval:
             self.base.eval()
+
+
+    def save_pretrained(self, save_dir: str) -> None:
+        """
+        Save Phase-2 model in HF-compatible layout.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 1) Save base LM (this includes Z embeddings!)
+        self.base.save_pretrained(save_dir)
+
+        # 2) Save Phase-2–specific state
+        torch.save(
+            {
+                "z_selector": self.z_selector.state_dict(),
+                "z_token_ids": self.z_token_ids,
+                "answer_token_id": self.answer_token_id,
+                "latent_token_id": self.latent_token_id,
+            },
+            os.path.join(save_dir, "phase2_state.pt"),
+        )
 
     # ─────────────────────────────────────────────
     # Helpers
