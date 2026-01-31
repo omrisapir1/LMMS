@@ -18,7 +18,7 @@ from typing import Optional
 import torch
 from datasets import DatasetDict
 from torch.optim import AdamW
-import datasets as dataset
+import datasets
 
 try:
     from phase2.train import run_phase2, Phase2Config
@@ -175,7 +175,11 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         try:
             ds_dict = DatasetDict.load_from_disk(ds_path)
         except Exception as e:
-            ds_dict = dataset.load_from_disk(ds_path)
+            ds_dict = datasets.load_dataset(
+                "parquet",
+                data_files=ds_path + "/train-00000-of-00001.parquet",
+                split="train"
+            )
 
         print("[run_experiment] Running Phase-3 training (resume)")
         with _autocast_ctx(device):
