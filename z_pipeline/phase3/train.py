@@ -230,7 +230,7 @@ def run_phase3(
             )
 
     device = _get_device_from_model(model)
-    print(f"[phase3/train] Device: {device}")
+    device = 'cuda'
     model.to(device)
 
     # Now that model exists, ensure we have z_token_ids + answer_token_id
@@ -381,7 +381,7 @@ def run_phase3(
             global_step += 1
 
             # Print occasionally (minimal)
-            if global_step % 100 == 0:
+            if global_step % 10 == 0:
                 la = float(losses["loss_answer"].item())
                 ls = float(losses["loss_sft"].item())
                 lk = float(losses["loss_kl"].item())
