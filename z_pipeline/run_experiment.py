@@ -49,7 +49,7 @@ class ExperimentConfig:
     gen_batch_size: int = 16
     gen_z_mode: str = "hard_sample"
     gen_temperature: float = 1.0
-    resume_phase3: bool = True
+    resume_phase3: bool = False
 
 
     def __post_init__(self):
