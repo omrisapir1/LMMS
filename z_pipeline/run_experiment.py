@@ -181,7 +181,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
                 split="train"
             )
 
-        print("[run_experiment] Running Phase-3 training (resume)")
+        print(f"[run_experiment] Running Phase-3 training (resume) ckpt={ckpt_path}")
         with _autocast_ctx(device):
             run_phase3(
                 cfg.phase3,
