@@ -383,7 +383,7 @@ class Phase3ZModel(nn.Module):
             [head(answer_hidden) for head in self.digit_heads],
             dim=1,
         )
-
+        print(sequences, digit_logits.argmax(dim=-1), sep="\n\n")
         return {
             "sequences": sequences,
             "digit_logits": digit_logits,
