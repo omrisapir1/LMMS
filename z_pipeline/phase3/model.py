@@ -13,11 +13,14 @@
 #
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
+from transformers import Qwen2ForCausalLM, AutoModel
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
 
 
 # ============================================================
@@ -177,6 +180,59 @@ class Phase3ZModel(nn.Module):
     # --------------------------------------------------
 
     @classmethod
+    def from_phase2_repo(
+            cls,
+            *,
+            repo_id: str,
+            fill_value: float = -1e4,
+            answer_init_std: float = 0.02,
+            device: str | torch.device = "cuda",
+    ) -> "Phase3ZModel":
+        # ---- load z_meta.json ----
+        z_meta_path = hf_hub_download(repo_id, "z_meta.json")
+        with open(z_meta_path, "r") as f:
+            z_meta = json.load(f)
+
+        z_token_ids = list(map(int, z_meta["z_token_ids"]))
+        answer_token_id = int(z_meta["answer_token_id"])
+
+        # ---- load base model body (saved by Phase2ZModel.save_pretrained) ----
+        base = AutoModel.from_pretrained(repo_id)
+
+        # Need a CausalLM for generate()
+        if base.__class__.__name__ == "Qwen2Model":
+            base = wrap_qwen2_body_as_causallm(base)
+
+        # ---- load phase2_state.pt ----
+        state_path = hf_hub_download(repo_id, "phase2_state.pt")
+        state = torch.load(state_path, map_location="cpu")
+
+        # ---- reconstruct digit heads and load weights ----
+        hidden_size = base.get_input_embeddings().embedding_dim
+        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
+        digit_heads.load_state_dict(state["digit_heads"])
+
+        # ---- build Phase3 model ----
+        model = cls(
+            base_lm=base,
+            digit_heads=digit_heads,
+            answer_token_id=answer_token_id,
+            z_token_ids=z_token_ids,
+            fill_value=fill_value,
+            answer_init_std=answer_init_std,
+        )
+
+        # init restricted head rows from z_selector weight
+        z_selector_weight = state["z_selector"]["weight"]  # [V,H]
+        model.restricted_lm_head.init_from_phase2(
+            z_selector_weight=z_selector_weight,
+            answer_init_std=answer_init_std,
+        )
+
+        model.to(device)
+        return model
+
+    @classmethod
     def from_phase2_ckpt(
         cls,
         *,
@@ -325,7 +381,8 @@ class Phase3ZModel(nn.Module):
             "digit_preds": digit_logits.argmax(dim=-1),
         }
 
-from transformers import Qwen2ForCausalLM
+
+
 
 def wrap_qwen2_body_as_causallm(
     body: torch.nn.Module,

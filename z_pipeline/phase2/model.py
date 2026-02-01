@@ -105,11 +105,64 @@ class Phase2ZModel(nn.Module):
             {
                 "z_selector": self.z_selector.state_dict(),
                 "z_token_ids": self.z_token_ids,
+                "digit_heads": self.digit_heads.state_dict(),
                 "answer_token_id": self.answer_token_id,
                 "latent_token_id": self.latent_token_id,
             },
             os.path.join(save_dir, "phase2_state.pt"),
         )
+
+    @classmethod
+    def from_pretrained(
+            cls,
+            repo_id: str,
+            *,
+            device: torch.device,
+    ) -> "Phase2ZModel":
+
+        from transformers import AutoModel
+        from huggingface_hub import hf_hub_download
+        import json
+
+        # ---- load base LM ----
+        base = AutoModel.from_pretrained(repo_id)
+        base.to(device)
+
+        # ---- load metadata ----
+        with open(hf_hub_download(repo_id, "z_meta.json")) as f:
+            meta = json.load(f)
+
+        z_token_ids = meta["z_token_ids"]
+        answer_token_id = meta["answer_token_id"]
+        latent_token_id = meta["latent_token_id"]
+
+        # ---- load phase2 state ----
+        state = torch.load(
+            hf_hub_download(repo_id, "phase2_state.pt"),
+            map_location="cpu",
+        )
+
+        # ---- reconstruct digit heads ----
+        hidden_size = base.get_input_embeddings().embedding_dim
+        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
+        digit_heads.load_state_dict(state["digit_heads"])
+
+        # ---- build model ----
+        model = cls(
+            base_lm=base,
+            digit_heads=digit_heads,
+            answer_token_id=answer_token_id,
+            latent_token_id=latent_token_id,
+            z_token_ids=z_token_ids,
+            freeze_base=True,
+            freeze_digit_heads=True,
+        )
+
+        model.z_selector.load_state_dict(state["z_selector"])
+        model.to(device)
+        model.eval()
+
+        return model
 
     # ─────────────────────────────────────────────
     # Helpers
