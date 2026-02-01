@@ -359,7 +359,7 @@ class Phase3ZModel(nn.Module):
         generate_kwargs = dict(generate_kwargs)
         generate_kwargs["return_dict_in_generate"] = True
         generate_kwargs["output_hidden_states"] = True
-
+        print(input_ids, attention_mask, sep="\n\n")
         gen = self.base.generate(
             input_ids=input_ids,
             eos_token_id=self.answer_token_id,
@@ -368,6 +368,7 @@ class Phase3ZModel(nn.Module):
         )
 
         sequences = gen.sequences
+        print(sequences, sep="\n\n")
         mask = (sequences == self.answer_token_id)
         # assert torch.all(mask.sum(dim=1) >= 1)
 
