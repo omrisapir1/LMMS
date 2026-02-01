@@ -367,36 +367,46 @@ class Phase3ZModel(nn.Module):
             **generate_kwargs,
         )
 
-        sequences = gen.sequences
-        # print(sequences, sep="\n\n")
-        mask = (sequences == self.answer_token_id)
-        # assert torch.all(mask.sum(dim=1) >= 1)
+        sequences = gen.sequences  # [B, T_total]
 
-        pos = mask.float().argmax(dim=1)
-        print(pos, sep="\n\n")
-        hs = gen.hidden_states
-        # print(hs, sep="\n\n")
-        last_hidden = hs[-1] if torch.is_tensor(hs[-1]) else hs[-1][-1]
-        # print(last_hidden, sep="\n\n")
+        # Make an attention mask for the full sequences
+        # (If you have pad_token_id=None, set it in tokenizer or use eos as pad)
+        pad_id = getattr(self.base.config, "pad_token_id", None)
+        assert pad_id is not None, "pad_token_id not set in tokenizer config"
 
-        bidx = torch.arange(last_hidden.size(0), device=last_hidden.device)
-        # print(bidx, sep="\n\n")
-        answer_hidden = last_hidden[bidx, pos]
-        print(pos)
-        print(answer_hidden, sep="\n\n")
+        full_attn = (sequences != pad_id).long()
 
-        digit_logits = torch.stack(
-            [head(answer_hidden) for head in self.digit_heads],
-            dim=1,
+        # Re-run forward to get full hidden states
+        out_full = self.base(
+            input_ids=sequences,
+            attention_mask=full_attn,
+            output_hidden_states=True,
+            return_dict=True,
         )
-        print(sequences, digit_logits.argmax(dim=-1), sep="\n\n")
+
+        hidden_last = out_full.hidden_states[-1]  # [B, T_total, H]
+
+        mask = (sequences == self.answer_token_id)
+        has_answer = mask.any(dim=1)
+
+        # if some rows didn't generate <ANSWER>, you can decide a fallback:
+        # e.g., use last token position (or skip those rows)
+        pos = mask.float().argmax(dim=1)
+        pos = torch.where(
+            has_answer,
+            pos,
+            (full_attn.sum(dim=1) - 1).clamp(min=0)  # fallback = last non-pad token
+        )
+
+        bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
+        answer_hidden = hidden_last[bidx, pos]  # [B, H]
+
+        digit_logits = torch.stack([head(answer_hidden) for head in self.digit_heads], dim=1)
         return {
             "sequences": sequences,
             "digit_logits": digit_logits,
             "digit_preds": digit_logits.argmax(dim=-1),
         }
-
-
 
 
 def wrap_qwen2_body_as_causallm(
