@@ -65,14 +65,7 @@ class RestrictedLMHead(nn.Module):
 
         ids = torch.tensor(self.restricted_token_ids, dtype=torch.long, device=device)
         self.register_buffer("_token_ids", ids, persistent=False)
-        vocab_size_full = self.base.get_input_embeddings().weight.shape[0]
-        max_id = max(self.z_token_ids + [self.answer_token_id])
 
-        if max_id >= vocab_size_full:
-            raise RuntimeError(
-                f"Token id out of range: max_id={max_id} >= vocab_size_full={vocab_size_full}. "
-                "Your z_meta token ids don't fit the loaded base model embeddings."
-            )
 
     @torch.no_grad()
     def init_from_phase2(
@@ -165,6 +158,14 @@ class Phase3ZModel(nn.Module):
             dtype=dtype,
             device=device,
         )
+        vocab_size_full = self.base.get_input_embeddings().weight.shape[0]
+        max_id = max(self.z_token_ids + [self.answer_token_id])
+
+        if max_id >= vocab_size_full:
+            raise RuntimeError(
+                f"Token id out of range: max_id={max_id} >= vocab_size_full={vocab_size_full}. "
+                "Your z_meta token ids don't fit the loaded base model embeddings."
+            )
 
         # HF CausalLMs usually expose either lm_head OR get_output_embeddings/set_output_embeddings
         if hasattr(self.base, "lm_head"):
