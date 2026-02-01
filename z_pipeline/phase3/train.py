@@ -259,6 +259,7 @@ def run_phase3(
         tokenizer=tokenizer,
         batch_size=cfg.eval.batch_size,
         answer_token_id=answer_token_id,
+        pad_token_id=pad_token_id,
         device=device,
     )
 

@@ -371,8 +371,8 @@ class Phase3ZModel(nn.Module):
 
         # Make an attention mask for the full sequences
         # (If you have pad_token_id=None, set it in tokenizer or use eos as pad)
-        pad_id = getattr(self.base.config, "pad_token_id", None)
-        assert pad_id is not None, "pad_token_id not set in tokenizer config"
+        pad_id = generate_kwargs.get("pad_token_id", self.base.config.eos_token_id)
+        # pad_id = getattr(self.base.config, "pad_token_id", None)
 
         full_attn = (sequences != pad_id).long()
 
