@@ -359,7 +359,7 @@ class Phase3ZModel(nn.Module):
         generate_kwargs = dict(generate_kwargs)
         generate_kwargs["return_dict_in_generate"] = True
         generate_kwargs["output_hidden_states"] = True
-        print(input_ids, attention_mask, sep="\n\n")
+        # print(input_ids, attention_mask, sep="\n\n")
         gen = self.base.generate(
             input_ids=input_ids,
             eos_token_id=self.answer_token_id,
@@ -368,19 +368,19 @@ class Phase3ZModel(nn.Module):
         )
 
         sequences = gen.sequences
-        print(sequences, sep="\n\n")
+        # print(sequences, sep="\n\n")
         mask = (sequences == self.answer_token_id)
         # assert torch.all(mask.sum(dim=1) >= 1)
 
         pos = mask.float().argmax(dim=1)
         print(pos, sep="\n\n")
         hs = gen.hidden_states
-        print(hs, sep="\n\n")
+        # print(hs, sep="\n\n")
         last_hidden = hs[-1] if torch.is_tensor(hs[-1]) else hs[-1][-1]
-        print(last_hidden, sep="\n\n")
+        # print(last_hidden, sep="\n\n")
 
         bidx = torch.arange(last_hidden.size(0), device=last_hidden.device)
-        print(bidx, sep="\n\n")
+        # print(bidx, sep="\n\n")
         answer_hidden = last_hidden[bidx, pos]
         print(pos)
         print(answer_hidden, sep="\n\n")
