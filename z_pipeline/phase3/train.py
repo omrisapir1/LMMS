@@ -266,10 +266,7 @@ def run_phase3(
     # Training loop
     # --------------------------------------------------
     model.train()
-    "loss_total": loss_total,
-    "loss_answer": loss_answer,
-    "loss_sft": loss_sft,
-    "loss_kl": loss_kl,
+
     cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
