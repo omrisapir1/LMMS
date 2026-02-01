@@ -373,7 +373,7 @@ class Phase3ZModel(nn.Module):
         # assert torch.all(mask.sum(dim=1) >= 1)
 
         pos = mask.float().argmax(dim=1)
-
+        print(pos, sep="\n\n")
         hs = gen.hidden_states
         last_hidden = hs[-1] if torch.is_tensor(hs[-1]) else hs[-1][-1]
 
