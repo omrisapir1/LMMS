@@ -375,10 +375,14 @@ class Phase3ZModel(nn.Module):
         pos = mask.float().argmax(dim=1)
         print(pos, sep="\n\n")
         hs = gen.hidden_states
+        print(hs, sep="\n\n")
         last_hidden = hs[-1] if torch.is_tensor(hs[-1]) else hs[-1][-1]
+        print(last_hidden, sep="\n\n")
 
         bidx = torch.arange(last_hidden.size(0), device=last_hidden.device)
+        print(bidx, sep="\n\n")
         answer_hidden = last_hidden[bidx, pos]
+        print(answer_hidden, sep="\n\n")
 
         digit_logits = torch.stack(
             [head(answer_hidden) for head in self.digit_heads],
