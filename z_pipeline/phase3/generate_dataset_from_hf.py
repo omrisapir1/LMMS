@@ -18,6 +18,7 @@ from huggingface_hub import HfApi
 
 from z_pipeline.phase2.dataset import Phase2Dataset, phase2_collate_fn
 from z_pipeline.phase2.model import Phase2ZModel
+from z_pipeline.phase2.conf import Phase2Config
 
 
 # ------------------------------------------------------------
@@ -147,7 +148,7 @@ def generate_phase3_dataset_from_hf(
     phase3_dataset_repo_id: str,
     dataset_name: str,
     batch_size: int,
-    z_mode: str = "hard_argmax",
+    z_mode: str = "hard_sample",
     temperature: float = 1.0,
     device: str = "cuda",
     hf_token: str,
@@ -215,3 +216,6 @@ def generate_phase3_dataset_from_hf(
 
 
 __all__ = ["generate_phase3_dataset_from_hf"]
+
+if __name__ == '__main__':
+    generate_phase3_dataset_from_hf(phase2_repo_id=Phase2Config.hf_repo, phase3_dataset_repo_id="omrisap/phase3_train_dataset", dataset_name=Phase2Config.data.dataset_name, batch_size=64, device="cuda")
