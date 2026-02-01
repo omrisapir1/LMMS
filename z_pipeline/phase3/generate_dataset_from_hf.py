@@ -16,9 +16,14 @@ from datasets import Dataset, DatasetDict
 from transformers import AutoTokenizer
 from huggingface_hub import HfApi
 
-from z_pipeline.phase2.dataset import Phase2Dataset, phase2_collate_fn
-from z_pipeline.phase2.model import Phase2ZModel
-from z_pipeline.phase2.conf import Phase2Config
+try:
+    from z_pipeline.phase2.dataset import Phase2Dataset, phase2_collate_fn
+    from z_pipeline.phase2.model import Phase2ZModel
+    from z_pipeline.phase2.conf import Phase2Config
+except ImportError:
+    from .z_pipeline.phase2.dataset import Phase2Dataset, phase2_collate_fn
+    from .z_pipeline.phase2.model import Phase2ZModel
+    from .z_pipeline.phase2.conf import Phase2Config
 
 
 # ------------------------------------------------------------
