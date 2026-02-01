@@ -141,6 +141,7 @@ class Phase3CheckpointConfig:
 @dataclass
 class Phase3Config:
     seed: int = 42
+    phase2_repo_id: str = "omrisap/phaseZ"
 
     data: Phase3DataConfig = field(default_factory=Phase3DataConfig)
     loss: Phase3LossConfig = field(default_factory=Phase3LossConfig)
