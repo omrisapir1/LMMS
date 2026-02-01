@@ -182,11 +182,17 @@ class DigitKLDiversityLoss:
         p_ref = p_ref.clamp_min(eps)
         p_alt = p_alt.clamp_min(eps)
 
-        kl = (p_ref * (p_ref.log() - p_alt.log())).sum(dim=-1)  # [B,5]
-        kl = kl.sum(dim=-1).mean()  # scalar
-
-        # NEGATIVE → maximize KL
-        return -kl
+        # kl = (p_ref * (p_ref.log() - p_alt.log())).sum(dim=-1)  # [B,5]
+        # kl = kl.sum(dim=-1).mean()  # scalar
+        #
+        # # NEGATIVE → maximize KL
+        # return -kl
+        m = 0.5 * (p_ref + p_alt)
+        kl_pm = (p_ref * (p_ref.log() - m.log())).sum(dim=-1)  # [B,5]
+        kl_qm = (p_alt * (p_alt.log() - m.log())).sum(dim=-1)  # [B,5]
+        js = 0.5 * (kl_pm + kl_qm)  # [B,5]
+        js = js.mean(dim=-1).mean()
+        return -js
 
 
 # -------------------------------------------------
