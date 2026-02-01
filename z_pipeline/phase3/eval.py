@@ -163,7 +163,12 @@ class Phase3Evaluator:
             B = sequences.size(0)
 
             for b in range(B):
-                seq_ids = sequences[b].tolist()
+                try:
+                    seq_ids = sequences[b].tolist()
+                except Exception as e:
+                    print(sequences[b])
+                    print(f"Error on batch {b}: {e}")
+                    continue
                 seq_ids = self._truncate_at_answer(seq_ids)
                 decoded = self._decode_tokens(seq_ids)
 
