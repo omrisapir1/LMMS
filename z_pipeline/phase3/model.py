@@ -382,6 +382,7 @@ class Phase3ZModel(nn.Module):
         bidx = torch.arange(last_hidden.size(0), device=last_hidden.device)
         print(bidx, sep="\n\n")
         answer_hidden = last_hidden[bidx, pos]
+        print(pos)
         print(answer_hidden, sep="\n\n")
 
         digit_logits = torch.stack(
