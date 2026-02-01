@@ -18,7 +18,18 @@ from datasets import load_dataset
 SYSTEM_PROMPT = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
+FIRST_PART_PROMPT = '''<|im_start|>system\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>user\n'''
+SECOND_PART_PROMPT = '''<|im_end|>\n<|im_start|>assistant\n'''
 
+def build_prompt(tokenizer, question: str) -> str:
+    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    return FIRST_PART_PROMPT + question + SECOND_PART_PROMPT
 
 class Phase3Evaluator:
     def __init__(
@@ -40,6 +51,7 @@ class Phase3Evaluator:
         # Load dataset ONCE
         # ---------------------------------------------
         self.ds = load_dataset(dataset_name, split=split)
+        self.ds = self.ds[:100]
 
         # ---------------------------------------------
         # Build dataloader ONCE
@@ -61,15 +73,9 @@ class Phase3Evaluator:
         final_answers = []
 
         for ex in batch:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": ex["problem"]},
-            ]
-            enc = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-            )
+            prompt = build_prompt(tokenizer=self.tokenizer, question=ex["problem"])
+        
+            enc = self.tokenizer.encode(prompt, add_special_tokens=False)
             input_ids.append(torch.tensor(enc, dtype=torch.long))
             attention_mask.append(torch.ones(len(enc), dtype=torch.long))
             problems.append(ex["problem"])
