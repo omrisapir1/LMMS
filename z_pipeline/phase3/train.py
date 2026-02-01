@@ -143,18 +143,17 @@ def _load_ckpt(
 def run_phase3(
     cfg: Phase3Config,
     *,
-    phase2_repo_id: str,
-    ds_dict: Optional[DatasetDict] = None,
-    ds_path: Optional[str] = None,
     ckpt_path: Optional[str] = None,
-    save_dataset_to_disk: Optional[str] = None,
 ) -> Dict[str, Any]:
 
     cfg = cfg.validate()
     set_seed_best_effort(cfg.seed)
+    phase2_repo_id = cfg.phase2_repo_id
+    phase3_dataset_repo_id = cfg.phase3_dataset_repo_id
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --------------------------------------------------
-    # Load tokenizer + Phase-2 metadata from HF
+    # Load tokenizer + Phase-2 metadata
     # --------------------------------------------------
     from transformers import AutoTokenizer
     from huggingface_hub import hf_hub_download
@@ -174,24 +173,18 @@ def run_phase3(
     pad_token_id = tokenizer.pad_token_id
 
     # --------------------------------------------------
-    # Resolve dataset
+    # Load Phase-3 dataset FROM HF
     # --------------------------------------------------
-    if ds_dict is None:
-        if ds_path is None:
-            raise ValueError("Provide ds_dict or ds_path")
-        ds_dict = load_from_disk(ds_path)
-        if not isinstance(ds_dict, DatasetDict):
-            raise RuntimeError("ds_path must contain a DatasetDict")
+    from datasets import load_dataset
 
-    if save_dataset_to_disk is not None:
-        _ensure_dir(save_dataset_to_disk)
-        ds_dict.save_to_disk(save_dataset_to_disk)
+    ds_dict = load_dataset(phase3_dataset_repo_id)
+
+    if not isinstance(ds_dict, DatasetDict):
+        raise RuntimeError("Phase-3 dataset repo must contain a DatasetDict")
 
     # --------------------------------------------------
-    # Build Phase-3 model FROM HF Phase-2 repo
+    # Build Phase-3 model FROM Phase-2 HF repo
     # --------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     model = Phase3ZModel.from_phase2_repo(
         repo_id=phase2_repo_id,
         fill_value=-1e4,
@@ -200,7 +193,7 @@ def run_phase3(
     )
 
     # --------------------------------------------------
-    # Resume Phase-3 checkpoint (optional)
+    # Optimizer
     # --------------------------------------------------
     optimizer = AdamW(
         model.parameters(),
@@ -224,7 +217,7 @@ def run_phase3(
         print(f"[phase3/train] Resumed from {ckpt_path} at step={global_step}")
 
     # --------------------------------------------------
-    # Dataset + Loader
+    # Dataset + DataLoader
     # --------------------------------------------------
     train_ds = Phase3Dataset(
         hf_dataset=ds_dict["train"],
@@ -270,10 +263,14 @@ def run_phase3(
     )
 
     # --------------------------------------------------
-    # Training loop (UNCHANGED SEMANTICS)
+    # Training loop
     # --------------------------------------------------
     model.train()
-
+    "loss_total": loss_total,
+    "loss_answer": loss_answer,
+    "loss_sft": loss_sft,
+    "loss_kl": loss_kl,
+    cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
@@ -326,12 +323,20 @@ def run_phase3(
 
             optimizer.step()
             global_step += 1
-
+            cur_loss_kl += losses["loss_kl"].item()
+            cur_loss_answer += losses["loss_answer"].item()
+            cur_loss_sft += losses["loss_sft"].item()
             if global_step % 10 == 0:
+                cur_loss_kl = cur_loss_kl / 10
+                cur_loss_answer = cur_loss_answer / 10
+                cur_loss_sft = cur_loss_sft / 10
+                print(f"[phase3/train] step={global_step} loss_answer={cur_loss_answer:.4f} loss_sft={cur_loss_sft:.4f} loss_kl={cur_loss_kl:.4f}")
                 print(
                     f"[phase3/train] step={global_step} "
                     f"loss={loss_total.item():.4f}"
                 )
+
+                cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
 
             if global_step % cfg.train.eval_every_steps == 0:
                 model.eval()
@@ -371,5 +376,3 @@ def run_phase3(
         "last_ckpt_path": last_ckpt_path,
     }
 
-
-__all__ = ["run_phase3"]
