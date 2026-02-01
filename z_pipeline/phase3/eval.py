@@ -166,7 +166,8 @@ class Phase3Evaluator:
                 try:
                     seq_ids = sequences[b].tolist()
                 except Exception as e:
-                    print(sequences[b])
+                    print(f'b is {b}')
+                    print(sequences)
                     print(f"Error on batch {b}: {e}")
                     continue
                 seq_ids = self._truncate_at_answer(seq_ids)
