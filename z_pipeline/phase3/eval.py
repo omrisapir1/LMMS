@@ -40,12 +40,14 @@ class Phase3Evaluator:
         split: str = "eval",
         batch_size: int,
         answer_token_id: int,
+        pad_token_id: int,
         device: Optional[torch.device] = None,
     ):
         self.tokenizer = tokenizer
         self.answer_token_id = int(answer_token_id)
         self.batch_size = int(batch_size)
         self.device = device
+        self.pad_token_id = int(pad_token_id)
 
         # ---------------------------------------------
         # Load dataset ONCE
@@ -154,6 +156,7 @@ class Phase3Evaluator:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_generation_tokens,
+                pad_token_id=self.pad_token_id,
                 do_sample=False,
             )
 
@@ -201,6 +204,7 @@ class Phase3Evaluator:
                 attention_mask=attention_mask,
                 max_new_tokens=max_generation_tokens,
                 do_sample=True,
+                pad_token_id=self.pad_token_id,
                 temperature=sampling_temperature,
                 top_p=top_p,
                 top_k=top_k,
