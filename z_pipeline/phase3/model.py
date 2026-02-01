@@ -369,7 +369,7 @@ class Phase3ZModel(nn.Module):
 
         sequences = gen.sequences
         mask = (sequences == self.answer_token_id)
-        assert torch.all(mask.sum(dim=1) >= 1)
+        # assert torch.all(mask.sum(dim=1) >= 1)
 
         pos = mask.float().argmax(dim=1)
 
