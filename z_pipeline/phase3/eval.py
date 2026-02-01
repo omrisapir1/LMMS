@@ -51,7 +51,7 @@ class Phase3Evaluator:
         # Load dataset ONCE
         # ---------------------------------------------
         self.ds = load_dataset(dataset_name, split=split)
-        self.ds = self.ds[:100]
+        # self.ds = self.ds[:100]
 
         # ---------------------------------------------
         # Build dataloader ONCE
@@ -74,7 +74,7 @@ class Phase3Evaluator:
 
         for ex in batch:
             prompt = build_prompt(tokenizer=self.tokenizer, question=ex["problem"])
-        
+
             enc = self.tokenizer.encode(prompt, add_special_tokens=False)
             input_ids.append(torch.tensor(enc, dtype=torch.long))
             attention_mask.append(torch.ones(len(enc), dtype=torch.long))
