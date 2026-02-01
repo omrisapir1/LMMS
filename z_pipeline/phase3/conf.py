@@ -104,7 +104,7 @@ class Phase3OptimConfig:
 class Phase3TrainConfig:
     num_epochs: int = 3
     eval_every_steps: int = 1000
-    batch_size: int = 24
+    batch_size: int = 12
 
 
 # ------------------------------------------------------------
