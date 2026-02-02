@@ -61,7 +61,7 @@ def _save_eval_rows(
     _ensure_dir(save_dir)
     df = pd.DataFrame(rows)
     path = os.path.join(save_dir, f"eval_step_{step}.pkl")
-    df.to_pickle(path, index=False)
+    df.to_pickle(path)
     return path
 
 
