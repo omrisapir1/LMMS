@@ -113,7 +113,7 @@ class Phase3TrainConfig:
 
 @dataclass
 class Phase3EvalConfig:
-    batch_size: int = 64
+    batch_size: int = 8
 
     # Generation control
     max_generation_tokens: int = 32
