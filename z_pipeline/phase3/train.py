@@ -346,7 +346,7 @@ def run_phase3(
                 print(f"[phase3/train] step={global_step} loss_answer={cur_loss_answer:.4f} loss_sft={cur_loss_sft:.4f} loss_kl={cur_loss_kl:.4f}")
                 print(
                     f"[phase3/train] step={global_step} "
-                    f"loss={loss_total.item():.4f}"
+                    f"loss={cfg.loss.lambda_answer * cur_loss_answer + cfg.loss.lambda_sft * cur_loss_sft + cfg.loss.lambda_kl * cur_loss_kl:.4f}"
                 )
 
                 cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
@@ -367,14 +367,6 @@ def run_phase3(
                 )
                 print("\n=== Phase-3 Eval ===")
                 print(f"[phase3/train] Saved eval rows to {eval_path}")
-                last_ckpt_path = _save_ckpt(
-                    save_dir=cfg.ckpt.save_dir,
-                    step=global_step,
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                )
-                print(f"[phase3/train] Saved {last_ckpt_path}")
                 model.train()
 
             if global_step % cfg.ckpt.save_every_steps == 0:
