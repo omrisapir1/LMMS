@@ -50,6 +50,21 @@ def _get_device_from_model(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def _save_eval_rows(
+    *,
+    rows: list[Dict[str, Any]],
+    save_dir: str,
+    step: int,
+) -> str:
+    import pandas as pd
+
+    _ensure_dir(save_dir)
+    df = pd.DataFrame(rows)
+    path = os.path.join(save_dir, f"eval_step_{step}.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
 def _mask_sft_to_start_at_first_z(
     *,
     input_ids: torch.Tensor,          # [B,T]
@@ -338,16 +353,20 @@ def run_phase3(
 
             if global_step % cfg.train.eval_every_steps == 0:
                 model.eval()
-                metrics = evaluator.evaluate(
+                rows = evaluator.evaluate(
                     model=model,
                     max_generation_tokens=cfg.eval.max_generation_tokens,
                     sampling_temperature=cfg.eval.sampling_temperature,
                     top_p=cfg.eval.top_p,
                     top_k=cfg.eval.top_k,
                 )
+                eval_path = _save_eval_rows(
+                    rows=rows,
+                    save_dir=cfg.ckpt.save_dir,
+                    step=global_step,
+                )
                 print("\n=== Phase-3 Eval ===")
-                for k, m in metrics.items():
-                    print(f"{k}: EM={m['digit_em']*100:.2f}%")
+                print(f"[phase3/train] Saved eval rows to {eval_path}")
                 model.train()
 
             if global_step % cfg.ckpt.save_every_steps == 0:
@@ -373,4 +392,3 @@ def run_phase3(
         "final_step": global_step,
         "last_ckpt_path": last_ckpt_path,
     }
-
