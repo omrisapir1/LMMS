@@ -87,14 +87,16 @@ class Phase3Evaluator:
 
         def pad(x, pad_val):
             return torch.cat(
-                [x, torch.full((max_len - x.size(0),), pad_val, dtype=x.dtype)],
+                [torch.full((max_len - x.size(0),), pad_val, dtype=x.dtype), x],
                 dim=0,
             )
 
         input_ids = torch.stack(
-            [pad(x, self.tokenizer.pad_token_id) for x in input_ids]
+            [pad(x, self.pad_token_id) for x in input_ids]
         )
-        attention_mask = torch.stack([pad(x, 0) for x in attention_mask])
+        attention_mask = torch.stack(
+            [pad(x, 0) for x in attention_mask]
+        )
 
         return {
             "input_ids": input_ids,
