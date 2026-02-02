@@ -60,8 +60,8 @@ def _save_eval_rows(
 
     _ensure_dir(save_dir)
     df = pd.DataFrame(rows)
-    path = os.path.join(save_dir, f"eval_step_{step}.csv")
-    df.to_csv(path, index=False)
+    path = os.path.join(save_dir, f"eval_step_{step}.pkl")
+    df.to_pickle(path, index=False)
     return path
 
 
@@ -367,6 +367,14 @@ def run_phase3(
                 )
                 print("\n=== Phase-3 Eval ===")
                 print(f"[phase3/train] Saved eval rows to {eval_path}")
+                last_ckpt_path = _save_ckpt(
+                    save_dir=cfg.ckpt.save_dir,
+                    step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    cfg=cfg,
+                )
+                print(f"[phase3/train] Saved {last_ckpt_path}")
                 model.train()
 
             if global_step % cfg.ckpt.save_every_steps == 0:
