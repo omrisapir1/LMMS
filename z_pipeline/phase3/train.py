@@ -254,16 +254,12 @@ def run_phase3(
     # Losses
     # --------------------------------------------------
 
-    sft_loss = RestrictedSFTLoss(
-    ignore_index=-100,
-    debug_every=50,   # print every 50 calls
-    debug_topk=1030,
-)
+
 
 
     loss_fn = Phase3Loss(
         answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
-        sft_loss=sft_loss,#RestrictedSFTLoss(ignore_index=-100),
+        sft_loss=RestrictedSFTLoss(ignore_index=-100),
         kl_loss=DigitKLDiversityLoss(
             z_token_ids=z_token_ids,
             answer_token_id=answer_token_id,
@@ -332,9 +328,6 @@ def run_phase3(
                     return_dict=True,
                     return_full_logits=False
                 )
-                print("[TRAIN] out.logits.shape =", tuple(out.logits.shape))  # should end with 1025
-                print("[TRAIN] restricted_size =", model.restricted_lm_head.restricted_size)
-
                 losses = loss_fn.compute(
                     model=model,
                     logits=out.logits,

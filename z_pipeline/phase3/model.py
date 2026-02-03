@@ -180,14 +180,6 @@ class Phase3ZModel(nn.Module):
             device=device,
         )
 
-        # --- sanity checks: LM head must be 1024 Z + 1 ANSWER ---
-        assert len(self.z_token_ids) == 1024, f"expected 1024 z tokens, got {len(self.z_token_ids)}"
-        assert self.answer_token_id not in self.z_token_ids, "answer_token_id is inside z_token_ids (dup bug)"
-        assert restricted_head.restricted_size == 1025, f"expected restricted_size=1025, got {restricted_head.restricted_size}"
-        assert int(restricted_head._full_to_restricted[self.answer_token_id].item()) != -1, "ANSWER not mapped"
-        print("[LM HEAD]", "restricted_size=", restricted_head.restricted_size,
-              "answer_rid=", int(restricted_head._full_to_restricted[self.answer_token_id].item()),
-              "last_token_id=", max(restricted_head.restricted_token_ids))
 
         vocab_size_full = self.base.get_input_embeddings().weight.shape[0]
         max_id = max(self.z_token_ids + [self.answer_token_id])
@@ -397,7 +389,8 @@ class Phase3ZModel(nn.Module):
         generate_kwargs = dict(generate_kwargs)
         generate_kwargs["return_dict_in_generate"] = True
         generate_kwargs["output_hidden_states"] = True
-        # print(input_ids, attention_mask, sep="\n\n")
+
+
         gen = self.base.generate(
             input_ids=input_ids,
             eos_token_id=self.answer_token_id,
