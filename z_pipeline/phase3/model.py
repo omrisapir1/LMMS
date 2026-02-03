@@ -100,7 +100,7 @@ class RestrictedLMHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        return_full_logits: bool = False,
+        return_full_logits: bool = True,
     ) -> torch.Tensor:
         """
         If return_full_logits=False:
@@ -340,7 +340,7 @@ class Phase3ZModel(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
             output_hidden_states: bool = False,
             return_dict: bool = True,
-            return_full_logits: bool = False,
+            return_full_logits: bool = True,
             **kwargs,
     ):
         out = self.base(
