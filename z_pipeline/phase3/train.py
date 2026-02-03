@@ -339,8 +339,6 @@ def run_phase3(
 
                 loss_total_accum += losses["loss_total"].item()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss_total_accum.backward()
 
             if cfg.optim.max_grad_norm:
                 torch.nn.utils.clip_grad_norm_(
