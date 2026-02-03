@@ -205,6 +205,7 @@ def run_phase3(
         answer_init_std=0.02,
         device=device,
     )
+    model.base.gradient_checkpointing_enable()
 
     # --------------------------------------------------
     # Optimizer
