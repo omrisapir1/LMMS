@@ -25,7 +25,7 @@ from datasets import DatasetDict
 from .conf import Phase3Config
 from .dataset import Phase3Dataset, phase3_collate_fn, TARGET_DIST
 from .eval import Phase3Evaluator
-from .loss import AnswerLoss, SFTLoss, DigitKLDiversityLoss, Phase3Loss
+from .loss import AnswerLoss, RestrictedSFTLoss, DigitKLDiversityLoss, Phase3Loss
 from .model import Phase3ZModel
 
 
@@ -206,7 +206,7 @@ def run_phase3(
         device=device,
     )
     model.base.gradient_checkpointing_enable()
-    
+
 
     # --------------------------------------------------
     # Optimizer
@@ -255,7 +255,7 @@ def run_phase3(
     # --------------------------------------------------
     loss_fn = Phase3Loss(
         answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
-        sft_loss=SFTLoss(ignore_index=-100),
+        sft_loss=RestrictedSFTLoss(ignore_index=-100),
         kl_loss=DigitKLDiversityLoss(
             z_token_ids=z_token_ids,
             answer_token_id=answer_token_id,
