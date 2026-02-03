@@ -317,29 +317,31 @@ class Phase3ZModel(nn.Module):
             *,
             input_ids: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            output_hidden_states: bool = False,
+            output_hidden_states: bool = False,  # keep arg for API compatibility
             return_dict: bool = True,
             **kwargs,
     ):
-        out = self.base(
+        # 1) Run transformer body to get LAST hidden state (no hidden_states list)
+        body_out = self.base.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            output_hidden_states=False,  # IMPORTANT
+            return_dict=True,
             **kwargs,
         )
+        hidden_last = body_out.last_hidden_state  # [B, T, H]
 
-        hidden_last = out.last_hidden_state
+        # 2) Produce logits using the (restricted) lm_head you already installed
+        logits = self.base.lm_head(hidden_last)
+
+        # 3) Digit logits from <ANSWER> position
         digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
 
         if return_dict:
-            out.digit_logits = digit_logits
-            return out
+            # mimic HF style output enough for your training loop
+            return type("Phase3Out", (), {"logits": logits, "digit_logits": digit_logits})
 
-        return {
-            "logits": out.logits,
-            "digit_logits": digit_logits,
-        }
+        return {"logits": logits, "digit_logits": digit_logits}
 
     # --------------------------------------------------
     # Generation + digits
