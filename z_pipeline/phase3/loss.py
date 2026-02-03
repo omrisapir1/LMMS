@@ -211,7 +211,7 @@ class Phase3Loss:
         self,
         *,
         answer_loss: AnswerLoss,
-        sft_loss: SFTLoss,
+        sft_loss: RestrictedSFTLoss,
         kl_loss: DigitKLDiversityLoss,
         lambda_answer: float,
         lambda_sft: float,
@@ -240,6 +240,7 @@ class Phase3Loss:
             logits=logits,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            full_to_restricted=model.restricted_lm_head._full_to_restricted,
         )
         loss_kl = self.kl_loss.compute(
             model=model,
@@ -260,3 +261,36 @@ class Phase3Loss:
             "loss_sft": loss_sft,
             "loss_kl": loss_kl,
         }
+class RestrictedSFTLoss:
+    def __init__(self, ignore_index: int = -100):
+        self.ignore_index = ignore_index
+
+    def compute(
+        self,
+        *,
+        logits: torch.Tensor,              # [B,T,R]
+        input_ids: torch.Tensor,           # [B,T]
+        attention_mask: torch.Tensor,      # [B,T]
+        full_to_restricted: torch.Tensor,  # [V_full]
+    ) -> torch.Tensor:
+
+        # shift
+        shift_logits = logits[:, :-1, :]           # [B,T-1,R]
+        shift_labels = input_ids[:, 1:]            # [B,T-1]
+        shift_mask = attention_mask[:, 1:]         # [B,T-1]
+
+        # map labels
+        restricted_labels = full_to_restricted[shift_labels]
+
+        # mask
+        restricted_labels[shift_mask == 0] = self.ignore_index
+
+        # safety: any non-Z tokens should not exist here
+        if (restricted_labels == -1).any():
+            raise RuntimeError("SFT saw non-restricted token — dataset contract violated")
+
+        return F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            restricted_labels.reshape(-1),
+            ignore_index=self.ignore_index,
+        )

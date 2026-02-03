@@ -65,6 +65,16 @@ class RestrictedLMHead(nn.Module):
 
         ids = torch.tensor(self.restricted_token_ids, dtype=torch.long, device=device)
         self.register_buffer("_token_ids", ids, persistent=False)
+        mapping = torch.full(
+            (vocab_size_full,),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        for i, tid in enumerate(self.restricted_token_ids):
+            mapping[tid] = i
+
+        self.register_buffer("_full_to_restricted", mapping, persistent=False)
 
 
     @torch.no_grad()
@@ -86,14 +96,27 @@ class RestrictedLMHead(nn.Module):
         # <ANSWER> row
         self.weight.data[V].normal_(mean=0.0, std=float(answer_init_std))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        return_full_logits: bool = False,
+    ) -> torch.Tensor:
+        """
+        If return_full_logits=False:
+            returns [B,T,R] restricted logits
+        If return_full_logits=True:
+            returns [B,T,V_full] (slow, memory-heavy)
+        """
         B, T, H = hidden_states.shape
-        assert H == self.hidden_size
 
         restricted_logits = torch.matmul(
             hidden_states,
-            self.weight.t(),
+            self.weight.t(),  # [B,T,R]
         )
+
+        if not return_full_logits:
+            return restricted_logits
 
         logits_full = torch.full(
             (B, T, self.vocab_size_full),
@@ -101,10 +124,8 @@ class RestrictedLMHead(nn.Module):
             device=hidden_states.device,
             dtype=restricted_logits.dtype,
         )
-
         logits_full.index_copy_(2, self._token_ids, restricted_logits)
         return logits_full
-
 
 # ============================================================
 # Phase-3 Model
@@ -312,35 +333,42 @@ class Phase3ZModel(nn.Module):
     # --------------------------------------------------
     # Forward
     # --------------------------------------------------
-
     def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: bool = True,
-        return_dict: bool = True,
-        **kwargs,
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            return_full_logits: bool = False,
+            **kwargs,
     ):
         out = self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=return_dict,
+            output_hidden_states=True,  # we still need last layer
+            return_dict=True,
             **kwargs,
         )
 
         hidden_last = out.hidden_states[-1]
+
+        # 🔥 THIS IS THE KEY CHANGE
+        logits = self.restricted_lm_head(
+            hidden_last,
+            return_full_logits=return_full_logits,
+        )
+
         digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
 
         if return_dict:
+            out.logits = logits
             out.digit_logits = digit_logits
             return out
 
         return {
-            "logits": out.logits,
+            "logits": logits,
             "digit_logits": digit_logits,
-            "hidden_states": out.hidden_states,
         }
 
     # --------------------------------------------------
