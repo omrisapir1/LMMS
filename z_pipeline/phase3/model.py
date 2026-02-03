@@ -91,9 +91,9 @@ class RestrictedLMHead(nn.Module):
         assert H == self.hidden_size
 
         restricted_logits = torch.matmul(
-            hidden_states.to(torch.float32),
-            self.weight.t().to(torch.float32),
-        )  # [B,T,R]
+            hidden_states,
+            self.weight.t(),
+        )
 
         logits_full = torch.full(
             (B, T, self.vocab_size_full),
@@ -206,7 +206,7 @@ class Phase3ZModel(nn.Module):
         answer_token_id = int(z_meta["answer_token_id"])
 
         # ---- load base model body (saved by Phase2ZModel.save_pretrained) ----
-        base = AutoModel.from_pretrained(repo_id)
+        base = AutoModel.from_pretrained(repo_id, torch_dtype=torch.bfloat16)
 
         # Need a CausalLM for generate()
         if base.__class__.__name__ == "Qwen2Model":
