@@ -97,9 +97,21 @@ class Phase3Dataset(Dataset):
         # Indices / rebalancing
         # -------------------------
         if self.split == "train" and self.rebalance_train:
-            self.indices = self._build_rebalanced_indices()
+            indices = self._build_rebalanced_indices()
         else:
-            self.indices = list(range(len(self.ds)))
+            indices = list(range(len(self.ds)))
+
+        # Filter out rows exceeding max_length
+        if self.max_length is not None:
+            filtered = []
+            for i in indices:
+                ex = self.ds[i]
+                inp = ex.get("input_ids")
+                if isinstance(inp, list) and len(inp) <= self.max_length:
+                    filtered.append(i)
+            self.indices = filtered
+        else:
+            self.indices = indices
 
 
     def __len__(self) -> int:
@@ -119,13 +131,18 @@ class Phase3Dataset(Dataset):
             b = self.ds[i].get("K_bucket", None)
             if b not in buckets:
                 raise RuntimeError(f"Unexpected K_bucket='{b}' at row {i}")
+            # Respect max_length if set
+            if self.max_length is not None:
+                inp = self.ds[i].get("input_ids")
+                if not isinstance(inp, list) or len(inp) > self.max_length:
+                    continue
             buckets[b].append(i)
 
         for b, idxs in buckets.items():
             if not idxs:
                 raise RuntimeError(f"Bucket '{b}' has 0 samples")
 
-        N = len(self.ds)
+        N = sum(len(idxs) for idxs in buckets.values())
         target_counts = {b: int(round(self.target_dist[b] * N)) for b in buckets}
         diff = N - sum(target_counts.values())
         if diff != 0:
