@@ -254,10 +254,10 @@ class Phase3ZModel(nn.Module):
 
         # init restricted head rows from z_selector weight
         z_selector_weight = state["z_selector"]["weight"]  # [V,H]
-        model.restricted_lm_head.init_from_phase2(
-            z_selector_weight=z_selector_weight,
-            answer_init_std=answer_init_std,
-        )
+        # model.restricted_lm_head.init_from_phase2(
+        #     z_selector_weight=z_selector_weight,
+        #     answer_init_std=answer_init_std,
+        # )
 
         model.to(device)
         return model
@@ -302,10 +302,10 @@ class Phase3ZModel(nn.Module):
         )
 
         # Initialize LM head Z rows from selector
-        model.restricted_lm_head.init_from_phase2(
-            z_selector_weight=z_selector.weight.detach(),
-            answer_init_std=answer_init_std,
-        )
+        # model.restricted_lm_head.init_from_phase2(
+        #     z_selector_weight=z_selector.weight.detach(),
+        #     answer_init_std=answer_init_std,
+        # )
 
         return model
 
