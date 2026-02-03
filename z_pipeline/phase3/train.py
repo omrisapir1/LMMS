@@ -253,9 +253,17 @@ def run_phase3(
     # --------------------------------------------------
     # Losses
     # --------------------------------------------------
+
+    sft_loss = RestrictedSFTLoss(
+    ignore_index=-100,
+    debug_every=50,   # print every 50 calls
+    debug_topk=5,
+)
+
+
     loss_fn = Phase3Loss(
         answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
-        sft_loss=RestrictedSFTLoss(ignore_index=-100),
+        sft_loss=sft_loss,#RestrictedSFTLoss(ignore_index=-100),
         kl_loss=DigitKLDiversityLoss(
             z_token_ids=z_token_ids,
             answer_token_id=answer_token_id,

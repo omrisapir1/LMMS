@@ -261,9 +261,58 @@ class Phase3Loss:
             "loss_sft": loss_sft,
             "loss_kl": loss_kl,
         }
+
+#
+# class RestrictedSFTLoss:
+#     def __init__(self, ignore_index: int = -100):
+#         self.ignore_index = ignore_index
+#
+#     def compute(
+#         self,
+#         *,
+#         logits: torch.Tensor,              # [B,T,R]
+#         input_ids: torch.Tensor,           # [B,T]
+#         attention_mask: torch.Tensor,      # [B,T]
+#         full_to_restricted: torch.Tensor,  # [V_full]
+#     ) -> torch.Tensor:
+#
+#         # shift
+#         shift_logits = logits[:, :-1, :]           # [B,T-1,R]
+#         shift_labels = input_ids[:, 1:]            # [B,T-1]
+#         shift_mask = attention_mask[:, 1:]         # [B,T-1]
+#
+#         # map labels
+#         restricted_labels = full_to_restricted[shift_labels]
+#
+#         # mask
+#         restricted_labels[shift_mask == 0] = self.ignore_index
+#
+#         # safety: any non-Z tokens should not exist here
+#         if (restricted_labels == -1).any():
+#             raise RuntimeError("SFT saw non-restricted token — dataset contract violated")
+#
+#         return F.cross_entropy(
+#             shift_logits.reshape(-1, shift_logits.size(-1)),
+#             restricted_labels.reshape(-1),
+#             ignore_index=self.ignore_index,
+#         )
+
+
+
+import torch
+import torch.nn.functional as F
+
 class RestrictedSFTLoss:
-    def __init__(self, ignore_index: int = -100):
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        debug_every: int = 0,   # 0 = off, otherwise print every N calls
+        debug_topk: int = 5,
+    ):
         self.ignore_index = ignore_index
+        self.debug_every = debug_every
+        self.debug_topk = debug_topk
+        self._step = 0
 
     def compute(
         self,
@@ -274,23 +323,91 @@ class RestrictedSFTLoss:
         full_to_restricted: torch.Tensor,  # [V_full]
     ) -> torch.Tensor:
 
+        self._step += 1
+
+        # --------------------------------------------------
         # shift
+        # --------------------------------------------------
         shift_logits = logits[:, :-1, :]           # [B,T-1,R]
         shift_labels = input_ids[:, 1:]            # [B,T-1]
         shift_mask = attention_mask[:, 1:]         # [B,T-1]
 
+        # --------------------------------------------------
         # map labels
+        # --------------------------------------------------
         restricted_labels = full_to_restricted[shift_labels]
 
         # mask
         restricted_labels[shift_mask == 0] = self.ignore_index
 
-        # safety: any non-Z tokens should not exist here
-        if (restricted_labels == -1).any():
-            raise RuntimeError("SFT saw non-restricted token — dataset contract violated")
+        # safety check
+        bad = (restricted_labels == -1) & (restricted_labels != self.ignore_index)
+        if bad.any():
+            bad_pos = bad.nonzero(as_tuple=False)[0]
+            b, t = bad_pos.tolist()
+            raise RuntimeError(
+                f"SFT saw non-restricted token at batch={b}, pos={t}, "
+                f"token_id={int(shift_labels[b,t])}"
+            )
 
-        return F.cross_entropy(
+        # --------------------------------------------------
+        # DEBUG PRINTS
+        # --------------------------------------------------
+        if self.debug_every > 0 and self._step % self.debug_every == 0:
+            self._debug_print(
+                shift_logits=shift_logits,
+                restricted_labels=restricted_labels,
+                shift_mask=shift_mask,
+            )
+
+        # --------------------------------------------------
+        # CE
+        # --------------------------------------------------
+        R = shift_logits.size(-1)
+        assert R < 2048, f"SFT loss seeing large vocab: R={R} (likely full V!)"
+        loss = F.cross_entropy(
             shift_logits.reshape(-1, shift_logits.size(-1)),
             restricted_labels.reshape(-1),
             ignore_index=self.ignore_index,
         )
+        return loss
+
+    # --------------------------------------------------
+    # Debug helper
+    # --------------------------------------------------
+    @torch.no_grad()
+    def _debug_print(
+        self,
+        *,
+        shift_logits: torch.Tensor,        # [B,T-1,R]
+        restricted_labels: torch.Tensor,   # [B,T-1]
+        shift_mask: torch.Tensor,          # [B,T-1]
+    ):
+        # pick first valid position
+        valid = (restricted_labels != self.ignore_index) & (shift_mask == 1)
+        if not valid.any():
+            print("[SFT DEBUG] no valid tokens")
+            return
+
+        b, t = valid.nonzero(as_tuple=False)[0].tolist()
+
+        logits_bt = shift_logits[b, t]  # [R]
+        probs_bt = logits_bt.softmax(dim=-1)
+
+        gold = int(restricted_labels[b, t])
+        gold_prob = float(probs_bt[gold])
+        ce = -torch.log(probs_bt[gold] + 1e-12).item()
+
+        topk = min(self.debug_topk, probs_bt.numel())
+        vals, idx = probs_bt.topk(topk)
+
+        print("\n[SFT DEBUG]")
+        print(f" step={self._step}")
+        print(f" batch={b}, pos={t}")
+        print(f" gold_restricted_id={gold}")
+        print(f" gold_prob={gold_prob:.6f}")
+        print(f" CE_contribution={ce:.6f}")
+        print(" top-k probs:")
+        for i in range(topk):
+            print(f"   id={int(idx[i]):<4d} prob={float(vals[i]):.6f}")
+        print("-" * 40)
