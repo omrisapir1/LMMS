@@ -339,6 +339,9 @@ def run_phase3(
                 loss.backward(retain_graph=retain)
 
                 loss_total_accum += losses["loss_total"].item()
+                cur_loss_kl += losses["loss_kl"].item()
+                cur_loss_answer += losses["loss_answer"].item()
+                cur_loss_sft += losses["loss_sft"].item()
 
 
             if cfg.optim.max_grad_norm:
@@ -349,9 +352,7 @@ def run_phase3(
 
             optimizer.step()
             global_step += 1
-            cur_loss_kl += loss_total_accum["loss_kl"].item()
-            cur_loss_answer += loss_total_accum["loss_answer"].item()
-            cur_loss_sft += loss_total_accum["loss_sft"].item()
+
             if global_step % 10 == 0:
                 cur_loss_kl = cur_loss_kl / 10
                 cur_loss_answer = cur_loss_answer / 10
