@@ -257,7 +257,7 @@ def run_phase3(
     sft_loss = RestrictedSFTLoss(
     ignore_index=-100,
     debug_every=50,   # print every 50 calls
-    debug_topk=5,
+    debug_topk=1025,
 )
 
 
