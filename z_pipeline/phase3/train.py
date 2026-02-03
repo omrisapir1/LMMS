@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from datasets import DatasetDict
 
 from .conf import Phase3Config
-from .dataset import Phase3Dataset, phase3_collate_fn
+from .dataset import Phase3Dataset, phase3_collate_fn, TARGET_DIST
 from .eval import Phase3Evaluator
 from .loss import AnswerLoss, SFTLoss, DigitKLDiversityLoss, Phase3Loss
 from .model import Phase3ZModel
@@ -142,7 +142,7 @@ def _load_ckpt(
     ckpt_path: str,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    map_location: Union[str, torch.device] = "cpu",
+    map_location: str | torch.device = "cpu",
 ) -> int:
     payload = torch.load(ckpt_path, map_location=map_location)
     model.load_state_dict(payload["model_state"], strict=True)
@@ -205,8 +205,7 @@ def run_phase3(
         answer_init_std=0.02,
         device=device,
     )
-    model.base.gradient_checkpointing_enable()
-    # model.base.config.use_cache = False
+    
 
     # --------------------------------------------------
     # Optimizer
@@ -320,7 +319,7 @@ def run_phase3(
                 out = model(
                     input_ids=input_ids[start:end],
                     attention_mask=attention_mask[start:end],
-                    output_hidden_states=False,
+                    output_hidden_states=True,
                     return_dict=True,
                 )
 
