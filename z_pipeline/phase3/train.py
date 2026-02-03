@@ -206,7 +206,7 @@ def run_phase3(
         device=device,
     )
     model.base.gradient_checkpointing_enable()
-    model.base.config.use_cache = False
+    # model.base.config.use_cache = False
 
     # --------------------------------------------------
     # Optimizer
