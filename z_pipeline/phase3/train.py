@@ -338,7 +338,6 @@ def run_phase3(
                 retain = (end < B)  # retain graph except for last microbatch
                 loss.backward(retain_graph=retain)
 
-                loss_total_accum += losses["loss_total"].item()
                 cur_loss_kl += losses["loss_kl"].item()
                 cur_loss_answer += losses["loss_answer"].item()
                 cur_loss_sft += losses["loss_sft"].item()
@@ -354,9 +353,9 @@ def run_phase3(
             global_step += 1
 
             if global_step % 10 == 0:
-                cur_loss_kl = cur_loss_kl / 10
-                cur_loss_answer = cur_loss_answer / 10
-                cur_loss_sft = cur_loss_sft / 10
+                cur_loss_kl = cur_loss_kl / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
+                cur_loss_answer = cur_loss_answer / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
+                cur_loss_sft = cur_loss_sft / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
                 print(f"[phase3/train] step={global_step} loss_answer={cur_loss_answer:.4f} loss_sft={cur_loss_sft:.4f} loss_kl={cur_loss_kl:.4f}")
                 print(
                     f"[phase3/train] step={global_step} "
