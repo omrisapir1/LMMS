@@ -287,7 +287,7 @@ def run_phase3(
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
-            print([tokenizer.decode(ids).count('Z_') for ids in input_ids])
+            
 
             attention_mask = batch["attention_mask"].to(device)
             digit_labels = batch["digit_labels"].to(device)
