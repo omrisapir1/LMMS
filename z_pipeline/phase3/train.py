@@ -332,6 +332,8 @@ def run_phase3(
                     return_dict=True,
                     return_full_logits=False
                 )
+                print("[TRAIN] out.logits.shape =", tuple(out.logits.shape))  # should end with 1025
+                print("[TRAIN] restricted_size =", model.restricted_lm_head.restricted_size)
 
                 losses = loss_fn.compute(
                     model=model,
