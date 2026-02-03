@@ -206,6 +206,7 @@ def run_phase3(
         device=device,
     )
     model.base.gradient_checkpointing_enable()
+    model.base.config.use_cache = False
 
     # --------------------------------------------------
     # Optimizer
@@ -319,7 +320,7 @@ def run_phase3(
                 out = model(
                     input_ids=input_ids[start:end],
                     attention_mask=attention_mask[start:end],
-                    output_hidden_states=True,
+                    output_hidden_states=False,
                     return_dict=True,
                 )
 
