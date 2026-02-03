@@ -335,7 +335,8 @@ def run_phase3(
 
                 # scale so total gradient matches full-batch loss
                 loss = losses["loss_total"] * ((end - start) / B)
-                loss.backward()
+                retain = (end < B)  # retain graph except for last microbatch
+                loss.backward(retain_graph=retain)
 
                 loss_total_accum += losses["loss_total"].item()
 
