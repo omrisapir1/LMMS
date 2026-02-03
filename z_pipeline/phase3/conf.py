@@ -21,7 +21,7 @@ from typing import Dict, Optional
 @dataclass
 class Phase3DataConfig:
     batch_size: int = 8
-    max_length: int = 2048
+    max_length: int = 512
 
     # Rebalancing (train only)
     rebalance_train: bool = True
