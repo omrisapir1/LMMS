@@ -102,9 +102,9 @@ class Phase3OptimConfig:
 @dataclass
 class Phase3TrainConfig:
     num_epochs: int = 30
-    eval_every_steps: int = 200
-    batch_size: int = 2
-    loss_batch_size: int = 2
+    eval_every_steps: int = 500
+    batch_size: int = 128
+    loss_batch_size: int = 64
 
 
 
@@ -130,7 +130,7 @@ class Phase3EvalConfig:
 @dataclass
 class Phase3CheckpointConfig:
     save_dir: str = "./phase3_ckpts"
-    save_every_steps: int = 1000
+    save_every_steps: int = 500
     save_best: bool = True
     save_at_start: bool = True
 
