@@ -354,6 +354,11 @@ class RestrictedSFTLoss:
         # DEBUG PRINTS
         # --------------------------------------------------
         if self.debug_every > 0 and self._step % self.debug_every == 0:
+            ans_rid = int(full_to_restricted[151665].item())  # store answer_token_id on init
+            print("[SFT] logits_R =", logits.size(-1))
+            print("[SFT] answer_rid =", ans_rid)
+            # How often is ANSWER the gold label in this batch?
+            print("[SFT] gold_is_answer_count =", int((restricted_labels == ans_rid).sum().item()))
             self._debug_print(
                 shift_logits=shift_logits,
                 restricted_labels=restricted_labels,
