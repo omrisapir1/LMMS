@@ -312,36 +312,36 @@ class Phase3ZModel(nn.Module):
     # --------------------------------------------------
     # Forward
     # --------------------------------------------------
+
     def forward(
-            self,
-            *,
-            input_ids: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            output_hidden_states: bool = False,  # keep arg for API compatibility
-            return_dict: bool = True,
-            **kwargs,
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = True,
+        return_dict: bool = True,
+        **kwargs,
     ):
-        # 1) Run transformer body to get LAST hidden state (no hidden_states list)
-        body_out = self.base.model(
+        out = self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=False,  # IMPORTANT
-            return_dict=True,
+            output_hidden_states=True,
+            return_dict=return_dict,
             **kwargs,
         )
-        hidden_last = body_out.last_hidden_state  # [B, T, H]
 
-        # 2) Produce logits using the (restricted) lm_head you already installed
-        logits = self.base.lm_head(hidden_last)
-
-        # 3) Digit logits from <ANSWER> position
+        hidden_last = out.hidden_states[-1]
         digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
 
         if return_dict:
-            # mimic HF style output enough for your training loop
-            return type("Phase3Out", (), {"logits": logits, "digit_logits": digit_logits})
+            out.digit_logits = digit_logits
+            return out
 
-        return {"logits": logits, "digit_logits": digit_logits}
+        return {
+            "logits": out.logits,
+            "digit_logits": digit_logits,
+            "hidden_states": out.hidden_states,
+        }
 
     # --------------------------------------------------
     # Generation + digits
