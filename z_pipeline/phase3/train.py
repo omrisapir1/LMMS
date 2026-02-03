@@ -291,7 +291,6 @@ def run_phase3(
 
             attention_mask = batch["attention_mask"].to(device)
             digit_labels = batch["digit_labels"].to(device)
-
             input_ids = _apply_pad_id_safely(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -309,39 +308,38 @@ def run_phase3(
                 z_token_ids=z_token_ids,
             )
 
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
             B = input_ids.size(0)
             micro_bs = cfg.train.loss_batch_size
 
             optimizer.zero_grad(set_to_none=True)
 
-            loss_total_accum = 0.0
             for start in range(0, B, micro_bs):
                 end = min(start + micro_bs, B)
 
+                out = model(
+                    input_ids=input_ids[start:end],
+                    attention_mask=attention_mask[start:end],
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+
                 losses = loss_fn.compute(
                     model=model,
-                    logits=out.logits[start:end],
+                    logits=out.logits,
                     input_ids=input_ids[start:end],
                     attention_mask=sft_attention[start:end],
-                    digit_logits=out.digit_logits[start:end],
+                    digit_logits=out.digit_logits,
                     digit_labels=digit_labels[start:end],
                 )
 
-                # scale so total gradient matches full-batch loss
+                # ✅ scale so total gradient == full batch gradient
                 loss = losses["loss_total"] * ((end - start) / B)
-                retain = (end < B)  # retain graph except for last microbatch
-                loss.backward(retain_graph=retain)
+                loss.backward()
 
+                # logging only (no graph dependency)
                 cur_loss_kl += losses["loss_kl"].item()
                 cur_loss_answer += losses["loss_answer"].item()
                 cur_loss_sft += losses["loss_sft"].item()
-
 
             if cfg.optim.max_grad_norm:
                 torch.nn.utils.clip_grad_norm_(
