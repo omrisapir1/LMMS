@@ -322,6 +322,7 @@ def run_phase3(
                     attention_mask=attention_mask[start:end],
                     output_hidden_states=True,
                     return_dict=True,
+                    return_full_logits=False
                 )
 
                 losses = loss_fn.compute(
