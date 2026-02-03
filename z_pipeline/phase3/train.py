@@ -11,8 +11,7 @@
 #
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import os
 import random
@@ -21,10 +20,10 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from datasets import DatasetDict, load_from_disk
+from datasets import DatasetDict
 
 from .conf import Phase3Config
-from .dataset import Phase3Dataset, phase3_collate_fn, TARGET_DIST
+from .dataset import Phase3Dataset, phase3_collate_fn
 from .eval import Phase3Evaluator
 from .loss import AnswerLoss, SFTLoss, DigitKLDiversityLoss, Phase3Loss
 from .model import Phase3ZModel
@@ -143,7 +142,7 @@ def _load_ckpt(
     ckpt_path: str,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    map_location: str | torch.device = "cpu",
+    map_location: Union[str, torch.device] = "cpu",
 ) -> int:
     payload = torch.load(ckpt_path, map_location=map_location)
     model.load_state_dict(payload["model_state"], strict=True)
@@ -155,6 +154,7 @@ def _load_ckpt(
 # ------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------
+
 def run_phase3(
     cfg: Phase3Config,
     *,
@@ -218,7 +218,7 @@ def run_phase3(
         weight_decay=cfg.optim.weight_decay,
     )
 
-    global_step = 0
+    global_step = 0  # counts optimizer steps
     last_ckpt_path: Optional[str] = None
 
     if ckpt_path is not None:
@@ -284,103 +284,136 @@ def run_phase3(
     model.train()
 
     cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
+    accum_counter = 0
+    grad_accum_steps = max(int(cfg.train.gradient_accumulation_steps), 1)
+    loss_chunk_size = max(int(cfg.train.loss_batch_size), 1)
+
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            
+            # Move full batch to device and apply pad-id safely
+            input_ids_full = batch["input_ids"].to(device)
+            attention_mask_full = batch["attention_mask"].to(device)
+            digit_labels_full = batch["digit_labels"].to(device)
 
-            attention_mask = batch["attention_mask"].to(device)
-            digit_labels = batch["digit_labels"].to(device)
-
-            input_ids = _apply_pad_id_safely(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+            input_ids_full = _apply_pad_id_safely(
+                input_ids=input_ids_full,
+                attention_mask=attention_mask_full,
                 pad_token_id=pad_token_id,
             )
 
-            if input_ids.size(1) > cfg.data.max_length:
+            if input_ids_full.size(1) > cfg.data.max_length:
                 raise RuntimeError(
-                    f"Sequence too long: {input_ids.size(1)} > {cfg.data.max_length}"
+                    f"Sequence too long: {input_ids_full.size(1)} > {cfg.data.max_length}"
                 )
 
-            sft_attention = _mask_sft_to_start_at_first_z(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                z_token_ids=z_token_ids,
-            )
+            # Zero grads at the start of an accumulation window
+            if accum_counter == 0:
+                optimizer.zero_grad(set_to_none=True)
 
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+            # Single forward pass over the BIG batch (rollout)
+            out_full = model(
+                input_ids=input_ids_full,
+                attention_mask=attention_mask_full,
                 output_hidden_states=True,
                 return_dict=True,
             )
 
-            losses = loss_fn.compute(
-                model=model,
-                logits=out.logits,
-                input_ids=input_ids,
-                attention_mask=sft_attention,
-                digit_logits=out.digit_logits,
-                digit_labels=digit_labels,
-            )
+            # Micro-batch the loss computation to reduce memory
+            B = input_ids_full.size(0)
+            start_idx = 0
+            while start_idx < B:
+                end_idx = min(start_idx + loss_chunk_size, B)
+                input_ids = input_ids_full[start_idx:end_idx]
+                attention_mask = attention_mask_full[start_idx:end_idx]
+                digit_labels = digit_labels_full[start_idx:end_idx]
 
-            loss_total = losses["loss_total"]
-
-            optimizer.zero_grad(set_to_none=True)
-            loss_total.backward()
-
-            if cfg.optim.max_grad_norm:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    cfg.optim.max_grad_norm,
+                sft_attention = _mask_sft_to_start_at_first_z(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    z_token_ids=z_token_ids,
                 )
 
-            optimizer.step()
-            global_step += 1
-            cur_loss_kl += losses["loss_kl"].item()
-            cur_loss_answer += losses["loss_answer"].item()
-            cur_loss_sft += losses["loss_sft"].item()
-            if global_step % 10 == 0:
-                cur_loss_kl = cur_loss_kl / 10
-                cur_loss_answer = cur_loss_answer / 10
-                cur_loss_sft = cur_loss_sft / 10
-                print(f"[phase3/train] step={global_step} loss_answer={cur_loss_answer:.4f} loss_sft={cur_loss_sft:.4f} loss_kl={cur_loss_kl:.4f}")
-                print(
-                    f"[phase3/train] step={global_step} "
-                    f"loss={cfg.loss.lambda_answer * cur_loss_answer + cfg.loss.lambda_sft * cur_loss_sft + cfg.loss.lambda_kl * cur_loss_kl:.4f}"
-                )
+                # Slice logits from the BIG batch forward
+                logits = out_full.logits[start_idx:end_idx]
+                digit_logits = out_full.digit_logits[start_idx:end_idx]
 
-                cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
-
-            if global_step % cfg.train.eval_every_steps == 0:
-                model.eval()
-                rows = evaluator.evaluate(
+                losses = loss_fn.compute(
                     model=model,
-                    max_generation_tokens=cfg.eval.max_generation_tokens,
-                    sampling_temperature=cfg.eval.sampling_temperature,
-                    top_p=cfg.eval.top_p,
-                    top_k=cfg.eval.top_k,
+                    logits=logits,
+                    input_ids=input_ids,
+                    attention_mask=sft_attention,
+                    digit_logits=digit_logits,
+                    digit_labels=digit_labels,
                 )
-                eval_path = _save_eval_rows(
-                    rows=rows,
-                    save_dir=cfg.ckpt.save_dir,
-                    step=global_step,
-                )
-                print("\n=== Phase-3 Eval ===")
-                print(f"[phase3/train] Saved eval rows to {eval_path}")
-                model.train()
 
-            if global_step % cfg.ckpt.save_every_steps == 0:
-                last_ckpt_path = _save_ckpt(
-                    save_dir=cfg.ckpt.save_dir,
-                    step=global_step,
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                )
-                print(f"[phase3/train] Saved {last_ckpt_path}")
+                # Normalize loss for gradient accumulation
+                loss_total = losses["loss_total"] / grad_accum_steps
+                loss_total.backward()
 
+                # Track running averages for logging
+                cur_loss_kl += losses["loss_kl"].item()
+                cur_loss_answer += losses["loss_answer"].item()
+                cur_loss_sft += losses["loss_sft"].item()
+
+                start_idx = end_idx
+
+            # Completed one forward/backward pass over the loader batch
+            accum_counter += 1
+
+            # Step optimizer when reaching accumulation steps
+            if accum_counter >= grad_accum_steps:
+                if cfg.optim.max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        cfg.optim.max_grad_norm,
+                    )
+                optimizer.step()
+                global_step += 1
+                accum_counter = 0
+
+                # Logging every 10 optimizer steps
+                if global_step % 10 == 0:
+                    avg_kl = cur_loss_kl / (10 * 1)  # averaged over last 10 optimizer steps; per-step sums
+                    avg_answer = cur_loss_answer / (10 * 1)
+                    avg_sft = cur_loss_sft / (10 * 1)
+                    print(f"[phase3/train] step={global_step} loss_answer={avg_answer:.4f} loss_sft={avg_sft:.4f} loss_kl={avg_kl:.4f}")
+                    print(
+                        f"[phase3/train] step={global_step} "
+                        f"loss={cfg.loss.lambda_answer * avg_answer + cfg.loss.lambda_sft * avg_sft + cfg.loss.lambda_kl * avg_kl:.4f}"
+                    )
+                    cur_loss_kl, cur_loss_answer, cur_loss_sft = 0, 0, 0
+
+                # Periodic evaluation based on optimizer steps
+                if global_step % cfg.train.eval_every_steps == 0:
+                    model.eval()
+                    rows = evaluator.evaluate(
+                        model=model,
+                        max_generation_tokens=cfg.eval.max_generation_tokens,
+                        sampling_temperature=cfg.eval.sampling_temperature,
+                        top_p=cfg.eval.top_p,
+                        top_k=cfg.eval.top_k,
+                    )
+                    eval_path = _save_eval_rows(
+                        rows=rows,
+                        save_dir=cfg.ckpt.save_dir,
+                        step=global_step,
+                    )
+                    print("\n=== Phase-3 Eval ===")
+                    print(f"[phase3/train] Saved eval rows to {eval_path}")
+                    model.train()
+
+                # Periodic checkpointing based on optimizer steps
+                if global_step % cfg.ckpt.save_every_steps == 0:
+                    last_ckpt_path = _save_ckpt(
+                        save_dir=cfg.ckpt.save_dir,
+                        step=global_step,
+                        model=model,
+                        optimizer=optimizer,
+                        cfg=cfg,
+                    )
+                    print(f"[phase3/train] Saved {last_ckpt_path}")
+
+    # Final checkpoint
     last_ckpt_path = _save_ckpt(
         save_dir=cfg.ckpt.save_dir,
         step=global_step,
