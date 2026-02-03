@@ -179,6 +179,13 @@ class Phase3ZModel(nn.Module):
             dtype=dtype,
             device=device,
         )
+
+        # --- sanity checks: LM head must be 1024 Z + 1 ANSWER ---
+        assert len(self.z_token_ids) == 1024, f"expected 1024 z tokens, got {len(self.z_token_ids)}"
+        assert self.answer_token_id not in self.z_token_ids, "answer_token_id is inside z_token_ids (dup bug)"
+        assert restricted_head.restricted_size == 1025, f"expected restricted_size=1025, got {restricted_head.restricted_size}"
+        assert int(restricted_head._full_to_restricted[self.answer_token_id].item()) != -1, "ANSWER not mapped"
+
         vocab_size_full = self.base.get_input_embeddings().weight.shape[0]
         max_id = max(self.z_token_ids + [self.answer_token_id])
 
