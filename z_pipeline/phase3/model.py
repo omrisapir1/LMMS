@@ -312,25 +312,24 @@ class Phase3ZModel(nn.Module):
     # --------------------------------------------------
     # Forward
     # --------------------------------------------------
-
     def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: bool = True,
-        return_dict: bool = True,
-        **kwargs,
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            **kwargs,
     ):
         out = self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             **kwargs,
         )
 
-        hidden_last = out.hidden_states[-1]
+        hidden_last = out.last_hidden_state
         digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
 
         if return_dict:
@@ -340,7 +339,6 @@ class Phase3ZModel(nn.Module):
         return {
             "logits": out.logits,
             "digit_logits": digit_logits,
-            "hidden_states": out.hidden_states,
         }
 
     # --------------------------------------------------
