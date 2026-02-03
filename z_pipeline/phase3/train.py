@@ -11,8 +11,7 @@
 #
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import os
 import random
@@ -21,10 +20,10 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from datasets import DatasetDict, load_from_disk
+from datasets import DatasetDict
 
 from .conf import Phase3Config
-from .dataset import Phase3Dataset, phase3_collate_fn, TARGET_DIST
+from .dataset import Phase3Dataset, phase3_collate_fn
 from .eval import Phase3Evaluator
 from .loss import AnswerLoss, SFTLoss, DigitKLDiversityLoss, Phase3Loss
 from .model import Phase3ZModel
@@ -143,7 +142,7 @@ def _load_ckpt(
     ckpt_path: str,
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    map_location: str | torch.device = "cpu",
+    map_location: Union[str, torch.device] = "cpu",
 ) -> int:
     payload = torch.load(ckpt_path, map_location=map_location)
     model.load_state_dict(payload["model_state"], strict=True)
