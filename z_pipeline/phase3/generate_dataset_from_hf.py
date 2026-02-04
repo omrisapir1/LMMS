@@ -223,4 +223,4 @@ def generate_phase3_dataset_from_hf(
 __all__ = ["generate_phase3_dataset_from_hf"]
 
 if __name__ == '__main__':
-    generate_phase3_dataset_from_hf(phase2_repo_id=Phase2Config.hf_repo, phase3_dataset_repo_id="omrisap/phase3_train_dataset_0.5", dataset_name=Phase2Config.data.dataset_name, batch_size=64, device="cuda", temperature=0.5)
+    generate_phase3_dataset_from_hf(phase2_repo_id=Phase2Config.hf_repo, phase3_dataset_repo_id="omrisap/phase3_train_dataset_0.0", dataset_name=Phase2Config.data.dataset_name, batch_size=64, device="cuda", temperature=0.0)
