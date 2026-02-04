@@ -102,7 +102,7 @@ class Phase3OptimConfig:
 
 @dataclass
 class Phase3WarmupConfig:
-    enable: bool = True
+    enable: bool = False
 
     # number of optimizer steps (not epochs)
     steps: int = 500
