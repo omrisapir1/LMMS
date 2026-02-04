@@ -158,7 +158,7 @@ class Phase3CheckpointConfig:
 class Phase3Config:
     seed: int = 42
     phase2_repo_id: str = "omrisap/phaseZ"
-    phase3_dataset_repo_id: str = "omrisap/phase3_train_dataset_0.0"
+    phase3_dataset_repo_id: str = "omrisap/phase3_train_dataset_hard_max"
 
     data: Phase3DataConfig = field(default_factory=Phase3DataConfig)
     loss: Phase3LossConfig = field(default_factory=Phase3LossConfig)
