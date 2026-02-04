@@ -151,6 +151,109 @@ def _load_ckpt(
     return int(payload.get("step", 0))
 
 
+
+def run_lm_head_sft_warmup(
+    *,
+    model: Phase3ZModel,
+    train_loader: DataLoader,
+    sft_loss: RestrictedSFTLoss,
+    optimizer_cfg,
+    z_token_ids: list[int],
+    pad_token_id: Optional[int],
+    device: torch.device,
+    steps: int,
+    lr: float,
+    print_every: int,
+) -> None:
+    """
+    LM-head-only SFT warmup.
+
+    Trains ONLY the restricted LM head to predict Z / <ANSWER> tokens.
+    No digit loss, no KL loss.
+    """
+
+    print(f"[phase3/warmup] Starting LM-head SFT warmup for {steps} steps")
+
+    # --------------------------------------------------
+    # Freeze everything except LM head
+    # --------------------------------------------------
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.restricted_lm_head.parameters():
+        p.requires_grad = True
+
+    model.train()
+
+    warmup_optimizer = AdamW(
+        model.restricted_lm_head.parameters(),
+        lr=lr,
+        betas=optimizer_cfg.betas,
+        eps=optimizer_cfg.eps,
+        weight_decay=0.0,
+    )
+
+    train_iter = iter(train_loader)
+
+    for step in range(1, steps + 1):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        input_ids = _apply_pad_id_safely(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=pad_token_id,
+        )
+
+        sft_attention = _mask_sft_to_start_at_first_z(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            z_token_ids=z_token_ids,
+        )
+
+        warmup_optimizer.zero_grad(set_to_none=True)
+
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            return_full_logits=False,
+        )
+
+        loss = sft_loss.compute(
+            logits=out.logits,
+            input_ids=input_ids,
+            attention_mask=sft_attention,
+            full_to_restricted=model.restricted_lm_head._full_to_restricted,
+        )
+
+        loss.backward()
+
+        if optimizer_cfg.max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(
+                model.restricted_lm_head.parameters(),
+                optimizer_cfg.max_grad_norm,
+            )
+
+        warmup_optimizer.step()
+
+        if step % print_every == 0:
+            print(f"[phase3/warmup] step={step} sft_loss={loss.item():.4f}")
+
+    print("[phase3/warmup] Done")
+
+    # --------------------------------------------------
+    # Unfreeze everything back
+    # --------------------------------------------------
+    for p in model.parameters():
+        p.requires_grad = True
+
+
 # ------------------------------------------------------------
 # Main entry point
 # ------------------------------------------------------------
@@ -209,6 +312,38 @@ def run_phase3(
 
 
     # --------------------------------------------------
+    # Dataset + DataLoader
+    # --------------------------------------------------
+    train_ds = Phase3Dataset(
+        hf_dataset=ds_dict["train"],
+        z_token_ids=z_token_ids,
+        answer_token_id=answer_token_id,
+        max_length=cfg.data.max_length,
+        rebalance_train=True,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.train.batch_size,
+        shuffle=True,
+        collate_fn=phase3_collate_fn,
+    )
+
+    if cfg.warmup.enable and cfg.warmup.steps > 0:
+        run_lm_head_sft_warmup(
+            model=model,
+            train_loader=train_loader,
+            sft_loss=RestrictedSFTLoss(ignore_index=-100),
+            optimizer_cfg=cfg.optim,
+            z_token_ids=z_token_ids,
+            pad_token_id=pad_token_id,
+            device=device,
+            steps=cfg.warmup.steps,
+            lr=cfg.warmup.lr,
+            print_every=cfg.warmup.print_every,
+        )
+
+    # --------------------------------------------------
     # Optimizer
     # --------------------------------------------------
     optimizer = AdamW(
@@ -233,29 +368,8 @@ def run_phase3(
         print(f"[phase3/train] Resumed from {ckpt_path} at step={global_step}")
 
     # --------------------------------------------------
-    # Dataset + DataLoader
-    # --------------------------------------------------
-    train_ds = Phase3Dataset(
-        hf_dataset=ds_dict["train"],
-        z_token_ids=z_token_ids,
-        answer_token_id=answer_token_id,
-        max_length=cfg.data.max_length,
-        rebalance_train=True,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.train.batch_size,
-        shuffle=True,
-        collate_fn=phase3_collate_fn,
-    )
-
-    # --------------------------------------------------
     # Losses
     # --------------------------------------------------
-
-
-
 
     loss_fn = Phase3Loss(
         answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
@@ -355,10 +469,10 @@ def run_phase3(
             optimizer.step()
             global_step += 1
 
-            if global_step % 10 == 0:
-                cur_loss_kl = cur_loss_kl / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
-                cur_loss_answer = cur_loss_answer / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
-                cur_loss_sft = cur_loss_sft / (10 * (cfg.train.batch_size / cfg.train.loss_batch_size))
+            if global_step % cfg.loss.print_every == 0:
+                cur_loss_kl = cur_loss_kl / (cfg.loss.print_every * (cfg.train.batch_size / cfg.train.loss_batch_size))
+                cur_loss_answer = cur_loss_answer / (cfg.loss.print_every * (cfg.train.batch_size / cfg.train.loss_batch_size))
+                cur_loss_sft = cur_loss_sft / (cfg.loss.print_every * (cfg.train.batch_size / cfg.train.loss_batch_size))
                 print(f"[phase3/train] step={global_step} loss_answer={cur_loss_answer:.4f} loss_sft={cur_loss_sft:.4f} loss_kl={cur_loss_kl:.4f}")
                 print(
                     f"[phase3/train] step={global_step} "

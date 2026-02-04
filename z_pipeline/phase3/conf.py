@@ -43,7 +43,7 @@ class Phase3DataConfig:
 @dataclass
 class Phase3LossConfig:
     # Main weights
-    print_every: int = 20
+    print_every: int = 5
     lambda_answer: float = 1.0
     lambda_sft: float = 0.1
     lambda_kl: float = 0.5
@@ -99,12 +99,27 @@ class Phase3OptimConfig:
 # Training loop
 # ------------------------------------------------------------
 
+
+@dataclass
+class Phase3WarmupConfig:
+    enable: bool = True
+
+    # number of optimizer steps (not epochs)
+    steps: int = 500
+
+    # LR for LM head warmup (often slightly higher is OK)
+    lr: float = 2e-4
+
+    # logging
+    print_every: int = 5
+
+
 @dataclass
 class Phase3TrainConfig:
     num_epochs: int = 30
     eval_every_steps: int = 500
-    batch_size: int = 128
-    loss_batch_size: int = 64
+    batch_size: int = 96
+    loss_batch_size: int = 48
 
 
 
@@ -151,6 +166,7 @@ class Phase3Config:
     train: Phase3TrainConfig = field(default_factory=Phase3TrainConfig)
     eval: Phase3EvalConfig = field(default_factory=Phase3EvalConfig)
     ckpt: Phase3CheckpointConfig = field(default_factory=Phase3CheckpointConfig)
+    warmup: Phase3WarmupConfig = field(default_factory=Phase3WarmupConfig)
 
     def validate(self) -> "Phase3Config":
         # -----------------------------
