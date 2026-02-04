@@ -46,7 +46,7 @@ class Phase3LossConfig:
     print_every: int = 5
     lambda_answer: float = 1.0
     lambda_sft: float = 0.1
-    lambda_kl: float = 0.5
+    lambda_kl: float = 0.1
 
     # KL on digit distributions temperature
     digit_temperature: float = 1.0
@@ -158,7 +158,7 @@ class Phase3CheckpointConfig:
 class Phase3Config:
     seed: int = 42
     phase2_repo_id: str = "omrisap/phaseZ"
-    phase3_dataset_repo_id: str = "omrisap/phase3_train_dataset"
+    phase3_dataset_repo_id: str = "omrisap/phase3_train_dataset_0.0"
 
     data: Phase3DataConfig = field(default_factory=Phase3DataConfig)
     loss: Phase3LossConfig = field(default_factory=Phase3LossConfig)
