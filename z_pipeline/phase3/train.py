@@ -413,7 +413,7 @@ def run_phase3(
 
             attention_mask = batch["attention_mask"].to(device)
             digit_labels = batch["digit_labels"].to(device)
-            input_ids = _apply_pad_id_safely(
+            input_ids = apply_pad_id_safely(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pad_token_id=pad_token_id,
@@ -424,7 +424,7 @@ def run_phase3(
                     f"Sequence too long: {input_ids.size(1)} > {cfg.data.max_length}"
                 )
 
-            sft_attention = _mask_sft_to_start_at_first_z(
+            sft_attention = mask_sft_to_start_at_first_z(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 z_token_ids=z_token_ids,
