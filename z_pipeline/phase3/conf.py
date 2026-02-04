@@ -117,7 +117,7 @@ class Phase3WarmupConfig:
 @dataclass
 class Phase3TrainConfig:
     num_epochs: int = 30
-    eval_every_steps: int = 500
+    eval_every_steps: int = 250
     batch_size: int = 96
     loss_batch_size: int = 48
 
@@ -145,7 +145,7 @@ class Phase3EvalConfig:
 @dataclass
 class Phase3CheckpointConfig:
     save_dir: str = "./phase3_ckpts"
-    save_every_steps: int = 500
+    save_every_steps: int = 250
     save_best: bool = True
     save_at_start: bool = True
 
