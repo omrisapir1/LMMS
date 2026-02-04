@@ -108,7 +108,7 @@ class Phase3WarmupConfig:
     steps: int = 500
 
     # LR for LM head warmup (often slightly higher is OK)
-    lr: float = 2e-4
+    lr: float = 2e-3
 
     # logging
     print_every: int = 5
