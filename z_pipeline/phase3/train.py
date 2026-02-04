@@ -26,6 +26,7 @@ from .conf import Phase3Config
 from .dataset import Phase3Dataset, phase3_collate_fn, TARGET_DIST
 from .eval import Phase3Evaluator
 from .loss import AnswerLoss, RestrictedSFTLoss, DigitKLDiversityLoss, Phase3Loss
+from .loss_eval import evaluate_phase3_losses
 from .model import Phase3ZModel
 
 
@@ -310,6 +311,25 @@ def run_phase3(
     )
     model.base.gradient_checkpointing_enable()
 
+    # --------------------------------------------------
+    # Losses
+    # --------------------------------------------------
+
+    loss_fn = Phase3Loss(
+        answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
+        sft_loss=RestrictedSFTLoss(ignore_index=-100),
+        kl_loss=DigitKLDiversityLoss(
+            z_token_ids=z_token_ids,
+            answer_token_id=answer_token_id,
+            length_to_reverse_prob=cfg.loss.reverse_prob_by_k,
+            digit_temperature=cfg.loss.digit_temperature,
+            random_seed=cfg.seed,
+        ),
+        lambda_answer=cfg.loss.lambda_answer,
+        lambda_sft=cfg.loss.lambda_sft,
+        lambda_kl=cfg.loss.lambda_kl,
+    )
+
 
     # --------------------------------------------------
     # Dataset + DataLoader
@@ -329,6 +349,37 @@ def run_phase3(
         collate_fn=phase3_collate_fn,
     )
 
+    eval_ds = Phase3Dataset(
+        hf_dataset=ds_dict["eval"],
+        z_token_ids=z_token_ids,
+        answer_token_id=answer_token_id,
+        max_length=cfg.data.max_length,
+        rebalance_train=True,
+    )
+
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=cfg.train.batch_size,
+        shuffle=True,
+        collate_fn=phase3_collate_fn,
+    )
+    eval_metrics = evaluate_phase3_losses(
+        model=model,
+        data_loader=eval_loader,
+        loss_fn=loss_fn,
+        z_token_ids=z_token_ids,
+        pad_token_id=pad_token_id,
+        device=device,
+        max_batches=50,  # optional safety cap
+    )
+    print(
+        f"[phase3/eval-loss] step={0} "
+        f"total={eval_metrics['loss_total']:.4f} "
+        f"sft={eval_metrics['loss_sft']:.4f} "
+        f"answer={eval_metrics['loss_answer']:.4f} "
+        f"kl={eval_metrics['loss_kl']:.4f}"
+    )
+
     if cfg.warmup.enable and cfg.warmup.steps > 0:
         run_lm_head_sft_warmup(
             model=model,
@@ -341,6 +392,22 @@ def run_phase3(
             steps=cfg.warmup.steps,
             lr=cfg.warmup.lr,
             print_every=cfg.warmup.print_every,
+        )
+        eval_metrics = evaluate_phase3_losses(
+            model=model,
+            data_loader=eval_loader,
+            loss_fn=loss_fn,
+            z_token_ids=z_token_ids,
+            pad_token_id=pad_token_id,
+            device=device,
+            max_batches=50,  # optional safety cap
+        )
+        print(
+            f"[phase3/eval-loss] step={0} "
+            f"total={eval_metrics['loss_total']:.4f} "
+            f"sft={eval_metrics['loss_sft']:.4f} "
+            f"answer={eval_metrics['loss_answer']:.4f} "
+            f"kl={eval_metrics['loss_kl']:.4f}"
         )
 
     # --------------------------------------------------
@@ -367,24 +434,6 @@ def run_phase3(
         model.to(device)
         print(f"[phase3/train] Resumed from {ckpt_path} at step={global_step}")
 
-    # --------------------------------------------------
-    # Losses
-    # --------------------------------------------------
-
-    loss_fn = Phase3Loss(
-        answer_loss=AnswerLoss(keep_prob=cfg.loss.keep_prob),
-        sft_loss=RestrictedSFTLoss(ignore_index=-100),
-        kl_loss=DigitKLDiversityLoss(
-            z_token_ids=z_token_ids,
-            answer_token_id=answer_token_id,
-            length_to_reverse_prob=cfg.loss.reverse_prob_by_k,
-            digit_temperature=cfg.loss.digit_temperature,
-            random_seed=cfg.seed,
-        ),
-        lambda_answer=cfg.loss.lambda_answer,
-        lambda_sft=cfg.loss.lambda_sft,
-        lambda_kl=cfg.loss.lambda_kl,
-    )
 
     # --------------------------------------------------
     # Evaluator
@@ -497,6 +546,25 @@ def run_phase3(
                 )
                 print("\n=== Phase-3 Eval ===")
                 print(f"[phase3/train] Saved eval rows to {eval_path}")
+
+                eval_metrics = evaluate_phase3_losses(
+                    model=model,
+                    data_loader=eval_loader,
+                    loss_fn=loss_fn,
+                    z_token_ids=z_token_ids,
+                    pad_token_id=pad_token_id,
+                    device=device,
+                    max_batches=50,  # optional safety cap
+                )
+                print(
+                    f"[phase3/eval-loss] step={0} "
+                    f"total={eval_metrics['loss_total']:.4f} "
+                    f"sft={eval_metrics['loss_sft']:.4f} "
+                    f"answer={eval_metrics['loss_answer']:.4f} "
+                    f"kl={eval_metrics['loss_kl']:.4f}"
+                )
+
+
                 model.train()
 
             if global_step % cfg.ckpt.save_every_steps == 0:
