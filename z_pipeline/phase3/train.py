@@ -28,6 +28,11 @@ from .eval import Phase3Evaluator
 from .loss import AnswerLoss, RestrictedSFTLoss, DigitKLDiversityLoss, Phase3Loss
 from .loss_eval import evaluate_phase3_losses
 from .model import Phase3ZModel
+from .utils import (
+    apply_pad_id_safely,
+    mask_sft_to_start_at_first_z,
+)
+
 
 
 # ------------------------------------------------------------
@@ -63,57 +68,6 @@ def _save_eval_rows(
     path = os.path.join(save_dir, f"eval_step_{step}.pkl")
     df.to_pickle(path)
     return path
-
-
-def _mask_sft_to_start_at_first_z(
-    *,
-    input_ids: torch.Tensor,          # [B,T]
-    attention_mask: torch.Tensor,     # [B,T]
-    z_token_ids: list[int],
-) -> torch.Tensor:
-    """
-    Returns a new attention_mask' where tokens BEFORE the first Z token are masked out (set to 0),
-    keeping suffix padding semantics (still 0 after pad).
-    """
-    z_set = set(int(x) for x in z_token_ids)
-    B, T = input_ids.shape
-    out = attention_mask.clone()
-
-    # per-row scan (B is small; T is moderate)
-    for b in range(B):
-        # find first Z position among non-pad tokens
-        first_z = None
-        for t in range(T):
-            if out[b, t].item() == 0:
-                break
-            if int(input_ids[b, t].item()) in z_set:
-                first_z = t
-                break
-
-        if first_z is None:
-            # dataset contract violation: must contain Z tokens
-            raise RuntimeError("SFT mask: no Z token found in a sample (dataset contract violation)")
-
-        # mask out everything before first_z
-        if first_z > 0:
-            out[b, :first_z] = 0
-
-    return out
-
-
-def _apply_pad_id_safely(
-    *,
-    input_ids: torch.Tensor,          # [B,T]
-    attention_mask: torch.Tensor,     # [B,T]
-    pad_token_id: Optional[int],
-) -> torch.Tensor:
-    """
-    phase3_collate_fn pads input_ids with 0. Replace pad regions with tokenizer.pad_token_id if available.
-    """
-    if pad_token_id is None:
-        return input_ids
-    return input_ids.masked_fill(attention_mask == 0, int(pad_token_id))
-
 
 # ------------------------------------------------------------
 # Checkpoint I/O (minimal)
@@ -205,13 +159,13 @@ def run_lm_head_sft_warmup(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
 
-        input_ids = _apply_pad_id_safely(
+        input_ids = apply_pad_id_safely(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pad_token_id=pad_token_id,
         )
 
-        sft_attention = _mask_sft_to_start_at_first_z(
+        sft_attention = mask_sft_to_start_at_first_z(
             input_ids=input_ids,
             attention_mask=attention_mask,
             z_token_ids=z_token_ids,
