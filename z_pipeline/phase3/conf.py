@@ -46,7 +46,7 @@ class Phase3LossConfig:
     print_every: int = 5
     lambda_answer: float = 1.0
     lambda_sft: float = 0.15
-    lambda_kl: float = 0.15
+    lambda_kl: float = 0.25
 
     # KL on digit distributions temperature
     digit_temperature: float = 1.0
