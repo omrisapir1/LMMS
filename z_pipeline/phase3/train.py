@@ -389,15 +389,6 @@ def run_phase3(
         model.to(device)
         print(f"[phase3/train] Resumed from {ckpt_path} at step={global_step}")
 
-    ckpt_path = "phase3_ckpts/ckpt_step_1000.pt"  # <-- your file
-
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    model.to(device)
-    model.eval()
-
-    print("Loaded checkpoint at step:", ckpt["step"])
 
     # --------------------------------------------------
     # Evaluator
