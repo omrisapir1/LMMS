@@ -9,9 +9,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from .loss import Phase3Loss
-from .train import (
-    _apply_pad_id_safely,
-    _mask_sft_to_start_at_first_z,
+from .utils import (
+    apply_pad_id_safely,
+    mask_sft_to_start_at_first_z,
 )
 
 
@@ -48,13 +48,13 @@ def evaluate_phase3_losses(
         attention_mask = batch["attention_mask"].to(device)
         digit_labels = batch["digit_labels"].to(device)
 
-        input_ids = _apply_pad_id_safely(
+        input_ids = apply_pad_id_safely(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pad_token_id=pad_token_id,
         )
 
-        sft_attention = _mask_sft_to_start_at_first_z(
+        sft_attention = mask_sft_to_start_at_first_z(
             input_ids=input_ids,
             attention_mask=attention_mask,
             z_token_ids=z_token_ids,
