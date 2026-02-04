@@ -313,28 +313,29 @@ def run_phase3(
 
     eval_loader = DataLoader(
         eval_ds,
-        batch_size=cfg.train.batch_size,
+        batch_size=cfg.eval.batch_size,
         shuffle=True,
         collate_fn=phase3_collate_fn,
     )
-    eval_metrics = evaluate_phase3_losses(
-        model=model,
-        data_loader=eval_loader,
-        loss_fn=loss_fn,
-        z_token_ids=z_token_ids,
-        pad_token_id=pad_token_id,
-        device=device,
-        max_batches=50,  # optional safety cap
-    )
-    print(
-        f"[phase3/eval-loss] step={0} "
-        f"total={eval_metrics['loss_total']:.4f} "
-        f"sft={eval_metrics['loss_sft']:.4f} "
-        f"answer={eval_metrics['loss_answer']:.4f} "
-        f"kl={eval_metrics['loss_kl']:.4f}"
-    )
+
 
     if cfg.warmup.enable and cfg.warmup.steps > 0:
+        eval_metrics = evaluate_phase3_losses(
+            model=model,
+            data_loader=eval_loader,
+            loss_fn=loss_fn,
+            z_token_ids=z_token_ids,
+            pad_token_id=pad_token_id,
+            device=device,
+            max_batches=50,  # optional safety cap
+        )
+        print(
+            f"[phase3/eval-loss] step={0} "
+            f"total={eval_metrics['loss_total']:.4f} "
+            f"sft={eval_metrics['loss_sft']:.4f} "
+            f"answer={eval_metrics['loss_answer']:.4f} "
+            f"kl={eval_metrics['loss_kl']:.4f}"
+        )
         run_lm_head_sft_warmup(
             model=model,
             train_loader=train_loader,
@@ -388,6 +389,15 @@ def run_phase3(
         model.to(device)
         print(f"[phase3/train] Resumed from {ckpt_path} at step={global_step}")
 
+    ckpt_path = "phase3_ckpts/ckpt_step_1000.pt"  # <-- your file
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.to(device)
+    model.eval()
+
+    print("Loaded checkpoint at step:", ckpt["step"])
 
     # --------------------------------------------------
     # Evaluator

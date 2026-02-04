@@ -45,8 +45,8 @@ class Phase3LossConfig:
     # Main weights
     print_every: int = 5
     lambda_answer: float = 1.0
-    lambda_sft: float = 0.1
-    lambda_kl: float = 0.1
+    lambda_sft: float = 0.15
+    lambda_kl: float = 0.15
 
     # KL on digit distributions temperature
     digit_temperature: float = 1.0
@@ -102,7 +102,7 @@ class Phase3OptimConfig:
 
 @dataclass
 class Phase3WarmupConfig:
-    enable: bool = True
+    enable: bool = False
 
     # number of optimizer steps (not epochs)
     steps: int = 500
