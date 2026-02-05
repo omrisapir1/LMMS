@@ -131,7 +131,7 @@ class Phase2EvalConfig:
       - temperature annealing finished
       - cooldown_steps completed
     """
-    eval_every_steps: int = 500
+    eval_every_steps: int = 250
 
     # Early stopping criteria (checked on eval metric)
     patience: int = 5
