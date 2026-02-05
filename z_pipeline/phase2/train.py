@@ -413,11 +413,6 @@ def run_phase2(cfg: Phase2Config, hf_token: str):
     temp = float("nan")
 
     while global_step < max_steps:
-        # Stage transition at boundary
-        if global_step == anneal_steps:
-            print("\n=== Entering Stage 2 (cooldown): enabling digit heads + digit loss ===")
-            for p in model.digit_heads.parameters():
-                p.requires_grad = True
 
         try:
             batch = next(loader_iter)
