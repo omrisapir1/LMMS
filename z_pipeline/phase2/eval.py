@@ -26,6 +26,7 @@ def evaluate_phase2(
     answer_token_id: int,
     k_max: int = 20,
     device: Optional[torch.device] = None,
+    dataset_mode: str = "eval"
 ) -> Dict[str, Dict]:
 
     if device is None:
@@ -49,7 +50,7 @@ def evaluate_phase2(
     ds = Phase2Dataset(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
-        split="eval",
+        split=dataset_mode,
         k_max=k_max,
         latent_token_id=latent_token_id,
         answer_token_id=answer_token_id,

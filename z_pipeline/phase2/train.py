@@ -376,8 +376,8 @@ def run_phase2(cfg: Phase2Config, hf_token: str):
     # Optimizer (we keep digit-head params in the optimizer, but gate training via requires_grad)
     optim_params = [
         {"params": list(model.z_selector.parameters()), "weight_decay": cfg.optim.weight_decay},
-        {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
-        {"params": list(model.digit_heads.parameters()), "weight_decay": cfg.optim.weight_decay},
+        # {"params": [model.base.get_input_embeddings().weight], "weight_decay": cfg.optim.weight_decay},
+        # {"params": list(model.digit_heads.parameters()), "weight_decay": cfg.optim.weight_decay},
     ]
     optimizer = AdamW(
         optim_params,
@@ -510,53 +510,58 @@ def run_phase2(cfg: Phase2Config, hf_token: str):
         # Eval is diagnostic only
         if global_step % eval_every == 0 or global_step == max_steps - 1:
             eval_model = _EvalTemperatureProxy(model, eval_temp=1e-6)
-            metrics = evaluate_phase2(
-                model=eval_model,
-                tokenizer=tokenizer,
-                dataset_name=cfg.data.dataset_name,
-                batch_size=cfg.data.eval_batch_size,
-                latent_token_id=latent_token_id,
-                answer_token_id=answer_token_id,
-                k_max=cfg.data.k_max,
-                device=device,
-            )
-            print("\n================ Phase-2 Evaluation (diagnostic) ================")
+            num_iterates = 2 if global_step == max_steps - 1 else 1
 
-            for mode_name, m in metrics["modes"].items():
-                print(f"\n--- Z selection mode: {mode_name} ---")
-
-                # Global metrics
-                print(f"Digit EM (overall): {m['digit_em'] * 100:.2f}%")
-                print(f"Effective Z vocab size: {m['effective_vocab_size']:.1f} / {cfg.z_vocab_size}")
-                print_top_z(
-                    m["z_distribution_k1"],
-                    topk=5,
-                    title="Z distribution for K=1 rows (top 5):",
+            for i in range(num_iterates):
+                dataset_mode = 'eval' if i == 0 else 'train'
+                metrics = evaluate_phase2(
+                    model=eval_model,
+                    tokenizer=tokenizer,
+                    dataset_name=cfg.data.dataset_name,
+                    batch_size=cfg.data.eval_batch_size,
+                    latent_token_id=latent_token_id,
+                    answer_token_id=answer_token_id,
+                    k_max=cfg.data.k_max,
+                    device=device,
+                    dataset_mode=dataset_mode
                 )
+                print(f"\n================ Phase-2 Evaluation (diagnostic) {dataset_mode}================")
 
-                # Per-K diagnostics
-                print("\nPer-K diagnostics:")
-                print("-" * 60)
+                for mode_name, m in metrics["modes"].items():
+                    print(f"\n--- Z selection mode: {mode_name} ---")
 
-                all_Ks = sorted(
-                    set(m["digit_em_by_k"].keys())
-                    | set(m["unique_ratio_by_k"].keys())
-                    | set(m["adjacent_repeat_rate_by_k"].keys())
-                )
+                    # Global metrics
+                    print(f"Digit EM (overall): {m['digit_em'] * 100:.2f}%")
+                    print(f"Effective Z vocab size: {m['effective_vocab_size']:.1f} / {cfg.z_vocab_size}")
+                    print_top_z(
+                        m["z_distribution_k1"],
+                        topk=5,
+                        title="Z distribution for K=1 rows (top 5):",
+                    )
 
-                for K in all_Ks:
-                    em = m["digit_em_by_k"].get(K)
-                    uniq = m["unique_ratio_by_k"].get(K)
-                    adj = m["adjacent_repeat_rate_by_k"].get(K)
+                    # Per-K diagnostics
+                    print("\nPer-K diagnostics:")
+                    print("-" * 60)
 
-                    print(f"K={K:2d}:")
-                    if em is not None:
-                        print(f"  EM              : {em * 100:6.2f}%")
-                    if uniq is not None:
-                        print(f"  Unique ratio    : {uniq:6.3f}")
-                    if adj is not None:
-                        print(f"  Adj repeat rate : {adj:6.3f}")
-                    print()
+                    all_Ks = sorted(
+                        set(m["digit_em_by_k"].keys())
+                        | set(m["unique_ratio_by_k"].keys())
+                        | set(m["adjacent_repeat_rate_by_k"].keys())
+                    )
+
+                    for K in all_Ks:
+                        em = m["digit_em_by_k"].get(K)
+                        uniq = m["unique_ratio_by_k"].get(K)
+                        adj = m["adjacent_repeat_rate_by_k"].get(K)
+
+                        print(f"K={K:2d}:")
+                        if em is not None:
+                            print(f"  EM              : {em * 100:6.2f}%")
+                        if uniq is not None:
+                            print(f"  Unique ratio    : {uniq:6.3f}")
+                        if adj is not None:
+                            print(f"  Adj repeat rate : {adj:6.3f}")
+                        print()
 
             model.train()
 
