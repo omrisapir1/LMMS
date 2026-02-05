@@ -161,7 +161,7 @@ class Phase2Config:
     """
     # Identity / logging
     run_name: str = "phase2_z_learning"
-    hf_repo: str = "omrisap/phaseZ"
+    hf_repo: str = "omrisap/phaseZ_minimal"
     seed: int = 42
     print_every: int = 20
 
