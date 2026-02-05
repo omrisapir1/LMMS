@@ -357,13 +357,13 @@ def run_phase3(
             device=device,
             max_batches=50,  # optional safety cap
         )
-        print(
-            f"[phase3/eval-loss] step={0} "
-            f"total={eval_metrics['loss_total']:.4f} "
-            f"sft={eval_metrics['loss_sft']:.4f} "
-            f"answer={eval_metrics['loss_answer']:.4f} "
-            f"kl={eval_metrics['loss_kl']:.4f}"
-        )
+    print(
+        f"[phase3/eval-loss] step={0} "
+        f"total={eval_metrics['loss_total']:.4f} "
+        f"sft={eval_metrics['loss_sft']:.4f} "
+        f"answer={eval_metrics['loss_answer']:.4f} "
+        f"kl={eval_metrics['loss_kl']:.4f}"
+    )
 
     # --------------------------------------------------
     # Optimizer
