@@ -34,14 +34,14 @@ class TemperatureSchedule:
     type: Literal["linear", "cosine", "exponential"] = "cosine"
 
     temp_start: float = 1.5
-    temp_end: float = 1
+    temp_end: float = 0.5
 
     # Number of optimizer steps over which annealing happens
-    anneal_steps: int = 2500
+    anneal_steps: int = 500
 
     # After anneal_steps, temperature is held at temp_end
     # for additional stabilization before early stopping
-    cooldown_steps: int = 1000
+    cooldown_steps: int = 250
 
     def total_steps(self) -> int:
         return self.anneal_steps + self.cooldown_steps
@@ -77,7 +77,7 @@ class Phase2DataConfig:
 
     k_max: int = 20
 
-    batch_size: int = 24
+    batch_size: int = 4
     eval_batch_size: int = 64
 
     num_workers: int = 4
