@@ -348,15 +348,15 @@ def run_phase3(
             lr=cfg.warmup.lr,
             print_every=cfg.warmup.print_every,
         )
-        eval_metrics = evaluate_phase3_losses(
-            model=model,
-            data_loader=eval_loader,
-            loss_fn=loss_fn,
-            z_token_ids=z_token_ids,
-            pad_token_id=pad_token_id,
-            device=device,
-            max_batches=50,  # optional safety cap
-        )
+    eval_metrics = evaluate_phase3_losses(
+        model=model,
+        data_loader=eval_loader,
+        loss_fn=loss_fn,
+        z_token_ids=z_token_ids,
+        pad_token_id=pad_token_id,
+        device=device,
+        max_batches=50,  # optional safety cap
+    )
     print(
         f"[phase3/eval-loss] step={0} "
         f"total={eval_metrics['loss_total']:.4f} "
