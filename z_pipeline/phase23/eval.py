@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 from .conf import Config
 from .dataset import UnifiedDataset, collate_fn
@@ -113,3 +114,41 @@ def evaluate_on_loader(
         f"usage={metrics['usage']:.4f} eff_vocab={metrics['eff_vocab']:.2f}"
     )
     return metrics
+
+
+def evaluate(cfg: Config) -> dict:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.phase1_dir, trust_remote_code=True)
+    model = UnifiedZSoftModel.from_pretrained(
+        cfg.model.phase1_dir,
+        device=device,
+    )
+
+    dataset = UnifiedDataset(
+        tokenizer=tokenizer,
+        latent_token_id=model.latent_token_id,
+        answer_token_id=model.answer_token_id,
+        k_max=cfg.data.k_max,
+        dataset_name=cfg.data.dataset_name,
+        split=cfg.data.eval_split,
+        data_path=cfg.data.data_path,
+        max_length=cfg.data.max_length,
+    )
+    assert dataset.k_max == cfg.data.k_max, "dataset.k_max must match cfg.data.k_max"
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.data.batch_size,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
+        drop_last=False,
+    )
+    return evaluate_on_loader(model=model, loader=loader, cfg=cfg, device=device)
+
+
+if __name__ == "__main__":
+    evaluate(Config())
