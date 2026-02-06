@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoModel
 from huggingface_hub import hf_hub_download
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
@@ -96,11 +96,7 @@ class UnifiedZSoftModel(nn.Module):
     ) -> "UnifiedZSoftModel":
 
         # ---- load base LM ----
-        base = AutoModelForCausalLM.from_pretrained(
-            repo_id,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
+        base = AutoModel.from_pretrained(repo_id)
         base.to(device)
 
         # ---- load metadata ----
