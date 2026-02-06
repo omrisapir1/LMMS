@@ -153,22 +153,19 @@ def train(cfg: Config) -> None:
             loss_ans = ans_loss_fn(digit_logits, digit_labels)
 
             mask = (torch.arange(p_student.size(1), device=device)[None, :] < k_vals[:, None]).float()
-            print(f'p_student={p_student} q_teacher={q_teacher} mask={mask}')
-            print(f'p_student == q_teacher {p_student == q_teacher}')
             loss_softz = self_distill_z_kl_loss(p_student, q_teacher, mask=mask)
 
 
-            if cfg.loss.lambda_cf > 0 and p_student is not None:
-                loss_cf = cf_loss_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    digit_logits_ref=digit_logits,
-                    p_z=p_student,
-                    k_vals=k_vals,
-                )
-            else:
-                loss_cf = torch.tensor(0.0, device=device)
+
+            loss_cf = cf_loss_fn(
+                model=model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                digit_logits_ref=digit_logits,
+                p_z=p_student,
+                k_vals=k_vals,
+            )
+
 
             loss_usage = usage_shaping_loss_stub(device=device)
 
