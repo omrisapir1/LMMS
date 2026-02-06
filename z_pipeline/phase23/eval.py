@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 from .conf import Config
 from .dataset import UnifiedDataset, collate_fn
@@ -118,11 +117,14 @@ def evaluate_on_loader(
 
 def evaluate(cfg: Config) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.phase1_dir, trust_remote_code=True)
-    model = UnifiedZSoftModel.from_pretrained(
+    bundle = UnifiedZSoftModel.from_phase1(
         cfg.model.phase1_dir,
+        v_z=cfg.model.v_z,
         device=device,
+        torch_dtype=torch.bfloat16,
     )
+    tokenizer = bundle.tokenizer
+    model = bundle.model
 
     dataset = UnifiedDataset(
         tokenizer=tokenizer,

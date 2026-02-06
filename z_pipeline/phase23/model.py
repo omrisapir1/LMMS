@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
-from huggingface_hub import hf_hub_download
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -88,48 +85,81 @@ class UnifiedZSoftModel(nn.Module):
     # ============================================================
 
     @classmethod
+    def _build_from_phase1(
+        cls,
+        repo_or_dir: str,
+        *,
+        v_z: int,
+        device: torch.device,
+        torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
+    ) -> Phase23Bundle:
+        from z_pipeline.shared.load_model_phase1 import load_phase1, LATENT_TOKEN
+
+        tokenizer, phase1_model, _meta = load_phase1(
+            repo_or_dir=repo_or_dir,
+            device=str(device),
+            torch_dtype=torch_dtype,
+        )
+
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is None:
+                raise RuntimeError("Tokenizer has no pad or eos token; set pad token explicitly.")
+            tokenizer.pad_token = tokenizer.eos_token
+
+        latent_token_id = tokenizer.convert_tokens_to_ids(LATENT_TOKEN)
+        answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
+        if latent_token_id is None or latent_token_id < 0:
+            raise RuntimeError(f"Could not resolve latent token id for '{LATENT_TOKEN}'")
+        if answer_token_id is None or answer_token_id < 0:
+            raise RuntimeError("Could not resolve answer token id '<ANSWER>'")
+
+        phase0 = phase1_model.phase0
+        base_lm = phase0.model
+        digit_heads = phase0.digit_heads
+
+        z_tokens = [f"<Z_{i}>" for i in range(int(v_z))]
+        existing = set(tokenizer.get_vocab().keys())
+        to_add = [t for t in z_tokens if t not in existing]
+        if to_add:
+            tokenizer.add_tokens(to_add, special_tokens=False)
+        base_lm.resize_token_embeddings(len(tokenizer))
+
+        z_token_ids: List[int] = []
+        for i in range(int(v_z)):
+            tok = f"<Z_{i}>"
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if tid is None or tid < 0:
+                raise RuntimeError(f"Failed to convert token to id: {tok}")
+            z_token_ids.append(int(tid))
+
+        model = cls(
+            base_lm=base_lm,
+            digit_heads=digit_heads,
+            answer_token_id=int(answer_token_id),
+            latent_token_id=int(latent_token_id),
+            z_token_ids=z_token_ids,
+        )
+        model.to(device)
+        model.eval()
+
+        return Phase23Bundle(tokenizer=tokenizer, model=model)
+
+    @classmethod
     def from_pretrained(
         cls,
         repo_id: str,
         *,
         device: torch.device,
+        v_z: int = 512,
+        torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
     ) -> "UnifiedZSoftModel":
-
-        # ---- load base LM ----
-        base = AutoModel.from_pretrained(repo_id)
-        base.to(device)
-
-        # ---- load metadata ----
-        with open(hf_hub_download(repo_id, "z_meta.json")) as f:
-            meta = json.load(f)
-
-        z_token_ids = meta["z_token_ids"]
-        answer_token_id = meta["answer_token_id"]
-        latent_token_id = meta["latent_token_id"]
-
-        # ---- load phase2 state ----
-        state = torch.load(
-            hf_hub_download(repo_id, "phase2_state.pt"),
-            map_location="cpu",
+        bundle = cls._build_from_phase1(
+            repo_or_dir=repo_id,
+            v_z=v_z,
+            device=device,
+            torch_dtype=torch_dtype,
         )
-
-        # ---- reconstruct digit heads ----
-        hidden_size = base.get_input_embeddings().embedding_dim
-        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
-        digit_heads.load_state_dict(state["digit_heads"])
-
-        # ---- build model ----
-        model = cls(
-            base_lm=base,
-            digit_heads=digit_heads,
-            answer_token_id=answer_token_id,
-            latent_token_id=latent_token_id,
-            z_token_ids=z_token_ids,
-        )
-
-        model.to(device)
-        model.eval()
-        return model
+        return bundle.model
 
     @classmethod
     def from_phase1(
@@ -139,11 +169,12 @@ class UnifiedZSoftModel(nn.Module):
         device: torch.device | str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
     ) -> Phase23Bundle:
-        del v_z, torch_dtype
-        model = cls.from_pretrained(phase1_dir, device=torch.device(device))
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(phase1_dir, trust_remote_code=True)
-        return Phase23Bundle(tokenizer=tokenizer, model=model)
+        return cls._build_from_phase1(
+            repo_or_dir=phase1_dir,
+            v_z=v_z,
+            device=torch.device(device),
+            torch_dtype=torch_dtype,
+        )
 
     # ============================================================
     # Helpers
