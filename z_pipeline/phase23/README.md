@@ -71,7 +71,7 @@ Each example must contain:
 {
   "question": "...",
   "K": 1,
-  "final_answer": 12345
+  "answer_digits": 12345
 }
 ```
 

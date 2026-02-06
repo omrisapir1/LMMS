@@ -92,7 +92,7 @@ class UnifiedDataset(Dataset):
         ex = self.ds[idx]
         question = ex["question"]
         k_val = int(ex["num_latents"])
-        final_answer = int(ex["final_answer"])
+        final_answer = int(''.join([str(i) for i in ex["answer_digits"]]))
         if not (1 <= k_val <= self.k_max):
             raise ValueError(f"K={k_val} out of range")
 
