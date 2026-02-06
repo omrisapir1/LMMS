@@ -80,6 +80,41 @@ class UnifiedZSoftModel(nn.Module):
 
         self._embedding = self.base.get_input_embeddings()
 
+    @staticmethod
+    def _ensure_causal_lm(base_lm: nn.Module) -> nn.Module:
+        """
+        Ensure we have a CausalLM wrapper (with lm_head + generate).
+        Phase-1 may provide only a backbone model (e.g., Qwen2Model).
+        """
+        if hasattr(base_lm, "generate") and (
+            hasattr(base_lm, "get_output_embeddings") or hasattr(base_lm, "lm_head")
+        ):
+            return base_lm
+
+        # Qwen-specific backbone -> CausalLM wrapping
+        if base_lm.__class__.__name__ == "Qwen2Model":
+            from transformers import Qwen2ForCausalLM
+
+            causal_lm = Qwen2ForCausalLM(base_lm.config)
+            causal_lm.model.load_state_dict(base_lm.state_dict(), strict=True)
+
+            # Initialize lm_head from token embeddings for stable startup.
+            try:
+                if causal_lm.lm_head.weight.shape == causal_lm.model.embed_tokens.weight.shape:
+                    causal_lm.lm_head.weight.data.copy_(causal_lm.model.embed_tokens.weight.data)
+            except Exception:
+                pass
+            return causal_lm
+
+        raise RuntimeError(
+            f"Unsupported base model type for Phase23: {type(base_lm)}. "
+            "Expected a CausalLM or Qwen2Model backbone."
+        )
+
+    def _core_model(self) -> nn.Module:
+        # CausalLM wrappers expose `.model`; raw backbones are themselves the core.
+        return self.base.model if hasattr(self.base, "model") else self.base
+
     # ============================================================
     # Loading from pretrained repo/checkpoint
     # ============================================================
@@ -116,6 +151,7 @@ class UnifiedZSoftModel(nn.Module):
         phase0 = phase1_model.phase0
         base_lm = phase0.model
         digit_heads = phase0.digit_heads
+        base_lm = cls._ensure_causal_lm(base_lm)
 
         z_tokens = [f"<Z_{i}>" for i in range(int(v_z))]
         existing = set(tokenizer.get_vocab().keys())
@@ -292,7 +328,7 @@ class UnifiedZSoftModel(nn.Module):
 
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device)
-                out = self.base.model(
+                out = self._core_model()(
                     inputs_embeds=inputs_embeds[bs, :p],
                     attention_mask=attention_mask[bs, :p],
                     position_ids=position_ids[bs, :p],
@@ -314,7 +350,7 @@ class UnifiedZSoftModel(nn.Module):
                             s_logits, tau=tau_teacher, dim=-1
                         ).to(torch.float32)
 
-        out_final = self.base.model(
+        out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -375,7 +411,7 @@ class UnifiedZSoftModel(nn.Module):
                 p_s = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
                 inputs_embeds[bs, p] = p_s @ z_emb
 
-        out_final = self.base.model(
+        out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
