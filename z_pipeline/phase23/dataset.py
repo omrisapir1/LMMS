@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+import os
 
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -65,7 +66,12 @@ class UnifiedDataset(Dataset):
         if hf_dataset is not None:
             self.ds = hf_dataset
         elif data_path is not None:
-            self.ds = load_dataset("json", data_files=data_path, split=split or "train")
+            # data_path may be a local json/jsonl/parquet path OR an HF dataset repo id.
+            # Prefer local json loading only when path clearly exists locally.
+            if os.path.exists(data_path):
+                self.ds = load_dataset("json", data_files=data_path, split=split or "train")
+            else:
+                self.ds = load_dataset(data_path, split=split or "train")
         else:
             if dataset_name is None:
                 raise ValueError("dataset_name or data_path must be provided")
