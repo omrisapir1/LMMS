@@ -152,15 +152,9 @@ def train(cfg: Config) -> None:
 
             loss_ans = ans_loss_fn(digit_logits, digit_labels)
 
-            softz_enabled = cfg.loss.lambda_softz > 0
-            if cfg.loss.freeze_softz_after_steps is not None and (step + 1) > cfg.loss.freeze_softz_after_steps:
-                softz_enabled = False
+            mask = (torch.arange(p_student.size(1), device=device)[None, :] < k_vals[:, None]).float()
+            loss_softz = self_distill_z_kl_loss(p_student, q_teacher, mask=mask)
 
-            if softz_enabled and cfg.model.use_self_teacher and p_student is not None and q_teacher is not None:
-                mask = (torch.arange(p_student.size(1), device=device)[None, :] < k_vals[:, None]).float()
-                loss_softz = self_distill_z_kl_loss(p_student, q_teacher, mask=mask)
-            else:
-                loss_softz = torch.tensor(0.0, device=device)
 
             if cfg.loss.lambda_cf > 0 and p_student is not None:
                 loss_cf = cf_loss_fn(
