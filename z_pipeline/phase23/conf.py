@@ -20,7 +20,7 @@ class ModelConfig:
     # tau_student: controls exploration in student Z mixtures used for embedding injection
     tau_student: float = 1.0
     # tau_teacher: controls self-distillation target sharpness
-    tau_teacher: float = 1.0
+    tau_teacher: float = 2.0
 
     # Whether to compute self-teacher distributions for KL
     use_self_teacher: bool = True
