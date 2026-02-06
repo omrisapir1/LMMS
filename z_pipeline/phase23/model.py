@@ -103,6 +103,11 @@ class UnifiedZSoftModel(nn.Module):
 
             causal_lm = Qwen2ForCausalLM(base_lm.config)
             causal_lm.model.load_state_dict(base_lm.state_dict(), strict=True)
+            try:
+                base_dtype = next(base_lm.parameters()).dtype
+                causal_lm = causal_lm.to(dtype=base_dtype)
+            except StopIteration:
+                pass
 
             # Initialize lm_head from token embeddings for stable startup.
             try:
@@ -309,23 +314,24 @@ class UnifiedZSoftModel(nn.Module):
 
         position_ids = self._build_position_ids(attention_mask)
         inputs_embeds = self._embedding(input_ids)
+        dist_dtype = inputs_embeds.dtype
 
         latent_lists, Kmax = self._latent_lists(input_ids)
         B = input_ids.size(0)
         Vz = len(self.z_token_ids)
 
-        slot_mask = torch.zeros((B, Kmax), device=input_ids.device)
+        slot_mask = torch.zeros((B, Kmax), device=input_ids.device, dtype=torch.bool)
         for b, ps in enumerate(latent_lists):
-            slot_mask[b, : len(ps)] = 1.0
+            slot_mask[b, : len(ps)] = True
 
         p_student = None
         q_teacher = None
         if return_distributions or use_self_teacher:
-            p_student = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=torch.float32)
+            p_student = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=dist_dtype)
         if use_self_teacher:
-            q_teacher = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=torch.float32)
+            q_teacher = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=dist_dtype)
 
-        z_emb = self._z_embeddings()
+        z_emb = self._z_embeddings().to(dtype=dist_dtype)
 
         for pass_idx in range(Kmax):
             buckets = self._bucket_fill_positions(latent_lists, pass_idx)
@@ -344,9 +350,9 @@ class UnifiedZSoftModel(nn.Module):
                 u = out.hidden_states[-1][:, p - 1]
 
                 s_logits = self._z_logits_from_hidden(u)
-                p_s = safe_softmax(s_logits, tau=tau_student, dim=-1).to(torch.float32)
-
-                inputs_embeds[bs, p] = (p_s.to(inputs_embeds.dtype)) @ z_emb
+                p_s = safe_softmax(s_logits, tau=tau_student, dim=-1).to(dist_dtype)
+                e_student = torch.matmul(p_s, z_emb).to(dist_dtype)
+                inputs_embeds[bs, p] = e_student
                 p_student[bs, pass_idx] = p_s
 
                 if use_self_teacher:
@@ -354,7 +360,7 @@ class UnifiedZSoftModel(nn.Module):
                     with torch.no_grad():
                         q_teacher[bs, pass_idx] = safe_softmax(
                             s_logits, tau=tau_teacher, dim=-1
-                        ).to(torch.float32)
+                        ).to(dist_dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
@@ -406,7 +412,7 @@ class UnifiedZSoftModel(nn.Module):
         if p_z.size(2) != len(self.z_token_ids):
             raise RuntimeError("p_z V dimension must equal number of Z tokens")
 
-        z_emb = self._z_embeddings()
+        z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
         for pass_idx in range(Kmax):
             buckets = self._bucket_fill_positions(latent_lists, pass_idx)
@@ -415,7 +421,7 @@ class UnifiedZSoftModel(nn.Module):
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device)
                 p_s = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
-                inputs_embeds[bs, p] = p_s @ z_emb
+                inputs_embeds[bs, p] = torch.matmul(p_s, z_emb).to(inputs_embeds.dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
