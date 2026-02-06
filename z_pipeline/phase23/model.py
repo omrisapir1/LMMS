@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
+from huggingface_hub import hf_hub_download
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -83,8 +84,56 @@ class UnifiedZSoftModel(nn.Module):
         self._embedding = self.base.get_input_embeddings()
 
     # ============================================================
-    # Loading from Phase-1
+    # Loading from pretrained repo/checkpoint
     # ============================================================
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_id: str,
+        *,
+        device: torch.device,
+    ) -> "UnifiedZSoftModel":
+
+        # ---- load base LM ----
+        base = AutoModelForCausalLM.from_pretrained(
+            repo_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        base.to(device)
+
+        # ---- load metadata ----
+        with open(hf_hub_download(repo_id, "z_meta.json")) as f:
+            meta = json.load(f)
+
+        z_token_ids = meta["z_token_ids"]
+        answer_token_id = meta["answer_token_id"]
+        latent_token_id = meta["latent_token_id"]
+
+        # ---- load phase2 state ----
+        state = torch.load(
+            hf_hub_download(repo_id, "phase2_state.pt"),
+            map_location="cpu",
+        )
+
+        # ---- reconstruct digit heads ----
+        hidden_size = base.get_input_embeddings().embedding_dim
+        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
+        digit_heads.load_state_dict(state["digit_heads"])
+
+        # ---- build model ----
+        model = cls(
+            base_lm=base,
+            digit_heads=digit_heads,
+            answer_token_id=answer_token_id,
+            latent_token_id=latent_token_id,
+            z_token_ids=z_token_ids,
+        )
+
+        model.to(device)
+        model.eval()
+        return model
 
     @classmethod
     def from_phase1(
@@ -94,85 +143,10 @@ class UnifiedZSoftModel(nn.Module):
         device: torch.device | str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
     ) -> Phase23Bundle:
-
-        meta_path = f"{phase1_dir}/phase1_meta.json"
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        phase0_repo = meta.get("phase0_repo")
-        if phase0_repo is None:
-            raise RuntimeError("phase1_meta.json missing phase0_repo")
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            phase1_dir,
-            trust_remote_code=True,
-        )
-
-        # Ensure Z tokens exist
-        z_tokens = [f"<Z_{i}>" for i in range(int(v_z))]
-        unk = tokenizer.unk_token_id
-        to_add = [t for t in z_tokens if tokenizer.convert_tokens_to_ids(t) == unk]
-        if to_add:
-            tokenizer.add_tokens(to_add)
-
-        base = AutoModelForCausalLM.from_pretrained(
-            phase0_repo,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        )
-        base.resize_token_embeddings(len(tokenizer))
-
-        # Load Phase-1 weights if present
-        weights_path = f"{phase1_dir}/phase1_weights.pt"
-        try:
-            state = torch.load(weights_path, map_location="cpu")
-        except FileNotFoundError:
-            state = None
-
-        if state is not None:
-            model_state = {
-                k.replace("phase0.model.", ""): v
-                for k, v in state.items()
-                if k.startswith("phase0.model.")
-            }
-            if model_state:
-                try:
-                    base.model.load_state_dict(model_state, strict=False)
-                except Exception:
-                    base.load_state_dict(
-                        {"model." + k: v for k, v in model_state.items()},
-                        strict=False,
-                    )
-
-        # Digit heads
-        hidden_size = base.get_input_embeddings().embedding_dim
-        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
-
-        if state is not None:
-            dh_state = {
-                k.replace("phase0.digit_heads.", ""): v
-                for k, v in state.items()
-                if k.startswith("phase0.digit_heads.")
-            }
-            if dh_state:
-                digit_heads.load_state_dict(dh_state, strict=False)
-
-        latent_token_id = tokenizer.convert_tokens_to_ids("<|latent|>")
-        answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
-        z_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in z_tokens]
-
-        if latent_token_id == unk or answer_token_id == unk:
-            raise RuntimeError("Tokenizer missing special tokens")
-
-        model = cls(
-            base_lm=base,
-            digit_heads=digit_heads,
-            latent_token_id=latent_token_id,
-            answer_token_id=answer_token_id,
-            z_token_ids=z_token_ids,
-        )
-        model.to(device)
-
+        del v_z, torch_dtype
+        model = cls.from_pretrained(phase1_dir, device=torch.device(device))
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(phase1_dir, trust_remote_code=True)
         return Phase23Bundle(tokenizer=tokenizer, model=model)
 
     # ============================================================
