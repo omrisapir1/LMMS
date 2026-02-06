@@ -38,7 +38,7 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     # HuggingFace dataset name (optional)
-    dataset_name: Optional[str] = "omrisap/LMMS_phase2_latents"
+    dataset_name: Optional[str] = "omrisap/phaseZ"
     train_split: str = "train"
     eval_split: str = "eval"
 
