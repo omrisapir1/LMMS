@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, List
 @dataclass
 class ModelConfig:
     # Path to Phase-1 checkpoint directory
-    phase1_dir: str = ""
+    phase1_dir: str = "omrisap/LMMS_phase1"
 
     # Z vocabulary size
     v_z: int = 512
@@ -38,12 +38,12 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     # HuggingFace dataset name (optional)
-    dataset_name: Optional[str] = None
+    dataset_name: Optional[str] = "omrisap/LMMS_phase2_latents"
     train_split: str = "train"
     eval_split: str = "eval"
 
     # Optional local dataset path (jsonl / parquet / HF-compatible)
-    data_path: Optional[str] = None
+    data_path: Optional[str] = "omrisap/LMMS_phase2_latents"
 
     # Max sequence length (None = no truncation)
     max_length: Optional[int] = None
