@@ -80,10 +80,14 @@ def random_mixture_like(
     out = torch.zeros_like(p_z)
     if k <= 0:
         return out
-    samples = torch.empty((k, V), device=p_z.device, dtype=p_z.dtype).gamma_(
-        alpha=max(float(alpha), 1e-6),
+    samples = torch.rand(
+        (k, V),
+        device=p_z.device,
+        dtype=p_z.dtype,
         generator=generator,
     )
+    if alpha != 1.0:
+        samples = samples.pow(1.0 / max(float(alpha), 1e-6))
     samples = samples / samples.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     out[:k] = samples
     return out

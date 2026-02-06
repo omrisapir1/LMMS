@@ -186,8 +186,10 @@ class CounterfactualAnswerLoss(nn.Module):
                 out[b, :k] = permute_slots(active, k)
             else:
                 # sample random mixtures for exactly k slots
-                samples = torch.empty((k, V), device=device, dtype=p_z.dtype).gamma_(
-                    alpha=1.0,
+                samples = torch.rand(
+                    (k, V),
+                    device=device,
+                    dtype=p_z.dtype,
                     generator=gen,
                 )
                 samples = samples / samples.sum(dim=-1, keepdim=True).clamp_min(1e-8)
