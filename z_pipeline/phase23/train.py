@@ -154,6 +154,7 @@ def train(cfg: Config) -> None:
 
             mask = (torch.arange(p_student.size(1), device=device)[None, :] < k_vals[:, None]).float()
             print(f'p_student={p_student} q_teacher={q_teacher} mask={mask}')
+            print(f'p_student == q_teacher {p_student == q_teacher}')
             loss_softz = self_distill_z_kl_loss(p_student, q_teacher, mask=mask)
 
 
