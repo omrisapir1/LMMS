@@ -43,7 +43,7 @@ class DataConfig:
     eval_split: str = "eval"
 
     # Optional local dataset path (jsonl / parquet / HF-compatible)
-    data_path: Optional[str] = "omrisap/LMMS_phase2_latents"
+    data_path: Optional[str] = None
 
     # Max sequence length (None = no truncation)
     max_length: Optional[int] = None

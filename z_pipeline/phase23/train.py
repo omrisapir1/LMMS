@@ -78,24 +78,26 @@ def train(cfg: Config) -> None:
         drop_last=False,
     )
 
-    eval_dataset = UnifiedDataset(
-        tokenizer=tokenizer,
-        latent_token_id=model.latent_token_id,
-        answer_token_id=model.answer_token_id,
-        k_max=cfg.data.k_max,
-        dataset_name=cfg.data.dataset_name,
-        split=cfg.data.eval_split,
-        data_path=cfg.data.data_path,
-        max_length=cfg.data.max_length,
+    eval_loader = None
+    if cfg.train.eval_every > 0:
+        eval_dataset = UnifiedDataset(
+            tokenizer=tokenizer,
+            latent_token_id=model.latent_token_id,
+            answer_token_id=model.answer_token_id,
+            k_max=cfg.data.k_max,
+            dataset_name=cfg.data.dataset_name,
+            split=cfg.data.eval_split,
+            data_path=cfg.data.data_path,
+            max_length=cfg.data.max_length,
         )
 
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=cfg.data.batch_size,
-        shuffle=False,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
-        drop_last=False,
-    )
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=cfg.data.batch_size,
+            shuffle=False,
+            collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
+            drop_last=False,
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -160,15 +162,17 @@ def train(cfg: Config) -> None:
             else:
                 loss_softz = torch.tensor(0.0, device=device)
 
-
-            loss_cf = cf_loss_fn(
-                model=model,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                digit_logits_ref=digit_logits,
-                p_z=p_student,
-                k_vals=k_vals,
-            )
+            if cfg.loss.lambda_cf > 0 and p_student is not None:
+                loss_cf = cf_loss_fn(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    digit_logits_ref=digit_logits,
+                    p_z=p_student,
+                    k_vals=k_vals,
+                )
+            else:
+                loss_cf = torch.tensor(0.0, device=device)
 
             loss_usage = usage_shaping_loss_stub(device=device)
 
