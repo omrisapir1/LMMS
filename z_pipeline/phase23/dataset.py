@@ -79,7 +79,7 @@ class UnifiedDataset(Dataset):
 
         self._buckets: List[str] = []
         for i in range(len(self.ds)):
-            k_val = int(self.ds[i]["K"])
+            k_val = int(self.ds[i]["num_latents"])
             if not (1 <= k_val <= self.k_max):
                 raise ValueError(f"K={k_val} out of range")
             # Buckets are used ONLY for sampling balance, not for conditioning or loss computation.
@@ -91,7 +91,7 @@ class UnifiedDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         ex = self.ds[idx]
         question = ex["question"]
-        k_val = int(ex["K"])
+        k_val = int(ex["num_latents"])
         final_answer = int(ex["final_answer"])
         if not (1 <= k_val <= self.k_max):
             raise ValueError(f"K={k_val} out of range")
