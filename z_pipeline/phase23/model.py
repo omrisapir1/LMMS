@@ -86,9 +86,15 @@ class UnifiedZSoftModel(nn.Module):
         Ensure we have a CausalLM wrapper (with lm_head + generate).
         Phase-1 may provide only a backbone model (e.g., Qwen2Model).
         """
-        if hasattr(base_lm, "generate") and (
-            hasattr(base_lm, "get_output_embeddings") or hasattr(base_lm, "lm_head")
-        ):
+        has_lm_head = getattr(base_lm, "lm_head", None) is not None
+        has_output_head = False
+        if hasattr(base_lm, "get_output_embeddings"):
+            try:
+                has_output_head = base_lm.get_output_embeddings() is not None
+            except Exception:
+                has_output_head = False
+
+        if hasattr(base_lm, "generate") and (has_lm_head or has_output_head):
             return base_lm
 
         # Qwen-specific backbone -> CausalLM wrapping
