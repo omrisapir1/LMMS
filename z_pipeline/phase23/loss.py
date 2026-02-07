@@ -214,7 +214,7 @@ class CounterfactualAnswerLoss(nn.Module):
 
         js = js_divergence(p_ref, p_cf).mean()
         # Negative because we want to maximize divergence.
-        return -js
+        return 1 -js
 
 
 def usage_shaping_loss_stub(*, device: torch.device) -> torch.Tensor:
