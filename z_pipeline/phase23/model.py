@@ -1,19 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
 from .utils import safe_softmax
 
-
-# ============================================================
-# Bundle
-# ============================================================
 
 @dataclass
 class Phase23Bundle:
@@ -21,15 +20,10 @@ class Phase23Bundle:
     model: "UnifiedZSoftModel"
 
 
-# ============================================================
-# Logits processor (Phase3-style masking, no lm_head replacement)
-# ============================================================
-
 class AllowedTokensOnly(LogitsProcessor):
-    """
-    Masks logits so that ONLY allowed_token_ids may be generated.
-    """
-    def __init__(self, allowed_token_ids: List[int], fill_value: float = -1e4):
+    """Masks logits so that only allowed token ids can be generated."""
+
+    def __init__(self, allowed_token_ids: List[int], fill_value: float = -1e4) -> None:
         self.allowed = torch.tensor(allowed_token_ids, dtype=torch.long)
         self.fill_value = float(fill_value)
 
@@ -38,26 +32,23 @@ class AllowedTokensOnly(LogitsProcessor):
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        device = scores.device
-        allowed = self.allowed.to(device)
-
+        del input_ids
+        allowed = self.allowed.to(scores.device)
         masked = scores.new_full(scores.shape, self.fill_value)
         masked.index_copy_(1, allowed, scores.index_select(1, allowed))
         return masked
 
 
-# ============================================================
-# Unified Phase-2.5 Model
-# ============================================================
-
 class UnifiedZSoftModel(nn.Module):
     """
-    Unified Phase-2.5 model:
+    Phase23 merged model.
 
-    - Soft latent execution with expected Z embeddings
-    - Z distributions come from the LM head (restricted rows)
-    - Digit heads predict final answer
-    - Generation uses standard HF .generate() with logits masking
+    GS-forward / soft-backprop latent execution:
+    - At each <|latent|> slot, compute Z logits from LM head rows.
+    - If use_gs=True: inject hard one-hot sample via Gumbel-ST.
+    - If use_gs=False: inject deterministic argmax Z.
+
+    No teacher pathway in Phase23-GS.
     """
 
     def __init__(
@@ -70,65 +61,52 @@ class UnifiedZSoftModel(nn.Module):
         z_token_ids: List[int],
     ) -> None:
         super().__init__()
-
         self.base = base_lm
         self.digit_heads = digit_heads
-
         self.latent_token_id = int(latent_token_id)
         self.answer_token_id = int(answer_token_id)
-        self.z_token_ids = list(map(int, z_token_ids))
+        self.z_token_ids = [int(x) for x in z_token_ids]
 
         self._embedding = self.base.get_input_embeddings()
 
     @staticmethod
     def _ensure_causal_lm(base_lm: nn.Module) -> nn.Module:
-        """
-        Ensure we have a CausalLM wrapper (with lm_head + generate).
-        Phase-1 may provide only a backbone model (e.g., Qwen2Model).
-        """
-        has_lm_head = getattr(base_lm, "lm_head", None) is not None
+        """Ensure a CausalLM wrapper with lm_head and .generate exists."""
         has_output_head = False
         if hasattr(base_lm, "get_output_embeddings"):
             try:
                 has_output_head = base_lm.get_output_embeddings() is not None
             except Exception:
                 has_output_head = False
+        has_lm_head = getattr(base_lm, "lm_head", None) is not None
 
-        if hasattr(base_lm, "generate") and (has_lm_head or has_output_head):
+        if hasattr(base_lm, "generate") and (has_output_head or has_lm_head):
             return base_lm
 
-        # Qwen-specific backbone -> CausalLM wrapping
+        # Phase1 currently yields Qwen backbone (Qwen2Model). Re-wrap into causal LM.
         if base_lm.__class__.__name__ == "Qwen2Model":
             from transformers import Qwen2ForCausalLM
 
-            causal_lm = Qwen2ForCausalLM(base_lm.config)
-            causal_lm.model.load_state_dict(base_lm.state_dict(), strict=True)
+            wrapped = Qwen2ForCausalLM(base_lm.config)
+            wrapped.model.load_state_dict(base_lm.state_dict(), strict=True)
             try:
-                base_dtype = next(base_lm.parameters()).dtype
-                causal_lm = causal_lm.to(dtype=base_dtype)
+                p = next(base_lm.parameters())
+                wrapped = wrapped.to(dtype=p.dtype)
             except StopIteration:
                 pass
 
-            # Initialize lm_head from token embeddings for stable startup.
-            try:
-                if causal_lm.lm_head.weight.shape == causal_lm.model.embed_tokens.weight.shape:
-                    causal_lm.lm_head.weight.data.copy_(causal_lm.model.embed_tokens.weight.data)
-            except Exception:
-                pass
-            return causal_lm
+            # Initialize lm_head from token embeddings for a stable starting point.
+            if wrapped.lm_head.weight.shape == wrapped.model.embed_tokens.weight.shape:
+                wrapped.lm_head.weight.data.copy_(wrapped.model.embed_tokens.weight.data)
+            return wrapped
 
         raise RuntimeError(
-            f"Unsupported base model type for Phase23: {type(base_lm)}. "
-            "Expected a CausalLM or Qwen2Model backbone."
+            f"Unsupported base LM type for Phase23: {type(base_lm)}. "
+            "Expected CausalLM or Qwen2Model backbone."
         )
 
     def _core_model(self) -> nn.Module:
-        # CausalLM wrappers expose `.model`; raw backbones are themselves the core.
         return self.base.model if hasattr(self.base, "model") else self.base
-
-    # ============================================================
-    # Loading from pretrained repo/checkpoint
-    # ============================================================
 
     @classmethod
     def _build_from_phase1(
@@ -138,8 +116,11 @@ class UnifiedZSoftModel(nn.Module):
         v_z: int,
         device: torch.device,
         torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
+        z_prefix: str = "Z_",
+        latent_token: str = "<|latent|>",
+        answer_token: str = "<ANSWER>",
     ) -> Phase23Bundle:
-        from z_pipeline.shared.load_model_phase1 import load_phase1, LATENT_TOKEN
+        from z_pipeline.shared.load_model_phase1 import load_phase1
 
         tokenizer, phase1_model, _meta = load_phase1(
             repo_or_dir=repo_or_dir,
@@ -149,99 +130,143 @@ class UnifiedZSoftModel(nn.Module):
 
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is None:
-                raise RuntimeError("Tokenizer has no pad or eos token; set pad token explicitly.")
+                raise RuntimeError("Tokenizer has no pad/eos token.")
             tokenizer.pad_token = tokenizer.eos_token
 
-        latent_token_id = tokenizer.convert_tokens_to_ids(LATENT_TOKEN)
-        answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
-        if latent_token_id is None or latent_token_id < 0:
-            raise RuntimeError(f"Could not resolve latent token id for '{LATENT_TOKEN}'")
-        if answer_token_id is None or answer_token_id < 0:
-            raise RuntimeError("Could not resolve answer token id '<ANSWER>'")
+        latent_token_id = tokenizer.convert_tokens_to_ids(latent_token)
+        answer_token_id = tokenizer.convert_tokens_to_ids(answer_token)
+        if latent_token_id is None or int(latent_token_id) < 0:
+            raise RuntimeError(f"Could not resolve latent token id for '{latent_token}'")
+        if answer_token_id is None or int(answer_token_id) < 0:
+            raise RuntimeError(f"Could not resolve answer token id '{answer_token}'")
 
         phase0 = phase1_model.phase0
-        base_lm = phase0.model
+        base_lm = cls._ensure_causal_lm(phase0.model)
         digit_heads = phase0.digit_heads
-        base_lm = cls._ensure_causal_lm(base_lm)
 
-        z_tokens = [f"<Z_{i}>" for i in range(int(v_z))]
-        existing = set(tokenizer.get_vocab().keys())
-        to_add = [t for t in z_tokens if t not in existing]
+        z_tokens = [f"<{z_prefix}{i}>" for i in range(int(v_z))]
+        vocab = tokenizer.get_vocab()
+        to_add = [tok for tok in z_tokens if tok not in vocab]
         if to_add:
             tokenizer.add_tokens(to_add, special_tokens=False)
         base_lm.resize_token_embeddings(len(tokenizer))
 
         z_token_ids: List[int] = []
         for i in range(int(v_z)):
-            tok = f"<Z_{i}>"
+            tok = f"<{z_prefix}{i}>"
             tid = tokenizer.convert_tokens_to_ids(tok)
-            if tid is None or tid < 0:
-                raise RuntimeError(f"Failed to convert token to id: {tok}")
+            if tid is None or int(tid) < 0:
+                raise RuntimeError(f"Failed to resolve token id for {tok}")
             z_token_ids.append(int(tid))
 
         model = cls(
             base_lm=base_lm,
             digit_heads=digit_heads,
-            answer_token_id=int(answer_token_id),
             latent_token_id=int(latent_token_id),
+            answer_token_id=int(answer_token_id),
             z_token_ids=z_token_ids,
         )
         model.to(device)
         model.eval()
-
         return Phase23Bundle(tokenizer=tokenizer, model=model)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        repo_id: str,
-        *,
-        device: torch.device,
-        v_z: int = 512,
-        torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
-    ) -> "UnifiedZSoftModel":
-        bundle = cls._build_from_phase1(
-            repo_or_dir=repo_id,
-            v_z=v_z,
-            device=device,
-            torch_dtype=torch_dtype,
-        )
-        return bundle.model
 
     @classmethod
     def from_phase1(
         cls,
         phase1_dir: str,
         v_z: int,
-        device: torch.device | str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16,
+        device: Union[torch.device, str] = "cuda",
+        torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
+        z_prefix: str = "Z_",
+        latent_token: str = "<|latent|>",
+        answer_token: str = "<ANSWER>",
     ) -> Phase23Bundle:
         return cls._build_from_phase1(
             repo_or_dir=phase1_dir,
             v_z=v_z,
             device=torch.device(device),
             torch_dtype=torch_dtype,
+            z_prefix=z_prefix,
+            latent_token=latent_token,
+            answer_token=answer_token,
         )
 
-    # ============================================================
-    # Helpers
-    # ============================================================
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_or_dir: str,
+        *,
+        device: Union[torch.device, str],
+        v_z: int = 512,
+        torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
+        z_prefix: str = "Z_",
+        latent_token: str = "<|latent|>",
+        answer_token: str = "<ANSWER>",
+    ) -> "UnifiedZSoftModel":
+        """
+        Load Phase23 model either from:
+        1) phase23 checkpoint directory (phase23_state.pt + config.json + tokenizer files), or
+        2) Phase1 repo/directory (build fresh phase23 wrapper from Phase1).
+        """
+        device_t = torch.device(device)
+        state_path = os.path.join(repo_or_dir, "phase23_state.pt")
+        config_path = os.path.join(repo_or_dir, "config.json")
+
+        if os.path.isdir(repo_or_dir) and os.path.exists(state_path):
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(
+                    f"Missing config for phase23 checkpoint: {config_path}"
+                )
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+
+            phase1_dir = cfg.get("model", {}).get("phase1_dir")
+            if not phase1_dir:
+                raise RuntimeError("config.json missing model.phase1_dir required for restore")
+            ckpt_vz = int(cfg.get("model", {}).get("v_z", v_z))
+            ckpt_z_prefix = cfg.get("model", {}).get("z_prefix", z_prefix)
+            ckpt_latent_token = cfg.get("model", {}).get("latent_token", latent_token)
+            ckpt_answer_token = cfg.get("model", {}).get("answer_token", answer_token)
+
+            bundle = cls.from_phase1(
+                phase1_dir=phase1_dir,
+                v_z=ckpt_vz,
+                device=device_t,
+                torch_dtype=torch_dtype,
+                z_prefix=ckpt_z_prefix,
+                latent_token=ckpt_latent_token,
+                answer_token=ckpt_answer_token,
+            )
+            state = torch.load(state_path, map_location="cpu")
+            bundle.model.load_state_dict(state, strict=True)
+            bundle.model.to(device_t)
+            bundle.model.eval()
+            return bundle.model
+
+        bundle = cls.from_phase1(
+            phase1_dir=repo_or_dir,
+            v_z=v_z,
+            device=device_t,
+            torch_dtype=torch_dtype,
+            z_prefix=z_prefix,
+            latent_token=latent_token,
+            answer_token=answer_token,
+        )
+        return bundle.model
 
     def _build_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
         pos = torch.cumsum(attention_mask.to(torch.long), dim=1) - 1
         return torch.clamp(pos, min=0)
 
     def _latent_lists(self, input_ids: torch.Tensor) -> Tuple[List[List[int]], int]:
-        B, _ = input_ids.shape
+        bsz = input_ids.size(0)
         idx = (input_ids == self.latent_token_id).nonzero(as_tuple=False)
-
-        lists: List[List[int]] = []
-        for b in range(B):
-            ps = [int(i[1]) for i in idx if int(i[0]) == b]
-            ps.sort()
-            lists.append(ps)
-
-        return lists, max((len(x) for x in lists), default=0)
+        latent_lists: List[List[int]] = []
+        for b in range(bsz):
+            pos = [int(i[1]) for i in idx if int(i[0]) == b]
+            pos.sort()
+            latent_lists.append(pos)
+        return latent_lists, max((len(x) for x in latent_lists), default=0)
 
     def _bucket_fill_positions(
         self,
@@ -249,28 +274,19 @@ class UnifiedZSoftModel(nn.Module):
         pass_idx: int,
     ) -> Dict[int, List[int]]:
         buckets: Dict[int, List[int]] = {}
-        for b, ps in enumerate(latent_lists):
-            if pass_idx < len(ps):
-                p = ps[pass_idx]
+        for b, pos_list in enumerate(latent_lists):
+            if pass_idx < len(pos_list):
+                p = pos_list[pass_idx]
                 if p <= 0:
-                    raise RuntimeError("<|latent|> at position 0")
+                    raise RuntimeError("Found <|latent|> at sequence position 0")
                 buckets.setdefault(p, []).append(b)
         return buckets
 
-    def _digit_logits_from_hidden(
-        self,
-        hidden_last: torch.Tensor,
-        input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def _find_answer_pos(self, input_ids: torch.Tensor) -> torch.Tensor:
         mask = (input_ids == self.answer_token_id)
         if not torch.all(mask.sum(dim=1) == 1):
-            raise RuntimeError("Each sample must contain exactly one <ANSWER>")
-
-        idx = mask.float().argmax(dim=1)
-        bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
-        h = hidden_last[bidx, idx]
-
-        return torch.stack([head(h) for head in self.digit_heads], dim=1)
+            raise RuntimeError("Each sample must contain exactly one <ANSWER> token")
+        return mask.float().argmax(dim=1)
 
     def _get_lm_head(self) -> nn.Module:
         if hasattr(self.base, "get_output_embeddings"):
@@ -279,88 +295,112 @@ class UnifiedZSoftModel(nn.Module):
                 return head
         head = getattr(self.base, "lm_head", None)
         if head is None:
-            raise RuntimeError("Base LM has no lm_head")
+            raise RuntimeError("Base LM has no output head")
         return head
+
+    def _lm_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        head = self._get_lm_head()
+        logits = hidden @ head.weight.t()
+        bias = getattr(head, "bias", None)
+        if bias is not None:
+            logits = logits + bias
+        return logits
 
     def _z_logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         head = self._get_lm_head()
-        W = head.weight[self.z_token_ids]          # [Vz, H]
-        logits = hidden @ W.t()
-        b = getattr(head, "bias", None)
-        if b is not None:
-            logits = logits + b[self.z_token_ids]
+        w = head.weight[self.z_token_ids]
+        logits = hidden @ w.t()
+        bias = getattr(head, "bias", None)
+        if bias is not None:
+            logits = logits + bias[self.z_token_ids]
         return logits
 
     def _z_embeddings(self) -> torch.Tensor:
         return self.base.get_input_embeddings().weight[self.z_token_ids]
 
-    # ============================================================
-    # Training forward (soft-embedding latent execution)
-    # ============================================================
+    def _digit_logits_from_hidden(self, hidden_last: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        answer_pos = self._find_answer_pos(input_ids)
+        bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
+        h_answer = hidden_last[bidx, answer_pos]
+        return torch.stack([head(h_answer) for head in self.digit_heads], dim=1)
+
+    def _answer_next_logits_from_hidden(self, hidden_last: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        answer_pos = self._find_answer_pos(input_ids)
+        prev_pos = (answer_pos - 1).clamp(min=0)
+        bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
+        h_prev = hidden_last[bidx, prev_pos]
+        return self._lm_logits_from_hidden(h_prev)
 
     def forward(
         self,
         *,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        use_self_teacher: bool = True,
-        tau_teacher: float = 1.0,
-        tau_student: float = 1.0,
+        gumbel_tau: float = 1.0,
+        use_gs: bool = True,
         return_distributions: bool = False,
     ) -> Dict[str, torch.Tensor]:
-
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
         position_ids = self._build_position_ids(attention_mask)
         inputs_embeds = self._embedding(input_ids)
-        dist_dtype = inputs_embeds.dtype
 
-        latent_lists, Kmax = self._latent_lists(input_ids)
-        B = input_ids.size(0)
-        Vz = len(self.z_token_ids)
+        latent_lists, kmax = self._latent_lists(input_ids)
+        bsz = input_ids.size(0)
+        vz = len(self.z_token_ids)
 
-        slot_mask = torch.zeros((B, Kmax), device=input_ids.device, dtype=torch.bool)
-        for b, ps in enumerate(latent_lists):
-            slot_mask[b, : len(ps)] = True
+        slot_mask = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.bool)
+        for b, positions in enumerate(latent_lists):
+            slot_mask[b, : len(positions)] = True
 
-        p_student = None
-        q_teacher = None
-        if return_distributions or use_self_teacher:
-            p_student = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=dist_dtype)
-        if use_self_teacher:
-            q_teacher = torch.zeros((B, Kmax, Vz), device=input_ids.device, dtype=dist_dtype)
+        p_student: Optional[torch.Tensor] = None
+        if return_distributions:
+            p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=torch.float32)
 
-        z_emb = self._z_embeddings().to(dtype=dist_dtype)
+        z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
-        for pass_idx in range(Kmax):
+        tau = max(float(gumbel_tau), 1e-6)
+        for pass_idx in range(kmax):
             buckets = self._bucket_fill_positions(latent_lists, pass_idx)
             if not buckets:
                 continue
 
             for p in sorted(buckets):
-                bs = torch.tensor(buckets[p], device=input_ids.device)
-                out = self._core_model()(
+                bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
+                out_prefix = self._core_model()(
                     inputs_embeds=inputs_embeds[bs, :p],
                     attention_mask=attention_mask[bs, :p],
                     position_ids=position_ids[bs, :p],
                     use_cache=False,
                     output_hidden_states=True,
+                    return_dict=True,
                 )
-                u = out.hidden_states[-1][:, p - 1]
+                u = out_prefix.hidden_states[-1][:, p - 1]
 
-                s_logits = self._z_logits_from_hidden(u)
-                p_s = safe_softmax(s_logits, tau=tau_student, dim=-1).to(dist_dtype)
-                e_student = torch.matmul(p_s, z_emb).to(dist_dtype)
-                inputs_embeds[bs, p] = e_student
-                p_student[bs, pass_idx] = p_s
+                s_logits = self._z_logits_from_hidden(u).to(torch.float32)
 
-                if use_self_teacher:
-                    # Teacher is self-teacher computed from the same logits, pre-injection.
-                    with torch.no_grad():
-                        q_teacher[bs, pass_idx] = safe_softmax(
-                            s_logits, tau=tau_teacher, dim=-1
-                        ).to(dist_dtype)
+                if use_gs:
+                    # GS-ST with explicit soft sample tracking:
+                    # forward uses hard one-hot; backward flows through y_soft.
+                    u_rand = torch.rand_like(s_logits).clamp_(1e-6, 1.0 - 1e-6)
+                    g_noise = -torch.log(-torch.log(u_rand))
+                    y_soft = safe_softmax(s_logits + g_noise, tau=tau, dim=-1)
+                    z_idx = y_soft.argmax(dim=-1)
+                    y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float32)
+                    z_st = y_hard - y_soft.detach() + y_soft
+                    p_slot = y_soft
+                else:
+                    # Deterministic evaluation path: no gumbel noise.
+                    z_idx = s_logits.argmax(dim=-1)
+                    z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float32)
+                    p_slot = z_st
+
+                e_latent = torch.matmul(z_st.to(z_emb.dtype), z_emb).to(inputs_embeds.dtype)
+                inputs_embeds[bs, p] = e_latent
+
+                if p_student is not None:
+                    p_student[bs, pass_idx] = p_slot
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
@@ -368,23 +408,21 @@ class UnifiedZSoftModel(nn.Module):
             position_ids=position_ids,
             use_cache=False,
             output_hidden_states=True,
+            return_dict=True,
         )
         hidden_last = out_final.hidden_states[-1]
-        digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
 
-        out = {
+        digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
+        answer_next_logits = self._answer_next_logits_from_hidden(hidden_last, input_ids)
+
+        out: Dict[str, torch.Tensor] = {
             "digit_logits": digit_logits,
+            "answer_next_logits": answer_next_logits,
             "slot_mask": slot_mask,
         }
         if return_distributions:
             out["p_student"] = p_student
-            out["q_teacher"] = q_teacher
-
         return out
-
-    # ============================================================
-    # Forward with externally provided Z distributions
-    # ============================================================
 
     def forward_with_fixed_z_distributions(
         self,
@@ -394,34 +432,35 @@ class UnifiedZSoftModel(nn.Module):
         p_z: torch.Tensor,  # [B,Kmax,Vz]
     ) -> torch.Tensor:
         """
-        Inject fixed per-slot Z mixtures and return digit logits only.
+        Inject fixed per-slot Z mixtures (no GS sampling) and return digit logits [B,5,10].
         """
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        position_ids = self._build_position_ids(attention_mask)
-        inputs_embeds = self._embedding(input_ids)
-        latent_lists, Kmax = self._latent_lists(input_ids)
-
         if p_z.dim() != 3:
             raise RuntimeError("p_z must have shape [B,Kmax,Vz]")
+
+        position_ids = self._build_position_ids(attention_mask)
+        inputs_embeds = self._embedding(input_ids)
+
+        latent_lists, kmax = self._latent_lists(input_ids)
         if p_z.size(0) != input_ids.size(0):
-            raise RuntimeError("p_z batch size must match input_ids")
-        if p_z.size(1) < Kmax:
-            raise RuntimeError("p_z K dimension smaller than required latent count")
+            raise RuntimeError("p_z batch dimension must match input_ids")
+        if p_z.size(1) < kmax:
+            raise RuntimeError("p_z slot dimension is smaller than required latent slots")
         if p_z.size(2) != len(self.z_token_ids):
-            raise RuntimeError("p_z V dimension must equal number of Z tokens")
+            raise RuntimeError("p_z last dimension must equal len(z_token_ids)")
 
         z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
-        for pass_idx in range(Kmax):
+        for pass_idx in range(kmax):
             buckets = self._bucket_fill_positions(latent_lists, pass_idx)
             if not buckets:
                 continue
             for p in sorted(buckets):
-                bs = torch.tensor(buckets[p], device=input_ids.device)
-                p_s = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
-                inputs_embeds[bs, p] = torch.matmul(p_s, z_emb).to(inputs_embeds.dtype)
+                bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
+                slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
+                inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
@@ -429,13 +468,10 @@ class UnifiedZSoftModel(nn.Module):
             position_ids=position_ids,
             use_cache=False,
             output_hidden_states=True,
+            return_dict=True,
         )
         hidden_last = out_final.hidden_states[-1]
         return self._digit_logits_from_hidden(hidden_last, input_ids)
-
-    # ============================================================
-    # Generation (Phase3-style, but lm_head intact)
-    # ============================================================
 
     @torch.no_grad()
     def generate(
@@ -447,25 +483,20 @@ class UnifiedZSoftModel(nn.Module):
         fill_value: float = -1e4,
         **kwargs,
     ) -> torch.Tensor:
-
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
         allowed = self.z_token_ids + [self.answer_token_id]
-        lp = LogitsProcessorList([AllowedTokensOnly(allowed, fill_value)])
+        processors = LogitsProcessorList([AllowedTokensOnly(allowed, fill_value=fill_value)])
 
         return self.base.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             eos_token_id=self.answer_token_id,
-            logits_processor=lp,
+            logits_processor=processors,
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
-
-    # ============================================================
-    # Generation + digits
-    # ============================================================
 
     @torch.no_grad()
     def generate_with_digits(
@@ -476,7 +507,6 @@ class UnifiedZSoftModel(nn.Module):
         pad_token_id: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-
         sequences = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -487,7 +517,6 @@ class UnifiedZSoftModel(nn.Module):
             pad_token_id = getattr(self.base.config, "pad_token_id", self.answer_token_id)
 
         full_attn = (sequences != pad_token_id).long()
-
         out = self.base(
             input_ids=sequences,
             attention_mask=full_attn,
