@@ -55,7 +55,7 @@ class LossConfig:
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
 
-    digit_temperature: float = 0.5
+    digit_temperature: float = 0.1
     # Keep-prob from Phase3 style; accepts tuple/list or dict keys 0..4/1..5.
     keep_prob: Optional[Union[Mapping[int, float], Sequence[float]]] = (0.02, 0.05, 0.1, 0.5, 1)
 
