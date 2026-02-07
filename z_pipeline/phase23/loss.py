@@ -211,7 +211,15 @@ class CounterfactualAnswerLoss(nn.Module):
             p_z=p_cf_z,
         )
         p_cf = safe_softmax(digit_logits_cf, tau=self.digit_temperature, dim=-1)
-
+        mean_abs_logit_diff = (digit_logits_ref_det.detach() - digit_logits_cf.detach()).abs().mean().item()
+        # also useful: argmax disagreement rate across all digits
+        ref_arg = digit_logits_ref_det.detach().argmax(dim=-1)  # [B,5]
+        cf_arg = digit_logits_cf.detach().argmax(dim=-1)  # [B,5]
+        disagree = (ref_arg != cf_arg).float().mean().item()
+        print(
+            f"[cf_loss] |logit_diff|={mean_abs_logit_diff:.6f} "
+            f"disagree={disagree:.3f} tau={self.digit_temperature:.3f}"
+        )
         js = js_divergence(p_ref, p_cf).mean()
         # Negative because we want to maximize divergence.
         return 1 -js
