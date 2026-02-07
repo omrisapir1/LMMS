@@ -252,7 +252,7 @@ def train(cfg: Config) -> None:
                 config=cfg,
             )
 
-        if step  % cfg.train.eval_every == 0:
+        if step  % cfg.train.eval_every == 0 and step > 0:
             metrics = evaluate(
                 model=model,
                 loader=eval_loader,

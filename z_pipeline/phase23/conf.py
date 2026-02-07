@@ -33,7 +33,7 @@ class DataConfig:
     data_path: Optional[str] = None
 
     max_length: Optional[int] = None
-    batch_size: int = 8
+    batch_size: int = 16
     rebalance_train: bool = True
     k_max: int = 20
 
@@ -49,8 +49,8 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    lambda_ans: float = 0.5
-    lambda_sft: float = 0.05
+    lambda_ans: float = 0.1
+    lambda_sft: float = 0.01
     lambda_cf: float = 1.0
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
