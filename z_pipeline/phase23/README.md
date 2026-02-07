@@ -1,67 +1,122 @@
+# Phase23-GS (Merged Mode): Discrete Latent Execution via Gumbel-Softmax ST
 
-# Phase23 (Merged Mode): Soft Latent Execution + Self-Teacher Distillation
+This package implements **Phase2.5-GS / Merged Mode (GS-ST)** latent reasoning for decoder-only LLMs.
 
-This package implements **Phase2.5 / Merged Mode** latent reasoning for decoder-only LLMs.
+"Phase23-GS" is an internal nickname referring to the merge of:
+- Coconut-style latent reasoning
+- Discrete Z-token execution
+- Phase-3-compatible LM-head semantics
 
-“Merged Mode” is an internal nickname referring to the merge of Phase-2 soft latent execution
-with Phase-3-style LM-head supervision. In code and checkpoints, this phase is referred to
-as **Phase23**.
+using the **Gumbel-Softmax Straight-Through (GS-ST)** estimator.
+
+Phase23-GS corresponds to Phase 2.5-GS in the overall pipeline.
 
 It keeps a mostly standard Hugging Face CausalLM, preserves `.generate()`, and adds:
 
-- Soft latent execution at `<|latent|>` positions using expected Z embeddings.
-- Optional self-teacher distillation (same pre-injection logits, different temperature).
+- Discrete latent execution at `<|latent|>` positions using GS-ST.
+- A Z-token policy implemented directly in the LM head (no separate selector).
 - Digit answer heads at `<ANSWER>` for supervised numeric prediction.
-- Counterfactual answer loss that perturbs latent Z mixtures and maximizes output divergence.
+- Counterfactual answer loss that perturbs latent Z sequences and maximizes output divergence.
+- Optional batch-level and in-sequence Z regularization to prevent collapse.
 
-## Why Phase 2.5 exists
+Unlike Phase23 (soft mixtures), this phase executes **hard discrete Z tokens in the forward pass**, while remaining fully differentiable during training.
 
-Phase 2.5 is a deliberate transition stage between soft latent reasoning (Phase 2)
-and discrete latent policy optimization (Phase 3 / PPO).
+---
 
-It allows the LM head itself to learn Z-token semantics under full supervision and
-differentiability, so that PPO later operates on a well-shaped policy rather than
-random logits.
+## Why Phase 2.5-GS exists
+
+Phase 2.5-GS is a deliberate transition stage between:
+
+- **Soft latent reasoning** (Phase 2 / Coconut-style execution)
+- **Discrete latent policy optimization** (Phase 3 / PPO)
+
+It teaches the LM head itself to act as a **latent action policy** over Z tokens *without requiring any Z supervision*.
+
+By the end of this phase:
+
+- Z tokens are true discrete actions
+- The model is PPO-ready
+- The model is compatible with standard HF `.generate()` and vLLM
+
+---
 
 ## Core idea
 
 For each latent slot position `p_i` in the sequence (corresponding to a `<|latent|>` token):
 
-1. Run prefix forward to get pre-injection hidden state `u_i`.
-2. Compute student logits over Z tokens using LM head rows:
+1. Run prefix forward to get the pre-injection hidden state `u_i`.
+2. Compute logits over Z tokens using LM head rows:
    - `s_i = W_Z @ u_i`
-   - `p_i = softmax(s_i / tau_student)`
-3. Compute expected Z embedding and inject:
-   - `e_i = p_i @ E_Z`
-4. Replace embedding at `p_i` with `e_i`.
+3. Sample a Z distribution using Gumbel-Softmax:
+   - `p_i = softmax((s_i + g_i) / tau)`
+4. Perform **GS-ST execution**:
+   - **Forward (hard):** `k = argmax(p_i)`, inject `E_Z[k]`
+   - **Backward (soft):** gradients flow as if `e_i = p_i @ E_Z`
+5. Replace the embedding at `p_i` with the injected Z embedding and continue the forward pass.
 
-Optional self-teacher target:
+This makes Z tokens:
+- Discrete in execution
+- Differentiable in training
+- Interpretable as latent actions
+- Discrete actions represented as Z tokens
 
-- `q_i = softmax(s_i / tau_teacher)`
-- Same `s_i` as student, pre-injection, stop-grad.
-- The teacher exists to prevent early collapse of Z distributions and to stabilize training before discrete sampling is introduced.
-- The teacher distribution is computed from the **same pre-injection hidden state `u_i`**
-- as the student and never observes the injected mixture embedding `e_i`.
+---
 
-Losses:
+## `<ANSWER>` semantics
 
-- `AnswerDigitLoss` (CE over 5 digit heads)
-- `self_distill_z_kl_loss = KL(q || p)`
-- `CounterfactualAnswerLoss = -JS(p_ref_digits, p_cf_digits)`
-- `usage_shaping_loss_stub` (disabled by default)
+- `<ANSWER>` is a real token in the vocabulary.
+- It terminates latent execution.
+- Digit heads read the hidden state at `<ANSWER>`.
 
-This loss explicitly enforces that latent Z structure is causally relevant to the final answer, not merely an auxiliary representation.
+This is the **only position with next-token supervision** in this phase.
+
+---
+
+## Losses
+
+Phase23-GS intentionally avoids any cross-entropy supervision over Z tokens. All learning signals are compatible with GS-ST.
+
+### Primary losses
+
+- `AnswerDigitLoss`
+  Cross-entropy over 5 digit heads at `<ANSWER>`.
+
+- `AnswerTokenSFTLoss`
+  Cross-entropy enforcing that `<ANSWER>` follows the final Z token.
+
+- `CounterfactualAnswerLoss`
+  Negative JS divergence between digit distributions produced by:
+  - the original Z sequence
+  - a perturbed Z sequence (reverse / resample)
+
+This explicitly enforces that Z tokens are **causally relevant** to the final answer.
+
+### Optional regularizers
+
+- `BatchZDiversityLoss`
+  KL divergence between the batch-averaged soft Z distribution (`p_z`) and uniform.
+  Prevents global Z collapse.
+
+- `InSequenceZConsistencyLoss`
+  KL divergence between adjacent Z distributions within a single sequence.
+  Encourages stable latent trajectories.
+
+No loss in this phase requires ground-truth Z labels.
+
+---
 
 ## Package layout
 
 - `conf.py`: dataclass configs for model/data/loss/train
 - `dataset.py`: dataset building, collate, and K-bucket rebalanced sampler
-- `model.py`: `UnifiedZSoftModel` and `from_phase1(...)` loader
+- `model.py`: GS-ST latent execution model and `from_phase1(...)` loader
 - `loss.py`: canonical loss definitions
 - `train.py`: training loop + checkpoint saving
 - `eval.py`: eval loop with same losses/forward API
 - `utils.py`: shared helpers
 - `__init__.py`: package exports
+
+---
 
 ## Data contract
 
@@ -78,7 +133,7 @@ Each example must contain:
 Where:
 
 - `K` is in `[1, k_max]` (default `k_max=20`)
-- `final_answer` is an integer in `[0, 99999]`
+- `answer_digits` is an integer in `[0, 99999]`
 
 The dataset builds per-sample tokens as:
 
@@ -86,97 +141,96 @@ The dataset builds per-sample tokens as:
 
 Padding is suffix-only in `collate_fn`.
 
-## K-bucket balancing
+### K-bucket balancing
 
 Training can rebalance by K buckets with target distribution:
 
 - `K1`, `K2`, `K3`, `K4_7`, `K8_12`, `K13_20`
 
-Buckets are used **only for sampling balance**, not model conditioning.
+Buckets are used only for sampling balance, not model conditioning.
 
 ## Model API
 
-### `UnifiedZSoftModel.forward(...)`
+### `UnifiedZGSModel.forward(...)`
 
 Arguments:
 
 - `input_ids`, `attention_mask`
-- `use_self_teacher: bool`
-- `tau_student: float`
-- `tau_teacher: float`
+- `tau: float` (Gumbel-Softmax temperature)
 - `return_distributions: bool`
 
 Returns:
 
 - always: `digit_logits` with shape `[B, 5, 10]`
-- auxiliary: `slot_mask` with shape `[B, Kmax]` (internal training mask, not required as external serving API)
+- auxiliary: `slot_mask` with shape `[B, Kmax]`
 - when `return_distributions=True`:
-  - `p_student` shape `[B, Kmax, Vz]`
-  - `q_teacher` shape `[B, Kmax, Vz]` (or `None` if self-teacher disabled)
+  - `p_z` shape `[B, Kmax, Vz]` (soft distributions used for gradients)
 
-### `UnifiedZSoftModel.forward_with_fixed_z_distributions(...)`
+### `UnifiedZGSModel.forward_with_fixed_z(...)`
 
 Used by counterfactual loss.
 
-- Inputs: `input_ids`, `attention_mask`, `p_z` with shape `[B, Kmax, Vz]`
-- Behavior: inject provided per-slot mixtures instead of recomputing student `p`
-- Output: `digit_logits` `[B, 5, 10]`
+- Inputs: `input_ids`, `attention_mask`, `z_override`
+- Behavior: injects provided Z tokens or distributions
+- Output: `digit_logits [B, 5, 10]`
 
 ### `generate()` and `generate_with_digits()`
 
-- `generate()` uses HF `.generate()` with logits masking (`AllowedTokensOnly`) and does not replace LM head.
-- `generate_with_digits()` runs generation, then computes digit-head logits at `<ANSWER>` (or fallback final token position).
+- `generate()` uses HF `.generate()` with logits masking over `{Z tokens + <ANSWER>}`.
+- `generate_with_digits()` runs generation, then computes digit-head logits at `<ANSWER>`.
+
+No latent injection occurs during inference.
+GS-ST is applied only during training; inference uses standard discrete token generation.
 
 ## Configuration reference (`conf.py`)
 
-### `ModelConfig`
+### ModelConfig
 
 - `phase1_dir: str`
 - `v_z: int`
-- `tau_student: float` (student mixture exploration/sharpness)
-- `tau_teacher: float` (self-distillation target sharpness)
-- `use_self_teacher: bool`
+- `gumbel_tau_start: float`
+- `gumbel_tau_end: float`
+- `gumbel_anneal_steps: int`
 
-### `DataConfig`
+### DataConfig
 
 - `dataset_name: Optional[str]`
-- `data_path: Optional[str]` (JSONL/local)
-- `train_split: str`
-- `eval_split: str`
-- `batch_size: int`
-- `max_length: Optional[int]`
-- `k_max: int`
-- `rebalance_train: bool`
-- `target_k_dist: Dict[str, float]`
+- `data_path: Optional[str]`
+- `train_split, eval_split`
+- `batch_size`
+- `max_length`
+- `k_max`
+- `rebalance_train`
+- `target_k_dist`
 
-### `LossConfig`
+### LossConfig
 
-- `lambda_ans: float`
-- `lambda_softz: float`
-- `lambda_cf: float`
-- `lambda_usage: float` (default `0.0`)
-- `digit_temperature: float`
-- `counterfactual_schedule: Dict[int, float]`
-- `freeze_softz_after_steps: Optional[int]`
+- `lambda_ans`
+- `lambda_sft`
+- `lambda_cf`
+- `lambda_batch`
+- `lambda_consistency`
+- `digit_temperature`
+- `counterfactual_schedule`
 
-### `TrainConfig`
+### TrainConfig
 
-- `lr`, `weight_decay`
-- `steps`, `grad_accum`
-- `print_every`, `save_every`
-- `seed`, `output_dir`
+- `lr, weight_decay`
+- `steps, grad_accum`
+- `print_every, save_every`
+- `seed, output_dir`
 
 ## Training
 
-Example (from repo root):
+Example:
 
 ```python
-from z_pipeline.phase23.conf import Config
-from z_pipeline.phase23.train import train
+from z_pipeline.phase23_gs.conf import Config
+from z_pipeline.phase23_gs.train import train
 
 cfg = Config()
 cfg.model.phase1_dir = "/path/to/phase1_checkpoint"
-cfg.data.data_path = "/path/to/train.jsonl"  # or set dataset_name + train_split
+cfg.data.data_path = "/path/to/train.jsonl"
 cfg.train.steps = 1000
 
 train(cfg)
@@ -185,56 +239,47 @@ train(cfg)
 Training loop behavior:
 
 - Loads tokenizer/model from `from_phase1(...)`
-- Builds `UnifiedDataset`
-- Optional K-bucket rebalanced sampler
+- Builds dataset with `<|latent|>` slots
+- Optional K-bucket rebalanced sampling
+- Applies GS-ST latent execution
 - Computes losses and weighted sum
-- Logs periodic metrics (including effective vocab)
 - Saves checkpoints under `output_dir/step_<N>/`
-
-Checkpoint contents:
-
-- `phase23_state.pt`
-- tokenizer files
-- `config.json`
 
 ## Evaluation
 
 ```python
-from z_pipeline.phase23.conf import Config
-from z_pipeline.phase23.eval import evaluate
+from z_pipeline.phase23_gs.conf import Config
+from z_pipeline.phase23_gs.eval import evaluate
 
 cfg = Config()
 cfg.model.phase1_dir = "/path/to/phase1_checkpoint"
-cfg.data.data_path = "/path/to/eval.jsonl"  # or set dataset_name + eval_split
+cfg.data.data_path = "/path/to/eval.jsonl"
 
 metrics = evaluate(cfg)
 print(metrics)
 ```
 
-Eval computes the same loss components as training and reports dataset averages.
-
-## Dependencies
-
-Typical required packages:
-
-- `torch`
-- `transformers`
-- `datasets`
-
-Use a Python environment where these are installed and compatible with your CUDA/CPU runtime.
+Eval computes the same loss components as training.
 
 ## Notes and assumptions
 
-- Phase23 relies on `<|latent|>` and `<ANSWER>` existing in tokenizer/phase checkpoints.
-- `from_phase1(...)` includes pragmatic key mapping from Phase1 weights; adjust if your checkpoint schema differs.
-- The package is intentionally focused on merged mode and does not implement PPO/value heads.
-- After Phase 2.5, the same model can be trained with PPO by replacing soft mixtures with sampled Z tokens, without changing architecture.
+- `<|latent|>` and `<ANSWER>` must exist in the tokenizer.
+- Phase23-GS does not require Z labels.
+- The package does not implement PPO or value heads.
+- After Phase 2.5-GS, the same model can be trained with PPO without architectural changes.
 
 ## Quick troubleshooting
 
-- **`Tokenizer missing special tokens`**
-  - Ensure Phase1 tokenizer artifacts include `<|latent|>` and `<ANSWER>`.
-- **`p_z shape` runtime errors in CF loss**
-  - Confirm `p_student`/`p_z` shape is `[B, Kmax, Vz]` and `Vz == len(z_token_ids)`.
-- **Bucket errors in rebalancing**
-  - Ensure the dataset contains examples across all configured target buckets, or disable rebalancing.
+### Tokenizer missing special tokens
+
+Ensure Phase1 tokenizer includes `<|latent|>` and `<ANSWER>`.
+
+### Z collapse
+
+- Increase `lambda_batch` or temperature
+- Verify Gumbel noise is enabled
+
+### Unstable Z switching
+
+- Increase `lambda_consistency`
+- Slow down temperature annealing

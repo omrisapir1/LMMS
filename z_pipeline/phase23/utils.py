@@ -38,9 +38,8 @@ def effective_vocab_size(p: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
       - p: [B, K, V]  (averages over K first)
     """
     if p.dim() == 3:
-        p = p.mean(dim=1)  # average over latent slots
-    mean_p = p.mean(dim=0)
-    mean_p = mean_p.clamp_min(eps)
+        p = p.mean(dim=1)
+    mean_p = p.mean(dim=0).clamp_min(eps)
     entropy = -(mean_p * mean_p.log()).sum(dim=-1)
     return entropy.exp()
 
@@ -49,6 +48,23 @@ def safe_softmax(logits: torch.Tensor, tau: float = 1.0, dim: int = -1) -> torch
     if tau <= 0:
         raise ValueError("tau must be > 0")
     return torch.softmax(logits / tau, dim=dim)
+
+
+def gumbel_tau_at_step(
+    *,
+    step: int,
+    tau_start: float,
+    tau_end: float,
+    tau_anneal_steps: int,
+) -> float:
+    """
+    Linear anneal with floor at tau_end.
+    """
+    if tau_anneal_steps <= 0:
+        return float(tau_end)
+    t = float(step) / float(tau_anneal_steps)
+    tau = float(tau_start) - (float(tau_start) - float(tau_end)) * t
+    return float(max(float(tau_end), tau))
 
 
 def permute_slots(p_z: torch.Tensor, k: Optional[int] = None) -> torch.Tensor:

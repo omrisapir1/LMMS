@@ -1,62 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
-from typing import Optional, Dict, Any, List
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
-
-# ─────────────────────────────────────────────
-# Model configuration
-# ─────────────────────────────────────────────
 
 @dataclass
 class ModelConfig:
-    # Path to Phase-1 checkpoint directory
+    # Phase-1 repo/directory used as base for Phase23 construction.
     phase1_dir: str = "omrisap/LMMS_phase1"
 
-    # Z vocabulary size
+    # Z vocabulary size (<Z_0> ... <Z_{v_z-1}>).
     v_z: int = 512
 
-    # Temperatures
-    # tau_student: controls exploration in student Z mixtures used for embedding injection
-    tau_student: float = 1.0
-    # tau_teacher: controls self-distillation target sharpness
-    tau_teacher: float = 2.0
+    # Gumbel-Softmax temperature schedule (controls exploration hardness for GS-ST).
+    gumbel_tau_start: float = 1.0
+    gumbel_tau_end: float = 0.3
+    gumbel_anneal_steps: int = 10_000
 
-    # Whether to compute self-teacher distributions for KL
-    use_self_teacher: bool = True
-
-    # Token strings (do NOT hardcode elsewhere)
+    # Token strings.
     z_prefix: str = "Z_"
     latent_token: str = "<|latent|>"
     answer_token: str = "<ANSWER>"
 
 
-# ─────────────────────────────────────────────
-# Data configuration
-# ─────────────────────────────────────────────
-
 @dataclass
 class DataConfig:
-    # HuggingFace dataset name (optional)
     dataset_name: Optional[str] = "omrisap/phaseZ"
     train_split: str = "train"
     eval_split: str = "eval"
 
-    # Optional local dataset path (jsonl / parquet / HF-compatible)
+    # Optional local path (json/jsonl/parquet) OR HF dataset repo id.
     data_path: Optional[str] = None
 
-    # Max sequence length (None = no truncation)
     max_length: Optional[int] = None
-
     batch_size: int = 8
-
-    # Whether to rebalance training samples by K buckets
     rebalance_train: bool = True
-
-    # Maximum number of latent steps
     k_max: int = 20
 
-    # Target K distribution for rebalancing
     target_k_dist: Dict[str, float] = field(default_factory=lambda: {
         "K1": 0.075,
         "K2": 0.10,
@@ -67,30 +47,18 @@ class DataConfig:
     })
 
 
-# ─────────────────────────────────────────────
-# Loss configuration
-# ─────────────────────────────────────────────
-
 @dataclass
 class LossConfig:
-    # Main loss weights
     lambda_ans: float = 1.0
-    # Self-distillation on Z distributions (not external supervision)
-    lambda_softz: float = 1.0
+    lambda_sft: float = 1.0
     lambda_cf: float = 1.0
+    lambda_batch: float = 0.0
+    lambda_consistency: float = 0.0
 
-    # Optional usage shaping (default OFF)
-    lambda_usage: float = 0.0
-
-    # Temperature for digit probability distributions
     digit_temperature: float = 1.0
-    # Per-digit keep probability for zero labels (MSB -> LSB). Matches Phase-2/3 logic.
-    keep_prob: Optional[List[float]] = field(default_factory=lambda: [0.02, 0.05, 0.1, 0.5, 1.0])
+    # Keep-prob from Phase3 style; accepts tuple/list or dict keys 0..4/1..5.
+    keep_prob: Optional[Union[Mapping[int, float], Sequence[float]]] = (0.02, 0.05, 0.1, 0.5, 1)
 
-    # Future hook (e.g., PPO): freeze self-distill after N steps
-    freeze_softz_after_steps: Optional[int] = None
-
-    # Counterfactual perturbation schedule (by K)
     counterfactual_schedule: Dict[int, float] = field(default_factory=lambda: {
         1: 0.0,
         2: 0.10, 3: 0.15, 4: 0.20, 5: 0.30,
@@ -102,33 +70,20 @@ class LossConfig:
     })
 
 
-# ─────────────────────────────────────────────
-# Training configuration
-# ─────────────────────────────────────────────
-
 @dataclass
 class TrainConfig:
     lr: float = 3e-5
-    weight_decay: float = 0.00
-
-    # Total training steps
+    weight_decay: float = 0.0
     steps: int = 1000
-
-    # Gradient accumulation
     grad_accum: int = 1
 
-    # Logging / checkpoint cadence
     print_every: int = 5
     eval_every: int = 0
     save_every: int = 500
 
     seed: int = 42
-    output_dir: str = "./runs/phase23"
+    output_dir: str = "./runs/phase23_gs"
 
-
-# ─────────────────────────────────────────────
-# Root config
-# ─────────────────────────────────────────────
 
 @dataclass
 class Config:

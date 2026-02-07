@@ -1,7 +1,7 @@
-from .conf import Config, ModelConfig, DataConfig, LossConfig, TrainConfig
-from .dataset import UnifiedDataset, collate_fn, build_rebalanced_sampler
+from .conf import Config, DataConfig, LossConfig, ModelConfig, TrainConfig
+from .dataset import UnifiedDataset, build_rebalanced_sampler, collate_fn
+from .loss import AnswerDigitLoss, AnswerTokenSFTLoss, CounterfactualAnswerLoss
 from .model import UnifiedZSoftModel
-from .loss import CounterfactualAnswerLoss, AnswerDigitLoss, self_distill_z_kl_loss
 
 __all__ = [
     "Config",
@@ -15,5 +15,5 @@ __all__ = [
     "UnifiedZSoftModel",
     "CounterfactualAnswerLoss",
     "AnswerDigitLoss",
-    "self_distill_z_kl_loss",
+    "AnswerTokenSFTLoss",
 ]
