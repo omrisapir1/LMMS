@@ -78,7 +78,7 @@ class TrainConfig:
     grad_accum: int = 1
 
     print_every: int = 5
-    eval_every: int = 0
+    eval_every: int = 100
     save_every: int = 500
 
     seed: int = 42
