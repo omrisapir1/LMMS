@@ -202,18 +202,23 @@ class CounterfactualAnswerLoss(nn.Module):
             apply_cf_answer_z_bias: bool = False,
             global_step: Optional[int] = None,
             stage_name: str = "main",
-    ) -> torch.Tensor:
+            return_details: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         # ----------------------------
         # Reference
         # ----------------------------
-        digit_logits_ref_det = model.forward_with_fixed_z_distributions(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            p_z=p_z.detach(),
-            cf_bias_scale=0.0,
-            apply_cf_answer_z_bias=False,
-            cf_attention_bias_strength=0.0,
-        )
+        with torch.no_grad():
+            ref_out = model.forward_with_fixed_z_distributions(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                p_z=p_z.detach(),
+                cf_bias_scale=0.0,
+                apply_cf_answer_z_bias=False,
+                cf_attention_bias_strength=0.0,
+                return_answer_hidden=True,
+            )
+        digit_logits_ref_det = ref_out["digit_logits"]
+        h_ans_ref = ref_out["h_answer"]
         p_ref = safe_softmax(
             digit_logits_ref_det, tau=self.digit_temperature, dim=-1
         ).detach()  # [B,5,10]
@@ -222,23 +227,34 @@ class CounterfactualAnswerLoss(nn.Module):
         # Counterfactual
         # ----------------------------
         p_cf_z = self._build_counterfactual_pz(p_z, k_vals)
-        digit_logits_cf = model.forward_with_fixed_z_distributions(
+        cf_out = model.forward_with_fixed_z_distributions(
             input_ids=input_ids,
             attention_mask=attention_mask,
             p_z=p_cf_z,
             cf_bias_scale=float(cf_bias_scale),
             apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
             cf_attention_bias_strength=float(cf_attention_bias_strength),
+            return_answer_hidden=True,
         )
+        digit_logits_cf = cf_out["digit_logits"]
+        h_ans_cf = cf_out["h_answer"]
         p_cf = safe_softmax(
             digit_logits_cf, tau=self.digit_temperature, dim=-1
         )  # [B,5,10]
 
         # ----------------------------
-        # Loss
+        # Losses
         # ----------------------------
         js = js_divergence(p_ref, p_cf).mean()
-        loss = torch.log(torch.tensor(2.0, device=js.device, dtype=js.dtype)) - js
+        loss_cf = torch.log(torch.tensor(2.0, device=js.device, dtype=js.dtype)) - js
+
+        ref_norm = F.normalize(h_ans_ref.detach().float(), p=2, dim=-1)
+        cf_norm = F.normalize(h_ans_cf.float(), p=2, dim=-1)
+        cos_sim = (ref_norm * cf_norm).sum(dim=-1).mean()
+        # Minimize cosine similarity to enforce answer-state dependence on latent Z.
+        # (equivalent up to constant shift: cos_sim - 1.0)
+        loss_dep = cos_sim - 1.0
+        dep_norm = (h_ans_ref.detach().float() - h_ans_cf.float()).norm(dim=-1).mean()
 
         if self.debug_every > 0 and global_step is not None and (int(global_step) % self.debug_every == 0):
             with torch.no_grad():
@@ -265,12 +281,18 @@ class CounterfactualAnswerLoss(nn.Module):
                     f"|dlogits|={float(delta_logits):.4f} "
                     f"JS={float(js):.4f} "
                     f"flip={float(flip):.4f} "
+                    f"cos_sim={float(cos_sim):.4f} dep_norm={float(dep_norm):.4f} "
                     f"conf_ref={float(conf_ref):.4f} conf_cf={float(conf_cf):.4f} "
                     f"margin_ref={float(margin_ref):.4f} margin_cf={float(margin_cf):.4f} "
                     f"H_ref={float(h_ref):.4f} H_cf={float(h_cf):.4f}"
                 )
 
-        return loss
+        if return_details:
+            return {
+                "loss_cf": loss_cf,
+                "loss_dep": loss_dep,
+            }
+        return loss_cf
 
 
 def usage_shaping_loss_stub(*, device: torch.device) -> torch.Tensor:

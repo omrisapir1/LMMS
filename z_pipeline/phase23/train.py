@@ -232,6 +232,7 @@ def train(cfg: Config) -> None:
         "ans": 0.0,
         "sft": 0.0,
         "cf": 0.0,
+        "dep": 0.0,
         "eff_vocab": 0.0,
     }
     log_count = 0
@@ -296,8 +297,8 @@ def train(cfg: Config) -> None:
             loss_ans = ans_loss_fn(digit_logits, digit_labels)
             loss_sft = sft_loss_fn(answer_next_logits)
 
-            if cfg.loss.lambda_cf > 0 and p_student is not None:
-                loss_cf = cf_loss_fn(
+            if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+                cf_terms = cf_loss_fn(
                     model=model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -310,9 +311,13 @@ def train(cfg: Config) -> None:
                     ),
                     global_step=step + 1,
                     stage_name=current_stage,
+                    return_details=True,
                 )
+                loss_cf = cf_terms["loss_cf"]
+                loss_dep = cf_terms["loss_dep"]
             else:
                 loss_cf = torch.zeros((), device=device)
+                loss_dep = torch.zeros((), device=device)
 
             loss_batch = torch.zeros((), device=device)
             loss_consistency = torch.zeros((), device=device)
@@ -321,6 +326,7 @@ def train(cfg: Config) -> None:
                 cfg.loss.lambda_ans * loss_ans
                 + cfg.loss.lambda_sft * loss_sft
                 + cfg.loss.lambda_cf * loss_cf
+                + cfg.loss.lambda_dep * loss_dep
                 + cfg.loss.lambda_batch * loss_batch
                 + cfg.loss.lambda_consistency * loss_consistency
             )
@@ -331,6 +337,7 @@ def train(cfg: Config) -> None:
         log_sums["ans"] += float(loss_ans.detach().cpu())
         log_sums["sft"] += float(loss_sft.detach().cpu())
         log_sums["cf"] += float(loss_cf.detach().cpu())
+        log_sums["dep"] += float(loss_dep.detach().cpu())
         log_count += 1
 
         if p_student is not None:
@@ -350,6 +357,7 @@ def train(cfg: Config) -> None:
                 f"ans={log_sums['ans'] / denom:.4f} "
                 f"sft={log_sums['sft'] / denom:.4f} "
                 f"cf={log_sums['cf'] / denom:.4f} "
+                f"dep={log_sums['dep'] / denom:.4f} "
                 f"tau={g_tau:.4f} "
                 f"stage={current_stage} "
                 f"cf_bias_scale={current_bias_scale:.3f}"
@@ -363,6 +371,7 @@ def train(cfg: Config) -> None:
                 "ans": 0.0,
                 "sft": 0.0,
                 "cf": 0.0,
+                "dep": 0.0,
                 "eff_vocab": 0.0,
             }
             log_count = 0

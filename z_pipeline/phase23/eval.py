@@ -50,6 +50,8 @@ def evaluate(
         totals["sft"] = 0.0
     if cfg.loss.lambda_cf > 0:
         totals["cf"] = 0.0
+    if cfg.loss.lambda_dep > 0:
+        totals["dep"] = 0.0
     if cfg.loss.lambda_batch > 0:
         totals["batch"] = 0.0
     if cfg.loss.lambda_consistency > 0:
@@ -84,16 +86,20 @@ def evaluate(
                 loss_ans = ans_loss_fn(digit_logits, digit_labels)
                 loss_sft = sft_loss_fn(answer_next_logits)
 
-                if cfg.loss.lambda_cf > 0 and p_student is not None:
-                    loss_cf = cf_loss_fn(
+                if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+                    cf_terms = cf_loss_fn(
                         model=model,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         p_z=p_student,
                         k_vals=k_vals,
+                        return_details=True,
                     )
+                    loss_cf = cf_terms["loss_cf"]
+                    loss_dep = cf_terms["loss_dep"]
                 else:
                     loss_cf = torch.zeros((), device=device)
+                    loss_dep = torch.zeros((), device=device)
 
                 loss_batch = torch.zeros((), device=device)
                 loss_consistency = torch.zeros((), device=device)
@@ -102,6 +108,7 @@ def evaluate(
                     cfg.loss.lambda_ans * loss_ans
                     + cfg.loss.lambda_sft * loss_sft
                     + cfg.loss.lambda_cf * loss_cf
+                    + cfg.loss.lambda_dep * loss_dep
                     + cfg.loss.lambda_batch * loss_batch
                     + cfg.loss.lambda_consistency * loss_consistency
                 )
@@ -114,6 +121,8 @@ def evaluate(
                 totals["sft"] += float(loss_sft.detach().cpu()) * bsz
             if "cf" in totals:
                 totals["cf"] += float(loss_cf.detach().cpu()) * bsz
+            if "dep" in totals:
+                totals["dep"] += float(loss_dep.detach().cpu()) * bsz
             if "batch" in totals:
                 totals["batch"] += float(loss_batch.detach().cpu()) * bsz
             if "consistency" in totals:
