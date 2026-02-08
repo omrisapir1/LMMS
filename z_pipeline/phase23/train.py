@@ -231,6 +231,8 @@ def train(cfg: Config) -> None:
         "loss": 0.0,
         "ans": 0.0,
         "sft": 0.0,
+        "cf_gs": 0.0,
+        "cf_det": 0.0,
         "cf": 0.0,
         "dep": 0.0,
         "eff_vocab": 0.0,
@@ -250,13 +252,9 @@ def train(cfg: Config) -> None:
             optimizer = _build_optimizer(model, cfg, stage_name=stage_name)
             optimizer.zero_grad(set_to_none=True)
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(
-                f"stage_switch step={step} stage={stage_name} "
-                f"cf_bias_scale={cf_bias_scale:.3f} trainable={trainable}"
-            )
+
             current_stage = stage_name
         current_bias_scale = cf_bias_scale
-        print(f"step {step + 1} stage={current_stage} cf_bias_scale={current_bias_scale:.3f}")
 
         try:
             batch = next(train_iter)
@@ -298,7 +296,7 @@ def train(cfg: Config) -> None:
             loss_sft = sft_loss_fn(answer_next_logits)
 
             if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
-                cf_terms = cf_loss_fn(
+                cf_gs = cf_loss_fn(
                     model=model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -309,13 +307,33 @@ def train(cfg: Config) -> None:
                     apply_cf_answer_z_bias=(
                         cfg.train.cf_bias_apply_cf_path_only and current_bias_scale > 0.0
                     ),
+                    cf_mode="gs",
                     global_step=step + 1,
                     stage_name=current_stage,
                     return_details=True,
                 )
-                loss_cf = cf_terms["loss_cf"]
-                loss_dep = cf_terms["loss_dep"]
+                cf_det = cf_loss_fn(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    p_z=p_student,
+                    k_vals=k_vals,
+                    cf_bias_scale=0.0,
+                    cf_attention_bias_strength=0.0,
+                    apply_cf_answer_z_bias=False,
+                    cf_mode="det",
+                    global_step=step + 1,
+                    stage_name=current_stage,
+                    return_details=True,
+                )
+                loss_cf_gs = cf_gs["loss_cf"]
+                loss_cf_det = cf_det["loss_cf"]
+                loss_dep_gs = cf_gs["loss_dep"]
+                loss_cf = 0.5 * (loss_cf_gs + loss_cf_det)
+                loss_dep = loss_dep_gs
             else:
+                loss_cf_gs = torch.zeros((), device=device)
+                loss_cf_det = torch.zeros((), device=device)
                 loss_cf = torch.zeros((), device=device)
                 loss_dep = torch.zeros((), device=device)
 
@@ -336,6 +354,8 @@ def train(cfg: Config) -> None:
         log_sums["loss"] += float(total.detach().cpu())
         log_sums["ans"] += float(loss_ans.detach().cpu())
         log_sums["sft"] += float(loss_sft.detach().cpu())
+        log_sums["cf_gs"] += float(loss_cf_gs.detach().cpu())
+        log_sums["cf_det"] += float(loss_cf_det.detach().cpu())
         log_sums["cf"] += float(loss_cf.detach().cpu())
         log_sums["dep"] += float(loss_dep.detach().cpu())
         log_count += 1
@@ -356,6 +376,8 @@ def train(cfg: Config) -> None:
                 f"loss={log_sums['loss'] / denom:.4f} "
                 f"ans={log_sums['ans'] / denom:.4f} "
                 f"sft={log_sums['sft'] / denom:.4f} "
+                f"cf_gs={log_sums['cf_gs'] / denom:.4f} "
+                f"cf_det={log_sums['cf_det'] / denom:.4f} "
                 f"cf={log_sums['cf'] / denom:.4f} "
                 f"dep={log_sums['dep'] / denom:.4f} "
                 f"tau={g_tau:.4f} "
@@ -370,6 +392,8 @@ def train(cfg: Config) -> None:
                 "loss": 0.0,
                 "ans": 0.0,
                 "sft": 0.0,
+                "cf_gs": 0.0,
+                "cf_det": 0.0,
                 "cf": 0.0,
                 "dep": 0.0,
                 "eff_vocab": 0.0,
