@@ -173,17 +173,17 @@ class CounterfactualAnswerLoss(nn.Module):
             active_idx = p_z[b, :k].argmax(dim=-1)  # [k]
             prob = self.permute_prob.get(k, 0.0)
 
-            if k > 1 and torch.rand((), device=device, generator=gen) < prob:
-                perm = torch.randperm(k, device=device, generator=gen)
-                cf_idx = active_idx[perm]
-            else:
-                cf_idx = torch.randint(
-                    low=0,
-                    high=vocab,
-                    size=(k,),
-                    device=device,
-                    generator=gen,
-                )
+            # if k > 1 and torch.rand((), device=device, generator=gen) < prob:
+            #     perm = torch.randperm(k, device=device, generator=gen)
+            #     cf_idx = active_idx[perm]
+            # else:
+            cf_idx = torch.randint(
+                low=0,
+                high=vocab,
+                size=(k,),
+                device=device,
+                generator=gen,
+            )
             out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
 
         return out
