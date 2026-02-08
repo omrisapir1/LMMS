@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -341,31 +342,30 @@ class UnifiedZSoftModel(nn.Module):
         attention_mask: torch.Tensor,   # [B,T]
         cf_bias_scale: float,
         cf_attention_bias_strength: float,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Build only the additive bias tensor [B,1,T,T] for answer->Z-slot attention.
-        Causal/padding masking remains model-native.
+        Build compact additive bias [B,1,1,T] and answer query positions [B].
+        Bias is injected only at the answer query row inside attention hooks.
         """
         bsz, t = input_ids.shape
         device = input_ids.device
         valid = attention_mask.to(torch.bool)
-        bias = torch.zeros((bsz, 1, t, t), device=device, dtype=torch.float32)
+        bias = torch.zeros((bsz, 1, 1, t), device=device, dtype=torch.float32)
+        answer_pos = self._find_answer_pos(input_ids)  # [B]
 
         if cf_bias_scale <= 0.0 or cf_attention_bias_strength == 0.0:
-            return bias
+            return bias, answer_pos
 
-        answer_pos = self._find_answer_pos(input_ids)  # [B]
         # These are the sequence slots where latent Z embeddings are executed.
         z_slot_pos_mask = (input_ids == self.latent_token_id) & valid
         if not torch.all(z_slot_pos_mask.any(dim=1)):
             raise RuntimeError("CF bias expects latent slots to be present in input_ids.")
         bias_delta = float(cf_bias_scale) * float(cf_attention_bias_strength)
         for b in range(bsz):
-            q = int(answer_pos[b].item())
             key_mask = z_slot_pos_mask[b]
             if key_mask.any():
-                bias[b, 0, q, key_mask] += bias_delta
-        return bias
+                bias[b, 0, 0, key_mask] += bias_delta
+        return bias, answer_pos
 
     def _run_core_with_attention_score_bias(
         self,
@@ -374,6 +374,7 @@ class UnifiedZSoftModel(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
+        answer_pos: Optional[torch.Tensor] = None,
     ):
         core = self._core_model()
         if attn_bias is None:
@@ -389,15 +390,29 @@ class UnifiedZSoftModel(nn.Module):
         bias = attn_bias
         handles = []
         applied = {"ok": False}
+        modified_mask_ptrs = set()
 
         def _pre_hook(module, args, kwargs):
             am = kwargs.get("attention_mask", None)
             if isinstance(am, torch.Tensor) and am.dim() == 4:
                 local = bias.to(device=am.device, dtype=am.dtype)
-                q_len = am.size(-2)
                 k_len = am.size(-1)
-                if q_len == local.size(-2) and k_len == local.size(-1):
-                    kwargs["attention_mask"] = am + local
+                if local.size(-2) != 1 or k_len != local.size(-1):
+                    return args, kwargs
+                if answer_pos is None:
+                    raise RuntimeError("answer_pos must be provided when CF attention bias is enabled.")
+
+                ptr = am.data_ptr()
+                if ptr not in modified_mask_ptrs:
+                    q_len = am.size(-2)
+                    bsz = am.size(0)
+                    if answer_pos.numel() != bsz:
+                        raise RuntimeError("answer_pos batch size mismatch during CF bias injection.")
+                    for b in range(bsz):
+                        q = int(answer_pos[b].item())
+                        if 0 <= q < q_len:
+                            am[b, :, q, :] = am[b, :, q, :] + local[b, :, 0, :]
+                    modified_mask_ptrs.add(ptr)
                     applied["ok"] = True
             return args, kwargs
 
@@ -450,7 +465,7 @@ class UnifiedZSoftModel(nn.Module):
 
         p_student: Optional[torch.Tensor] = None
         if return_distributions:
-            p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=torch.float32)
+            p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
 
         z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
@@ -462,15 +477,36 @@ class UnifiedZSoftModel(nn.Module):
 
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
-                out_prefix = self._core_model()(
-                    inputs_embeds=inputs_embeds[bs, :p],
-                    attention_mask=attention_mask[bs, :p],
-                    position_ids=position_ids[bs, :p],
-                    use_cache=False,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                u = out_prefix.hidden_states[-1][:, p - 1]
+
+                def _prefix_last_hidden(
+                    emb: torch.Tensor,
+                    attn: torch.Tensor,
+                    pos: torch.Tensor,
+                ) -> torch.Tensor:
+                    out_prefix = self._core_model()(
+                        inputs_embeds=emb,
+                        attention_mask=attn,
+                        position_ids=pos,
+                        use_cache=False,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                    return out_prefix.last_hidden_state
+
+                prefix_emb = inputs_embeds[bs, :p]
+                prefix_attn = attention_mask[bs, :p]
+                prefix_pos = position_ids[bs, :p]
+                if self.training:
+                    hidden_prefix = activation_checkpoint(
+                        _prefix_last_hidden,
+                        prefix_emb,
+                        prefix_attn,
+                        prefix_pos,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_prefix = _prefix_last_hidden(prefix_emb, prefix_attn, prefix_pos)
+                u = hidden_prefix[:, p - 1]
 
                 s_logits = self._z_logits_from_hidden(u).to(torch.float32)
 
@@ -494,7 +530,7 @@ class UnifiedZSoftModel(nn.Module):
                 inputs_embeds[bs, p] = e_latent
 
                 if p_student is not None:
-                    p_student[bs, pass_idx] = p_slot
+                    p_student[bs, pass_idx] = p_slot.to(dtype=p_student.dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
@@ -523,7 +559,8 @@ class UnifiedZSoftModel(nn.Module):
         *,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        p_z: torch.Tensor,  # [B,Kmax,Vz]
+        p_z: Optional[torch.Tensor] = None,  # [B,Kmax,Vz]
+        p_z_idx: Optional[torch.Tensor] = None,  # [B,Kmax]
         cf_bias_scale: float = 0.0,
         apply_cf_answer_z_bias: bool = False,
         cf_attention_bias_strength: float = 0.0,
@@ -536,19 +573,31 @@ class UnifiedZSoftModel(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        if p_z.dim() != 3:
-            raise RuntimeError("p_z must have shape [B,Kmax,Vz]")
+        if p_z is None and p_z_idx is None:
+            raise RuntimeError("One of p_z or p_z_idx must be provided.")
+        if p_z is not None and p_z_idx is not None:
+            raise RuntimeError("Provide only one of p_z or p_z_idx, not both.")
 
         position_ids = self._build_position_ids(attention_mask)
         inputs_embeds = self._embedding(input_ids)
 
         latent_lists, kmax = self._latent_lists(input_ids)
-        if p_z.size(0) != input_ids.size(0):
-            raise RuntimeError("p_z batch dimension must match input_ids")
-        if p_z.size(1) < kmax:
-            raise RuntimeError("p_z slot dimension is smaller than required latent slots")
-        if p_z.size(2) != len(self.z_token_ids):
-            raise RuntimeError("p_z last dimension must equal len(z_token_ids)")
+        if p_z is not None:
+            if p_z.dim() != 3:
+                raise RuntimeError("p_z must have shape [B,Kmax,Vz]")
+            if p_z.size(0) != input_ids.size(0):
+                raise RuntimeError("p_z batch dimension must match input_ids")
+            if p_z.size(1) < kmax:
+                raise RuntimeError("p_z slot dimension is smaller than required latent slots")
+            if p_z.size(2) != len(self.z_token_ids):
+                raise RuntimeError("p_z last dimension must equal len(z_token_ids)")
+        if p_z_idx is not None:
+            if p_z_idx.dim() != 2:
+                raise RuntimeError("p_z_idx must have shape [B,Kmax]")
+            if p_z_idx.size(0) != input_ids.size(0):
+                raise RuntimeError("p_z_idx batch dimension must match input_ids")
+            if p_z_idx.size(1) < kmax:
+                raise RuntimeError("p_z_idx slot dimension is smaller than required latent slots")
 
         z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
@@ -558,11 +607,15 @@ class UnifiedZSoftModel(nn.Module):
                 continue
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
-                slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
-                inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
+                if p_z_idx is not None:
+                    slot_idx = p_z_idx[bs, pass_idx].to(dtype=torch.long)
+                    inputs_embeds[bs, p] = z_emb.index_select(0, slot_idx).to(inputs_embeds.dtype)
+                else:
+                    slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
+                    inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
 
         if apply_cf_answer_z_bias and cf_bias_scale > 0.0:
-            attn_bias = self._build_additive_causal_mask_with_answer_z_bias(
+            attn_bias, answer_pos = self._build_additive_causal_mask_with_answer_z_bias(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 cf_bias_scale=float(cf_bias_scale),
@@ -573,6 +626,7 @@ class UnifiedZSoftModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 attn_bias=attn_bias,
+                answer_pos=answer_pos,
             )
         else:
             out_final = self._run_core_with_attention_score_bias(
@@ -580,6 +634,7 @@ class UnifiedZSoftModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 attn_bias=None,
+                answer_pos=None,
             )
         hidden_last = out_final.hidden_states[-1]
         h_answer = self._answer_hidden_from_hidden(hidden_last, input_ids)

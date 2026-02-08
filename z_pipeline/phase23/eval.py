@@ -87,11 +87,13 @@ def evaluate(
                 loss_sft = sft_loss_fn(answer_next_logits)
 
                 if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+                    p_student_det_idx = p_student.detach().argmax(dim=-1)
                     cf_terms = cf_loss_fn(
                         model=model,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        p_z=p_student,
+                        p_z=None,
+                        p_z_idx_det=p_student_det_idx,
                         k_vals=k_vals,
                         cf_bias_scale=0.0,
                         cf_attention_bias_strength=0.0,

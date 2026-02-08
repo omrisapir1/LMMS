@@ -158,6 +158,12 @@ class CounterfactualAnswerLoss(nn.Module):
         idx = p_z.argmax(dim=-1)
         return F.one_hot(idx, num_classes=vocab).to(dtype=p_z.dtype)
 
+    def _deterministic_z_idx(
+        self,
+        p_z: torch.Tensor,  # [B,Kmax,V]
+    ) -> torch.Tensor:
+        return p_z.argmax(dim=-1)
+
     def _build_counterfactual_pz(
         self,
         p_z: torch.Tensor,      # [B,Kmax,V]
@@ -218,13 +224,52 @@ class CounterfactualAnswerLoss(nn.Module):
 
         return out
 
+    def _build_counterfactual_z_idx(
+        self,
+        z_idx: torch.Tensor,    # [B,Kmax]
+        k_vals: torch.Tensor,   # [B]
+        vocab_size: int,
+    ) -> torch.Tensor:
+        bsz, kmax = z_idx.shape
+        device = z_idx.device
+        out = z_idx.clone()
+
+        gen = torch.Generator(device=device)
+        if self.seed is not None:
+            gen.manual_seed(int(self.seed))
+
+        for b in range(bsz):
+            k = int(k_vals[b].item())
+            if k <= 0:
+                continue
+            if k > kmax:
+                raise RuntimeError(f"k_vals[{b}]={k} exceeds z_idx slots={kmax}")
+
+            prob = self.permute_prob.get(k, 0.0)
+            do_permute = (k > 1 and torch.rand((), device=device, generator=gen) < prob)
+            if do_permute:
+                perm = torch.randperm(k, device=device, generator=gen)
+                out[b, :k] = z_idx[b, :k][perm]
+            else:
+                if vocab_size <= 0:
+                    raise RuntimeError("Cannot sample deterministic CF indices: empty latent vocabulary.")
+                out[b, :k] = torch.randint(
+                    low=0,
+                    high=vocab_size,
+                    size=(k,),
+                    device=device,
+                    generator=gen,
+                )
+        return out
+
     def forward(
             self,
             *,
             model,
             input_ids: torch.Tensor,
             attention_mask: torch.Tensor,
-            p_z: torch.Tensor,
+            p_z: Optional[torch.Tensor] = None,
+            p_z_idx_det: Optional[torch.Tensor] = None,
             k_vals: torch.Tensor,
             cf_bias_scale: float = 0.0,
             cf_attention_bias_strength: float = 0.0,
@@ -239,25 +284,43 @@ class CounterfactualAnswerLoss(nn.Module):
         is_det = (cf_mode == "det")
 
         if is_det:
-            p_ref_z = self._deterministic_pz(p_z)
+            if p_z_idx_det is None:
+                if p_z is None:
+                    raise ValueError("DET mode requires p_z_idx_det or p_z.")
+                p_ref_idx = self._deterministic_z_idx(p_z)
+            else:
+                p_ref_idx = p_z_idx_det
             cf_bias_scale = 0.0
             apply_cf_answer_z_bias = False
         else:
+            if p_z is None:
+                raise ValueError("GS mode requires p_z.")
             p_ref_z = p_z
 
         # ----------------------------
         # Reference
         # ----------------------------
         with torch.no_grad():
-            ref_out = model.forward_with_fixed_z_distributions(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                p_z=p_ref_z.detach(),
-                cf_bias_scale=0.0,
-                apply_cf_answer_z_bias=False,
-                cf_attention_bias_strength=0.0,
-                return_answer_hidden=True,
-            )
+            if is_det:
+                ref_out = model.forward_with_fixed_z_distributions(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    p_z_idx=p_ref_idx.detach(),
+                    cf_bias_scale=0.0,
+                    apply_cf_answer_z_bias=False,
+                    cf_attention_bias_strength=0.0,
+                    return_answer_hidden=True,
+                )
+            else:
+                ref_out = model.forward_with_fixed_z_distributions(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    p_z=p_ref_z.detach(),
+                    cf_bias_scale=0.0,
+                    apply_cf_answer_z_bias=False,
+                    cf_attention_bias_strength=0.0,
+                    return_answer_hidden=True,
+                )
         digit_logits_ref_det = ref_out["digit_logits"]
         h_ans_ref = ref_out["h_answer"]
         p_ref = safe_softmax(
@@ -267,16 +330,33 @@ class CounterfactualAnswerLoss(nn.Module):
         # ----------------------------
         # Counterfactual
         # ----------------------------
-        p_cf_z = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
-        cf_out = model.forward_with_fixed_z_distributions(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            p_z=p_cf_z,
-            cf_bias_scale=float(cf_bias_scale),
-            apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
-            cf_attention_bias_strength=float(cf_attention_bias_strength),
-            return_answer_hidden=True,
-        )
+        if is_det:
+            p_cf_idx = self._build_counterfactual_z_idx(
+                p_ref_idx,
+                k_vals,
+                vocab_size=len(model.z_token_ids),
+            )
+            with torch.no_grad():
+                cf_out = model.forward_with_fixed_z_distributions(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    p_z_idx=p_cf_idx,
+                    cf_bias_scale=0.0,
+                    apply_cf_answer_z_bias=False,
+                    cf_attention_bias_strength=0.0,
+                    return_answer_hidden=True,
+                )
+        else:
+            p_cf_z = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
+            cf_out = model.forward_with_fixed_z_distributions(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                p_z=p_cf_z,
+                cf_bias_scale=float(cf_bias_scale),
+                apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
+                cf_attention_bias_strength=float(cf_attention_bias_strength),
+                return_answer_hidden=True,
+            )
         digit_logits_cf = cf_out["digit_logits"]
         h_ans_cf = cf_out["h_answer"]
         p_cf = safe_softmax(
