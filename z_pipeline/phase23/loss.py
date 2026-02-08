@@ -300,27 +300,27 @@ class CounterfactualAnswerLoss(nn.Module):
         # ----------------------------
         # Reference
         # ----------------------------
-        with torch.no_grad():
-            if is_det:
-                ref_out = model.forward_with_fixed_z_distributions(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    p_z_idx=p_ref_idx.detach(),
-                    cf_bias_scale=0.0,
-                    apply_cf_answer_z_bias=False,
-                    cf_attention_bias_strength=0.0,
-                    return_answer_hidden=True,
-                )
-            else:
-                ref_out = model.forward_with_fixed_z_distributions(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    p_z=p_ref_z.detach(),
-                    cf_bias_scale=0.0,
-                    apply_cf_answer_z_bias=False,
-                    cf_attention_bias_strength=0.0,
-                    return_answer_hidden=True,
-                )
+
+        if is_det:
+            ref_out = model.forward_with_fixed_z_distributions(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                p_z_idx=p_ref_idx.detach(),
+                cf_bias_scale=0.0,
+                apply_cf_answer_z_bias=False,
+                cf_attention_bias_strength=0.0,
+                return_answer_hidden=True,
+            )
+        else:
+            ref_out = model.forward_with_fixed_z_distributions(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                p_z=p_ref_z.detach(),
+                cf_bias_scale=0.0,
+                apply_cf_answer_z_bias=False,
+                cf_attention_bias_strength=0.0,
+                return_answer_hidden=True,
+            )
         digit_logits_ref_det = ref_out["digit_logits"]
         h_ans_ref = ref_out["h_answer"]
         p_ref = safe_softmax(
@@ -336,16 +336,16 @@ class CounterfactualAnswerLoss(nn.Module):
                 k_vals,
                 vocab_size=len(model.z_token_ids),
             )
-            with torch.no_grad():
-                cf_out = model.forward_with_fixed_z_distributions(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    p_z_idx=p_cf_idx,
-                    cf_bias_scale=0.0,
-                    apply_cf_answer_z_bias=False,
-                    cf_attention_bias_strength=0.0,
-                    return_answer_hidden=True,
-                )
+
+            cf_out = model.forward_with_fixed_z_distributions(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                p_z_idx=p_cf_idx,
+                cf_bias_scale=0.0,
+                apply_cf_answer_z_bias=False,
+                cf_attention_bias_strength=0.0,
+                return_answer_hidden=True,
+            )
         else:
             p_cf_z = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
             cf_out = model.forward_with_fixed_z_distributions(
