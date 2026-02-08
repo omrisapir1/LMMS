@@ -33,7 +33,7 @@ class DataConfig:
     data_path: Optional[str] = None
 
     max_length: Optional[int] = None
-    batch_size: int = 8
+    batch_size: int = 32
     rebalance_train: bool = True
     k_max: int = 20
 
