@@ -319,10 +319,13 @@ class UnifiedZSoftModel(nn.Module):
         return self.base.get_input_embeddings().weight[self.z_token_ids]
 
     def _digit_logits_from_hidden(self, hidden_last: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        h_answer = self._answer_hidden_from_hidden(hidden_last, input_ids)
+        return torch.stack([head(h_answer) for head in self.digit_heads], dim=1)
+
+    def _answer_hidden_from_hidden(self, hidden_last: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         answer_pos = self._find_answer_pos(input_ids)
         bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
-        h_answer = hidden_last[bidx, answer_pos]
-        return torch.stack([head(h_answer) for head in self.digit_heads], dim=1)
+        return hidden_last[bidx, answer_pos]
 
     def _answer_next_logits_from_hidden(self, hidden_last: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         answer_pos = self._find_answer_pos(input_ids)
@@ -524,9 +527,11 @@ class UnifiedZSoftModel(nn.Module):
         cf_bias_scale: float = 0.0,
         apply_cf_answer_z_bias: bool = False,
         cf_attention_bias_strength: float = 0.0,
-    ) -> torch.Tensor:
+        return_answer_hidden: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Inject fixed per-slot Z mixtures (no GS sampling) and return digit logits [B,5,10].
+        Inject fixed per-slot Z mixtures (no GS sampling).
+        Returns digit logits [B,5,10], and optionally <ANSWER> hidden state [B,H].
         """
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -577,7 +582,14 @@ class UnifiedZSoftModel(nn.Module):
                 attn_bias=None,
             )
         hidden_last = out_final.hidden_states[-1]
-        return self._digit_logits_from_hidden(hidden_last, input_ids)
+        h_answer = self._answer_hidden_from_hidden(hidden_last, input_ids)
+        digit_logits = torch.stack([head(h_answer) for head in self.digit_heads], dim=1)
+        if return_answer_hidden:
+            return {
+                "digit_logits": digit_logits,
+                "h_answer": h_answer,
+            }
+        return digit_logits
 
     @torch.no_grad()
     def generate(
