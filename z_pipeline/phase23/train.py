@@ -156,6 +156,7 @@ def train(cfg: Config) -> None:
     )
     tokenizer = bundle.tokenizer
     model = bundle.model
+    model.base.gradient_checkpointing_enable()
     model.train()
 
     train_ds = UnifiedDataset(
@@ -315,22 +316,22 @@ def train(cfg: Config) -> None:
                     stage_name=current_stage,
                     return_details=True,
                 )
-                with torch.no_grad():
-                    cf_det = cf_loss_fn(
-                        model=model,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        p_z=None,
-                        p_z_idx_det=p_student_det_idx,
-                        k_vals=k_vals,
-                        cf_bias_scale=0.0,
-                        cf_attention_bias_strength=0.0,
-                        apply_cf_answer_z_bias=False,
-                        cf_mode="det",
-                        global_step=step + 1,
-                        stage_name=current_stage,
-                        return_details=True,
-                    )
+
+                cf_det = cf_loss_fn(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    p_z=None,
+                    p_z_idx_det=p_student_det_idx,
+                    k_vals=k_vals,
+                    cf_bias_scale=0.0,
+                    cf_attention_bias_strength=0.0,
+                    apply_cf_answer_z_bias=False,
+                    cf_mode="det",
+                    global_step=step + 1,
+                    stage_name=current_stage,
+                    return_details=True,
+                )
                 loss_cf_gs = cf_gs["loss_cf"]
                 loss_cf_det = cf_det["loss_cf"]
                 loss_dep_gs = cf_gs["loss_dep"]
