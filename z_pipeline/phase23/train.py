@@ -329,7 +329,8 @@ def train(cfg: Config) -> None:
                 loss_cf_gs = cf_gs["loss_cf"]
                 loss_cf_det = cf_det["loss_cf"]
                 loss_dep_gs = cf_gs["loss_dep"]
-                loss_cf = 0.5 * (loss_cf_gs + loss_cf_det)
+                # loss_cf = 0.5 * (loss_cf_gs + loss_cf_det)
+                loss_cf = 0.2 * loss_cf_gs + 0.8 *loss_cf_det
                 loss_dep = loss_dep_gs
             else:
                 loss_cf_gs = torch.zeros((), device=device)
