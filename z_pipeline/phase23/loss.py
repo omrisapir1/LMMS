@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Sequence, Union
+import math
 
 import torch
 import torch.nn as nn
