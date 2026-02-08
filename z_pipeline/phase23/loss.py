@@ -134,95 +134,91 @@ def js_divergence(
     kl_qm = (q * (q.log() - m.log())).sum(dim=-1)
     return 0.5 * (kl_pm + kl_qm)
 
+import math
 
-class CounterfactualAnswerLoss(nn.Module):
-    def __init__(
-        self,
-        *,
-        permute_prob: Dict[int, float],
-        digit_temperature: float = 1.0,
-        seed: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.permute_prob = {int(k): float(v) for k, v in permute_prob.items()}
-        self.digit_temperature = float(digit_temperature)
-        self.seed = seed
+def forward(
+    self,
+    *,
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    p_z: torch.Tensor,
+    k_vals: torch.Tensor,
+) -> torch.Tensor:
+    # ----------------------------
+    # Reference
+    # ----------------------------
+    digit_logits_ref_det = model.forward_with_fixed_z_distributions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        p_z=p_z.detach(),
+    )
+    p_ref = safe_softmax(
+        digit_logits_ref_det, tau=self.digit_temperature, dim=-1
+    ).detach()  # [B,5,10]
 
-    def _build_counterfactual_pz(
-        self,
-        p_z: torch.Tensor,      # [B,Kmax,V]
-        k_vals: torch.Tensor,   # [B]
-    ) -> torch.Tensor:
-        bsz, kmax, vocab = p_z.shape
-        device = p_z.device
-        out = p_z.clone()
+    # ----------------------------
+    # Counterfactual
+    # ----------------------------
+    p_cf_z = self._build_counterfactual_pz(p_z, k_vals)
+    digit_logits_cf = model.forward_with_fixed_z_distributions(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        p_z=p_cf_z,
+    )
+    p_cf = safe_softmax(
+        digit_logits_cf, tau=self.digit_temperature, dim=-1
+    )  # [B,5,10]
 
-        gen = torch.Generator(device=device)
-        if self.seed is not None:
-            gen.manual_seed(int(self.seed))
+    # ----------------------------
+    # Diagnostics (all detached)
+    # ----------------------------
+    with torch.no_grad():
+        # 1) Logit movement
+        mean_abs_logit_diff = (
+            digit_logits_ref_det.detach()
+            - digit_logits_cf.detach()
+        ).abs().mean().item()
 
-        for b in range(bsz):
-            k = int(k_vals[b].item())
-            if k <= 0:
-                continue
-            if k > kmax:
-                raise RuntimeError(f"k_vals[{b}]={k} exceeds p_z slots={kmax}")
-
-            # Counterfactual operates on discrete latent actions (slot-wise argmax indices).
-            active_idx = p_z[b, :k].argmax(dim=-1)  # [k]
-            prob = self.permute_prob.get(k, 0.0)
-
-            if k > 1 and torch.rand((), device=device, generator=gen) < prob:
-                perm = torch.randperm(k, device=device, generator=gen)
-                cf_idx = active_idx[perm]
-            else:
-                cf_idx = torch.randint(
-                    low=0,
-                    high=vocab,
-                    size=(k,),
-                    device=device,
-                    generator=gen,
-                )
-            out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
-
-        return out
-
-    def forward(
-        self,
-        *,
-        model,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        p_z: torch.Tensor,
-        k_vals: torch.Tensor,
-    ) -> torch.Tensor:
-        # Reference path is deterministic and must not apply extra gumbel noise.
-        digit_logits_ref_det = model.forward_with_fixed_z_distributions(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            p_z=p_z.detach(),
-        )
-        p_ref = safe_softmax(digit_logits_ref_det, tau=self.digit_temperature, dim=-1).detach()
-
-        p_cf_z = self._build_counterfactual_pz(p_z, k_vals)
-        digit_logits_cf = model.forward_with_fixed_z_distributions(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            p_z=p_cf_z,
-        )
-        p_cf = safe_softmax(digit_logits_cf, tau=self.digit_temperature, dim=-1)
-        mean_abs_logit_diff = (digit_logits_ref_det.detach() - digit_logits_cf.detach()).abs().mean().item()
-        # also useful: argmax disagreement rate across all digits
+        # 2) Argmax disagreement
         ref_arg = digit_logits_ref_det.detach().argmax(dim=-1)  # [B,5]
-        cf_arg = digit_logits_cf.detach().argmax(dim=-1)  # [B,5]
+        cf_arg  = digit_logits_cf.detach().argmax(dim=-1)       # [B,5]
         disagree = (ref_arg != cf_arg).float().mean().item()
+
+        # 3) JS itself
+        js_val = js_divergence(p_ref, p_cf).mean().item()
+
+        # 4) Confidence (max prob)
+        conf_ref = p_ref.max(dim=-1).values.mean().item()
+        conf_cf  = p_cf.detach().max(dim=-1).values.mean().item()
+
+        # 5) Margin (top1 - top2)
+        ref_top2 = p_ref.topk(2, dim=-1).values
+        cf_top2  = p_cf.detach().topk(2, dim=-1).values
+        margin_ref = (ref_top2[..., 0] - ref_top2[..., 1]).mean().item()
+        margin_cf  = (cf_top2[..., 0]  - cf_top2[..., 1]).mean().item()
+
+        # 6) Entropy
+        ent_ref = -(p_ref * (p_ref + 1e-9).log()).sum(dim=-1).mean().item()
+        ent_cf  = -(p_cf.detach() * (p_cf.detach() + 1e-9).log()).sum(dim=-1).mean().item()
+
         print(
-            f"[cf_loss] |logit_diff|={mean_abs_logit_diff:.6f} "
-            f"disagree={disagree:.3f} tau={self.digit_temperature:.3f}"
+            "[cf_loss] "
+            f"|Δlogits|={mean_abs_logit_diff:.4f} | "
+            f"JS={js_val:.4f} | "
+            f"flip={disagree:.3f} | "
+            f"conf_ref={conf_ref:.3f} conf_cf={conf_cf:.3f} | "
+            f"margin_ref={margin_ref:.3f} margin_cf={margin_cf:.3f} | "
+            f"H_ref={ent_ref:.3f} H_cf={ent_cf:.3f} | "
+            f"tau={self.digit_temperature:.2f}"
         )
-        js = js_divergence(p_ref, p_cf).mean()
-        # Negative because we want to maximize divergence.
-        return 1 -js
+
+    # ----------------------------
+    # Loss
+    # ----------------------------
+    js = js_divergence(p_ref, p_cf).mean()
+    return math.log(2) - js
+
 
 
 def usage_shaping_loss_stub(*, device: torch.device) -> torch.Tensor:
