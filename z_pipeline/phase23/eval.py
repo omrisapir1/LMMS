@@ -93,6 +93,10 @@ def evaluate(
                         attention_mask=attention_mask,
                         p_z=p_student,
                         k_vals=k_vals,
+                        cf_bias_scale=0.0,
+                        cf_attention_bias_strength=0.0,
+                        apply_cf_answer_z_bias=False,
+                        cf_mode="det",
                         return_details=True,
                     )
                     loss_cf = cf_terms["loss_cf"]

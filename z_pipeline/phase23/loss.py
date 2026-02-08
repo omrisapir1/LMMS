@@ -150,14 +150,30 @@ class CounterfactualAnswerLoss(nn.Module):
         self.seed = seed
         self.debug_every = int(debug_every)
 
+    def _deterministic_pz(
+        self,
+        p_z: torch.Tensor,  # [B,Kmax,V]
+    ) -> torch.Tensor:
+        vocab = p_z.size(-1)
+        idx = p_z.argmax(dim=-1)
+        return F.one_hot(idx, num_classes=vocab).to(dtype=p_z.dtype)
+
     def _build_counterfactual_pz(
         self,
         p_z: torch.Tensor,      # [B,Kmax,V]
         k_vals: torch.Tensor,   # [B]
+        cf_mode: str,
     ) -> torch.Tensor:
         bsz, kmax, vocab = p_z.shape
         device = p_z.device
-        out = p_z.clone()
+        if cf_mode == "det":
+            base = self._deterministic_pz(p_z)
+        elif cf_mode == "gs":
+            base = p_z
+        else:
+            raise ValueError(f"Unknown cf_mode: {cf_mode}")
+
+        out = base.clone()
 
         gen = torch.Generator(device=device)
         if self.seed is not None:
@@ -170,22 +186,35 @@ class CounterfactualAnswerLoss(nn.Module):
             if k > kmax:
                 raise RuntimeError(f"k_vals[{b}]={k} exceeds p_z slots={kmax}")
 
-            # Counterfactual operates on discrete latent actions (slot-wise argmax indices).
-            active_idx = p_z[b, :k].argmax(dim=-1)  # [k]
             prob = self.permute_prob.get(k, 0.0)
 
-            if k > 1 and torch.rand((), device=device, generator=gen) < prob:
+            do_permute = (k > 1 and torch.rand((), device=device, generator=gen) < prob)
+            if do_permute:
                 perm = torch.randperm(k, device=device, generator=gen)
-                cf_idx = active_idx[perm]
+                if cf_mode == "det":
+                    active_idx = base[b, :k].argmax(dim=-1)
+                    cf_idx = active_idx[perm]
+                    out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
+                else:
+                    out[b, :k] = base[b, :k][perm]
             else:
-                cf_idx = torch.randint(
-                    low=0,
-                    high=vocab,
-                    size=(k,),
-                    device=device,
-                    generator=gen,
-                )
-            out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
+                if cf_mode == "det":
+                    cf_idx = torch.randint(
+                        low=0,
+                        high=vocab,
+                        size=(k,),
+                        device=device,
+                        generator=gen,
+                    )
+                    out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
+                else:
+                    # Structure-preserving GS perturbation:
+                    # temperature-warp current policy distributions (no fresh random simplex samples).
+                    active = base[b, :k].clamp_min(1e-8)
+                    tau = torch.empty((k, 1), device=device, dtype=active.dtype)
+                    tau.uniform_(0.7, 1.6, generator=gen)
+                    warped = torch.softmax(active.log() / tau, dim=-1)
+                    out[b, :k] = warped.to(dtype=p_z.dtype)
 
         return out
 
@@ -200,10 +229,22 @@ class CounterfactualAnswerLoss(nn.Module):
             cf_bias_scale: float = 0.0,
             cf_attention_bias_strength: float = 0.0,
             apply_cf_answer_z_bias: bool = False,
+            cf_mode: str = "gs",
             global_step: Optional[int] = None,
             stage_name: str = "main",
             return_details: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        if cf_mode not in {"gs", "det"}:
+            raise ValueError("cf_mode must be one of {'gs','det'}")
+        is_det = (cf_mode == "det")
+
+        if is_det:
+            p_ref_z = self._deterministic_pz(p_z)
+            cf_bias_scale = 0.0
+            apply_cf_answer_z_bias = False
+        else:
+            p_ref_z = p_z
+
         # ----------------------------
         # Reference
         # ----------------------------
@@ -211,7 +252,7 @@ class CounterfactualAnswerLoss(nn.Module):
             ref_out = model.forward_with_fixed_z_distributions(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                p_z=p_z.detach(),
+                p_z=p_ref_z.detach(),
                 cf_bias_scale=0.0,
                 apply_cf_answer_z_bias=False,
                 cf_attention_bias_strength=0.0,
@@ -226,7 +267,7 @@ class CounterfactualAnswerLoss(nn.Module):
         # ----------------------------
         # Counterfactual
         # ----------------------------
-        p_cf_z = self._build_counterfactual_pz(p_z, k_vals)
+        p_cf_z = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
         cf_out = model.forward_with_fixed_z_distributions(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -251,9 +292,13 @@ class CounterfactualAnswerLoss(nn.Module):
         ref_norm = F.normalize(h_ans_ref.detach().float(), p=2, dim=-1)
         cf_norm = F.normalize(h_ans_cf.float(), p=2, dim=-1)
         cos_sim = (ref_norm * cf_norm).sum(dim=-1).mean()
-        # Minimize cosine similarity to enforce answer-state dependence on latent Z.
-        # (equivalent up to constant shift: cos_sim - 1.0)
-        loss_dep = cos_sim - 1.0
+        # Use dependence loss only for GS-mode objective to avoid fighting deterministic CF.
+        if cf_mode == "gs":
+            # Minimize cosine similarity to enforce answer-state dependence on latent Z.
+            # (equivalent up to constant shift: cos_sim - 1.0)
+            loss_dep = cos_sim - 1.0
+        else:
+            loss_dep = torch.zeros((), device=cos_sim.device, dtype=cos_sim.dtype)
         dep_norm = (h_ans_ref.detach().float() - h_ans_cf.float()).norm(dim=-1).mean()
 
         if self.debug_every > 0 and global_step is not None and (int(global_step) % self.debug_every == 0):
@@ -276,7 +321,7 @@ class CounterfactualAnswerLoss(nn.Module):
                 h_cf = (-(p_cf.clamp_min(1e-8) * p_cf.clamp_min(1e-8).log()).sum(dim=-1)).mean()
 
                 print(
-                    f"cf_debug step={int(global_step)} stage={stage_name} "
+                    f"cf_debug step={int(global_step)} stage={stage_name} mode={cf_mode} "
                     f"bias_scale={float(cf_bias_scale):.3f} "
                     f"|dlogits|={float(delta_logits):.4f} "
                     f"JS={float(js):.4f} "
