@@ -79,12 +79,12 @@ class TrainConfig:
     grad_accum: int = 1
 
     print_every: int = 5
-    eval_every: int = 100
+    eval_every: int = 50
     save_every: int = 500
     cf_debug_every: int = 0
 
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
-    cf_warmup_steps: int = 400
+    cf_warmup_steps: int = 150
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
     cf_bias_anneal_steps: int = 1000
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
