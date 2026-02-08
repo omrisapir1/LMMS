@@ -80,6 +80,16 @@ class TrainConfig:
     print_every: int = 5
     eval_every: int = 100
     save_every: int = 500
+    cf_debug_every: int = 0
+
+    # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
+    cf_warmup_steps: int = 400
+    # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
+    cf_bias_anneal_steps: int = 1000
+    # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
+    cf_attention_bias_strength: float = 2.0
+    cf_attention_bias_enabled: bool = True
+    cf_bias_apply_cf_path_only: bool = True
 
     seed: int = 42
     output_dir: str = "./runs/phase23_gs"

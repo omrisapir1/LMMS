@@ -4,7 +4,7 @@ import json
 import os
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -38,11 +38,110 @@ def _save_checkpoint(
         json.dump(asdict(config), f, indent=2)
 
 
+def _cf_stage_and_bias_scale(step: int, cfg: Config) -> Tuple[str, float]:
+    warmup = max(0, int(cfg.train.cf_warmup_steps))
+    anneal = max(0, int(cfg.train.cf_bias_anneal_steps))
+
+    if step < warmup:
+        stage = "warmup_frozen"
+        scale = 1.0
+    elif step < warmup + anneal and anneal > 0:
+        stage = "anneal_unfrozen"
+        progress = float(step - warmup) / float(max(anneal, 1))
+        scale = max(0.0, 1.0 - progress)
+    else:
+        stage = "main"
+        scale = 0.0
+
+    if not cfg.train.cf_attention_bias_enabled:
+        scale = 0.0
+    return stage, float(scale)
+
+
+def _build_optimizer(
+    model: UnifiedZSoftModel,
+    cfg: Config,
+    stage_name: str,
+) -> torch.optim.Optimizer:
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters found for optimizer.")
+    if stage_name != "warmup_frozen":
+        return torch.optim.AdamW(
+            params,
+            lr=cfg.train.lr,
+            weight_decay=cfg.train.weight_decay,
+        )
+
+    emb_weight = model.base.get_input_embeddings().weight
+    emb_params = []
+    other_params = []
+    for p in params:
+        if p is emb_weight:
+            emb_params.append(p)
+        else:
+            other_params.append(p)
+
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "weight_decay": cfg.train.weight_decay})
+    if emb_params:
+        # Keep non-Z rows fully stable; row updates are controlled only by grad mask.
+        param_groups.append({"params": emb_params, "weight_decay": 0.0})
+
+    return torch.optim.AdamW(
+        param_groups,
+        lr=cfg.train.lr,
+    )
+
+
+def _configure_stage_trainability(
+    *,
+    model: UnifiedZSoftModel,
+    stage_name: str,
+    embed_grad_hook: Optional[torch.utils.hooks.RemovableHandle],
+) -> Optional[torch.utils.hooks.RemovableHandle]:
+    # Remove previous embedding grad mask hook before changing stage.
+    if embed_grad_hook is not None:
+        embed_grad_hook.remove()
+        embed_grad_hook = None
+
+    if stage_name == "warmup_frozen":
+        # Freeze everything first.
+        for p in model.parameters():
+            p.requires_grad = False
+
+        # Unfreeze LM head.
+        lm_head = model._get_lm_head()
+        for p in lm_head.parameters():
+            p.requires_grad = True
+
+        # Unfreeze embedding matrix but allow gradients only for Z rows.
+        emb_weight = model.base.get_input_embeddings().weight
+        emb_weight.requires_grad = True
+        z_ids = torch.tensor(model.z_token_ids, device=emb_weight.device, dtype=torch.long)
+        z_mask = torch.zeros(emb_weight.size(0), device=emb_weight.device, dtype=emb_weight.dtype)
+        z_mask[z_ids] = 1.0
+
+        def _mask_non_z_rows(grad: torch.Tensor) -> torch.Tensor:
+            return grad * z_mask.unsqueeze(1).to(grad.dtype)
+
+        embed_grad_hook = emb_weight.register_hook(_mask_non_z_rows)
+    else:
+        # Stages B/C: full model trainable.
+        for p in model.parameters():
+            p.requires_grad = True
+
+    return embed_grad_hook
+
+
 def train(cfg: Config) -> None:
     set_seed(cfg.train.seed)
 
     if cfg.loss.lambda_sft <= 0:
         raise ValueError("Phase23 requires AnswerTokenSFTLoss: set loss.lambda_sft > 0")
+    if not cfg.train.cf_bias_apply_cf_path_only:
+        raise ValueError("This training plan requires cf_bias_apply_cf_path_only=True")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -114,21 +213,19 @@ def train(cfg: Config) -> None:
             drop_last=False,
         )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.train.lr,
-        weight_decay=cfg.train.weight_decay,
-    )
-
     ans_loss_fn = AnswerDigitLoss(keep_prob=cfg.loss.keep_prob)
     sft_loss_fn = AnswerTokenSFTLoss(answer_token_id=model.answer_token_id)
     cf_loss_fn = CounterfactualAnswerLoss(
         permute_prob=cfg.loss.counterfactual_schedule,
         digit_temperature=cfg.loss.digit_temperature,
+        debug_every=cfg.train.cf_debug_every,
     )
 
     step = 0
-    optimizer.zero_grad(set_to_none=True)
+    current_stage = ""
+    current_bias_scale = 0.0
+    embed_grad_hook: Optional[torch.utils.hooks.RemovableHandle] = None
+    optimizer: Optional[torch.optim.Optimizer] = None
 
     log_sums: Dict[str, float] = {
         "loss": 0.0,
@@ -142,6 +239,24 @@ def train(cfg: Config) -> None:
 
     train_iter = iter(train_loader)
     while step < cfg.train.steps:
+        stage_name, cf_bias_scale = _cf_stage_and_bias_scale(step, cfg)
+        if stage_name != current_stage:
+            embed_grad_hook = _configure_stage_trainability(
+                model=model,
+                stage_name=stage_name,
+                embed_grad_hook=embed_grad_hook,
+            )
+            optimizer = _build_optimizer(model, cfg, stage_name=stage_name)
+            optimizer.zero_grad(set_to_none=True)
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(
+                f"stage_switch step={step} stage={stage_name} "
+                f"cf_bias_scale={cf_bias_scale:.3f} trainable={trainable}"
+            )
+            current_stage = stage_name
+        current_bias_scale = cf_bias_scale
+        print(f"step {step + 1} stage={current_stage} cf_bias_scale={current_bias_scale:.3f}")
+
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -188,6 +303,13 @@ def train(cfg: Config) -> None:
                     attention_mask=attention_mask,
                     p_z=p_student,
                     k_vals=k_vals,
+                    cf_bias_scale=current_bias_scale,
+                    cf_attention_bias_strength=cfg.train.cf_attention_bias_strength,
+                    apply_cf_answer_z_bias=(
+                        cfg.train.cf_bias_apply_cf_path_only and current_bias_scale > 0.0
+                    ),
+                    global_step=step + 1,
+                    stage_name=current_stage,
                 )
             else:
                 loss_cf = torch.zeros((), device=device)
@@ -216,6 +338,7 @@ def train(cfg: Config) -> None:
             log_eff_count += 1
 
         if (step + 1) % cfg.train.grad_accum == 0:
+            assert optimizer is not None
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -227,7 +350,9 @@ def train(cfg: Config) -> None:
                 f"ans={log_sums['ans'] / denom:.4f} "
                 f"sft={log_sums['sft'] / denom:.4f} "
                 f"cf={log_sums['cf'] / denom:.4f} "
-                f"tau={g_tau:.4f}"
+                f"tau={g_tau:.4f} "
+                f"stage={current_stage} "
+                f"cf_bias_scale={current_bias_scale:.3f}"
             )
             if log_eff_count > 0:
                 msg += f" | eff_vocab={log_sums['eff_vocab'] / log_eff_count:.2f}"
@@ -252,7 +377,7 @@ def train(cfg: Config) -> None:
                 config=cfg,
             )
 
-        if step  % cfg.train.eval_every == 0 and step > 0:
+        if eval_loader is not None and cfg.train.eval_every > 0 and (step + 1) % cfg.train.eval_every == 0:
             metrics = evaluate(
                 model=model,
                 loader=eval_loader,

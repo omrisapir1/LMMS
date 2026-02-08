@@ -331,6 +331,97 @@ class UnifiedZSoftModel(nn.Module):
         h_prev = hidden_last[bidx, prev_pos]
         return self._lm_logits_from_hidden(h_prev)
 
+    def _build_additive_causal_mask_with_answer_z_bias(
+        self,
+        *,
+        input_ids: torch.Tensor,        # [B,T]
+        attention_mask: torch.Tensor,   # [B,T]
+        cf_bias_scale: float,
+        cf_attention_bias_strength: float,
+    ) -> torch.Tensor:
+        """
+        Build only the additive bias tensor [B,1,T,T] for answer->Z-slot attention.
+        Causal/padding masking remains model-native.
+        """
+        bsz, t = input_ids.shape
+        device = input_ids.device
+        valid = attention_mask.to(torch.bool)
+        bias = torch.zeros((bsz, 1, t, t), device=device, dtype=torch.float32)
+
+        if cf_bias_scale <= 0.0 or cf_attention_bias_strength == 0.0:
+            return bias
+
+        answer_pos = self._find_answer_pos(input_ids)  # [B]
+        # These are the sequence slots where latent Z embeddings are executed.
+        z_slot_pos_mask = (input_ids == self.latent_token_id) & valid
+        if not torch.all(z_slot_pos_mask.any(dim=1)):
+            raise RuntimeError("CF bias expects latent slots to be present in input_ids.")
+        bias_delta = float(cf_bias_scale) * float(cf_attention_bias_strength)
+        for b in range(bsz):
+            q = int(answer_pos[b].item())
+            key_mask = z_slot_pos_mask[b]
+            if key_mask.any():
+                bias[b, 0, q, key_mask] += bias_delta
+        return bias
+
+    def _run_core_with_attention_score_bias(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+    ):
+        core = self._core_model()
+        if attn_bias is None:
+            return core(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        bias = attn_bias
+        handles = []
+        applied = {"ok": False}
+
+        def _pre_hook(module, args, kwargs):
+            am = kwargs.get("attention_mask", None)
+            if isinstance(am, torch.Tensor) and am.dim() == 4:
+                local = bias.to(device=am.device, dtype=am.dtype)
+                q_len = am.size(-2)
+                k_len = am.size(-1)
+                if q_len == local.size(-2) and k_len == local.size(-1):
+                    kwargs["attention_mask"] = am + local
+                    applied["ok"] = True
+            return args, kwargs
+
+        try:
+            for mod in core.modules():
+                name = mod.__class__.__name__.lower()
+                if "attention" in name:
+                    handles.append(mod.register_forward_pre_hook(_pre_hook, with_kwargs=True))
+
+            out = core(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            if not applied["ok"]:
+                raise RuntimeError(
+                    "CF attention bias was requested but could not be applied to attention scores "
+                    "(no compatible 4D attention_mask observed inside attention modules)."
+                )
+            return out
+        finally:
+            for h in handles:
+                h.remove()
+
     def forward(
         self,
         *,
@@ -430,6 +521,9 @@ class UnifiedZSoftModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         p_z: torch.Tensor,  # [B,Kmax,Vz]
+        cf_bias_scale: float = 0.0,
+        apply_cf_answer_z_bias: bool = False,
+        cf_attention_bias_strength: float = 0.0,
     ) -> torch.Tensor:
         """
         Inject fixed per-slot Z mixtures (no GS sampling) and return digit logits [B,5,10].
@@ -462,14 +556,26 @@ class UnifiedZSoftModel(nn.Module):
                 slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
                 inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
 
-        out_final = self._core_model()(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        if apply_cf_answer_z_bias and cf_bias_scale > 0.0:
+            attn_bias = self._build_additive_causal_mask_with_answer_z_bias(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                cf_bias_scale=float(cf_bias_scale),
+                cf_attention_bias_strength=float(cf_attention_bias_strength),
+            )
+            out_final = self._run_core_with_attention_score_bias(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                attn_bias=attn_bias,
+            )
+        else:
+            out_final = self._run_core_with_attention_score_bias(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                attn_bias=None,
+            )
         hidden_last = out_final.hidden_states[-1]
         return self._digit_logits_from_hidden(hidden_last, input_ids)
 

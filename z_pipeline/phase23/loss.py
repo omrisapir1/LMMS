@@ -3,7 +3,6 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Sequence, Union
-import math
 
 import torch
 import torch.nn as nn
@@ -143,11 +142,13 @@ class CounterfactualAnswerLoss(nn.Module):
         permute_prob: Dict[int, float],
         digit_temperature: float = 1.0,
         seed: Optional[int] = None,
+        debug_every: int = 0,
     ) -> None:
         super().__init__()
         self.permute_prob = {int(k): float(v) for k, v in permute_prob.items()}
         self.digit_temperature = float(digit_temperature)
         self.seed = seed
+        self.debug_every = int(debug_every)
 
     def _build_counterfactual_pz(
         self,
@@ -173,22 +174,20 @@ class CounterfactualAnswerLoss(nn.Module):
             active_idx = p_z[b, :k].argmax(dim=-1)  # [k]
             prob = self.permute_prob.get(k, 0.0)
 
-            # if k > 1 and torch.rand((), device=device, generator=gen) < prob:
-            #     perm = torch.randperm(k, device=device, generator=gen)
-            #     cf_idx = active_idx[perm]
-            # else:
-            cf_idx = torch.randint(
-                low=0,
-                high=vocab,
-                size=(k,),
-                device=device,
-                generator=gen,
-            )
+            if k > 1 and torch.rand((), device=device, generator=gen) < prob:
+                perm = torch.randperm(k, device=device, generator=gen)
+                cf_idx = active_idx[perm]
+            else:
+                cf_idx = torch.randint(
+                    low=0,
+                    high=vocab,
+                    size=(k,),
+                    device=device,
+                    generator=gen,
+                )
             out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
 
         return out
-
-    import math
 
     def forward(
             self,
@@ -198,6 +197,11 @@ class CounterfactualAnswerLoss(nn.Module):
             attention_mask: torch.Tensor,
             p_z: torch.Tensor,
             k_vals: torch.Tensor,
+            cf_bias_scale: float = 0.0,
+            cf_attention_bias_strength: float = 0.0,
+            apply_cf_answer_z_bias: bool = False,
+            global_step: Optional[int] = None,
+            stage_name: str = "main",
     ) -> torch.Tensor:
         # ----------------------------
         # Reference
@@ -206,6 +210,9 @@ class CounterfactualAnswerLoss(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             p_z=p_z.detach(),
+            cf_bias_scale=0.0,
+            apply_cf_answer_z_bias=False,
+            cf_attention_bias_strength=0.0,
         )
         p_ref = safe_softmax(
             digit_logits_ref_det, tau=self.digit_temperature, dim=-1
@@ -219,59 +226,51 @@ class CounterfactualAnswerLoss(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             p_z=p_cf_z,
+            cf_bias_scale=float(cf_bias_scale),
+            apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
+            cf_attention_bias_strength=float(cf_attention_bias_strength),
         )
         p_cf = safe_softmax(
             digit_logits_cf, tau=self.digit_temperature, dim=-1
         )  # [B,5,10]
 
         # ----------------------------
-        # Diagnostics (all detached)
-        # ----------------------------
-        with torch.no_grad():
-            # 1) Logit movement
-            mean_abs_logit_diff = (
-                    digit_logits_ref_det.detach()
-                    - digit_logits_cf.detach()
-            ).abs().mean().item()
-
-            # 2) Argmax disagreement
-            ref_arg = digit_logits_ref_det.detach().argmax(dim=-1)  # [B,5]
-            cf_arg = digit_logits_cf.detach().argmax(dim=-1)  # [B,5]
-            disagree = (ref_arg != cf_arg).float().mean().item()
-
-            # 3) JS itself
-            js_val = js_divergence(p_ref, p_cf).mean().item()
-
-            # 4) Confidence (max prob)
-            conf_ref = p_ref.max(dim=-1).values.mean().item()
-            conf_cf = p_cf.detach().max(dim=-1).values.mean().item()
-
-            # 5) Margin (top1 - top2)
-            ref_top2 = p_ref.topk(2, dim=-1).values
-            cf_top2 = p_cf.detach().topk(2, dim=-1).values
-            margin_ref = (ref_top2[..., 0] - ref_top2[..., 1]).mean().item()
-            margin_cf = (cf_top2[..., 0] - cf_top2[..., 1]).mean().item()
-
-            # 6) Entropy
-            ent_ref = -(p_ref * (p_ref + 1e-9).log()).sum(dim=-1).mean().item()
-            ent_cf = -(p_cf.detach() * (p_cf.detach() + 1e-9).log()).sum(dim=-1).mean().item()
-
-            print(
-                "[cf_loss] "
-                f"|Δlogits|={mean_abs_logit_diff:.4f} | "
-                f"JS={js_val:.4f} | "
-                f"flip={disagree:.3f} | "
-                f"conf_ref={conf_ref:.3f} conf_cf={conf_cf:.3f} | "
-                f"margin_ref={margin_ref:.3f} margin_cf={margin_cf:.3f} | "
-                f"H_ref={ent_ref:.3f} H_cf={ent_cf:.3f} | "
-                f"tau={self.digit_temperature:.2f}"
-            )
-
-        # ----------------------------
         # Loss
         # ----------------------------
         js = js_divergence(p_ref, p_cf).mean()
-        return math.log(2) - js
+        loss = torch.log(torch.tensor(2.0, device=js.device, dtype=js.dtype)) - js
+
+        if self.debug_every > 0 and global_step is not None and (int(global_step) % self.debug_every == 0):
+            with torch.no_grad():
+                delta_logits = (digit_logits_ref_det - digit_logits_cf).abs().mean()
+                pred_ref = digit_logits_ref_det.argmax(dim=-1)  # [B,5]
+                pred_cf = digit_logits_cf.argmax(dim=-1)        # [B,5]
+                # Per-digit flip rate over [B,5].
+                flip = (pred_ref != pred_cf).float().mean()
+
+                conf_ref = p_ref.max(dim=-1).values.mean()
+                conf_cf = p_cf.max(dim=-1).values.mean()
+
+                top2_ref = torch.topk(p_ref, k=2, dim=-1).values
+                top2_cf = torch.topk(p_cf, k=2, dim=-1).values
+                margin_ref = (top2_ref[..., 0] - top2_ref[..., 1]).mean()
+                margin_cf = (top2_cf[..., 0] - top2_cf[..., 1]).mean()
+
+                h_ref = (-(p_ref.clamp_min(1e-8) * p_ref.clamp_min(1e-8).log()).sum(dim=-1)).mean()
+                h_cf = (-(p_cf.clamp_min(1e-8) * p_cf.clamp_min(1e-8).log()).sum(dim=-1)).mean()
+
+                print(
+                    f"cf_debug step={int(global_step)} stage={stage_name} "
+                    f"bias_scale={float(cf_bias_scale):.3f} "
+                    f"|dlogits|={float(delta_logits):.4f} "
+                    f"JS={float(js):.4f} "
+                    f"flip={float(flip):.4f} "
+                    f"conf_ref={float(conf_ref):.4f} conf_cf={float(conf_cf):.4f} "
+                    f"margin_ref={float(margin_ref):.4f} margin_cf={float(margin_cf):.4f} "
+                    f"H_ref={float(h_ref):.4f} H_cf={float(h_cf):.4f}"
+                )
+
+        return loss
 
 
 def usage_shaping_loss_stub(*, device: torch.device) -> torch.Tensor:
