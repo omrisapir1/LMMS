@@ -273,6 +273,8 @@ def train(cfg: Config) -> None:
             tau_end=cfg.model.gumbel_tau_end,
             tau_anneal_steps=cfg.model.gumbel_anneal_steps,
         )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         amp_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -296,6 +298,7 @@ def train(cfg: Config) -> None:
             loss_sft = sft_loss_fn(answer_next_logits)
 
             if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+                p_student_det_idx = p_student.detach().argmax(dim=-1)
                 cf_gs = cf_loss_fn(
                     model=model,
                     input_ids=input_ids,
@@ -312,25 +315,27 @@ def train(cfg: Config) -> None:
                     stage_name=current_stage,
                     return_details=True,
                 )
-                cf_det = cf_loss_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    p_z=p_student,
-                    k_vals=k_vals,
-                    cf_bias_scale=0.0,
-                    cf_attention_bias_strength=0.0,
-                    apply_cf_answer_z_bias=False,
-                    cf_mode="det",
-                    global_step=step + 1,
-                    stage_name=current_stage,
-                    return_details=True,
-                )
+                with torch.no_grad():
+                    cf_det = cf_loss_fn(
+                        model=model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        p_z=None,
+                        p_z_idx_det=p_student_det_idx,
+                        k_vals=k_vals,
+                        cf_bias_scale=0.0,
+                        cf_attention_bias_strength=0.0,
+                        apply_cf_answer_z_bias=False,
+                        cf_mode="det",
+                        global_step=step + 1,
+                        stage_name=current_stage,
+                        return_details=True,
+                    )
                 loss_cf_gs = cf_gs["loss_cf"]
                 loss_cf_det = cf_det["loss_cf"]
                 loss_dep_gs = cf_gs["loss_dep"]
                 # loss_cf = 0.5 * (loss_cf_gs + loss_cf_det)
-                loss_cf = 0.05 * loss_cf_gs + 0.95 *loss_cf_det
+                loss_cf = 0.05 * loss_cf_gs + 0.95 * loss_cf_det
                 loss_dep = loss_dep_gs
             else:
                 loss_cf_gs = torch.zeros((), device=device)
@@ -351,6 +356,11 @@ def train(cfg: Config) -> None:
             )
 
         total.backward()
+        step_cuda_max_mem = (
+            float(torch.cuda.max_memory_allocated(device)) / float(1024 ** 3)
+            if device.type == "cuda"
+            else 0.0
+        )
 
         log_sums["loss"] += float(total.detach().cpu())
         log_sums["ans"] += float(loss_ans.detach().cpu())
@@ -387,6 +397,8 @@ def train(cfg: Config) -> None:
             )
             if log_eff_count > 0:
                 msg += f" | eff_vocab={log_sums['eff_vocab'] / log_eff_count:.2f}"
+            if device.type == "cuda":
+                msg += f" | cuda_max_mem_gb={step_cuda_max_mem:.2f}"
             print(msg)
 
             log_sums = {
