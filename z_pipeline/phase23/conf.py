@@ -33,7 +33,7 @@ class DataConfig:
     data_path: Optional[str] = None
 
     max_length: Optional[int] = None
-    batch_size: int = 16
+    batch_size: int = 32
     rebalance_train: bool = True
     k_max: int = 20
 
@@ -84,7 +84,7 @@ class TrainConfig:
     cf_debug_every: int = 0
 
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
-    cf_warmup_steps: int = 250
+    cf_warmup_steps: int = 150
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
     cf_bias_anneal_steps: int = 1000
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
