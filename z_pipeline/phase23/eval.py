@@ -82,8 +82,8 @@ def _digit_preds_from_sequences(
     return preds
 
 
-def decode_suffix_upto_answer(tokenizer, suffix: torch.Tensor, answer_token_id: int) -> str:
-    ids = suffix.tolist()
+def decode_full_upto_answer(tokenizer, seq: torch.Tensor, answer_token_id: int) -> str:
+    ids = seq.tolist()
     if answer_token_id in ids:
         ids = ids[: ids.index(answer_token_id) + 1]
     return tokenizer.decode(ids, skip_special_tokens=False)
@@ -312,27 +312,27 @@ def evaluate_generate_table(
                     device=device,
                 )[0]
 
-                greedy_text = decode_suffix_upto_answer(
-                    tokenizer, greedy_suffix.detach().cpu(), model.answer_token_id
+                greedy_text = decode_full_upto_answer(
+                    tokenizer, greedy_seqs[0].detach().cpu(), model.answer_token_id
                 )
-                sample_text = decode_suffix_upto_answer(
-                    tokenizer, sample_suffix.detach().cpu(), model.answer_token_id
+                sample_text = decode_full_upto_answer(
+                    tokenizer, sample_seqs[0].detach().cpu(), model.answer_token_id
                 )
-                greedy_rand_text = decode_suffix_upto_answer(
-                    tokenizer, greedy_suffix_rand.detach().cpu(), model.answer_token_id
+                greedy_rand_text = decode_full_upto_answer(
+                    tokenizer, greedy_rand[0].detach().cpu(), model.answer_token_id
                 )
-                sample_rand_text = decode_suffix_upto_answer(
-                    tokenizer, sample_suffix_rand.detach().cpu(), model.answer_token_id
+                sample_rand_text = decode_full_upto_answer(
+                    tokenizer, sample_rand[0].detach().cpu(), model.answer_token_id
                 )
 
                 row = {
-                    "greedy_tokens": greedy_text,
+                    "greedy_full_text": greedy_text,
                     "greedy_digit_pred": greedy_pred,
-                    "sample_tokens": sample_text,
+                    "sample_full_text": sample_text,
                     "sample_digit_pred": sample_pred,
-                    "greedy_randomized_tokens": greedy_rand_text,
+                    "greedy_randomized_full_text": greedy_rand_text,
                     "greedy_randomized_digit_pred": greedy_rand_pred,
-                    "sample_randomized_tokens": sample_rand_text,
+                    "sample_randomized_full_text": sample_rand_text,
                     "sample_randomized_digit_pred": sample_rand_pred,
                     "question": questions[i],
                     "answer_digits": answer_digits[i],
