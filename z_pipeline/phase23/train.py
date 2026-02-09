@@ -283,7 +283,7 @@ def train(cfg: Config) -> None:
             if device.type == "cuda"
             else nullcontext()
         )
-        print(f'Example {tokenizer.decode(input_ids[0], skip_special_tokens=True)} -> {digit_labels[0]}')
+        print(f'Example {tokenizer.decode(input_ids[0], skip_special_tokens=False)} -> {digit_labels[0]}')
         with amp_ctx:
             out = model(
                 input_ids=input_ids,
