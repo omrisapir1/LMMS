@@ -243,6 +243,17 @@ def train(cfg: Config) -> None:
 
     train_iter = iter(train_loader)
     while step < cfg.train.steps:
+
+        evaluate_generate_table(
+            model=model,
+            loader=eval_loader,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            device=device,
+            step=step + 1,
+            pad_token_id=pad_token_id,
+        )
+
         stage_name, cf_bias_scale = _cf_stage_and_bias_scale(step, cfg)
         if stage_name != current_stage:
             embed_grad_hook = _configure_stage_trainability(

@@ -680,12 +680,18 @@ class UnifiedZSoftModel(nn.Module):
         pad_token_id: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        sequences = self.generate(
+        gen_out = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pad_token_id=pad_token_id,
             **kwargs,
         )
+        if isinstance(gen_out, torch.Tensor):
+            sequences = gen_out
+        elif hasattr(gen_out, "sequences"):
+            sequences = gen_out.sequences
+        else:
+            raise TypeError(f"Unexpected generate() output type: {type(gen_out)}")
 
         if pad_token_id is None:
             pad_token_id = getattr(self.base.config, "pad_token_id", self.answer_token_id)
