@@ -81,7 +81,7 @@ class TrainConfig:
     print_every: int = 5
     eval_every: int = 50
     eval_generate_every_mult: int = 4
-    eval_generate_max_new_tokens: int = 64
+    eval_generate_max_new_tokens: int = 6
     eval_generate_temperature: float = 1.0
     eval_generate_top_p: float = 0.95
     save_every: int = 500
