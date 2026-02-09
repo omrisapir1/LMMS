@@ -671,8 +671,7 @@ class UnifiedZSoftModel(nn.Module):
             **kwargs,
         )
 
-    import torch
-    from typing import Dict, Optional
+
 
     @torch.inference_mode()
     def generate_with_digits(
@@ -701,11 +700,13 @@ class UnifiedZSoftModel(nn.Module):
 
         full_attn = (sequences != pad_token_id).long()
 
-        # IMPORTANT: don't request all hidden states (huge VRAM). We only need the last hidden state.
-        out = self.base(
+        # IMPORTANT: run the *core* model to get last_hidden_state without storing all hidden_states.
+        core = self._core_model()
+        out = core(
             input_ids=sequences,
             attention_mask=full_attn,
-            output_hidden_states=False,
+            use_cache=False,  # keeps memory down
+            output_hidden_states=False,  # don't materialize per-layer states
             return_dict=True,
         )
         hidden_last = out.last_hidden_state  # [B, T, H]
