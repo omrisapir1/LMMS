@@ -47,6 +47,16 @@ def _digit_preds_from_sequences(
     device: torch.device,
 ) -> List[Optional[int]]:
     full_attn = (sequences != pad_token_id).long()
+    answer_mask = (sequences == model.answer_token_id)
+    has_answer = answer_mask.any(dim=1)
+    preds: List[Optional[int]] = [None] * int(sequences.size(0))
+    if not bool(has_answer.any().item()):
+        return preds
+
+    valid_idx = torch.nonzero(has_answer, as_tuple=False).squeeze(1)
+    seqs_valid = sequences.index_select(0, valid_idx)
+    attn_valid = full_attn.index_select(0, valid_idx)
+
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if device.type == "cuda"
@@ -54,29 +64,26 @@ def _digit_preds_from_sequences(
     )
     with amp_ctx:
         out = model.base(
-            input_ids=sequences,
-            attention_mask=full_attn,
+            input_ids=seqs_valid,
+            attention_mask=attn_valid,
             output_hidden_states=True,
             return_dict=True,
         )
         hidden_last = out.hidden_states[-1]
-
-        answer_mask = (sequences == model.answer_token_id)
-        pos = answer_mask.float().argmax(dim=1)
+        answer_mask_valid = (seqs_valid == model.answer_token_id)
+        pos = answer_mask_valid.float().argmax(dim=1)
         bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
         h = hidden_last[bidx, pos]
         digit_logits = torch.stack([head(h) for head in model.digit_heads], dim=1)
         digit_preds = digit_logits.argmax(dim=-1)
 
-    has_answer = answer_mask.any(dim=1).tolist()
-    preds: List[Optional[int]] = []
-    for i, ok in enumerate(has_answer):
-        preds.append(_digits_to_int(digit_preds[i]) if ok else None)
+    for j, bi in enumerate(valid_idx.tolist()):
+        preds[bi] = _digits_to_int(digit_preds[j])
     return preds
 
 
-def decode_upto_answer(tokenizer, seq: torch.Tensor, answer_token_id: int) -> str:
-    ids = seq.tolist()
+def decode_suffix_upto_answer(tokenizer, suffix: torch.Tensor, answer_token_id: int) -> str:
+    ids = suffix.tolist()
     if answer_token_id in ids:
         ids = ids[: ids.index(answer_token_id) + 1]
     return tokenizer.decode(ids, skip_special_tokens=False)
@@ -231,7 +238,6 @@ def evaluate_generate_table(
     with torch.no_grad(), open(out_path, "w", encoding="utf-8") as f:
         for batch in loader:
             questions = [str(x) for x in batch.get("question", [])]
-            k_vals = [int(x) for x in batch["K"].tolist()]
             prompts = [build_prompt(tokenizer, q) for q in questions]
             tok = tokenizer(
                 prompts,
@@ -240,37 +246,32 @@ def evaluate_generate_table(
                 truncation=True,
                 add_special_tokens=False,
             )
-            gen_input_ids = tok["input_ids"].to(device)
-            gen_attention_mask = tok["attention_mask"].to(device)
-
-            if "answer_digits" in batch:
-                ans_digits_raw = batch["answer_digits"]
-                if isinstance(ans_digits_raw, torch.Tensor):
-                    answer_digits = [int(x) for x in ans_digits_raw.tolist()]
-                else:
-                    answer_digits = [int(x) for x in ans_digits_raw]
-            else:
-                answer_digits = [_digits_to_int(x) for x in batch["digit_labels"]]
+            ids = tok["input_ids"].to(device)
+            mask = tok["attention_mask"].to(device)
+            prefix_lens = mask.sum(dim=1).tolist()
+            answer_digits = [_digits_to_int(x) for x in batch["digit_labels"]]
 
             for i in range(len(questions)):
+                prefix_len = int(prefix_lens[i])
+                prefix_ids = ids[i:i + 1, :prefix_len]
+                prefix_mask = mask[i:i + 1, :prefix_len]
                 amp_ctx = (
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if device.type == "cuda"
                     else nullcontext()
                 )
-                max_new_tokens = int(k_vals[i]) + 1
                 with amp_ctx:
                     greedy_out = model.generate_with_digits(
-                        input_ids=gen_input_ids[i:i + 1],
-                        attention_mask=gen_attention_mask[i:i + 1],
-                        max_new_tokens=max_new_tokens,
+                        input_ids=prefix_ids,
+                        attention_mask=prefix_mask,
+                        max_new_tokens=cfg.train.eval_generate_max_new_tokens,
                         do_sample=False,
                         pad_token_id=pad_token_id,
                     )
                     sample_out = model.generate_with_digits(
-                        input_ids=gen_input_ids[i:i + 1],
-                        attention_mask=gen_attention_mask[i:i + 1],
-                        max_new_tokens=max_new_tokens,
+                        input_ids=prefix_ids,
+                        attention_mask=prefix_mask,
+                        max_new_tokens=cfg.train.eval_generate_max_new_tokens,
                         do_sample=True,
                         temperature=cfg.train.eval_generate_temperature,
                         top_p=cfg.train.eval_generate_top_p,
@@ -279,20 +280,24 @@ def evaluate_generate_table(
 
                 greedy_seqs = greedy_out["sequences"]
                 sample_seqs = sample_out["sequences"]
+                greedy_suffix = greedy_seqs[0, prefix_len:]
+                sample_suffix = sample_seqs[0, prefix_len:]
 
-                if (greedy_seqs == model.latent_token_id).any() or (sample_seqs == model.latent_token_id).any():
-                    raise RuntimeError("Generation produced <|latent|> tokens, which indicates a prompt/generation bug.")
+                if (greedy_suffix == model.latent_token_id).any() or (sample_suffix == model.latent_token_id).any():
+                    raise RuntimeError("Generated <|latent|> in suffix - generation masking is broken.")
 
-                greedy_has_answer = bool((greedy_seqs == model.answer_token_id).any(dim=1)[0].item())
-                sample_has_answer = bool((sample_seqs == model.answer_token_id).any(dim=1)[0].item())
+                greedy_has_answer = bool((greedy_suffix == model.answer_token_id).any().item())
+                sample_has_answer = bool((sample_suffix == model.answer_token_id).any().item())
                 greedy_with_answer += int(greedy_has_answer)
                 sample_with_answer += int(sample_has_answer)
 
                 greedy_pred = _digits_to_int(greedy_out["digit_preds"][0]) if greedy_has_answer else None
                 sample_pred = _digits_to_int(sample_out["digit_preds"][0]) if sample_has_answer else None
 
-                greedy_rand = _randomize_z_tokens(greedy_seqs, z_ids)
-                sample_rand = _randomize_z_tokens(sample_seqs, z_ids)
+                greedy_suffix_rand = _randomize_z_tokens(greedy_suffix.unsqueeze(0), z_ids)[0]
+                sample_suffix_rand = _randomize_z_tokens(sample_suffix.unsqueeze(0), z_ids)[0]
+                greedy_rand = torch.cat([prefix_ids[0], greedy_suffix_rand], dim=0).unsqueeze(0)
+                sample_rand = torch.cat([prefix_ids[0], sample_suffix_rand], dim=0).unsqueeze(0)
 
                 greedy_rand_pred = _digit_preds_from_sequences(
                     model=model,
@@ -307,10 +312,18 @@ def evaluate_generate_table(
                     device=device,
                 )[0]
 
-                greedy_text = decode_upto_answer(tokenizer, greedy_seqs[0].detach().cpu(), model.answer_token_id)
-                sample_text = decode_upto_answer(tokenizer, sample_seqs[0].detach().cpu(), model.answer_token_id)
-                greedy_rand_text = decode_upto_answer(tokenizer, greedy_rand[0].detach().cpu(), model.answer_token_id)
-                sample_rand_text = decode_upto_answer(tokenizer, sample_rand[0].detach().cpu(), model.answer_token_id)
+                greedy_text = decode_suffix_upto_answer(
+                    tokenizer, greedy_suffix.detach().cpu(), model.answer_token_id
+                )
+                sample_text = decode_suffix_upto_answer(
+                    tokenizer, sample_suffix.detach().cpu(), model.answer_token_id
+                )
+                greedy_rand_text = decode_suffix_upto_answer(
+                    tokenizer, greedy_suffix_rand.detach().cpu(), model.answer_token_id
+                )
+                sample_rand_text = decode_suffix_upto_answer(
+                    tokenizer, sample_suffix_rand.detach().cpu(), model.answer_token_id
+                )
 
                 row = {
                     "greedy_tokens": greedy_text,
