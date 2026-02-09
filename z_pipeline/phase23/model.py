@@ -335,6 +335,47 @@ class UnifiedZSoftModel(nn.Module):
         h_prev = hidden_last[bidx, prev_pos]
         return self._lm_logits_from_hidden(h_prev)
 
+    def _latent_answer_logit_and_logsumexp_from_hidden(
+        self,
+        latent_hidden: torch.Tensor,  # [N, H]
+        chunk_size: int = 4096,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute answer-token logit and logsumexp over vocab for latent slots only.
+        Avoids materializing [B,T,V] by working on [N,H] and chunking vocab.
+        """
+        if latent_hidden.ndim != 2:
+            raise ValueError("latent_hidden must be [N,H]")
+        if latent_hidden.size(0) == 0:
+            empty = latent_hidden.new_zeros((0,), dtype=torch.float32)
+            return empty, empty
+
+        head = self._get_lm_head()
+        hidden = latent_hidden.to(torch.float32)
+        w = head.weight.to(device=hidden.device, dtype=torch.float32)
+        bias = getattr(head, "bias", None)
+        if bias is not None:
+            bias = bias.to(device=hidden.device, dtype=torch.float32)
+
+        ans_w = w[self.answer_token_id]
+        ans_logit = hidden @ ans_w
+        if bias is not None:
+            ans_logit = ans_logit + bias[self.answer_token_id]
+
+        running_lse: Optional[torch.Tensor] = None
+        vocab = int(w.size(0))
+        for start in range(0, vocab, int(chunk_size)):
+            end = min(start + int(chunk_size), vocab)
+            logits_chunk = hidden @ w[start:end].t()
+            if bias is not None:
+                logits_chunk = logits_chunk + bias[start:end]
+            chunk_lse = torch.logsumexp(logits_chunk, dim=-1)
+            running_lse = chunk_lse if running_lse is None else torch.logaddexp(running_lse, chunk_lse)
+
+        if running_lse is None:
+            raise RuntimeError("Failed to compute latent logsumexp")
+        return ans_logit, running_lse
+
     def _build_additive_causal_mask_with_answer_z_bias(
         self,
         *,
@@ -552,6 +593,32 @@ class UnifiedZSoftModel(nn.Module):
         }
         if return_distributions:
             out["p_student"] = p_student
+            out["latent_slot_mask"] = slot_mask
+
+            latent_answer_logit = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float32)
+            latent_logsumexp = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float32)
+            if kmax > 0 and slot_mask.any():
+                latent_pos = torch.full((bsz, kmax), -1, device=input_ids.device, dtype=torch.long)
+                for b, positions in enumerate(latent_lists):
+                    if positions:
+                        latent_pos[b, : len(positions)] = torch.tensor(
+                            positions, device=input_ids.device, dtype=torch.long
+                        )
+
+                valid_idx = torch.nonzero(slot_mask, as_tuple=False)  # [N,2] => b, slot
+                vb = valid_idx[:, 0]
+                vs = valid_idx[:, 1]
+                vp = latent_pos[vb, vs]
+                if (vp < 0).any():
+                    raise RuntimeError("Invalid latent position encountered while building latent answer stats.")
+
+                latent_hidden = hidden_last[vb, vp]
+                ans_logit_valid, lse_valid = self._latent_answer_logit_and_logsumexp_from_hidden(latent_hidden)
+                latent_answer_logit[vb, vs] = ans_logit_valid
+                latent_logsumexp[vb, vs] = lse_valid
+
+            out["latent_answer_logit"] = latent_answer_logit
+            out["latent_logsumexp"] = latent_logsumexp
         return out
 
     def forward_with_fixed_z_distributions(
@@ -727,4 +794,3 @@ class UnifiedZSoftModel(nn.Module):
             "digit_logits": digit_logits,
             "digit_preds": digit_logits.argmax(dim=-1),
         }
-

@@ -215,7 +215,10 @@ def train(cfg: Config) -> None:
         )
 
     ans_loss_fn = AnswerDigitLoss(keep_prob=cfg.loss.keep_prob)
-    sft_loss_fn = AnswerTokenSFTLoss(answer_token_id=model.answer_token_id)
+    sft_loss_fn = AnswerTokenSFTLoss(
+        answer_token_id=model.answer_token_id,
+        lambda_no_answer_on_latent=cfg.loss.lambda_no_answer_on_latent,
+    )
     cf_loss_fn = CounterfactualAnswerLoss(
         permute_prob=cfg.loss.counterfactual_schedule,
         digit_temperature=cfg.loss.digit_temperature,
@@ -232,6 +235,9 @@ def train(cfg: Config) -> None:
         "loss": 0.0,
         "ans": 0.0,
         "sft": 0.0,
+        "sft_ce": 0.0,
+        "sft_no_answer_latent": 0.0,
+        "sft_latent_p_ans": 0.0,
         "cf_gs": 0.0,
         "cf_det": 0.0,
         "cf": 0.0,
@@ -283,7 +289,6 @@ def train(cfg: Config) -> None:
             if device.type == "cuda"
             else nullcontext()
         )
-        print(f'Example {tokenizer.decode(input_ids[0], skip_special_tokens=False)} -> {digit_labels[0]}')
         with amp_ctx:
             out = model(
                 input_ids=input_ids,
@@ -295,10 +300,23 @@ def train(cfg: Config) -> None:
 
             digit_logits = out["digit_logits"]
             answer_next_logits = out["answer_next_logits"]
+            latent_answer_logit = out.get("latent_answer_logit")
+            latent_logsumexp = out.get("latent_logsumexp")
+            latent_slot_mask = out.get("latent_slot_mask", out.get("slot_mask"))
             p_student = out.get("p_student")
 
             loss_ans = ans_loss_fn(digit_logits, digit_labels)
-            loss_sft = sft_loss_fn(answer_next_logits)
+            sft_terms = sft_loss_fn(
+                answer_next_logits,
+                latent_answer_logits=latent_answer_logit,
+                latent_logsumexp=latent_logsumexp,
+                latent_slot_mask=latent_slot_mask,
+                return_details=True,
+            )
+            loss_sft = sft_terms["loss_total"]
+            loss_sft_ce = sft_terms["loss_answer_ce"]
+            loss_sft_no_answer_latent = sft_terms["loss_no_answer_latent"]
+            sft_latent_p_ans = sft_terms["latent_p_ans_mean"]
 
             if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
                 p_student_det_idx = p_student.detach().argmax(dim=-1)
@@ -368,6 +386,9 @@ def train(cfg: Config) -> None:
         log_sums["loss"] += float(total.detach().cpu())
         log_sums["ans"] += float(loss_ans.detach().cpu())
         log_sums["sft"] += float(loss_sft.detach().cpu())
+        log_sums["sft_ce"] += float(loss_sft_ce.detach().cpu())
+        log_sums["sft_no_answer_latent"] += float(loss_sft_no_answer_latent.detach().cpu())
+        log_sums["sft_latent_p_ans"] += float(sft_latent_p_ans.detach().cpu())
         log_sums["cf_gs"] += float(loss_cf_gs.detach().cpu())
         log_sums["cf_det"] += float(loss_cf_det.detach().cpu())
         log_sums["cf"] += float(loss_cf.detach().cpu())
@@ -389,7 +410,10 @@ def train(cfg: Config) -> None:
                 f"step {step + 1} | "
                 f"loss={log_sums['loss'] / denom:.4f} "
                 f"ans={log_sums['ans'] / denom:.4f} "
-                f"sft={log_sums['sft'] / denom:.4f} "
+                f"sft_total={log_sums['sft'] / denom:.4f} "
+                f"sft_ce={log_sums['sft_ce'] / denom:.4f} "
+                f"sft_no_answer_latent={log_sums['sft_no_answer_latent'] / denom:.4f} "
+                f"sft_latent_p_ans={log_sums['sft_latent_p_ans'] / denom:.4f} "
                 f"cf_gs={log_sums['cf_gs'] / denom:.4f} "
                 f"cf_det={log_sums['cf_det'] / denom:.4f} "
                 f"cf={log_sums['cf'] / denom:.4f} "
@@ -408,6 +432,9 @@ def train(cfg: Config) -> None:
                 "loss": 0.0,
                 "ans": 0.0,
                 "sft": 0.0,
+                "sft_ce": 0.0,
+                "sft_no_answer_latent": 0.0,
+                "sft_latent_p_ans": 0.0,
                 "cf_gs": 0.0,
                 "cf_det": 0.0,
                 "cf": 0.0,

@@ -108,7 +108,10 @@ def evaluate(
     model.eval()
 
     ans_loss_fn = AnswerDigitLoss(keep_prob=cfg.loss.keep_prob)
-    sft_loss_fn = AnswerTokenSFTLoss(answer_token_id=model.answer_token_id)
+    sft_loss_fn = AnswerTokenSFTLoss(
+        answer_token_id=model.answer_token_id,
+        lambda_no_answer_on_latent=cfg.loss.lambda_no_answer_on_latent,
+    )
     cf_loss_fn = CounterfactualAnswerLoss(
         permute_prob=cfg.loss.counterfactual_schedule,
         digit_temperature=cfg.loss.digit_temperature,
@@ -120,6 +123,9 @@ def evaluate(
         totals["ans"] = 0.0
     if cfg.loss.lambda_sft > 0:
         totals["sft"] = 0.0
+        totals["sft_ce"] = 0.0
+        totals["sft_no_answer_latent"] = 0.0
+        totals["sft_latent_p_ans"] = 0.0
     if cfg.loss.lambda_cf > 0:
         totals["cf"] = 0.0
     if cfg.loss.lambda_dep > 0:
@@ -153,10 +159,23 @@ def evaluate(
 
                 digit_logits = out["digit_logits"]
                 answer_next_logits = out["answer_next_logits"]
+                latent_answer_logit = out.get("latent_answer_logit")
+                latent_logsumexp = out.get("latent_logsumexp")
+                latent_slot_mask = out.get("latent_slot_mask", out.get("slot_mask"))
                 p_student = out.get("p_student")
 
                 loss_ans = ans_loss_fn(digit_logits, digit_labels)
-                loss_sft = sft_loss_fn(answer_next_logits)
+                sft_terms = sft_loss_fn(
+                    answer_next_logits,
+                    latent_answer_logits=latent_answer_logit,
+                    latent_logsumexp=latent_logsumexp,
+                    latent_slot_mask=latent_slot_mask,
+                    return_details=True,
+                )
+                loss_sft = sft_terms["loss_total"]
+                loss_sft_ce = sft_terms["loss_answer_ce"]
+                loss_sft_no_answer_latent = sft_terms["loss_no_answer_latent"]
+                sft_latent_p_ans = sft_terms["latent_p_ans_mean"]
 
                 if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
                     p_student_det_idx = p_student.detach().argmax(dim=-1)
@@ -197,6 +216,9 @@ def evaluate(
                 totals["ans"] += float(loss_ans.detach().cpu()) * bsz
             if "sft" in totals:
                 totals["sft"] += float(loss_sft.detach().cpu()) * bsz
+                totals["sft_ce"] += float(loss_sft_ce.detach().cpu()) * bsz
+                totals["sft_no_answer_latent"] += float(loss_sft_no_answer_latent.detach().cpu()) * bsz
+                totals["sft_latent_p_ans"] += float(sft_latent_p_ans.detach().cpu()) * bsz
             if "cf" in totals:
                 totals["cf"] += float(loss_cf.detach().cpu()) * bsz
             if "dep" in totals:
