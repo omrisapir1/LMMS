@@ -33,7 +33,7 @@ class DataConfig:
     data_path: Optional[str] = None
 
     max_length: Optional[int] = None
-    batch_size: int = 32
+    batch_size: int = 64
     rebalance_train: bool = True
     k_max: int = 20
 
@@ -49,7 +49,7 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    lambda_ans: float = 0.2
+    lambda_ans: float = 0.1
     lambda_sft: float = 0.000000001
     lambda_cf: float = 1.0
     lambda_dep: float = 0.05
@@ -81,14 +81,14 @@ class TrainConfig:
     print_every: int = 5
     eval_every: int = 50
     eval_generate_every_mult: int = 4
-    eval_generate_max_new_tokens: int = 6
+    eval_generate_max_new_tokens: int = 64
     eval_generate_temperature: float = 1.0
     eval_generate_top_p: float = 0.95
     save_every: int = 500
     cf_debug_every: int = 0
 
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
-    cf_warmup_steps: int = 150
+    cf_warmup_steps: int = 50
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
     cf_bias_anneal_steps: int = 1000
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
