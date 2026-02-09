@@ -300,8 +300,8 @@ def train(cfg: Config) -> None:
 
             digit_logits = out["digit_logits"]
             answer_next_logits = out["answer_next_logits"]
-            latent_answer_logit = out.get("latent_answer_logit")
-            latent_logsumexp = out.get("latent_logsumexp")
+            latent_answer_logit = out.get("latent_answer_logit_allowed")
+            latent_logsumexp = out.get("latent_logsumexp_allowed")
             latent_slot_mask = out.get("latent_slot_mask", out.get("slot_mask"))
             p_student = out.get("p_student")
 

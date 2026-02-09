@@ -335,46 +335,24 @@ class UnifiedZSoftModel(nn.Module):
         h_prev = hidden_last[bidx, prev_pos]
         return self._lm_logits_from_hidden(h_prev)
 
-    def _latent_answer_logit_and_logsumexp_from_hidden(
-        self,
-        latent_hidden: torch.Tensor,  # [N, H]
-        chunk_size: int = 4096,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute answer-token logit and logsumexp over vocab for latent slots only.
-        Avoids materializing [B,T,V] by working on [N,H] and chunking vocab.
-        """
-        if latent_hidden.ndim != 2:
-            raise ValueError("latent_hidden must be [N,H]")
-        if latent_hidden.size(0) == 0:
-            empty = latent_hidden.new_zeros((0,), dtype=torch.float16)
-            return empty, empty
+    def _answer_logit_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Answer-token logit at hidden states [N,H] without materializing full vocab logits."""
+        if hidden.ndim != 2:
+            raise ValueError("hidden must be [N,H]")
+        if hidden.size(0) == 0:
+            return torch.zeros((0,), device=hidden.device, dtype=torch.float16)
 
         head = self._get_lm_head()
-        hidden = latent_hidden.to(torch.float16)
-        w = head.weight.to(device=hidden.device, dtype=torch.float16)
+        h = hidden.to(torch.float16)
+
+        ans_w = head.weight[self.answer_token_id].to(device=h.device, dtype=torch.float16)
+        ans_logit = h @ ans_w
+
         bias = getattr(head, "bias", None)
         if bias is not None:
-            bias = bias.to(device=hidden.device, dtype=torch.float16)
-
-        ans_w = w[self.answer_token_id]
-        ans_logit = hidden @ ans_w
-        if bias is not None:
-            ans_logit = ans_logit + bias[self.answer_token_id]
-
-        running_lse: Optional[torch.Tensor] = None
-        vocab = int(w.size(0))
-        for start in range(0, vocab, int(chunk_size)):
-            end = min(start + int(chunk_size), vocab)
-            logits_chunk = hidden @ w[start:end].t()
-            if bias is not None:
-                logits_chunk = logits_chunk + bias[start:end]
-            chunk_lse = torch.logsumexp(logits_chunk, dim=-1)
-            running_lse = chunk_lse if running_lse is None else torch.logaddexp(running_lse, chunk_lse)
-
-        if running_lse is None:
-            raise RuntimeError("Failed to compute latent logsumexp")
-        return ans_logit, running_lse
+            ans_b = bias[self.answer_token_id].to(device=h.device, dtype=torch.float16)
+            ans_logit = ans_logit + ans_b
+        return ans_logit
 
     def _build_additive_causal_mask_with_answer_z_bias(
         self,
@@ -505,8 +483,13 @@ class UnifiedZSoftModel(nn.Module):
             slot_mask[b, : len(positions)] = True
 
         p_student: Optional[torch.Tensor] = None
+        latent_answer_logit_allowed: Optional[torch.Tensor] = None
+        latent_logsumexp_allowed: Optional[torch.Tensor] = None
         if return_distributions:
             p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
+            # Shifted no-ANSWER supervision is tracked on latent *decision* states (u at p-1).
+            latent_answer_logit_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
+            latent_logsumexp_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
 
         z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
 
@@ -550,6 +533,16 @@ class UnifiedZSoftModel(nn.Module):
                 u = hidden_prefix[:, p - 1]
 
                 s_logits = self._z_logits_from_hidden(u).to(torch.float16)
+                if latent_answer_logit_allowed is not None and latent_logsumexp_allowed is not None:
+                    ans_logit_slot = self._answer_logit_from_hidden(u).to(s_logits.dtype)
+                    allowed_logits = torch.cat([s_logits, ans_logit_slot.unsqueeze(1)], dim=1)
+                    lse_allowed_slot = torch.logsumexp(allowed_logits, dim=-1)
+                    latent_answer_logit_allowed[bs, pass_idx] = ans_logit_slot.to(
+                        latent_answer_logit_allowed.dtype
+                    )
+                    latent_logsumexp_allowed[bs, pass_idx] = lse_allowed_slot.to(
+                        latent_logsumexp_allowed.dtype
+                    )
 
                 if use_gs:
                     # GS-ST with explicit soft sample tracking:
@@ -594,31 +587,13 @@ class UnifiedZSoftModel(nn.Module):
         if return_distributions:
             out["p_student"] = p_student
             out["latent_slot_mask"] = slot_mask
-
-            latent_answer_logit = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
-            latent_logsumexp = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
-            if kmax > 0 and slot_mask.any():
-                latent_pos = torch.full((bsz, kmax), -1, device=input_ids.device, dtype=torch.long)
-                for b, positions in enumerate(latent_lists):
-                    if positions:
-                        latent_pos[b, : len(positions)] = torch.tensor(
-                            positions, device=input_ids.device, dtype=torch.long
-                        )
-
-                valid_idx = torch.nonzero(slot_mask, as_tuple=False)  # [N,2] => b, slot
-                vb = valid_idx[:, 0]
-                vs = valid_idx[:, 1]
-                vp = latent_pos[vb, vs]
-                if (vp < 0).any():
-                    raise RuntimeError("Invalid latent position encountered while building latent answer stats.")
-
-                latent_hidden = hidden_last[vb, vp]
-                ans_logit_valid, lse_valid = self._latent_answer_logit_and_logsumexp_from_hidden(latent_hidden)
-                latent_answer_logit[vb, vs] = ans_logit_valid.to(torch.float16)
-                latent_logsumexp[vb, vs] = lse_valid.to(torch.float16)
-
-            out["latent_answer_logit"] = latent_answer_logit
-            out["latent_logsumexp"] = latent_logsumexp
+            if latent_answer_logit_allowed is None or latent_logsumexp_allowed is None:
+                raise RuntimeError("Expected latent answer statistics when return_distributions=True")
+            out["latent_answer_logit_allowed"] = latent_answer_logit_allowed
+            out["latent_logsumexp_allowed"] = latent_logsumexp_allowed
+            # Backward-compatible aliases expected by existing callers.
+            out["latent_answer_logit"] = latent_answer_logit_allowed
+            out["latent_logsumexp"] = latent_logsumexp_allowed
         return out
 
     def forward_with_fixed_z_distributions(
