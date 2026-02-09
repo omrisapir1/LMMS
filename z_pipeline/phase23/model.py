@@ -347,15 +347,15 @@ class UnifiedZSoftModel(nn.Module):
         if latent_hidden.ndim != 2:
             raise ValueError("latent_hidden must be [N,H]")
         if latent_hidden.size(0) == 0:
-            empty = latent_hidden.new_zeros((0,), dtype=torch.float32)
+            empty = latent_hidden.new_zeros((0,), dtype=torch.float16)
             return empty, empty
 
         head = self._get_lm_head()
-        hidden = latent_hidden.to(torch.float32)
-        w = head.weight.to(device=hidden.device, dtype=torch.float32)
+        hidden = latent_hidden.to(torch.float16)
+        w = head.weight.to(device=hidden.device, dtype=torch.float16)
         bias = getattr(head, "bias", None)
         if bias is not None:
-            bias = bias.to(device=hidden.device, dtype=torch.float32)
+            bias = bias.to(device=hidden.device, dtype=torch.float16)
 
         ans_w = w[self.answer_token_id]
         ans_logit = hidden @ ans_w
@@ -391,7 +391,7 @@ class UnifiedZSoftModel(nn.Module):
         bsz, t = input_ids.shape
         device = input_ids.device
         valid = attention_mask.to(torch.bool)
-        bias = torch.zeros((bsz, 1, 1, t), device=device, dtype=torch.float32)
+        bias = torch.zeros((bsz, 1, 1, t), device=device, dtype=torch.float16)
         answer_pos = self._find_answer_pos(input_ids)  # [B]
 
         if cf_bias_scale <= 0.0 or cf_attention_bias_strength == 0.0:
@@ -549,7 +549,7 @@ class UnifiedZSoftModel(nn.Module):
                     hidden_prefix = _prefix_last_hidden(prefix_emb, prefix_attn, prefix_pos)
                 u = hidden_prefix[:, p - 1]
 
-                s_logits = self._z_logits_from_hidden(u).to(torch.float32)
+                s_logits = self._z_logits_from_hidden(u).to(torch.float16)
 
                 if use_gs:
                     # GS-ST with explicit soft sample tracking:
@@ -558,13 +558,13 @@ class UnifiedZSoftModel(nn.Module):
                     g_noise = -torch.log(-torch.log(u_rand))
                     y_soft = safe_softmax(s_logits + g_noise, tau=tau, dim=-1)
                     z_idx = y_soft.argmax(dim=-1)
-                    y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float32)
+                    y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
                     z_st = y_hard - y_soft.detach() + y_soft
                     p_slot = y_soft
                 else:
                     # Deterministic evaluation path: no gumbel noise.
                     z_idx = s_logits.argmax(dim=-1)
-                    z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float32)
+                    z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
                     p_slot = z_st
 
                 e_latent = torch.matmul(z_st.to(z_emb.dtype), z_emb).to(inputs_embeds.dtype)
@@ -595,8 +595,8 @@ class UnifiedZSoftModel(nn.Module):
             out["p_student"] = p_student
             out["latent_slot_mask"] = slot_mask
 
-            latent_answer_logit = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float32)
-            latent_logsumexp = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float32)
+            latent_answer_logit = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
+            latent_logsumexp = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
             if kmax > 0 and slot_mask.any():
                 latent_pos = torch.full((bsz, kmax), -1, device=input_ids.device, dtype=torch.long)
                 for b, positions in enumerate(latent_lists):
@@ -614,8 +614,8 @@ class UnifiedZSoftModel(nn.Module):
 
                 latent_hidden = hidden_last[vb, vp]
                 ans_logit_valid, lse_valid = self._latent_answer_logit_and_logsumexp_from_hidden(latent_hidden)
-                latent_answer_logit[vb, vs] = ans_logit_valid
-                latent_logsumexp[vb, vs] = lse_valid
+                latent_answer_logit[vb, vs] = ans_logit_valid.to(torch.float16)
+                latent_logsumexp[vb, vs] = lse_valid.to(torch.float16)
 
             out["latent_answer_logit"] = latent_answer_logit
             out["latent_logsumexp"] = latent_logsumexp
