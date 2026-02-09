@@ -344,6 +344,8 @@ def evaluate_generate_table(
         f"eval_generate@step {step} | path={out_path} rows={rows_written} "
         f"greedy_with_answer={greedy_with_answer} sample_with_answer={sample_with_answer}"
     )
+    torch.cuda.empty_cache()
+    model.train()
     return out_path
 
 
