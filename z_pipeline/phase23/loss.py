@@ -104,7 +104,13 @@ class AnswerDigitLoss(nn.Module):
 
 
 class AnswerTokenSFTLoss(nn.Module):
-    """CE on the next-token logits right before <ANSWER>, target is <ANSWER>."""
+    """
+    CE on the next-token logits right before <ANSWER>, plus optional no-ANSWER latent penalty.
+
+    Expected latent stats are over the restricted generation support (Z + <ANSWER>):
+      log_p_ans = latent_answer_logits - latent_logsumexp
+      p_ans = exp(log_p_ans)
+    """
 
     def __init__(self, answer_token_id: int, lambda_no_answer_on_latent: float = 0.1) -> None:
         super().__init__()
