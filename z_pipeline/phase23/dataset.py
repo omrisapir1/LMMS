@@ -123,9 +123,17 @@ class UnifiedDataset(Dataset):
 
         question = ex["question"]
         k_val = int(ex["num_latents"])
-        if "digit_labels" not in ex:
-            raise KeyError("Dataset samples must contain 'digit_labels' (list/tuple of 5 digits)")
-        digit_labels = _validate_answer_digits(ex["digit_labels"])
+        if "digit_labels" in ex:
+            raw_digits = ex["digit_labels"]
+        elif "answer_digits" in ex:
+            raw_digits = ex["answer_digits"]
+        else:
+            raise KeyError(
+                "Dataset samples must contain either 'digit_labels' or 'answer_digits' "
+                "(list/tuple of 5 digits)"
+            )
+
+        digit_labels = _validate_answer_digits(raw_digits)
         answer_digits = _digits_to_int(digit_labels)
 
         if not (1 <= k_val <= self.k_max):
