@@ -49,14 +49,14 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    lambda_ans: float = 0.1
-    lambda_sft: float = 0.1
+    lambda_ans: float = 0.01
+    lambda_sft: float = 0.01
     lambda_cf: float = 1.0
     lambda_dep: float = 0.05
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
     # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
-    lambda_no_answer_on_latent: float = 0.1
+    lambda_no_answer_on_latent: float = 1.0
 
     digit_temperature: float = 0.1
     # Keep-prob from Phase3 style; accepts tuple/list or dict keys 0..4/1..5.
