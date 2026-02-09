@@ -106,11 +106,19 @@ class AnswerDigitLoss(nn.Module):
 class AnswerTokenSFTLoss(nn.Module):
     """CE on the next-token logits right before <ANSWER>, target is <ANSWER>."""
 
-    def __init__(self, answer_token_id: int) -> None:
+    def __init__(self, answer_token_id: int, lambda_no_answer_on_latent: float = 0.1) -> None:
         super().__init__()
         self.answer_token_id = int(answer_token_id)
+        self.lambda_no_answer_on_latent = float(lambda_no_answer_on_latent)
 
-    def forward(self, answer_next_logits: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        answer_next_logits: torch.Tensor,
+        latent_answer_logits: Optional[torch.Tensor] = None,
+        latent_logsumexp: Optional[torch.Tensor] = None,
+        latent_slot_mask: Optional[torch.Tensor] = None,
+        return_details: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         if answer_next_logits.ndim != 2:
             raise ValueError("answer_next_logits must be [B,V]")
         labels = torch.full(
@@ -119,7 +127,36 @@ class AnswerTokenSFTLoss(nn.Module):
             dtype=torch.long,
             device=answer_next_logits.device,
         )
-        return F.cross_entropy(answer_next_logits, labels)
+        loss_answer_ce = F.cross_entropy(answer_next_logits, labels)
+
+        loss_no_answer = loss_answer_ce.new_zeros(())
+        latent_p_ans_mean = loss_answer_ce.new_zeros(())
+        if latent_answer_logits is not None or latent_logsumexp is not None or latent_slot_mask is not None:
+            if latent_answer_logits is None or latent_logsumexp is None or latent_slot_mask is None:
+                raise ValueError(
+                    "latent_answer_logits, latent_logsumexp, and latent_slot_mask must all be provided together"
+                )
+            if latent_answer_logits.shape != latent_logsumexp.shape:
+                raise ValueError("latent_answer_logits and latent_logsumexp must have the same shape")
+            if latent_slot_mask.shape != latent_answer_logits.shape:
+                raise ValueError("latent_slot_mask shape must match latent_answer_logits")
+
+            valid = latent_slot_mask.to(torch.bool)
+            if valid.any():
+                log_p_ans = latent_answer_logits.float() - latent_logsumexp.float()
+                p_ans = log_p_ans.exp().clamp(min=0.0, max=1.0)
+                loss_no_answer = p_ans[valid].mean().to(loss_answer_ce.dtype)
+                latent_p_ans_mean = loss_no_answer.detach()
+
+        loss_total = loss_answer_ce + self.lambda_no_answer_on_latent * loss_no_answer
+        if return_details:
+            return {
+                "loss_total": loss_total,
+                "loss_answer_ce": loss_answer_ce,
+                "loss_no_answer_latent": loss_no_answer,
+                "latent_p_ans_mean": latent_p_ans_mean,
+            }
+        return loss_total
 
 
 def js_divergence(

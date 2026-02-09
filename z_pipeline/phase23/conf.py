@@ -55,6 +55,8 @@ class LossConfig:
     lambda_dep: float = 0.05
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
+    # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
+    lambda_no_answer_on_latent: float = 0.1
 
     digit_temperature: float = 0.1
     # Keep-prob from Phase3 style; accepts tuple/list or dict keys 0..4/1..5.
