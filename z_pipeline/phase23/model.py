@@ -671,14 +671,17 @@ class UnifiedZSoftModel(nn.Module):
             **kwargs,
         )
 
-    @torch.no_grad()
+    import torch
+    from typing import Dict, Optional
+
+    @torch.inference_mode()
     def generate_with_digits(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        pad_token_id: Optional[int] = None,
-        **kwargs,
+            self,
+            *,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            pad_token_id: Optional[int] = None,
+            **kwargs,
     ) -> Dict[str, torch.Tensor]:
         gen_out = self.generate(
             input_ids=input_ids,
@@ -697,13 +700,15 @@ class UnifiedZSoftModel(nn.Module):
             pad_token_id = getattr(self.base.config, "pad_token_id", self.answer_token_id)
 
         full_attn = (sequences != pad_token_id).long()
+
+        # IMPORTANT: don't request all hidden states (huge VRAM). We only need the last hidden state.
         out = self.base(
             input_ids=sequences,
             attention_mask=full_attn,
-            output_hidden_states=True,
+            output_hidden_states=False,
             return_dict=True,
         )
-        hidden_last = out.hidden_states[-1]
+        hidden_last = out.last_hidden_state  # [B, T, H]
 
         mask = (sequences == self.answer_token_id)
         pos = torch.where(
@@ -721,3 +726,4 @@ class UnifiedZSoftModel(nn.Module):
             "digit_logits": digit_logits,
             "digit_preds": digit_logits.argmax(dim=-1),
         }
+
