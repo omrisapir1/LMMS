@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 from contextlib import nullcontext
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -15,6 +17,62 @@ from .loss import (
 )
 from .model import UnifiedZSoftModel
 from .utils import effective_vocab_size
+
+
+def _digits_to_int(d: torch.Tensor) -> int:
+    out = 0
+    for x in d.tolist():
+        out = out * 10 + int(x)
+    return out
+
+
+def _randomize_z_tokens(seqs: torch.Tensor, z_ids: torch.Tensor) -> torch.Tensor:
+    if z_ids.numel() == 0:
+        return seqs.clone()
+    seqs_rand = seqs.clone()
+    is_z = torch.isin(seqs_rand, z_ids)
+    num_z = int(is_z.sum().item())
+    if num_z == 0:
+        return seqs_rand
+    rand_idx = torch.randint(0, z_ids.numel(), size=(num_z,), device=seqs_rand.device)
+    seqs_rand[is_z] = z_ids[rand_idx]
+    return seqs_rand
+
+
+def _digit_preds_from_sequences(
+    *,
+    model: UnifiedZSoftModel,
+    sequences: torch.Tensor,
+    pad_token_id: int,
+    device: torch.device,
+) -> List[Optional[int]]:
+    full_attn = (sequences != pad_token_id).long()
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with amp_ctx:
+        out = model.base(
+            input_ids=sequences,
+            attention_mask=full_attn,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden_last = out.hidden_states[-1]
+
+        answer_mask = (sequences == model.answer_token_id)
+        pos = answer_mask.float().argmax(dim=1)
+        bidx = torch.arange(hidden_last.size(0), device=hidden_last.device)
+        h = hidden_last[bidx, pos]
+        digit_logits = torch.stack([head(h) for head in model.digit_heads], dim=1)
+        digit_preds = digit_logits.argmax(dim=-1)
+
+    has_answer = answer_mask.any(dim=1).tolist()
+    preds: List[Optional[int]] = []
+    for i, ok in enumerate(has_answer):
+        preds.append(_digits_to_int(digit_preds[i]) if ok else None)
+    return preds
 
 
 def evaluate(
@@ -141,6 +199,124 @@ def evaluate(
     metrics: Dict[str, float] = {k: v / n for k, v in totals.items() if k != "n"}
     metrics["n"] = float(totals["n"])
     return metrics
+
+
+def evaluate_generate_table(
+    *,
+    model: UnifiedZSoftModel,
+    loader: DataLoader,
+    tokenizer,
+    cfg: Config,
+    device: torch.device,
+    step: int,
+    pad_token_id: int,
+) -> str:
+    model.eval()
+    output_dir = cfg.train.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"eval_generations_step_{step}.jsonl")
+
+    z_ids = torch.tensor(model.z_token_ids, device=device, dtype=torch.long)
+    rows_written = 0
+    greedy_with_answer = 0
+    sample_with_answer = 0
+
+    with torch.no_grad(), open(out_path, "w", encoding="utf-8") as f:
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if device.type == "cuda"
+                else nullcontext()
+            )
+            with amp_ctx:
+                greedy_out = model.generate_with_digits(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=pad_token_id,
+                    max_new_tokens=cfg.train.eval_generate_max_new_tokens,
+                    do_sample=False,
+                )
+                sample_out = model.generate_with_digits(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=pad_token_id,
+                    max_new_tokens=cfg.train.eval_generate_max_new_tokens,
+                    do_sample=True,
+                    temperature=cfg.train.eval_generate_temperature,
+                    top_p=cfg.train.eval_generate_top_p,
+                )
+
+            greedy_seqs = greedy_out["sequences"]
+            sample_seqs = sample_out["sequences"]
+
+            greedy_has_answer = (greedy_seqs == model.answer_token_id).any(dim=1)
+            sample_has_answer = (sample_seqs == model.answer_token_id).any(dim=1)
+            greedy_with_answer += int(greedy_has_answer.sum().item())
+            sample_with_answer += int(sample_has_answer.sum().item())
+
+            greedy_preds_raw = greedy_out["digit_preds"]
+            sample_preds_raw = sample_out["digit_preds"]
+            greedy_preds: List[Optional[int]] = []
+            sample_preds: List[Optional[int]] = []
+            for i in range(greedy_seqs.size(0)):
+                greedy_preds.append(_digits_to_int(greedy_preds_raw[i]) if bool(greedy_has_answer[i].item()) else None)
+                sample_preds.append(_digits_to_int(sample_preds_raw[i]) if bool(sample_has_answer[i].item()) else None)
+
+            greedy_rand = _randomize_z_tokens(greedy_seqs, z_ids)
+            sample_rand = _randomize_z_tokens(sample_seqs, z_ids)
+
+            greedy_rand_preds = _digit_preds_from_sequences(
+                model=model,
+                sequences=greedy_rand,
+                pad_token_id=pad_token_id,
+                device=device,
+            )
+            sample_rand_preds = _digit_preds_from_sequences(
+                model=model,
+                sequences=sample_rand,
+                pad_token_id=pad_token_id,
+                device=device,
+            )
+
+            greedy_text = tokenizer.batch_decode(greedy_seqs.detach().cpu(), skip_special_tokens=False)
+            sample_text = tokenizer.batch_decode(sample_seqs.detach().cpu(), skip_special_tokens=False)
+            greedy_rand_text = tokenizer.batch_decode(greedy_rand.detach().cpu(), skip_special_tokens=False)
+            sample_rand_text = tokenizer.batch_decode(sample_rand.detach().cpu(), skip_special_tokens=False)
+
+            questions = [str(x) for x in batch.get("question", [""] * len(greedy_text))]
+            if "answer_digits" in batch:
+                ans_digits_raw = batch["answer_digits"]
+                if isinstance(ans_digits_raw, torch.Tensor):
+                    answer_digits = [int(x) for x in ans_digits_raw.tolist()]
+                else:
+                    answer_digits = [int(x) for x in ans_digits_raw]
+            else:
+                answer_digits = [_digits_to_int(x) for x in batch["digit_labels"]]
+
+            for i in range(len(greedy_text)):
+                row = {
+                    "greedy_tokens": greedy_text[i],
+                    "greedy_digit_pred": greedy_preds[i],
+                    "sample_tokens": sample_text[i],
+                    "sample_digit_pred": sample_preds[i],
+                    "greedy_randomized_tokens": greedy_rand_text[i],
+                    "greedy_randomized_digit_pred": greedy_rand_preds[i],
+                    "sample_randomized_tokens": sample_rand_text[i],
+                    "sample_randomized_digit_pred": sample_rand_preds[i],
+                    "question": questions[i],
+                    "answer_digits": answer_digits[i],
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                rows_written += 1
+
+    print(
+        f"eval_generate@step {step} | path={out_path} rows={rows_written} "
+        f"greedy_with_answer={greedy_with_answer} sample_with_answer={sample_with_answer}"
+    )
+    return out_path
 
 
 def evaluate_from_config(cfg: Config) -> Dict[str, float]:

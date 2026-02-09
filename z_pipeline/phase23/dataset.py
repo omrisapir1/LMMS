@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -43,6 +43,13 @@ def _validate_answer_digits(answer_digits: object) -> torch.Tensor:
             raise ValueError("answer_digits values must be in [0,9]")
         vals.append(v)
     return torch.tensor(vals, dtype=torch.long)
+
+
+def _digits_to_int(digits: torch.Tensor) -> int:
+    out = 0
+    for d in digits.tolist():
+        out = out * 10 + int(d)
+    return out
 
 
 class UnifiedDataset(Dataset):
@@ -111,12 +118,15 @@ class UnifiedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.ds)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         ex = self.ds[idx]
 
         question = ex["question"]
         k_val = int(ex["num_latents"])
-        digit_labels = _validate_answer_digits(ex["answer_digits"])
+        if "digit_labels" not in ex:
+            raise KeyError("Dataset samples must contain 'digit_labels' (list/tuple of 5 digits)")
+        digit_labels = _validate_answer_digits(ex["digit_labels"])
+        answer_digits = _digits_to_int(digit_labels)
 
         if not (1 <= k_val <= self.k_max):
             raise ValueError(f"K={k_val} out of range [1,{self.k_max}]")
@@ -139,14 +149,18 @@ class UnifiedDataset(Dataset):
             "digit_labels": digit_labels,
             "K": torch.tensor(k_val, dtype=torch.long),
             "K_bucket": self._buckets[idx],
+            "question": question,
+            "answer_digits": torch.tensor(answer_digits, dtype=torch.long),
         }
 
 
-def collate_fn(batch: List[Dict[str, torch.Tensor]], pad_token_id: int) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Dict[str, Any]], pad_token_id: int) -> Dict[str, Any]:
     input_ids = [b["input_ids"] for b in batch]
     digit_labels = torch.stack([b["digit_labels"] for b in batch], dim=0)
     k_vals = torch.stack([b["K"] for b in batch], dim=0)
     k_buckets = [b["K_bucket"] for b in batch]
+    questions = [str(b["question"]) for b in batch]
+    answer_digits = torch.stack([b["answer_digits"] for b in batch], dim=0)
 
     input_padded, attention_mask = suffix_pad(input_ids, pad_value=pad_token_id)
 
@@ -156,6 +170,8 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]], pad_token_id: int) -> Dict[
         "digit_labels": digit_labels,
         "K": k_vals,
         "K_bucket": k_buckets,
+        "question": questions,
+        "answer_digits": answer_digits,
     }
 
 

@@ -683,6 +683,7 @@ class UnifiedZSoftModel(nn.Module):
         sequences = self.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            pad_token_id=pad_token_id,
             **kwargs,
         )
 

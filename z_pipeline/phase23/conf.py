@@ -49,10 +49,10 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    lambda_ans: float = 0.1
+    lambda_ans: float = 0.2
     lambda_sft: float = 0.000000001
     lambda_cf: float = 1.0
-    lambda_dep: float = 0.01
+    lambda_dep: float = 0.05
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
 
@@ -80,6 +80,10 @@ class TrainConfig:
 
     print_every: int = 5
     eval_every: int = 50
+    eval_generate_every_mult: int = 4
+    eval_generate_max_new_tokens: int = 64
+    eval_generate_temperature: float = 1.0
+    eval_generate_top_p: float = 0.95
     save_every: int = 500
     cf_debug_every: int = 0
 

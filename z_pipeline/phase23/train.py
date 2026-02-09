@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from .conf import Config
 from .dataset import UnifiedDataset, build_rebalanced_sampler, collate_fn
-from .eval import evaluate
+from .eval import evaluate, evaluate_generate_table
 from .loss import (
     AnswerDigitLoss,
     AnswerTokenSFTLoss,
@@ -424,7 +424,21 @@ def train(cfg: Config) -> None:
                 config=cfg,
             )
 
-        if eval_loader is not None and cfg.train.eval_every > 0 and (step + 1) % cfg.train.eval_every == 0:
+        should_run_loss_eval = (
+            eval_loader is not None
+            and cfg.train.eval_every > 0
+            and (step + 1) % cfg.train.eval_every == 0
+        )
+        gen_eval_every = cfg.train.eval_every * cfg.train.eval_generate_every_mult
+        should_run_generation_eval = (
+            eval_loader is not None
+            and cfg.train.eval_every > 0
+            and cfg.train.eval_generate_every_mult > 0
+            and gen_eval_every > 0
+            and (step + 1) % gen_eval_every == 0
+        )
+
+        if should_run_loss_eval:
             metrics = evaluate(
                 model=model,
                 loader=eval_loader,
@@ -436,6 +450,19 @@ def train(cfg: Config) -> None:
                 f"eval@step {step + 1} | "
                 + " ".join(f"{k}={v:.4f}" for k, v in metrics.items() if k != "n")
             )
+
+        if should_run_generation_eval:
+            evaluate_generate_table(
+                model=model,
+                loader=eval_loader,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                step=step + 1,
+                pad_token_id=pad_token_id,
+            )
+
+        if should_run_loss_eval or should_run_generation_eval:
             model.train()
 
         step += 1
