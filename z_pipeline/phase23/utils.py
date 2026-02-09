@@ -5,6 +5,29 @@ from typing import List, Tuple, Optional
 
 import torch
 
+SYSTEM_PROMPT = (
+    "Please reason step by step, and put your final answer within \\boxed{}."
+)
+FIRST_PART_PROMPT = """<|im_start|>system
+Please reason step by step, and put your final answer within \\boxed{}.<|im_end|>
+<|im_start|>user
+"""
+SECOND_PART_PROMPT = """<|im_end|>
+<|im_start|>assistant
+"""
+
+
+def build_prompt(tokenizer, question: str) -> str:
+    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ]
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    return FIRST_PART_PROMPT + question + SECOND_PART_PROMPT
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)

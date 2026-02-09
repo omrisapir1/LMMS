@@ -8,7 +8,7 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset, WeightedRandomSampler
 
-from .utils import k_to_bucket, suffix_pad
+from .utils import build_prompt, k_to_bucket, suffix_pad
 
 
 TARGET_DIST = {
@@ -139,7 +139,8 @@ class UnifiedDataset(Dataset):
         if not (1 <= k_val <= self.k_max):
             raise ValueError(f"K={k_val} out of range [1,{self.k_max}]")
 
-        q_ids = self.tokenizer(question, add_special_tokens=False)["input_ids"]
+        prompt = build_prompt(self.tokenizer, question)
+        q_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
         if self.max_length is not None:
             max_q = self.max_length - k_val - 1
             if max_q < 1:

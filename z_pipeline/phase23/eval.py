@@ -16,7 +16,7 @@ from .loss import (
     CounterfactualAnswerLoss,
 )
 from .model import UnifiedZSoftModel
-from .utils import effective_vocab_size
+from .utils import build_prompt, effective_vocab_size
 
 
 def _digits_to_int(d: torch.Tensor) -> int:
@@ -73,6 +73,13 @@ def _digit_preds_from_sequences(
     for i, ok in enumerate(has_answer):
         preds.append(_digits_to_int(digit_preds[i]) if ok else None)
     return preds
+
+
+def decode_upto_answer(tokenizer, seq: torch.Tensor, answer_token_id: int) -> str:
+    ids = seq.tolist()
+    if answer_token_id in ids:
+        ids = ids[: ids.index(answer_token_id) + 1]
+    return tokenizer.decode(ids, skip_special_tokens=False)
 
 
 def evaluate(
@@ -223,70 +230,19 @@ def evaluate_generate_table(
 
     with torch.no_grad(), open(out_path, "w", encoding="utf-8") as f:
         for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            amp_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if device.type == "cuda"
-                else nullcontext()
+            questions = [str(x) for x in batch.get("question", [])]
+            k_vals = [int(x) for x in batch["K"].tolist()]
+            prompts = [build_prompt(tokenizer, q) for q in questions]
+            tok = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                add_special_tokens=False,
             )
-            with amp_ctx:
-                greedy_out = model.generate_with_digits(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pad_token_id=pad_token_id,
-                    max_new_tokens=cfg.train.eval_generate_max_new_tokens,
-                    do_sample=False,
-                )
-                sample_out = model.generate_with_digits(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pad_token_id=pad_token_id,
-                    max_new_tokens=cfg.train.eval_generate_max_new_tokens,
-                    do_sample=True,
-                    temperature=cfg.train.eval_generate_temperature,
-                    top_p=cfg.train.eval_generate_top_p,
-                )
+            gen_input_ids = tok["input_ids"].to(device)
+            gen_attention_mask = tok["attention_mask"].to(device)
 
-            greedy_seqs = greedy_out["sequences"]
-            sample_seqs = sample_out["sequences"]
-
-            greedy_has_answer = (greedy_seqs == model.answer_token_id).any(dim=1)
-            sample_has_answer = (sample_seqs == model.answer_token_id).any(dim=1)
-            greedy_with_answer += int(greedy_has_answer.sum().item())
-            sample_with_answer += int(sample_has_answer.sum().item())
-
-            greedy_preds_raw = greedy_out["digit_preds"]
-            sample_preds_raw = sample_out["digit_preds"]
-            greedy_preds: List[Optional[int]] = []
-            sample_preds: List[Optional[int]] = []
-            for i in range(greedy_seqs.size(0)):
-                greedy_preds.append(_digits_to_int(greedy_preds_raw[i]) if bool(greedy_has_answer[i].item()) else None)
-                sample_preds.append(_digits_to_int(sample_preds_raw[i]) if bool(sample_has_answer[i].item()) else None)
-
-            greedy_rand = _randomize_z_tokens(greedy_seqs, z_ids)
-            sample_rand = _randomize_z_tokens(sample_seqs, z_ids)
-
-            greedy_rand_preds = _digit_preds_from_sequences(
-                model=model,
-                sequences=greedy_rand,
-                pad_token_id=pad_token_id,
-                device=device,
-            )
-            sample_rand_preds = _digit_preds_from_sequences(
-                model=model,
-                sequences=sample_rand,
-                pad_token_id=pad_token_id,
-                device=device,
-            )
-
-            greedy_text = tokenizer.batch_decode(greedy_seqs.detach().cpu(), skip_special_tokens=False)
-            sample_text = tokenizer.batch_decode(sample_seqs.detach().cpu(), skip_special_tokens=False)
-            greedy_rand_text = tokenizer.batch_decode(greedy_rand.detach().cpu(), skip_special_tokens=False)
-            sample_rand_text = tokenizer.batch_decode(sample_rand.detach().cpu(), skip_special_tokens=False)
-
-            questions = [str(x) for x in batch.get("question", [""] * len(greedy_text))]
             if "answer_digits" in batch:
                 ans_digits_raw = batch["answer_digits"]
                 if isinstance(ans_digits_raw, torch.Tensor):
@@ -296,16 +252,75 @@ def evaluate_generate_table(
             else:
                 answer_digits = [_digits_to_int(x) for x in batch["digit_labels"]]
 
-            for i in range(len(greedy_text)):
+            for i in range(len(questions)):
+                amp_ctx = (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if device.type == "cuda"
+                    else nullcontext()
+                )
+                max_new_tokens = int(k_vals[i]) + 1
+                with amp_ctx:
+                    greedy_out = model.generate_with_digits(
+                        input_ids=gen_input_ids[i:i + 1],
+                        attention_mask=gen_attention_mask[i:i + 1],
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=pad_token_id,
+                    )
+                    sample_out = model.generate_with_digits(
+                        input_ids=gen_input_ids[i:i + 1],
+                        attention_mask=gen_attention_mask[i:i + 1],
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=cfg.train.eval_generate_temperature,
+                        top_p=cfg.train.eval_generate_top_p,
+                        pad_token_id=pad_token_id,
+                    )
+
+                greedy_seqs = greedy_out["sequences"]
+                sample_seqs = sample_out["sequences"]
+
+                if (greedy_seqs == model.latent_token_id).any() or (sample_seqs == model.latent_token_id).any():
+                    raise RuntimeError("Generation produced <|latent|> tokens, which indicates a prompt/generation bug.")
+
+                greedy_has_answer = bool((greedy_seqs == model.answer_token_id).any(dim=1)[0].item())
+                sample_has_answer = bool((sample_seqs == model.answer_token_id).any(dim=1)[0].item())
+                greedy_with_answer += int(greedy_has_answer)
+                sample_with_answer += int(sample_has_answer)
+
+                greedy_pred = _digits_to_int(greedy_out["digit_preds"][0]) if greedy_has_answer else None
+                sample_pred = _digits_to_int(sample_out["digit_preds"][0]) if sample_has_answer else None
+
+                greedy_rand = _randomize_z_tokens(greedy_seqs, z_ids)
+                sample_rand = _randomize_z_tokens(sample_seqs, z_ids)
+
+                greedy_rand_pred = _digit_preds_from_sequences(
+                    model=model,
+                    sequences=greedy_rand,
+                    pad_token_id=pad_token_id,
+                    device=device,
+                )[0]
+                sample_rand_pred = _digit_preds_from_sequences(
+                    model=model,
+                    sequences=sample_rand,
+                    pad_token_id=pad_token_id,
+                    device=device,
+                )[0]
+
+                greedy_text = decode_upto_answer(tokenizer, greedy_seqs[0].detach().cpu(), model.answer_token_id)
+                sample_text = decode_upto_answer(tokenizer, sample_seqs[0].detach().cpu(), model.answer_token_id)
+                greedy_rand_text = decode_upto_answer(tokenizer, greedy_rand[0].detach().cpu(), model.answer_token_id)
+                sample_rand_text = decode_upto_answer(tokenizer, sample_rand[0].detach().cpu(), model.answer_token_id)
+
                 row = {
-                    "greedy_tokens": greedy_text[i],
-                    "greedy_digit_pred": greedy_preds[i],
-                    "sample_tokens": sample_text[i],
-                    "sample_digit_pred": sample_preds[i],
-                    "greedy_randomized_tokens": greedy_rand_text[i],
-                    "greedy_randomized_digit_pred": greedy_rand_preds[i],
-                    "sample_randomized_tokens": sample_rand_text[i],
-                    "sample_randomized_digit_pred": sample_rand_preds[i],
+                    "greedy_tokens": greedy_text,
+                    "greedy_digit_pred": greedy_pred,
+                    "sample_tokens": sample_text,
+                    "sample_digit_pred": sample_pred,
+                    "greedy_randomized_tokens": greedy_rand_text,
+                    "greedy_randomized_digit_pred": greedy_rand_pred,
+                    "sample_randomized_tokens": sample_rand_text,
+                    "sample_randomized_digit_pred": sample_rand_pred,
                     "question": questions[i],
                     "answer_digits": answer_digits[i],
                 }
