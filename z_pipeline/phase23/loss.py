@@ -154,7 +154,7 @@ class AnswerTokenSFTLoss(nn.Module):
                 loss_no_answer = p_ans[valid].mean().to(loss_answer_ce.dtype)
                 latent_p_ans_mean = loss_no_answer.detach()
 
-        loss_total = 0 * loss_answer_ce + self.lambda_no_answer_on_latent * loss_no_answer
+        loss_total = (1 -  self.lambda_no_answer_on_latent) * loss_answer_ce + self.lambda_no_answer_on_latent * loss_no_answer
         if return_details:
             return {
                 "loss_total": loss_total,
