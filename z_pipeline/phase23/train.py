@@ -250,10 +250,7 @@ def train(cfg: Config) -> None:
         "sft_ce": 0.0,
         "sft_no_answer_latent": 0.0,
         "sft_latent_p_ans": 0.0,
-        "cf_gs": 0.0,
         "cf_det": 0.0,
-        "cf": 0.0,
-        "dep": 0.0,
         "eff_vocab": 0.0,
     }
     log_count = 0
@@ -352,15 +349,9 @@ def train(cfg: Config) -> None:
                     stage_name=current_stage,
                     return_details=True,
                 )
-                loss_cf_gs = torch.zeros((), device=device)
                 loss_cf_det = cf_det["loss_cf"]
-                loss_cf = loss_cf_det
-                loss_dep = torch.zeros((), device=device)
             else:
-                loss_cf_gs = torch.zeros((), device=device)
                 loss_cf_det = torch.zeros((), device=device)
-                loss_cf = torch.zeros((), device=device)
-                loss_dep = torch.zeros((), device=device)
 
             loss_batch = torch.zeros((), device=device)
             loss_consistency = torch.zeros((), device=device)
@@ -368,8 +359,7 @@ def train(cfg: Config) -> None:
             total = (
                 cfg.loss.lambda_ans * loss_ans
                 + cfg.loss.lambda_sft * loss_sft
-                + cfg.loss.lambda_cf * loss_cf
-                + cfg.loss.lambda_dep * loss_dep
+                + cfg.loss.lambda_cf * loss_cf_det
                 + cfg.loss.lambda_batch * loss_batch
                 + cfg.loss.lambda_consistency * loss_consistency
             )
@@ -387,10 +377,7 @@ def train(cfg: Config) -> None:
         log_sums["sft_ce"] += float(loss_sft_ce.detach().cpu())
         log_sums["sft_no_answer_latent"] += float(loss_sft_no_answer_latent.detach().cpu())
         log_sums["sft_latent_p_ans"] += float(sft_latent_p_ans.detach().cpu())
-        log_sums["cf_gs"] += float(loss_cf_gs.detach().cpu())
         log_sums["cf_det"] += float(loss_cf_det.detach().cpu())
-        log_sums["cf"] += float(loss_cf.detach().cpu())
-        log_sums["dep"] += float(loss_dep.detach().cpu())
         log_count += 1
 
         if p_student is not None:
@@ -412,10 +399,7 @@ def train(cfg: Config) -> None:
                 f"sft_ce={log_sums['sft_ce'] / denom:.4f} "
                 f"sft_no_answer_latent={log_sums['sft_no_answer_latent'] / denom:.4f} "
                 f"sft_latent_p_ans={log_sums['sft_latent_p_ans'] / denom:.4f} "
-                f"cf_gs={log_sums['cf_gs'] / denom:.4f} "
                 f"cf_det={log_sums['cf_det'] / denom:.4f} "
-                f"cf={log_sums['cf'] / denom:.4f} "
-                f"dep={log_sums['dep'] / denom:.4f} "
                 f"tau={g_tau:.4f} "
                 f"stage={current_stage} "
                 f"cf_bias_scale={current_bias_scale:.3f}"
@@ -433,10 +417,7 @@ def train(cfg: Config) -> None:
                 "sft_ce": 0.0,
                 "sft_no_answer_latent": 0.0,
                 "sft_latent_p_ans": 0.0,
-                "cf_gs": 0.0,
                 "cf_det": 0.0,
-                "cf": 0.0,
-                "dep": 0.0,
                 "eff_vocab": 0.0,
             }
             log_count = 0

@@ -52,7 +52,6 @@ class LossConfig:
     lambda_ans: float = 0.05
     lambda_sft: float = 0.01
     lambda_cf: float = 1.0
-    lambda_dep: float = 0.05
     lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
     # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
@@ -90,7 +89,7 @@ class TrainConfig:
     cf_debug_every: int = 0
 
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
-    cf_warmup_steps: int = 50
+    cf_warmup_steps: int = 100
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
     cf_bias_anneal_steps: int = 100
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
