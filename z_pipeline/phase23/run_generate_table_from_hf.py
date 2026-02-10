@@ -83,9 +83,9 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Run Phase23 evaluate_generate_table on an HF dataset with columns problem/final_answer."
     )
-    p.add_argument("--checkpoint_dir", required=True, help="Phase23 checkpoint dir (contains phase23_state.pt).")
-    p.add_argument("--dataset_name", required=True, help="HF dataset name or repo id.")
-    p.add_argument("--split", default="train", help="HF split name (default: train).")
+    p.add_argument("--checkpoint_dir", default="/workspace/LMMS/runs/phase23_gs/step_500", help="Phase23 checkpoint dir (contains phase23_state.pt).")
+    p.add_argument("--dataset_name", default="omrisap/phase_3", help="HF dataset name or repo id.")
+    p.add_argument("--split", default="eval", help="HF split name (default: train).")
     p.add_argument("--batch_size", type=int, default=16, help="Eval batch size.")
     p.add_argument("--step", type=int, default=0, help="Step label used in output filename.")
     p.add_argument(
