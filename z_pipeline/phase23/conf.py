@@ -92,7 +92,7 @@ class TrainConfig:
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
     cf_warmup_steps: int = 50
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
-    cf_bias_anneal_steps: int = 1000
+    cf_bias_anneal_steps: int = 100
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
     cf_attention_bias_strength: float = 2.0
     cf_attention_bias_enabled: bool = True

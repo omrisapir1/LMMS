@@ -4,6 +4,7 @@ import json
 import os
 from contextlib import nullcontext
 from dataclasses import asdict
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -19,6 +20,14 @@ from .loss import (
 )
 from .model import UnifiedZSoftModel
 from .utils import effective_vocab_size, gumbel_tau_at_step, set_seed
+
+
+def _log_line(msg: str, log_path: str) -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
+    line = f"{ts} | {msg}"
+    print(msg)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def _save_checkpoint(
@@ -137,6 +146,9 @@ def _configure_stage_trainability(
 
 def train(cfg: Config) -> None:
     set_seed(cfg.train.seed)
+    output_dir = cfg.train.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "train.log")
 
     if cfg.loss.lambda_sft <= 0:
         raise ValueError("Phase23 requires AnswerTokenSFTLoss: set loss.lambda_sft > 0")
@@ -318,25 +330,13 @@ def train(cfg: Config) -> None:
             loss_sft_no_answer_latent = sft_terms["loss_no_answer_latent"]
             sft_latent_p_ans = sft_terms["latent_p_ans_mean"]
 
-            if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+            if cfg.loss.lambda_cf > 0 and p_student is not None:
                 p_student_det_idx = p_student.detach().argmax(dim=-1)
-                cf_gs = cf_loss_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    p_z=p_student,
-                    k_vals=k_vals,
-                    cf_bias_scale=current_bias_scale,
-                    cf_attention_bias_strength=cfg.train.cf_attention_bias_strength,
-                    apply_cf_answer_z_bias=(
-                        cfg.train.cf_bias_apply_cf_path_only and current_bias_scale > 0.0
-                    ),
-                    cf_mode="gs",
-                    global_step=step + 1,
-                    stage_name=current_stage,
-                    return_details=True,
+                apply_det_bias = (
+                    cfg.train.cf_bias_apply_cf_path_only
+                    and cfg.train.cf_attention_bias_enabled
+                    and current_bias_scale > 0.0
                 )
-
                 cf_det = cf_loss_fn(
                     model=model,
                     input_ids=input_ids,
@@ -344,20 +344,18 @@ def train(cfg: Config) -> None:
                     p_z=None,
                     p_z_idx_det=p_student_det_idx,
                     k_vals=k_vals,
-                    cf_bias_scale=0.0,
-                    cf_attention_bias_strength=0.0,
-                    apply_cf_answer_z_bias=False,
+                    cf_bias_scale=current_bias_scale,
+                    cf_attention_bias_strength=cfg.train.cf_attention_bias_strength,
+                    apply_cf_answer_z_bias=apply_det_bias,
                     cf_mode="det",
                     global_step=step + 1,
                     stage_name=current_stage,
                     return_details=True,
                 )
-                loss_cf_gs = cf_gs["loss_cf"]
+                loss_cf_gs = torch.zeros((), device=device)
                 loss_cf_det = cf_det["loss_cf"]
-                loss_dep_gs = cf_gs["loss_dep"]
-                # loss_cf = 0.5 * (loss_cf_gs + loss_cf_det)
-                loss_cf = 0.05 * loss_cf_gs + 0.95 * loss_cf_det
-                loss_dep = loss_dep_gs
+                loss_cf = loss_cf_det
+                loss_dep = torch.zeros((), device=device)
             else:
                 loss_cf_gs = torch.zeros((), device=device)
                 loss_cf_det = torch.zeros((), device=device)
@@ -426,7 +424,7 @@ def train(cfg: Config) -> None:
                 msg += f" | eff_vocab={log_sums['eff_vocab'] / log_eff_count:.2f}"
             if device.type == "cuda":
                 msg += f" | cuda_max_mem_gb={step_cuda_max_mem:.2f}"
-            print(msg)
+            _log_line(msg, log_path)
 
             log_sums = {
                 "loss": 0.0,
@@ -475,9 +473,10 @@ def train(cfg: Config) -> None:
                 device=device,
                 global_step=step + 1,
             )
-            print(
+            _log_line(
                 f"eval@step {step + 1} | "
-                + " ".join(f"{k}={v:.4f}" for k, v in metrics.items() if k != "n")
+                + " ".join(f"{k}={v:.4f}" for k, v in metrics.items() if k != "n"),
+                log_path,
             )
 
         if should_run_generation_eval:

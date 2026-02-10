@@ -325,6 +325,12 @@ class CounterfactualAnswerLoss(nn.Module):
         if cf_mode not in {"gs", "det"}:
             raise ValueError("cf_mode must be one of {'gs','det'}")
         is_det = (cf_mode == "det")
+        det_bias_requested = bool(is_det and apply_cf_answer_z_bias and cf_bias_scale > 0.0)
+        det_bias_kwargs = {
+            "cf_bias_scale": float(cf_bias_scale),
+            "apply_cf_answer_z_bias": bool(apply_cf_answer_z_bias),
+            "cf_attention_bias_strength": float(cf_attention_bias_strength),
+        }
 
         if is_det:
             if p_z_idx_det is None:
@@ -333,8 +339,8 @@ class CounterfactualAnswerLoss(nn.Module):
                 p_ref_idx = self._deterministic_z_idx(p_z)
             else:
                 p_ref_idx = p_z_idx_det
-            cf_bias_scale = 0.0
-            apply_cf_answer_z_bias = False
+            if det_bias_requested and float(cf_attention_bias_strength) == 0.0:
+                raise ValueError("DET CF bias requested but cf_attention_bias_strength is 0.")
         else:
             if p_z is None:
                 raise ValueError("GS mode requires p_z.")
@@ -349,9 +355,7 @@ class CounterfactualAnswerLoss(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 p_z_idx=p_ref_idx.detach(),
-                cf_bias_scale=0.0,
-                apply_cf_answer_z_bias=False,
-                cf_attention_bias_strength=0.0,
+                **det_bias_kwargs,
                 return_answer_hidden=True,
             )
         else:
@@ -384,9 +388,7 @@ class CounterfactualAnswerLoss(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 p_z_idx=p_cf_idx,
-                cf_bias_scale=0.0,
-                apply_cf_answer_z_bias=False,
-                cf_attention_bias_strength=0.0,
+                **det_bias_kwargs,
                 return_answer_hidden=True,
             )
         else:
@@ -426,6 +428,13 @@ class CounterfactualAnswerLoss(nn.Module):
 
         if self.debug_every > 0 and global_step is not None and (int(global_step) % self.debug_every == 0):
             with torch.no_grad():
+                if det_bias_requested:
+                    print(
+                        f"cf_debug step={int(global_step)} stage={stage_name} mode=det "
+                        f"bias_requested=1 bias_scale={float(cf_bias_scale):.3f} "
+                        f"bias_strength={float(cf_attention_bias_strength):.3f}"
+                    )
+
                 delta_logits = (digit_logits_ref_det - digit_logits_cf).abs().mean()
                 pred_ref = digit_logits_ref_det.argmax(dim=-1)  # [B,5]
                 pred_cf = digit_logits_cf.argmax(dim=-1)        # [B,5]
@@ -443,6 +452,27 @@ class CounterfactualAnswerLoss(nn.Module):
                 h_ref = (-(p_ref.clamp_min(1e-8) * p_ref.clamp_min(1e-8).log()).sum(dim=-1)).mean()
                 h_cf = (-(p_cf.clamp_min(1e-8) * p_cf.clamp_min(1e-8).log()).sum(dim=-1)).mean()
 
+                det_bias_dlogits = torch.zeros_like(delta_logits)
+                det_bias_lcf_absdiff = torch.zeros_like(js)
+                if det_bias_requested:
+                    cf_out_nobias = model.forward_with_fixed_z_distributions(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        p_z_idx=p_cf_idx,
+                        cf_bias_scale=0.0,
+                        apply_cf_answer_z_bias=False,
+                        cf_attention_bias_strength=0.0,
+                        return_answer_hidden=True,
+                    )
+                    digit_logits_cf_nobias = cf_out_nobias["digit_logits"]
+                    p_cf_nobias = safe_softmax(
+                        digit_logits_cf_nobias, tau=self.digit_temperature, dim=-1
+                    )
+                    js_nobias = js_divergence(p_ref, p_cf_nobias).mean()
+                    loss_cf_nobias = torch.log(torch.tensor(2.0, device=js.device, dtype=js.dtype)) - js_nobias
+                    det_bias_dlogits = (digit_logits_cf - digit_logits_cf_nobias).abs().mean()
+                    det_bias_lcf_absdiff = (loss_cf - loss_cf_nobias).abs()
+
                 print(
                     f"cf_debug step={int(global_step)} stage={stage_name} mode={cf_mode} "
                     f"bias_scale={float(cf_bias_scale):.3f} "
@@ -452,7 +482,9 @@ class CounterfactualAnswerLoss(nn.Module):
                     f"cos_sim={float(cos_sim):.4f} dep_norm={float(dep_norm):.4f} "
                     f"conf_ref={float(conf_ref):.4f} conf_cf={float(conf_cf):.4f} "
                     f"margin_ref={float(margin_ref):.4f} margin_cf={float(margin_cf):.4f} "
-                    f"H_ref={float(h_ref):.4f} H_cf={float(h_cf):.4f}"
+                    f"H_ref={float(h_ref):.4f} H_cf={float(h_cf):.4f} "
+                    f"det_bias_dlogits={float(det_bias_dlogits):.4f} "
+                    f"det_bias_lcf_absdiff={float(det_bias_lcf_absdiff):.4f}"
                 )
 
         if return_details:
