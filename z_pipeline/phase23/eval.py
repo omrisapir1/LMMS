@@ -127,9 +127,7 @@ def evaluate(
         totals["sft_no_answer_latent"] = 0.0
         totals["sft_latent_p_ans"] = 0.0
     if cfg.loss.lambda_cf > 0:
-        totals["cf"] = 0.0
-    if cfg.loss.lambda_dep > 0:
-        totals["dep"] = 0.0
+        totals["cf_det"] = 0.0
     if cfg.loss.lambda_batch > 0:
         totals["batch"] = 0.0
     if cfg.loss.lambda_consistency > 0:
@@ -177,7 +175,7 @@ def evaluate(
                 loss_sft_no_answer_latent = sft_terms["loss_no_answer_latent"]
                 sft_latent_p_ans = sft_terms["latent_p_ans_mean"]
 
-                if (cfg.loss.lambda_cf > 0 or cfg.loss.lambda_dep > 0) and p_student is not None:
+                if cfg.loss.lambda_cf > 0 and p_student is not None:
                     p_student_det_idx = p_student.detach().argmax(dim=-1)
                     cf_terms = cf_loss_fn(
                         model=model,
@@ -192,11 +190,9 @@ def evaluate(
                         cf_mode="det",
                         return_details=True,
                     )
-                    loss_cf = cf_terms["loss_cf"]
-                    loss_dep = cf_terms["loss_dep"]
+                    loss_cf_det = cf_terms["loss_cf"]
                 else:
-                    loss_cf = torch.zeros((), device=device)
-                    loss_dep = torch.zeros((), device=device)
+                    loss_cf_det = torch.zeros((), device=device)
 
                 loss_batch = torch.zeros((), device=device)
                 loss_consistency = torch.zeros((), device=device)
@@ -204,8 +200,7 @@ def evaluate(
                 total = (
                     cfg.loss.lambda_ans * loss_ans
                     + cfg.loss.lambda_sft * loss_sft
-                    + cfg.loss.lambda_cf * loss_cf
-                    + cfg.loss.lambda_dep * loss_dep
+                    + cfg.loss.lambda_cf * loss_cf_det
                     + cfg.loss.lambda_batch * loss_batch
                     + cfg.loss.lambda_consistency * loss_consistency
                 )
@@ -219,10 +214,8 @@ def evaluate(
                 totals["sft_ce"] += float(loss_sft_ce.detach().cpu()) * bsz
                 totals["sft_no_answer_latent"] += float(loss_sft_no_answer_latent.detach().cpu()) * bsz
                 totals["sft_latent_p_ans"] += float(sft_latent_p_ans.detach().cpu()) * bsz
-            if "cf" in totals:
-                totals["cf"] += float(loss_cf.detach().cpu()) * bsz
-            if "dep" in totals:
-                totals["dep"] += float(loss_dep.detach().cpu()) * bsz
+            if "cf_det" in totals:
+                totals["cf_det"] += float(loss_cf_det.detach().cpu()) * bsz
             if "batch" in totals:
                 totals["batch"] += float(loss_batch.detach().cpu()) * bsz
             if "consistency" in totals:
