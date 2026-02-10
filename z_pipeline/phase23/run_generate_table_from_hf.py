@@ -25,8 +25,12 @@ def _extract_five_digits(final_answer: Any) -> List[int]:
 
     s = str(final_answer)
     digits = re.findall(r"\d", s)
-    # if len(digits) != 5:
-    #     raise ValueError(f"Could not parse exactly 5 digits from final_answer: {final_answer!r}")
+    if len(digits) == 0:
+        raise ValueError(f"Could not parse any digits from final_answer: {final_answer!r}")
+    if len(digits) > 5:
+        raise ValueError(f"Could not parse <=5 digits from final_answer: {final_answer!r}")
+    # final_answer may omit leading zeros (e.g. "8" -> 00008)
+    digits = (["0"] * (5 - len(digits))) + digits
     return [int(x) for x in digits]
 
 
