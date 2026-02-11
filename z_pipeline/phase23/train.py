@@ -125,6 +125,10 @@ def _configure_stage_trainability(
         for p in lm_head.parameters():
             p.requires_grad = True
 
+        # Warmup also trains digit heads (initialized from scratch in from_base()).
+        for p in model.digit_heads.parameters():
+            p.requires_grad = True
+
         # Unfreeze embedding matrix but allow gradients only for Z rows.
         emb_weight = model.base.get_input_embeddings().weight
         emb_weight.requires_grad = True
@@ -157,8 +161,8 @@ def train(cfg: Config) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    bundle = UnifiedZSoftModel.from_phase1(
-        phase1_dir=cfg.model.phase1_dir,
+    bundle = UnifiedZSoftModel.from_base(
+        base_model_id=cfg.model.base_model_id,
         v_z=cfg.model.v_z,
         device=device,
         torch_dtype=torch.bfloat16,
@@ -168,6 +172,13 @@ def train(cfg: Config) -> None:
     )
     tokenizer = bundle.tokenizer
     model = bundle.model
+    assert len(model.z_token_ids) == int(cfg.model.v_z), "len(model.z_token_ids) must equal cfg.model.v_z"
+    assert model.latent_token_id == tokenizer.convert_tokens_to_ids(
+        cfg.model.latent_token
+    ), "latent_token_id mismatch"
+    assert model.answer_token_id == tokenizer.convert_tokens_to_ids(
+        cfg.model.answer_token
+    ), "answer_token_id mismatch"
     model.base.gradient_checkpointing_enable()
     model.train()
 

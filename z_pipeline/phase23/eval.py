@@ -368,8 +368,8 @@ def evaluate_from_config(cfg: Config) -> Dict[str, float]:
     """Standalone eval entrypoint that loads model + eval dataset from config."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    bundle = UnifiedZSoftModel.from_phase1(
-        phase1_dir=cfg.model.phase1_dir,
+    bundle = UnifiedZSoftModel.from_base(
+        base_model_id=cfg.model.base_model_id,
         v_z=cfg.model.v_z,
         device=device,
         torch_dtype=torch.bfloat16,
@@ -379,6 +379,13 @@ def evaluate_from_config(cfg: Config) -> Dict[str, float]:
     )
     tokenizer = bundle.tokenizer
     model = bundle.model
+    assert len(model.z_token_ids) == int(cfg.model.v_z), "len(model.z_token_ids) must equal cfg.model.v_z"
+    assert model.latent_token_id == tokenizer.convert_tokens_to_ids(
+        cfg.model.latent_token
+    ), "latent_token_id mismatch"
+    assert model.answer_token_id == tokenizer.convert_tokens_to_ids(
+        cfg.model.answer_token
+    ), "answer_token_id mismatch"
 
     ds = UnifiedDataset(
         tokenizer=tokenizer,

@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -110,9 +111,9 @@ class UnifiedZSoftModel(nn.Module):
         return self.base.model if hasattr(self.base, "model") else self.base
 
     @classmethod
-    def _build_from_phase1(
+    def _build_from_base(
         cls,
-        repo_or_dir: str,
+        base_model_id: str,
         *,
         v_z: int,
         device: torch.device,
@@ -121,18 +122,39 @@ class UnifiedZSoftModel(nn.Module):
         latent_token: str = "<|latent|>",
         answer_token: str = "<ANSWER>",
     ) -> Phase23Bundle:
-        from z_pipeline.shared.load_model_phase1 import load_phase1
-
-        tokenizer, phase1_model, _meta = load_phase1(
-            repo_or_dir=repo_or_dir,
-            device=str(device),
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_id,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+        base_lm = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            trust_remote_code=True,
             torch_dtype=torch_dtype,
         )
+        base_lm = base_lm.to(device)
 
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is None:
                 raise RuntimeError("Tokenizer has no pad/eos token.")
             tokenizer.pad_token = tokenizer.eos_token
+
+        vocab = tokenizer.get_vocab()
+        special_to_add: List[str] = []
+        if latent_token not in vocab:
+            special_to_add.append(latent_token)
+        if answer_token not in vocab:
+            special_to_add.append(answer_token)
+        if special_to_add:
+            tokenizer.add_special_tokens({"additional_special_tokens": special_to_add})
+
+        z_tokens = [f"<{z_prefix}{i}>" for i in range(int(v_z))]
+        vocab = tokenizer.get_vocab()
+        to_add = [tok for tok in z_tokens if tok not in vocab]
+        if to_add:
+            tokenizer.add_tokens(to_add, special_tokens=False)
+        if special_to_add or to_add:
+            base_lm.resize_token_embeddings(len(tokenizer))
 
         latent_token_id = tokenizer.convert_tokens_to_ids(latent_token)
         answer_token_id = tokenizer.convert_tokens_to_ids(answer_token)
@@ -141,17 +163,6 @@ class UnifiedZSoftModel(nn.Module):
         if answer_token_id is None or int(answer_token_id) < 0:
             raise RuntimeError(f"Could not resolve answer token id '{answer_token}'")
 
-        phase0 = phase1_model.phase0
-        base_lm = cls._ensure_causal_lm(phase0.model)
-        digit_heads = phase0.digit_heads
-
-        z_tokens = [f"<{z_prefix}{i}>" for i in range(int(v_z))]
-        vocab = tokenizer.get_vocab()
-        to_add = [tok for tok in z_tokens if tok not in vocab]
-        if to_add:
-            tokenizer.add_tokens(to_add, special_tokens=False)
-        base_lm.resize_token_embeddings(len(tokenizer))
-
         z_token_ids: List[int] = []
         for i in range(int(v_z)):
             tok = f"<{z_prefix}{i}>"
@@ -159,6 +170,12 @@ class UnifiedZSoftModel(nn.Module):
             if tid is None or int(tid) < 0:
                 raise RuntimeError(f"Failed to resolve token id for {tok}")
             z_token_ids.append(int(tid))
+
+        hidden_size = int(getattr(base_lm.config, "hidden_size"))
+        digit_heads = nn.ModuleList([nn.Linear(hidden_size, 10) for _ in range(5)])
+        digit_heads = digit_heads.to(device=device)
+        if isinstance(torch_dtype, torch.dtype):
+            digit_heads = digit_heads.to(dtype=torch_dtype)
 
         model = cls(
             base_lm=base_lm,
@@ -172,9 +189,9 @@ class UnifiedZSoftModel(nn.Module):
         return Phase23Bundle(tokenizer=tokenizer, model=model)
 
     @classmethod
-    def from_phase1(
+    def from_base(
         cls,
-        phase1_dir: str,
+        base_model_id: str,
         v_z: int,
         device: Union[torch.device, str] = "cuda",
         torch_dtype: Union[str, torch.dtype] = torch.bfloat16,
@@ -182,8 +199,8 @@ class UnifiedZSoftModel(nn.Module):
         latent_token: str = "<|latent|>",
         answer_token: str = "<ANSWER>",
     ) -> Phase23Bundle:
-        return cls._build_from_phase1(
-            repo_or_dir=phase1_dir,
+        return cls._build_from_base(
+            base_model_id=base_model_id,
             v_z=v_z,
             device=torch.device(device),
             torch_dtype=torch_dtype,
@@ -207,7 +224,7 @@ class UnifiedZSoftModel(nn.Module):
         """
         Load Phase23 model either from:
         1) phase23 checkpoint directory (phase23_state.pt + config.json + tokenizer files), or
-        2) Phase1 repo/directory (build fresh phase23 wrapper from Phase1).
+        2) HF base model id (build fresh phase23 wrapper from base model).
         """
         device_t = torch.device(device)
         state_path = os.path.join(repo_or_dir, "phase23_state.pt")
@@ -221,16 +238,14 @@ class UnifiedZSoftModel(nn.Module):
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
 
-            phase1_dir = cfg.get("model", {}).get("phase1_dir")
-            if not phase1_dir:
-                raise RuntimeError("config.json missing model.phase1_dir required for restore")
+            base_model_id = cfg.get("model", {}).get("base_model_id", "Qwen/Qwen2.5-Math-1.5B-Instruct")
             ckpt_vz = int(cfg.get("model", {}).get("v_z", v_z))
             ckpt_z_prefix = cfg.get("model", {}).get("z_prefix", z_prefix)
             ckpt_latent_token = cfg.get("model", {}).get("latent_token", latent_token)
             ckpt_answer_token = cfg.get("model", {}).get("answer_token", answer_token)
 
-            bundle = cls.from_phase1(
-                phase1_dir=phase1_dir,
+            bundle = cls.from_base(
+                base_model_id=base_model_id,
                 v_z=ckpt_vz,
                 device=device_t,
                 torch_dtype=torch_dtype,
@@ -244,8 +259,8 @@ class UnifiedZSoftModel(nn.Module):
             bundle.model.eval()
             return bundle.model
 
-        bundle = cls.from_phase1(
-            phase1_dir=repo_or_dir,
+        bundle = cls.from_base(
+            base_model_id=repo_or_dir,
             v_z=v_z,
             device=device_t,
             torch_dtype=torch_dtype,

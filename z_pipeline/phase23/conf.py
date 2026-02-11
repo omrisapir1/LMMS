@@ -6,8 +6,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 @dataclass
 class ModelConfig:
-    # Phase-1 repo/directory used as base for Phase23 construction.
-    phase1_dir: str = "omrisap/LMMS_phase1"
+    # Base HF model for Phase23 construction.
+    base_model_id: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
 
     # Z vocabulary size (<Z_0> ... <Z_{v_z-1}>).
     v_z: int = 512
