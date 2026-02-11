@@ -50,7 +50,7 @@ class DataConfig:
 @dataclass
 class LossConfig:
     lambda_ans: float = 0.1
-    lambda_ans_start: float = 0.1
+    lambda_ans_start: float = 0.01
     lambda_ans_end: float = 1
     lambda_ans_anneal_steps: int = 1000
     lambda_sft: float = 0.05
