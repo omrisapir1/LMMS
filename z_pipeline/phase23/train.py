@@ -16,6 +16,7 @@ from .eval import evaluate, evaluate_generate_table
 from .loss import (
     AnswerDigitLoss,
     AnswerTokenSFTLoss,
+    batch_usage_entropy_loss,
     CounterfactualAnswerLoss,
 )
 from .model import UnifiedZSoftModel
@@ -65,6 +66,22 @@ def _cf_stage_and_bias_scale(step: int, cfg: Config) -> Tuple[str, float]:
     if not cfg.train.cf_attention_bias_enabled:
         scale = 0.0
     return stage, float(scale)
+
+
+def _lambda_ans_at_step(step: int, cfg: Config) -> float:
+    warmup = max(0, int(cfg.train.cf_warmup_steps))
+    anneal_steps = max(0, int(cfg.loss.lambda_ans_anneal_steps))
+    start = float(cfg.loss.lambda_ans_start)
+    end = float(cfg.loss.lambda_ans_end)
+
+    if step < warmup:
+        return start
+    if anneal_steps <= 0:
+        return start
+
+    progress = float(step - warmup) / float(anneal_steps)
+    progress = max(0.0, min(1.0, progress))
+    return float(start + progress * (end - start))
 
 
 def _build_optimizer(
@@ -251,6 +268,7 @@ def train(cfg: Config) -> None:
         "sft_no_answer_latent": 0.0,
         "sft_latent_p_ans": 0.0,
         "cf_det": 0.0,
+        "batch": 0.0,
         "eff_vocab": 0.0,
     }
     log_count = 0
@@ -298,6 +316,7 @@ def train(cfg: Config) -> None:
             if device.type == "cuda"
             else nullcontext()
         )
+        lambda_ans_current = _lambda_ans_at_step(step, cfg)
         with amp_ctx:
             out = model(
                 input_ids=input_ids,
@@ -353,11 +372,17 @@ def train(cfg: Config) -> None:
             else:
                 loss_cf_det = torch.zeros((), device=device)
 
-            loss_batch = torch.zeros((), device=device)
+            if cfg.loss.lambda_batch > 0 and p_student is not None:
+                loss_batch = batch_usage_entropy_loss(
+                    p_student=p_student,
+                    latent_slot_mask=out.get("latent_slot_mask", out.get("slot_mask")),
+                )
+            else:
+                loss_batch = torch.zeros((), device=device)
             loss_consistency = torch.zeros((), device=device)
 
             total = (
-                cfg.loss.lambda_ans * loss_ans
+                lambda_ans_current * loss_ans
                 + cfg.loss.lambda_sft * loss_sft
                 + cfg.loss.lambda_cf * loss_cf_det
                 + cfg.loss.lambda_batch * loss_batch
@@ -378,6 +403,7 @@ def train(cfg: Config) -> None:
         log_sums["sft_no_answer_latent"] += float(loss_sft_no_answer_latent.detach().cpu())
         log_sums["sft_latent_p_ans"] += float(sft_latent_p_ans.detach().cpu())
         log_sums["cf_det"] += float(loss_cf_det.detach().cpu())
+        log_sums["batch"] += float(loss_batch.detach().cpu())
         log_count += 1
 
         if p_student is not None:
@@ -400,9 +426,11 @@ def train(cfg: Config) -> None:
                 f"sft_no_answer_latent={log_sums['sft_no_answer_latent'] / denom:.4f} "
                 f"sft_latent_p_ans={log_sums['sft_latent_p_ans'] / denom:.4f} "
                 f"cf_det={log_sums['cf_det'] / denom:.4f} "
+                f"batch={log_sums['batch'] / denom:.4f} "
                 f"tau={g_tau:.4f} "
                 f"stage={current_stage} "
-                f"cf_bias_scale={current_bias_scale:.3f}"
+                f"cf_bias_scale={current_bias_scale:.3f} "
+                f"lambda_ans={lambda_ans_current:.4f}"
             )
             if log_eff_count > 0:
                 msg += f" | eff_vocab={log_sums['eff_vocab'] / log_eff_count:.2f}"
@@ -418,6 +446,7 @@ def train(cfg: Config) -> None:
                 "sft_no_answer_latent": 0.0,
                 "sft_latent_p_ans": 0.0,
                 "cf_det": 0.0,
+                "batch": 0.0,
                 "eff_vocab": 0.0,
             }
             log_count = 0

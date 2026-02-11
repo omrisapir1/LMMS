@@ -497,3 +497,27 @@ class CounterfactualAnswerLoss(nn.Module):
 
 def usage_shaping_loss_stub(*, device: torch.device) -> torch.Tensor:
     return torch.tensor(0.0, device=device)
+
+
+def batch_usage_entropy_loss(
+    *,
+    p_student: torch.Tensor,          # [B, Kmax, Vz]
+    latent_slot_mask: Optional[torch.Tensor],  # [B, Kmax]
+) -> torch.Tensor:
+    if latent_slot_mask is None:
+        raise RuntimeError("latent slot mask is required when lambda_batch > 0")
+    if p_student.ndim != 3:
+        raise ValueError("p_student must be [B,Kmax,Vz]")
+    if latent_slot_mask.shape != p_student.shape[:2]:
+        raise ValueError("latent_slot_mask must match p_student shape [B,Kmax]")
+
+    valid_slots = latent_slot_mask.to(torch.bool)
+    total_slots = valid_slots.sum()
+    if total_slots == 0:
+        return p_student.new_zeros(())
+
+    valid_slots_f = valid_slots.to(dtype=p_student.dtype).unsqueeze(-1)
+    p_sum = (p_student * valid_slots_f).sum(dim=(0, 1))
+    p_bar = p_sum / total_slots.to(dtype=p_student.dtype)
+    p_bar = p_bar.clamp_min(1e-8)
+    return (p_bar * p_bar.log()).sum()

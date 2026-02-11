@@ -15,7 +15,7 @@ class ModelConfig:
     # Gumbel-Softmax temperature schedule (controls exploration hardness for GS-ST).
     gumbel_tau_start: float = 1.0
     gumbel_tau_end: float = 0.3
-    gumbel_anneal_steps: int = 10_000
+    gumbel_anneal_steps: int = 3000
 
     # Token strings.
     z_prefix: str = "Z_"
@@ -50,9 +50,12 @@ class DataConfig:
 @dataclass
 class LossConfig:
     lambda_ans: float = 0.1
+    lambda_ans_start: float = 0.1
+    lambda_ans_end: float = 1
+    lambda_ans_anneal_steps: int = 1000
     lambda_sft: float = 0.05
     lambda_cf: float = 1.0
-    lambda_batch: float = 0.0
+    lambda_batch: float = 0.01
     lambda_consistency: float = 0.0
     # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
     lambda_no_answer_on_latent: float = 0.95
@@ -76,7 +79,7 @@ class LossConfig:
 class TrainConfig:
     lr: float = 3e-5
     weight_decay: float = 0.0
-    steps: int = 1000
+    steps: int = 3000
     grad_accum: int = 1
 
     print_every: int = 5
@@ -91,7 +94,7 @@ class TrainConfig:
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
     cf_warmup_steps: int = 100
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
-    cf_bias_anneal_steps: int = 100
+    cf_bias_anneal_steps: int = 300
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.
     cf_attention_bias_strength: float = 2.0
     cf_attention_bias_enabled: bool = True
