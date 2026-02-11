@@ -49,7 +49,7 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    lambda_ans: float = 0.1
+    lambda_ans: float = 0.5
     lambda_sft: float = 0.05
     lambda_cf: float = 1.0
     lambda_batch: float = 0.0
