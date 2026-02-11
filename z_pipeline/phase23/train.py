@@ -65,7 +65,7 @@ def _cf_stage_and_bias_scale(step: int, cfg: Config) -> Tuple[str, float]:
 
     if not cfg.train.cf_attention_bias_enabled:
         scale = 0.0
-    return stage, float(scale)
+    return stage, 0#float(scale)
 
 
 def _lambda_ans_at_step(step: int, cfg: Config) -> float:
