@@ -483,10 +483,13 @@ class UnifiedZSoftModel(nn.Module):
             slot_mask[b, : len(positions)] = True
 
         p_student: Optional[torch.Tensor] = None
+        p_student_det: Optional[torch.Tensor] = None
         latent_answer_logit_allowed: Optional[torch.Tensor] = None
         latent_logsumexp_allowed: Optional[torch.Tensor] = None
         if return_distributions:
             p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
+            p_student_det = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
+
             # Shifted no-ANSWER supervision is tracked on latent *decision* states (u at p-1).
             latent_answer_logit_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
             latent_logsumexp_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
@@ -533,6 +536,7 @@ class UnifiedZSoftModel(nn.Module):
                 u = hidden_prefix[:, p - 1]
 
                 s_logits = self._z_logits_from_hidden(u).to(torch.float16)
+                p_det_soft = safe_softmax(s_logits, tau=1.0, dim=-1)  # [bs, Vz]
                 if latent_answer_logit_allowed is not None and latent_logsumexp_allowed is not None:
                     ans_logit_slot = self._answer_logit_from_hidden(u).to(s_logits.dtype)
                     allowed_logits = torch.cat([s_logits, ans_logit_slot.unsqueeze(1)], dim=1)
@@ -565,6 +569,9 @@ class UnifiedZSoftModel(nn.Module):
 
                 if p_student is not None:
                     p_student[bs, pass_idx] = p_slot.to(dtype=p_student.dtype)
+
+                if p_student_det is not None:
+                    p_student_det[bs, pass_idx] = p_det_soft.to(dtype=p_student_det.dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
