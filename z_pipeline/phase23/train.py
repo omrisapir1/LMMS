@@ -332,6 +332,7 @@ def train(cfg: Config) -> None:
             latent_logsumexp = out.get("latent_logsumexp_allowed")
             latent_slot_mask = out.get("latent_slot_mask", out.get("slot_mask"))
             p_student = out.get("p_student")
+            p_student_det = out.get("p_student_det")
 
             loss_ans = ans_loss_fn(digit_logits, digit_labels)
             sft_terms = sft_loss_fn(
@@ -374,7 +375,7 @@ def train(cfg: Config) -> None:
 
             if cfg.loss.lambda_batch > 0 and p_student is not None:
                 loss_batch = batch_usage_entropy_loss(
-                    p_student=p_student,
+                    p_student=p_student_det,
                     latent_slot_mask=out.get("latent_slot_mask", out.get("slot_mask")),
                     vocab_size=cfg.model.v_z
                 )
