@@ -16,7 +16,7 @@ from .eval import evaluate, evaluate_generate_table
 from .loss import (
     AnswerDigitLoss,
     AnswerTokenSFTLoss,
-    batch_usage_entropy_loss,
+    batch_usage_collision_loss,
     CounterfactualAnswerLoss,
 )
 from .model import UnifiedZSoftModel
@@ -374,10 +374,9 @@ def train(cfg: Config) -> None:
                 loss_cf_det = torch.zeros((), device=device)
 
             if cfg.loss.lambda_batch > 0 and p_student is not None:
-                loss_batch = batch_usage_entropy_loss(
+                loss_batch = batch_usage_collision_loss(
                     p_student=p_student_det,
                     latent_slot_mask=out.get("latent_slot_mask", out.get("slot_mask")),
-                    vocab_size=cfg.model.v_z
                 )
             else:
                 loss_batch = torch.zeros((), device=device)

@@ -527,3 +527,25 @@ def batch_usage_entropy_loss(
     p_bar = p_sum / total_slots.to(dtype=p_student.dtype)
     p_bar = p_bar.clamp_min(1e-8)
     return math.log(vocab_size) + (p_bar * p_bar.log()).sum()
+
+
+def batch_usage_collision_loss(
+    *,
+    p_student: torch.Tensor,          # [B,Kmax,V]
+    latent_slot_mask: torch.Tensor,   # [B,Kmax]
+) -> torch.Tensor:
+    valid = latent_slot_mask.to(torch.bool)
+    total = valid.sum()
+    if total == 0:
+        return p_student.new_zeros(())
+
+    z_idx = p_student.argmax(dim=-1)  # [B,K]
+    one_hot = F.one_hot(z_idx, num_classes=p_student.size(-1)).to(p_student.dtype)
+    p_hard_st = one_hot + (p_student - p_student.detach())
+
+    p_sum = (p_hard_st * valid.unsqueeze(-1).to(p_student.dtype)).sum(dim=(0, 1))  # [V]
+    p_bar = (p_sum / total.to(p_student.dtype)).clamp_min(1e-8)
+
+    # Herfindahl: 1 (collapsed) -> 1/V (uniform)
+    return (p_bar * p_bar).sum()
+
