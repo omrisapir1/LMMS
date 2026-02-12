@@ -593,6 +593,7 @@ class UnifiedZSoftModel(nn.Module):
         }
         if return_distributions:
             out["p_student"] = p_student
+            out["p_student_det"] = p_student_det
             out["latent_slot_mask"] = slot_mask
             if latent_answer_logit_allowed is None or latent_logsumexp_allowed is None:
                 raise RuntimeError("Expected latent answer statistics when return_distributions=True")
