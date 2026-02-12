@@ -14,6 +14,7 @@ from .loss import (
     AnswerDigitLoss,
     AnswerTokenSFTLoss,
     CounterfactualAnswerLoss,
+    batch_usage_entropy_loss,
 )
 from .model import UnifiedZSoftModel
 from .utils import build_prompt, effective_vocab_size
@@ -194,7 +195,14 @@ def evaluate(
                 else:
                     loss_cf_det = torch.zeros((), device=device)
 
-                loss_batch = torch.zeros((), device=device)
+                if cfg.loss.lambda_batch > 0 and p_student is not None:
+                    loss_batch = batch_usage_entropy_loss(
+                        p_student=p_student,
+                        latent_slot_mask=latent_slot_mask,
+                        vocab_size=cfg.model.v_z,
+                    )
+                else:
+                    loss_batch = torch.zeros((), device=device)
                 loss_consistency = torch.zeros((), device=device)
 
                 total = (
