@@ -376,6 +376,7 @@ def train(cfg: Config) -> None:
                 loss_batch = batch_usage_entropy_loss(
                     p_student=p_student,
                     latent_slot_mask=out.get("latent_slot_mask", out.get("slot_mask")),
+                    vocab_size=cfg.model.v_z
                 )
             else:
                 loss_batch = torch.zeros((), device=device)

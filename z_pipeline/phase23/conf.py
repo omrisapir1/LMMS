@@ -55,7 +55,7 @@ class LossConfig:
     lambda_ans_anneal_steps: int = 1000
     lambda_sft: float = 0.05
     lambda_cf: float = 1.0
-    lambda_batch: float = 0.01
+    lambda_batch: float = 0.1
     lambda_consistency: float = 0.0
     # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
     lambda_no_answer_on_latent: float = 0.95
