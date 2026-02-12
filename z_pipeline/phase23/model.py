@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList
 
@@ -523,16 +522,8 @@ class UnifiedZSoftModel(nn.Module):
                 prefix_emb = inputs_embeds[bs, :p]
                 prefix_attn = attention_mask[bs, :p]
                 prefix_pos = position_ids[bs, :p]
-                if self.training:
-                    hidden_prefix = activation_checkpoint(
-                        _prefix_last_hidden,
-                        prefix_emb,
-                        prefix_attn,
-                        prefix_pos,
-                        use_reentrant=False,
-                    )
-                else:
-                    hidden_prefix = _prefix_last_hidden(prefix_emb, prefix_attn, prefix_pos)
+
+                hidden_prefix = _prefix_last_hidden(prefix_emb, prefix_attn, prefix_pos)
                 u = hidden_prefix[:, p - 1]
 
                 s_logits = self._z_logits_from_hidden(u).to(torch.float16)

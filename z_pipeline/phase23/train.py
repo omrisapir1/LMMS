@@ -220,6 +220,10 @@ def train(cfg: Config) -> None:
         shuffle=shuffle,
         collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
         drop_last=False,
+        num_workers=16,  # try 8–16 depending on CPU cores
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     eval_loader = None
@@ -297,10 +301,10 @@ def train(cfg: Config) -> None:
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        digit_labels = batch["digit_labels"].to(device)
-        k_vals = batch["K"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        digit_labels = batch["digit_labels"].to(device, non_blocking=True)
+        k_vals = batch["K"].to(device, non_blocking=True)
 
         g_tau = gumbel_tau_at_step(
             step=step,

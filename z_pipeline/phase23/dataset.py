@@ -81,6 +81,25 @@ class UnifiedDataset(Dataset):
         else:
             raise ValueError("Provide one of: hf_dataset, local data_path, or dataset_name")
 
+        self._tokenized_questions: List[List[int]] = []
+
+        print("Pre-tokenizing questions...")
+
+        for i in range(len(self.ds)):
+            ex = self.ds[i]
+            question = ex["question"]
+
+            prompt = build_prompt(self.tokenizer, question)
+            q_ids = self.tokenizer(
+                prompt,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            self._tokenized_questions.append(q_ids)
+
+        print(f"Pre-tokenization complete ({len(self._tokenized_questions)} samples)")
+
+
         self._buckets: List[str] = []
         for i in range(len(self.ds)):
             ex = self.ds[i]
@@ -139,8 +158,7 @@ class UnifiedDataset(Dataset):
         if not (1 <= k_val <= self.k_max):
             raise ValueError(f"K={k_val} out of range [1,{self.k_max}]")
 
-        prompt = build_prompt(self.tokenizer, question)
-        q_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        q_ids = self._tokenized_questions[idx]
         if self.max_length is not None:
             max_q = self.max_length - k_val - 1
             if max_q < 1:
