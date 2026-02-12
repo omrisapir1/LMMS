@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Sequence, Union
@@ -503,6 +504,7 @@ def batch_usage_entropy_loss(
     *,
     p_student: torch.Tensor,          # [B, Kmax, Vz]
     latent_slot_mask: Optional[torch.Tensor],  # [B, Kmax]
+    vocab_size: int
 ) -> torch.Tensor:
     if latent_slot_mask is None:
         raise RuntimeError("latent slot mask is required when lambda_batch > 0")
@@ -516,8 +518,12 @@ def batch_usage_entropy_loss(
     if total_slots == 0:
         return p_student.new_zeros(())
 
+    z_idx = p_student.argmax(dim=-1)
+    one_hot = F.one_hot(z_idx, num_classes=p_student.size(-1)).to(dtype=p_student.dtype)
+    p_hard_st = one_hot + (p_student - p_student.detach())
+
     valid_slots_f = valid_slots.to(dtype=p_student.dtype).unsqueeze(-1)
-    p_sum = (p_student * valid_slots_f).sum(dim=(0, 1))
+    p_sum = (p_hard_st * valid_slots_f).sum(dim=(0, 1))
     p_bar = p_sum / total_slots.to(dtype=p_student.dtype)
     p_bar = p_bar.clamp_min(1e-8)
-    return (p_bar * p_bar.log()).sum()
+    return math.log(vocab_size) + (p_bar * p_bar.log()).sum()
