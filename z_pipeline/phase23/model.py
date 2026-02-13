@@ -552,7 +552,7 @@ class UnifiedZSoftModel(nn.Module):
                 p_slot = z_st
 
             e_latent = torch.matmul(z_st.to(z_emb.dtype), z_emb).to(inputs_embeds.dtype)
-            inputs_embeds[b_idx, p_idx] = e_latent
+            inputs_embeds = inputs_embeds.index_put((b_idx, p_idx), e_latent)
 
             if p_student is not None:
                 p_student[b_idx, pass_idx] = p_slot.to(dtype=p_student.dtype)
@@ -660,12 +660,15 @@ class UnifiedZSoftModel(nn.Module):
                 continue
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
+                p_idx = torch.full((bs.numel(),), p, device=input_ids.device, dtype=torch.long)
                 if p_z_idx is not None:
                     slot_idx = p_z_idx[bs, pass_idx].to(dtype=torch.long)
-                    inputs_embeds[bs, p] = z_emb.index_select(0, slot_idx).to(inputs_embeds.dtype)
+                    e_latent = z_emb.index_select(0, slot_idx).to(inputs_embeds.dtype)
+                    inputs_embeds = inputs_embeds.index_put((bs, p_idx), e_latent)
                 else:
                     slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
-                    inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
+                    e_latent = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
+                    inputs_embeds = inputs_embeds.index_put((bs, p_idx), e_latent)
 
         if apply_cf_answer_z_bias and cf_bias_scale > 0.0:
             attn_bias, answer_pos = self._build_additive_causal_mask_with_answer_z_bias(
