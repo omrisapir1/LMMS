@@ -213,7 +213,7 @@ class CounterfactualAnswerLoss(nn.Module):
         p_z: torch.Tensor,      # [B,Kmax,V]
         k_vals: torch.Tensor,   # [B]
         cf_mode: str,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, kmax, vocab = p_z.shape
         device = p_z.device
         if cf_mode == "det":
@@ -224,6 +224,7 @@ class CounterfactualAnswerLoss(nn.Module):
             raise ValueError(f"Unknown cf_mode: {cf_mode}")
 
         out = base.clone()
+        new_k_vals = k_vals.clone()
 
         gen = torch.Generator(device=device)
         if self.seed is not None:
@@ -240,13 +241,21 @@ class CounterfactualAnswerLoss(nn.Module):
 
             do_permute = (k > 1 and torch.rand((), device=device, generator=gen) < prob)
             if do_permute:
-                perm = torch.randperm(k, device=device, generator=gen)
-                if cf_mode == "det":
-                    active_idx = base[b, :k].argmax(dim=-1)
-                    cf_idx = active_idx[perm]
-                    out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
+                do_truncate = (torch.rand((), device=device, generator=gen) < 0.5)
+                if do_truncate:
+                    r = torch.empty((), device=device).uniform_(0.5, 0.95, generator=gen)
+                    truncate = int(torch.floor(r * k).item())
+                    new_k = max(1, k - truncate)
+                    out[b, new_k:k] = 0
+                    new_k_vals[b] = new_k
                 else:
-                    out[b, :k] = base[b, :k][perm]
+                    perm = torch.randperm(k, device=device, generator=gen)
+                    if cf_mode == "det":
+                        active_idx = base[b, :k].argmax(dim=-1)
+                        cf_idx = active_idx[perm]
+                        out[b, :k] = F.one_hot(cf_idx, num_classes=vocab).to(dtype=p_z.dtype)
+                    else:
+                        out[b, :k] = base[b, :k][perm]
             else:
                 if cf_mode == "det":
                     cf_idx = torch.randint(
@@ -266,17 +275,18 @@ class CounterfactualAnswerLoss(nn.Module):
                     warped = torch.softmax(active.log() / tau, dim=-1)
                     out[b, :k] = warped.to(dtype=p_z.dtype)
 
-        return out
+        return out, new_k_vals
 
     def _build_counterfactual_z_idx(
         self,
         z_idx: torch.Tensor,    # [B,Kmax]
         k_vals: torch.Tensor,   # [B]
         vocab_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, kmax = z_idx.shape
         device = z_idx.device
         out = z_idx.clone()
+        new_k_vals = k_vals.clone()
 
         gen = torch.Generator(device=device)
         if self.seed is not None:
@@ -292,8 +302,16 @@ class CounterfactualAnswerLoss(nn.Module):
             prob = self.permute_prob.get(k, 0.0)
             do_permute = (k > 1 and torch.rand((), device=device, generator=gen) < prob)
             if do_permute:
-                perm = torch.randperm(k, device=device, generator=gen)
-                out[b, :k] = z_idx[b, :k][perm]
+                do_truncate = (torch.rand((), device=device, generator=gen) < 0.5)
+                if do_truncate:
+                    r = torch.empty((), device=device).uniform_(0.5, 0.95, generator=gen)
+                    truncate = int(torch.floor(r * k).item())
+                    new_k = max(1, k - truncate)
+                    out[b, new_k:k] = 0
+                    new_k_vals[b] = new_k
+                else:
+                    perm = torch.randperm(k, device=device, generator=gen)
+                    out[b, :k] = z_idx[b, :k][perm]
             else:
                 if vocab_size <= 0:
                     raise RuntimeError("Cannot sample deterministic CF indices: empty latent vocabulary.")
@@ -304,7 +322,7 @@ class CounterfactualAnswerLoss(nn.Module):
                     device=device,
                     generator=gen,
                 )
-        return out
+        return out, new_k_vals
 
     def forward(
             self,
@@ -379,7 +397,7 @@ class CounterfactualAnswerLoss(nn.Module):
         # Counterfactual
         # ----------------------------
         if is_det:
-            p_cf_idx = self._build_counterfactual_z_idx(
+            p_cf_idx, k_vals_cf = self._build_counterfactual_z_idx(
                 p_ref_idx,
                 k_vals,
                 vocab_size=len(model.z_token_ids),
@@ -389,15 +407,17 @@ class CounterfactualAnswerLoss(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 p_z_idx=p_cf_idx,
+                k_vals=k_vals_cf,
                 **det_bias_kwargs,
                 return_answer_hidden=True,
             )
         else:
-            p_cf_z = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
+            p_cf_z, k_vals_cf = self._build_counterfactual_pz(p_ref_z, k_vals, cf_mode=cf_mode)
             cf_out = model.forward_with_fixed_z_distributions(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 p_z=p_cf_z,
+                k_vals=k_vals_cf,
                 cf_bias_scale=float(cf_bias_scale),
                 apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
                 cf_attention_bias_strength=float(cf_attention_bias_strength),
@@ -460,6 +480,7 @@ class CounterfactualAnswerLoss(nn.Module):
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         p_z_idx=p_cf_idx,
+                        k_vals=k_vals_cf,
                         cf_bias_scale=0.0,
                         apply_cf_answer_z_bias=False,
                         cf_attention_bias_strength=0.0,
@@ -548,4 +569,3 @@ def batch_usage_collision_loss(
 
     # Herfindahl: 1 (collapsed) -> 1/V (uniform)
     return (p_bar * p_bar).sum()
-
