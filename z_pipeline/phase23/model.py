@@ -401,7 +401,7 @@ class UnifiedZSoftModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict=True,
             )
 
@@ -445,7 +445,7 @@ class UnifiedZSoftModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict=True,
             )
             if not applied["ok"]:
@@ -501,78 +501,74 @@ class UnifiedZSoftModel(nn.Module):
             if not buckets:
                 continue
 
+            out_pass = self._core_model()(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden_pass = out_pass.last_hidden_state
+
+            bs_all: List[torch.Tensor] = []
+            p_all: List[torch.Tensor] = []
             for p in sorted(buckets):
                 bs = torch.tensor(buckets[p], device=input_ids.device, dtype=torch.long)
+                bs_all.append(bs)
+                p_all.append(torch.full((bs.numel(),), p, device=input_ids.device, dtype=torch.long))
 
-                def _prefix_last_hidden(
-                    emb: torch.Tensor,
-                    attn: torch.Tensor,
-                    pos: torch.Tensor,
-                ) -> torch.Tensor:
-                    out_prefix = self._core_model()(
-                        inputs_embeds=emb,
-                        attention_mask=attn,
-                        position_ids=pos,
-                        use_cache=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                    return out_prefix.last_hidden_state
+            b_idx = torch.cat(bs_all, dim=0)
+            p_idx = torch.cat(p_all, dim=0)
+            u = hidden_pass[b_idx, p_idx - 1]
 
-                prefix_emb = inputs_embeds[bs, :p]
-                prefix_attn = attention_mask[bs, :p]
-                prefix_pos = position_ids[bs, :p]
+            s_logits = self._z_logits_from_hidden(u).to(torch.float16)
+            p_det_soft = safe_softmax(s_logits, tau=1.0, dim=-1)
+            if latent_answer_logit_allowed is not None and latent_logsumexp_allowed is not None:
+                ans_logit_slot = self._answer_logit_from_hidden(u).to(s_logits.dtype)
+                allowed_logits = torch.cat([s_logits, ans_logit_slot.unsqueeze(1)], dim=1)
+                lse_allowed_slot = torch.logsumexp(allowed_logits, dim=-1)
+                latent_answer_logit_allowed[b_idx, pass_idx] = ans_logit_slot.to(
+                    latent_answer_logit_allowed.dtype
+                )
+                latent_logsumexp_allowed[b_idx, pass_idx] = lse_allowed_slot.to(
+                    latent_logsumexp_allowed.dtype
+                )
 
-                hidden_prefix = _prefix_last_hidden(prefix_emb, prefix_attn, prefix_pos)
-                u = hidden_prefix[:, p - 1]
+            if use_gs:
+                # GS-ST with explicit soft sample tracking:
+                # forward uses hard one-hot; backward flows through y_soft.
+                u_rand = torch.rand_like(s_logits).clamp_(1e-6, 1.0 - 1e-6)
+                g_noise = -torch.log(-torch.log(u_rand))
+                y_soft = safe_softmax(s_logits + g_noise, tau=tau, dim=-1)
+                z_idx = y_soft.argmax(dim=-1)
+                y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
+                z_st = y_hard - y_soft.detach() + y_soft
+                p_slot = y_soft
+            else:
+                # Deterministic evaluation path: no gumbel noise.
+                z_idx = s_logits.argmax(dim=-1)
+                z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
+                p_slot = z_st
 
-                s_logits = self._z_logits_from_hidden(u).to(torch.float16)
-                p_det_soft = safe_softmax(s_logits, tau=1.0, dim=-1)  # [bs, Vz]
-                if latent_answer_logit_allowed is not None and latent_logsumexp_allowed is not None:
-                    ans_logit_slot = self._answer_logit_from_hidden(u).to(s_logits.dtype)
-                    allowed_logits = torch.cat([s_logits, ans_logit_slot.unsqueeze(1)], dim=1)
-                    lse_allowed_slot = torch.logsumexp(allowed_logits, dim=-1)
-                    latent_answer_logit_allowed[bs, pass_idx] = ans_logit_slot.to(
-                        latent_answer_logit_allowed.dtype
-                    )
-                    latent_logsumexp_allowed[bs, pass_idx] = lse_allowed_slot.to(
-                        latent_logsumexp_allowed.dtype
-                    )
+            e_latent = torch.matmul(z_st.to(z_emb.dtype), z_emb).to(inputs_embeds.dtype)
+            inputs_embeds[b_idx, p_idx] = e_latent
 
-                if use_gs:
-                    # GS-ST with explicit soft sample tracking:
-                    # forward uses hard one-hot; backward flows through y_soft.
-                    u_rand = torch.rand_like(s_logits).clamp_(1e-6, 1.0 - 1e-6)
-                    g_noise = -torch.log(-torch.log(u_rand))
-                    y_soft = safe_softmax(s_logits + g_noise, tau=tau, dim=-1)
-                    z_idx = y_soft.argmax(dim=-1)
-                    y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
-                    z_st = y_hard - y_soft.detach() + y_soft
-                    p_slot = y_soft
-                else:
-                    # Deterministic evaluation path: no gumbel noise.
-                    z_idx = s_logits.argmax(dim=-1)
-                    z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
-                    p_slot = z_st
+            if p_student is not None:
+                p_student[b_idx, pass_idx] = p_slot.to(dtype=p_student.dtype)
 
-                e_latent = torch.matmul(z_st.to(z_emb.dtype), z_emb).to(inputs_embeds.dtype)
-                inputs_embeds[bs, p] = e_latent
-
-                if p_student is not None:
-                    p_student[bs, pass_idx] = p_slot.to(dtype=p_student.dtype)
-
-                if p_student_det is not None:
-                    p_student_det[bs, pass_idx] = p_det_soft.to(dtype=p_student_det.dtype)
+            if p_student_det is not None:
+                p_student_det[b_idx, pass_idx] = p_det_soft.to(dtype=p_student_det.dtype)
 
         out_final = self._core_model()(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
-            output_hidden_states=True,
+            output_hidden_states=False,
             return_dict=True,
         )
-        hidden_last = out_final.hidden_states[-1]
+        hidden_last = out_final.last_hidden_state
 
         digit_logits = self._digit_logits_from_hidden(hidden_last, input_ids)
         answer_next_logits = self._answer_next_logits_from_hidden(hidden_last, input_ids)
@@ -693,7 +689,7 @@ class UnifiedZSoftModel(nn.Module):
                 attn_bias=None,
                 answer_pos=None,
             )
-        hidden_last = out_final.hidden_states[-1]
+        hidden_last = out_final.last_hidden_state
         h_answer = self._answer_hidden_from_hidden(hidden_last, input_ids)
         digit_logits = torch.stack([head(h_answer) for head in self.digit_heads], dim=1)
         if return_answer_hidden:
