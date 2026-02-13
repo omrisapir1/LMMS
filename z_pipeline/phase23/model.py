@@ -458,7 +458,7 @@ class UnifiedZSoftModel(nn.Module):
             for h in handles:
                 h.remove()
 
-    def forward(
+    def _forward_prefix_recompute(
         self,
         *,
         input_ids: torch.Tensor,
@@ -593,6 +593,228 @@ class UnifiedZSoftModel(nn.Module):
             # Backward-compatible aliases expected by existing callers.
             out["latent_answer_logit"] = latent_answer_logit_allowed
             out["latent_logsumexp"] = latent_logsumexp_allowed
+        return out
+
+    def _forward_streaming_with_kv_cache(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        gumbel_tau: float = 1.0,
+        use_gs: bool = True,
+        return_distributions: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        bsz, seq_len = input_ids.shape
+        position_ids = self._build_position_ids(attention_mask)
+        inputs_embeds = self._embedding(input_ids)
+
+        latent_lists, kmax = self._latent_lists(input_ids)
+        vz = len(self.z_token_ids)
+
+        slot_mask = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.bool)
+        slot_index_of_position = torch.full(
+            (bsz, seq_len),
+            fill_value=-1,
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        for b, positions in enumerate(latent_lists):
+            slot_mask[b, : len(positions)] = True
+            for pass_idx, pos in enumerate(positions):
+                if pos <= 0:
+                    raise RuntimeError("Found <|latent|> at sequence position 0")
+                slot_index_of_position[b, pos] = pass_idx
+
+        p_student: Optional[torch.Tensor] = None
+        p_student_det: Optional[torch.Tensor] = None
+        latent_answer_logit_allowed: Optional[torch.Tensor] = None
+        latent_logsumexp_allowed: Optional[torch.Tensor] = None
+        if return_distributions:
+            p_student = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
+            p_student_det = torch.zeros((bsz, kmax, vz), device=input_ids.device, dtype=inputs_embeds.dtype)
+            latent_answer_logit_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
+            latent_logsumexp_allowed = torch.zeros((bsz, kmax), device=input_ids.device, dtype=torch.float16)
+
+        answer_pos = self._find_answer_pos(input_ids).to(torch.long)
+        prev_pos = (answer_pos - 1).clamp(min=0)
+
+        hidden_dim = inputs_embeds.size(-1)
+        answer_hidden = torch.zeros((bsz, hidden_dim), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        answer_prev_hidden = torch.zeros((bsz, hidden_dim), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+        z_emb = self._z_embeddings().to(dtype=inputs_embeds.dtype)
+        tau = max(float(gumbel_tau), 1e-6)
+
+        core = self._core_model()
+        past_key_values = None
+        prev_hidden: Optional[torch.Tensor] = None
+        bidx = torch.arange(bsz, device=input_ids.device, dtype=torch.long)
+
+        # Streaming equivalence to old logic:
+        # at latent position p, old path used u = hidden_prefix[:, p-1];
+        # here prev_hidden is exactly hidden at timestep t-1 before feeding timestep t.
+        for t in range(seq_len):
+            step_embed = inputs_embeds[:, t : t + 1, :].clone()
+            slot_idx_t = slot_index_of_position[:, t]
+            latent_now = slot_idx_t >= 0
+
+            if latent_now.any():
+                if prev_hidden is None:
+                    raise RuntimeError("Latent slot requires previous hidden state, but none was available.")
+
+                lat_bs = bidx[latent_now]
+                pass_idx = slot_idx_t[latent_now]
+                u = prev_hidden[latent_now]
+
+                s_logits = self._z_logits_from_hidden(u).to(torch.float16)
+                p_det_soft = safe_softmax(s_logits, tau=1.0, dim=-1)
+                if p_student_det is not None:
+                    p_student_det[lat_bs, pass_idx] = p_det_soft.to(dtype=p_student_det.dtype)
+
+                if latent_answer_logit_allowed is not None and latent_logsumexp_allowed is not None:
+                    ans_logit_slot = self._answer_logit_from_hidden(u).to(s_logits.dtype)
+                    allowed_logits = torch.cat([s_logits, ans_logit_slot.unsqueeze(1)], dim=1)
+                    lse_allowed_slot = torch.logsumexp(allowed_logits, dim=-1)
+                    latent_answer_logit_allowed[lat_bs, pass_idx] = ans_logit_slot.to(
+                        dtype=latent_answer_logit_allowed.dtype
+                    )
+                    latent_logsumexp_allowed[lat_bs, pass_idx] = lse_allowed_slot.to(
+                        dtype=latent_logsumexp_allowed.dtype
+                    )
+
+                if use_gs:
+                    u_rand = torch.rand_like(s_logits).clamp_(1e-6, 1.0 - 1e-6)
+                    g_noise = -torch.log(-torch.log(u_rand))
+                    y_soft = safe_softmax(s_logits + g_noise, tau=tau, dim=-1)
+                    z_idx = y_soft.argmax(dim=-1)
+                    y_hard = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
+                    z_st = y_hard - y_soft.detach() + y_soft
+                    p_slot = y_soft
+                else:
+                    z_idx = s_logits.argmax(dim=-1)
+                    z_st = F.one_hot(z_idx, num_classes=vz).to(torch.float16)
+                    p_slot = z_st
+
+                e_latent = torch.matmul(z_st.to(dtype=z_emb.dtype), z_emb).to(dtype=inputs_embeds.dtype)
+                step_embed[latent_now, 0, :] = e_latent
+
+                if p_student is not None:
+                    p_student[lat_bs, pass_idx] = p_slot.to(dtype=p_student.dtype)
+
+            out_step = core(
+                inputs_embeds=step_embed,
+                attention_mask=attention_mask[:, : t + 1],
+                position_ids=position_ids[:, t : t + 1],
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+
+            past_key_values = out_step.past_key_values
+            hidden_t = out_step.last_hidden_state[:, 0, :]
+            prev_hidden = hidden_t
+
+            at_answer = (answer_pos == t)
+            if at_answer.any():
+                answer_hidden[at_answer] = hidden_t[at_answer]
+
+            at_prev = (prev_pos == t)
+            if at_prev.any():
+                answer_prev_hidden[at_prev] = hidden_t[at_prev]
+
+        digit_logits = torch.stack([head(answer_hidden) for head in self.digit_heads], dim=1)
+        answer_next_logits = self._lm_logits_from_hidden(answer_prev_hidden)
+
+        out: Dict[str, torch.Tensor] = {
+            "digit_logits": digit_logits,
+            "answer_next_logits": answer_next_logits,
+            "slot_mask": slot_mask,
+        }
+        if return_distributions:
+            out["p_student"] = p_student
+            out["p_student_det"] = p_student_det
+            out["latent_slot_mask"] = slot_mask
+            if latent_answer_logit_allowed is None or latent_logsumexp_allowed is None:
+                raise RuntimeError("Expected latent answer statistics when return_distributions=True")
+            out["latent_answer_logit_allowed"] = latent_answer_logit_allowed
+            out["latent_logsumexp_allowed"] = latent_logsumexp_allowed
+            out["latent_answer_logit"] = latent_answer_logit_allowed
+            out["latent_logsumexp"] = latent_logsumexp_allowed
+        return out
+
+    def _compare_forward_paths(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        gumbel_tau: float,
+        use_gs: bool,
+        return_distributions: bool,
+        out_streaming: Dict[str, torch.Tensor],
+    ) -> None:
+        tol = float(os.environ.get("PHASE23_DEBUG_COMPARE_TOL", "1e-3"))
+        with torch.no_grad():
+            out_prefix = self._forward_prefix_recompute(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                gumbel_tau=gumbel_tau,
+                use_gs=use_gs,
+                return_distributions=return_distributions,
+            )
+
+        def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
+            return float((a - b).abs().max().detach().cpu())
+
+        keys = ["digit_logits", "answer_next_logits"]
+        if return_distributions:
+            keys.extend(
+                [
+                    "p_student_det",
+                    "latent_answer_logit_allowed",
+                    "latent_logsumexp_allowed",
+                ]
+            )
+            if not use_gs:
+                keys.append("p_student")
+        for k in keys:
+            if k not in out_streaming or k not in out_prefix:
+                raise RuntimeError(f"Missing key during forward compare: {k}")
+            diff = _max_abs(out_streaming[k], out_prefix[k])
+            if diff > tol:
+                raise AssertionError(f"Forward mismatch for {k}: max_abs_diff={diff:.6g} > tol={tol:.6g}")
+
+        if not torch.equal(out_streaming["slot_mask"], out_prefix["slot_mask"]):
+            raise AssertionError("Forward mismatch for slot_mask")
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        gumbel_tau: float = 1.0,
+        use_gs: bool = True,
+        return_distributions: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        out = self._forward_streaming_with_kv_cache(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            gumbel_tau=gumbel_tau,
+            use_gs=use_gs,
+            return_distributions=return_distributions,
+        )
+        if os.environ.get("PHASE23_DEBUG_COMPARE_FORWARD", "0") == "1":
+            self._compare_forward_paths(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                gumbel_tau=gumbel_tau,
+                use_gs=use_gs,
+                return_distributions=return_distributions,
+                out_streaming=out,
+            )
         return out
 
     def forward_with_fixed_z_distributions(
