@@ -602,6 +602,7 @@ class UnifiedZSoftModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         p_z: Optional[torch.Tensor] = None,  # [B,Kmax,Vz]
         p_z_idx: Optional[torch.Tensor] = None,  # [B,Kmax]
+        k_vals: Optional[torch.Tensor] = None,  # [B], optional active latent counts per sample
         cf_bias_scale: float = 0.0,
         apply_cf_answer_z_bias: bool = False,
         cf_attention_bias_strength: float = 0.0,
@@ -622,7 +623,22 @@ class UnifiedZSoftModel(nn.Module):
         position_ids = self._build_position_ids(attention_mask)
         inputs_embeds = self._embedding(input_ids)
 
-        latent_lists, kmax = self._latent_lists(input_ids)
+        latent_lists, _ = self._latent_lists(input_ids)
+        if k_vals is not None:
+            if k_vals.dim() != 1 or k_vals.size(0) != input_ids.size(0):
+                raise RuntimeError("k_vals must have shape [B] matching input batch size")
+            latent_lists_capped: List[List[int]] = []
+            for b, pos_list in enumerate(latent_lists):
+                k_b = int(k_vals[b].item())
+                if k_b < 0:
+                    raise RuntimeError(f"k_vals[{b}] must be >= 0")
+                if k_b > len(pos_list):
+                    raise RuntimeError(
+                        f"k_vals[{b}]={k_b} exceeds available latent slots={len(pos_list)} for sample {b}"
+                    )
+                latent_lists_capped.append(pos_list[:k_b])
+            latent_lists = latent_lists_capped
+        kmax = max((len(x) for x in latent_lists), default=0)
         if p_z is not None:
             if p_z.dim() != 3:
                 raise RuntimeError("p_z must have shape [B,Kmax,Vz]")
