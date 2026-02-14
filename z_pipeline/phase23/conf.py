@@ -10,7 +10,7 @@ class ModelConfig:
     phase1_dir: str = "omrisap/LMMS_phase1"
 
     # Z vocabulary size (<Z_0> ... <Z_{v_z-1}>).
-    v_z: int = 512
+    v_z: int = 128
 
     # Gumbel-Softmax temperature schedule (controls exploration hardness for GS-ST).
     gumbel_tau_start: float = 1.0
