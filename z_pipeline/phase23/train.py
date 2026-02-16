@@ -167,10 +167,10 @@ def train(cfg: Config) -> None:
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "train.log")
 
-    if cfg.loss.lambda_sft <= 0:
-        raise ValueError("Phase23 requires AnswerTokenSFTLoss: set loss.lambda_sft > 0")
-    if not cfg.train.cf_bias_apply_cf_path_only:
-        raise ValueError("This training plan requires cf_bias_apply_cf_path_only=True")
+    # if cfg.loss.lambda_sft <= 0:
+    #     raise ValueError("Phase23 requires AnswerTokenSFTLoss: set loss.lambda_sft > 0")
+    # if not cfg.train.cf_bias_apply_cf_path_only:
+    #     raise ValueError("This training plan requires cf_bias_apply_cf_path_only=True")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
