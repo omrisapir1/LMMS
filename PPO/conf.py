@@ -16,7 +16,7 @@ class ModelConfig:
 class DataConfig:
     dataset_name: str = "omrisap/LMMS_numina_250K"
     train_split: str = "train"
-    question_field: str = "question"
+    question_field: str = "problem"
     answer_field: str = "final_answer"
 
 
