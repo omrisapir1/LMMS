@@ -164,7 +164,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _make_rng(seed: int, device: torch.device) -> torch.Generator:
-    g = torch.Generator(device="cpu") if device.type == "cpu" else torch.Generator(device=device)
+    del device
+    # Reward-mask RNG is used by CPU-side torch.rand in reward.py.
+    # Keep it CPU-backed to avoid generator/device mismatches.
+    g = torch.Generator(device="cpu")
     g.manual_seed(int(seed))
     return g
 
