@@ -22,7 +22,7 @@ class ModelConfig:
     latent_token: str = "<|latent|>"
     answer_token: str = "<ANSWER>"
 
-    answer_q_question_attn_bias: float = 0.0
+    answer_q_question_attn_bias: float = -1e4
 
 
 @dataclass
