@@ -358,8 +358,10 @@ class UnifiedZSoftModel(nn.Module):
         *,
         input_ids: torch.Tensor,        # [B,T]
         attention_mask: torch.Tensor,   # [B,T]
+        apply_cf_answer_z_bias: bool,
         cf_bias_scale: float,
         cf_attention_bias_strength: float,
+        answer_q_question_attn_bias: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Build compact additive bias [B,1,1,T] and answer query positions [B].
@@ -369,20 +371,49 @@ class UnifiedZSoftModel(nn.Module):
         device = input_ids.device
         valid = attention_mask.to(torch.bool)
         bias = torch.zeros((bsz, 1, 1, t), device=device, dtype=torch.float16)
-        answer_pos = self._find_answer_pos(input_ids)  # [B]
+        answer_mask = (input_ids == self.answer_token_id) & valid
+        has_answer = answer_mask.any(dim=1)
+        answer_pos = torch.full((bsz,), -1, device=device, dtype=torch.long)
+        if bool(has_answer.any().item()):
+            answer_pos[has_answer] = answer_mask[has_answer].float().argmax(dim=1).to(torch.long)
 
-        if cf_bias_scale <= 0.0 or cf_attention_bias_strength == 0.0:
+        apply_cf_bias = (
+            bool(apply_cf_answer_z_bias)
+            and (cf_bias_scale > 0.0)
+            and (cf_attention_bias_strength != 0.0)
+        )
+        aq_bias_delta = float(answer_q_question_attn_bias)
+        if not apply_cf_bias and aq_bias_delta == 0.0:
             return bias, answer_pos
 
-        # These are the sequence slots where latent Z embeddings are executed.
-        z_slot_pos_mask = (input_ids == self.latent_token_id) & valid
-        if not torch.all(z_slot_pos_mask.any(dim=1)):
-            raise RuntimeError("CF bias expects latent slots to be present in input_ids.")
-        bias_delta = float(cf_bias_scale) * float(cf_attention_bias_strength)
-        for b in range(bsz):
-            key_mask = z_slot_pos_mask[b]
-            if key_mask.any():
-                bias[b, 0, 0, key_mask] += bias_delta
+        if apply_cf_bias:
+            # These are the sequence slots where latent Z embeddings are executed.
+            z_slot_pos_mask = (input_ids == self.latent_token_id) & valid
+            if not torch.all(z_slot_pos_mask.any(dim=1)):
+                raise RuntimeError("CF bias expects latent slots to be present in input_ids.")
+            cf_bias_delta = float(cf_bias_scale) * float(cf_attention_bias_strength)
+            for b in range(bsz):
+                key_mask = z_slot_pos_mask[b]
+                if key_mask.any():
+                    bias[b, 0, 0, key_mask] += cf_bias_delta
+
+        if aq_bias_delta != 0.0:
+            latent_pos_mask = (input_ids == self.latent_token_id) & valid
+            for b in range(bsz):
+                if not bool(has_answer[b].item()):
+                    continue
+                ans_pos = int(answer_pos[b].item())
+                if ans_pos <= 0:
+                    continue
+                latent_pos = torch.nonzero(latent_pos_mask[b], as_tuple=False)
+                if latent_pos.numel() > 0:
+                    question_end = int(latent_pos[0, 0].item())
+                else:
+                    question_end = ans_pos
+                question_end = min(question_end, ans_pos)
+                if question_end <= 0:
+                    continue
+                bias[b, 0, 0, :question_end] += aq_bias_delta
         return bias, answer_pos
 
     def _run_core_with_attention_score_bias(
@@ -606,6 +637,7 @@ class UnifiedZSoftModel(nn.Module):
         cf_bias_scale: float = 0.0,
         apply_cf_answer_z_bias: bool = False,
         cf_attention_bias_strength: float = 0.0,
+        answer_q_question_attn_bias: float = 0.0,
         return_answer_hidden: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -671,12 +703,18 @@ class UnifiedZSoftModel(nn.Module):
                     slot_p = p_z[bs, pass_idx].to(dtype=inputs_embeds.dtype)
                     inputs_embeds[bs, p] = torch.matmul(slot_p, z_emb).to(inputs_embeds.dtype)
 
-        if apply_cf_answer_z_bias and cf_bias_scale > 0.0:
+        apply_attention_score_bias = (
+            (apply_cf_answer_z_bias and cf_bias_scale > 0.0)
+            or float(answer_q_question_attn_bias) != 0.0
+        )
+        if apply_attention_score_bias:
             attn_bias, answer_pos = self._build_additive_causal_mask_with_answer_z_bias(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
                 cf_bias_scale=float(cf_bias_scale),
                 cf_attention_bias_strength=float(cf_attention_bias_strength),
+                answer_q_question_attn_bias=float(answer_q_question_attn_bias),
             )
             out_final = self._run_core_with_attention_score_bias(
                 inputs_embeds=inputs_embeds,

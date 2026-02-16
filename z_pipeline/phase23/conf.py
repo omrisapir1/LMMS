@@ -22,6 +22,8 @@ class ModelConfig:
     latent_token: str = "<|latent|>"
     answer_token: str = "<ANSWER>"
 
+    answer_q_question_attn_bias: float = 0.0
+
 
 @dataclass
 class DataConfig:
@@ -50,12 +52,12 @@ class DataConfig:
 @dataclass
 class LossConfig:
     lambda_ans: float = 0.1
-    lambda_ans_start: float = 0.05
-    lambda_ans_end: float = 0.5
+    lambda_ans_start: float = 1.0
+    lambda_ans_end: float = 1.0
     lambda_ans_anneal_steps: int = 1000
-    lambda_sft: float = 0.05
-    lambda_cf: float = 1.0
-    lambda_batch: float = 0.5
+    lambda_sft: float = 0.00
+    lambda_cf: float = 0.0
+    lambda_batch: float = 0.0
     lambda_consistency: float = 0.0
     # Auxiliary SFT term: penalize p(<ANSWER>) at latent slots.
     lambda_no_answer_on_latent: float = 0.95
@@ -92,7 +94,7 @@ class TrainConfig:
     cf_debug_every: int = 0
 
     # Stage A: frozen backbone warmup (LM head + Z embedding rows only).
-    cf_warmup_steps: int = 100
+    cf_warmup_steps: int = 50
     # Stage B: full-model unfreeze with CF attention-bias anneal to zero.
     cf_bias_anneal_steps: int = 300
     # Additive attention logit bias strength for <ANSWER> query to latent(Z) keys.

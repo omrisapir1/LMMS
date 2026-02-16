@@ -335,6 +335,7 @@ class CounterfactualAnswerLoss(nn.Module):
             k_vals: torch.Tensor,
             cf_bias_scale: float = 0.0,
             cf_attention_bias_strength: float = 0.0,
+            answer_q_question_attn_bias: float = 0.0,
             apply_cf_answer_z_bias: bool = False,
             cf_mode: str = "gs",
             global_step: Optional[int] = None,
@@ -349,6 +350,7 @@ class CounterfactualAnswerLoss(nn.Module):
             "cf_bias_scale": float(cf_bias_scale),
             "apply_cf_answer_z_bias": bool(apply_cf_answer_z_bias),
             "cf_attention_bias_strength": float(cf_attention_bias_strength),
+            "answer_q_question_attn_bias": float(answer_q_question_attn_bias),
         }
 
         if is_det:
@@ -385,6 +387,7 @@ class CounterfactualAnswerLoss(nn.Module):
                 cf_bias_scale=0.0,
                 apply_cf_answer_z_bias=False,
                 cf_attention_bias_strength=0.0,
+                answer_q_question_attn_bias=float(answer_q_question_attn_bias),
                 return_answer_hidden=True,
             )
         digit_logits_ref_det = ref_out["digit_logits"]
@@ -421,6 +424,7 @@ class CounterfactualAnswerLoss(nn.Module):
                 cf_bias_scale=float(cf_bias_scale),
                 apply_cf_answer_z_bias=bool(apply_cf_answer_z_bias),
                 cf_attention_bias_strength=float(cf_attention_bias_strength),
+                answer_q_question_attn_bias=float(answer_q_question_attn_bias),
                 return_answer_hidden=True,
             )
         digit_logits_cf = cf_out["digit_logits"]
@@ -484,6 +488,7 @@ class CounterfactualAnswerLoss(nn.Module):
                         cf_bias_scale=0.0,
                         apply_cf_answer_z_bias=False,
                         cf_attention_bias_strength=0.0,
+                        answer_q_question_attn_bias=0.0,
                         return_answer_hidden=True,
                     )
                     digit_logits_cf_nobias = cf_out_nobias["digit_logits"]
