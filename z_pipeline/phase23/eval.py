@@ -187,6 +187,7 @@ def evaluate(
                         k_vals=k_vals,
                         cf_bias_scale=0.0,
                         cf_attention_bias_strength=0.0,
+                        answer_q_question_attn_bias=cfg.model.answer_q_question_attn_bias,
                         apply_cf_answer_z_bias=False,
                         cf_mode="det",
                         return_details=True,

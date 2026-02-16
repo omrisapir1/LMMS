@@ -367,6 +367,7 @@ def train(cfg: Config) -> None:
                     k_vals=k_vals,
                     cf_bias_scale=current_bias_scale,
                     cf_attention_bias_strength=cfg.train.cf_attention_bias_strength,
+                    answer_q_question_attn_bias=cfg.model.answer_q_question_attn_bias,
                     apply_cf_answer_z_bias=apply_det_bias,
                     cf_mode="det",
                     global_step=step + 1,
