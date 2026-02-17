@@ -22,10 +22,10 @@ class DataConfig:
 
 @dataclass
 class RolloutConfig:
-    max_new_tokens: int = 64
+    max_new_tokens: int = 64*4
     temperature: float = 1.0
     episodes_per_batch: int = 128
-    max_tokens_per_batch: int = 4096
+    max_tokens_per_batch: int = 4096*4
 
 
 @dataclass
