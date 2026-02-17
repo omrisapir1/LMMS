@@ -69,7 +69,7 @@ def _cf_stage_and_bias_scale(step: int, cfg: Config) -> Tuple[str, float]:
 
 
 def _lambda_ans_at_step(step: int, cfg: Config) -> float:
-    warmup = max(0, int(cfg.train.cf_warmup_steps))
+    warmup = max(0, int(cfg.train.cf_warmup_steps)) + cfg.loss.lambda_ans_anneal_start
     anneal_steps = max(0, int(cfg.loss.lambda_ans_anneal_steps))
     start = float(cfg.loss.lambda_ans_start)
     end = float(cfg.loss.lambda_ans_end)

@@ -22,7 +22,7 @@ class ModelConfig:
     latent_token: str = "<|latent|>"
     answer_token: str = "<ANSWER>"
 
-    answer_q_question_attn_bias: float = 1e-4
+    answer_q_question_attn_bias: float = 0
 
 
 @dataclass
@@ -54,6 +54,7 @@ class LossConfig:
     lambda_ans: float = 0.1
     lambda_ans_start: float = 0.05
     lambda_ans_end: float = 0.5
+    lambda_ans_anneal_start: int = 500
     lambda_ans_anneal_steps: int = 1000
     lambda_sft: float = 0.05
     lambda_cf: float = 1.0

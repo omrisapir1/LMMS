@@ -241,7 +241,7 @@ class CounterfactualAnswerLoss(nn.Module):
 
             do_permute = (k > 1 and torch.rand((), device=device, generator=gen) < prob)
             if do_permute:
-                do_truncate = (torch.rand((), device=device, generator=gen) < 0.5)
+                do_truncate = (torch.rand((), device=device, generator=gen) < 0.95)
                 if do_truncate:
                     r = torch.empty((), device=device).uniform_(0.5, 0.95, generator=gen)
                     truncate = int(torch.floor(r * k).item())
