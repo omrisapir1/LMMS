@@ -15,7 +15,7 @@ class Phase1Config:
     eval_interval_batches: int = 500
 
     min_delta: float = 0.01  # 1% improvement threshold
-    stage_patience: tuple = (3, 3, 3, 3, 3, 3, 3, 5)
+    stage_patience: tuple = (2, 3, 2, 2, 3, 2, 3, 5)
     max_steps_first_stage: int = 50
     permutation_loss_interval_batches: int = 8
 
@@ -34,3 +34,9 @@ class Phase1Config:
     # Logging
     log_dir: str = "runs/phase1"
     logg_loss_interval_batches: int = 10
+
+    # DataLoader
+    dataloader_num_workers: int = 4
+    eval_dataloader_num_workers: int = 2
+    dataloader_pin_memory: bool = True
+    dataloader_prefetch_factor: int = 2
