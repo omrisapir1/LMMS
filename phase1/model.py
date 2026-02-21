@@ -141,10 +141,16 @@ class Phase1CoconutModel(nn.Module):
         inputs_embeds = self._embedding(input_ids)
         max_steps = max((len(o) for o in fill_orders), default=0)
 
-        # Prefer backbone forward to get last_hidden_state directly without
+        # Use backbone forward to get last_hidden_state directly without
         # requesting the full hidden-state stack from CausalLM outputs.
         backbone = getattr(self.base_model, "model", None)
-        use_backbone = backbone is not None and callable(backbone)
+        if backbone is None:
+            backbone = getattr(self.base_model, "transformer", None)
+        if backbone is None or not callable(backbone):
+            raise RuntimeError(
+                "Could not resolve transformer backbone on base_model. "
+                "Expected `.model` or `.transformer` for prefix latent execution."
+            )
 
         for step_idx in range(max_steps):
             # Bucket samples by absolute latent position p for shared prefix forwards.
@@ -167,27 +173,15 @@ class Phase1CoconutModel(nn.Module):
                 prefix_mask = attention_mask.index_select(0, row_idx)[:, :p]
                 prefix_pos = position_ids.index_select(0, row_idx)[:, :p]
 
-                if use_backbone:
-                    out = backbone(
-                        inputs_embeds=prefix_embeds,
-                        attention_mask=prefix_mask,
-                        position_ids=prefix_pos,
-                        use_cache=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                    hidden = out.last_hidden_state
-                else:
-                    # Fallback for uncommon model wrappers.
-                    out = self.base_model(
-                        inputs_embeds=prefix_embeds,
-                        attention_mask=prefix_mask,
-                        position_ids=prefix_pos,
-                        use_cache=False,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    hidden = out.hidden_states[-1]
+                out = backbone(
+                    inputs_embeds=prefix_embeds,
+                    attention_mask=prefix_mask,
+                    position_ids=prefix_pos,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                hidden = out.last_hidden_state
                 inputs_embeds[row_idx, p, :] = hidden[:, p - 1, :]
 
         final = self.base_model(
