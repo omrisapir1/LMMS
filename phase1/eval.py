@@ -10,6 +10,8 @@ from .config import Phase1Config
 from .dataset import ANSWER_TOKEN, Phase1Collator, Phase1Dataset
 from .model import Phase1CoconutModel
 
+MAX_EVAL_ROWS = 500
+
 
 @dataclass
 class EvalMetrics:
@@ -59,6 +61,22 @@ def _extract_digit_token_predictions(
     return torch.gather(token_preds, 1, digit_position_indices)
 
 
+def _limit_eval_records(records: Iterable[Dict], limit: int = MAX_EVAL_ROWS):
+    if limit <= 0:
+        return records
+    if hasattr(records, "select") and hasattr(records, "__len__"):
+        n = min(int(limit), int(len(records)))
+        return records.select(range(n))
+    if isinstance(records, list):
+        return records[:limit]
+    out = []
+    for i, row in enumerate(records):
+        if i >= limit:
+            break
+        out.append(row)
+    return out
+
+
 def build_eval_loader(
     *,
     records: Iterable[Dict],
@@ -67,6 +85,7 @@ def build_eval_loader(
     stage: int,
     batch_size: Optional[int] = None,
 ) -> tuple[DataLoader, Phase1Dataset, Phase1Collator]:
+    records = _limit_eval_records(records, limit=MAX_EVAL_ROWS)
     ds = Phase1Dataset(
         records=records,
         tokenizer=tokenizer,
