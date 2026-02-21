@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional
@@ -293,6 +294,12 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
     )
 
     dtype = _dtype_from_str(config.torch_dtype)
+    if dtype != torch.bfloat16:
+        _log(
+            f"Overriding torch_dtype={config.torch_dtype} to bfloat16 as requested.",
+            log_path,
+        )
+        dtype = torch.bfloat16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(config.base_model)
@@ -300,6 +307,13 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
         config.base_model,
         torch_dtype=dtype,
     )
+    # OOM mitigation for long prefix-latent training.
+    if hasattr(base_model, "gradient_checkpointing_enable"):
+        base_model.gradient_checkpointing_enable()
+    if hasattr(base_model, "config"):
+        base_model.config.use_cache = False
+    if hasattr(base_model, "generation_config") and base_model.generation_config is not None:
+        base_model.generation_config.use_cache = False
     _ensure_special_tokens(tokenizer, base_model)
     digit_token_ids = _verify_digit_tokens(tokenizer)
 
@@ -314,7 +328,7 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
         base_model=base_model,
         latent_token_id=int(latent_token_id),
         perm_truncate_ratio=PERM_TRUNCATE_RATIO,
-    ).to(device)
+    ).to(device=device, dtype=torch.bfloat16)
 
     optimizer = AdamW(
         model.parameters(),
@@ -400,35 +414,41 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
             and microbatch % config.permutation_loss_interval_batches == 0
         )
 
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            compute_aux=compute_perm,
-            aux_seed=int(config.seed * 10_000_019 + microbatch),
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else nullcontext()
         )
-
-        answer_out = answer_loss.compute(
-            logits=out.logits_orig,
-            labels=labels,
-            digit_mask=digit_mask,
-            digit_position_indices=digit_pos,
-            digit_values=digit_values,
-            downsample_zeros=True,
-            seed=int(config.seed * 1_000_003 + microbatch),
-        )
-
-        perm_loss = out.logits_orig.new_zeros(())
-        if compute_perm and out.logits_aux is not None:
-            eligible = (latent_count >= 2) & out.aux_enabled_mask.to(device)
-            perm_loss = permutation_sensitivity_loss(
-                logits_orig=out.logits_orig,
-                logits_aux=out.logits_aux,
-                digit_position_indices=digit_pos,
-                digit_token_ids=digit_token_ids_t,
-                eligible_mask=eligible,
+        with amp_ctx:
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                compute_aux=compute_perm,
+                aux_seed=int(config.seed * 10_000_019 + microbatch),
             )
 
-        total_loss = answer_out.loss + perm_loss
+            answer_out = answer_loss.compute(
+                logits=out.logits_orig,
+                labels=labels,
+                digit_mask=digit_mask,
+                digit_position_indices=digit_pos,
+                digit_values=digit_values,
+                downsample_zeros=True,
+                seed=int(config.seed * 1_000_003 + microbatch),
+            )
+
+            perm_loss = out.logits_orig.new_zeros(())
+            if compute_perm and out.logits_aux is not None:
+                eligible = (latent_count >= 2) & out.aux_enabled_mask.to(device)
+                perm_loss = permutation_sensitivity_loss(
+                    logits_orig=out.logits_orig,
+                    logits_aux=out.logits_aux,
+                    digit_position_indices=digit_pos,
+                    digit_token_ids=digit_token_ids_t,
+                    eligible_mask=eligible,
+                )
+
+            total_loss = answer_out.loss + perm_loss
         scaled_loss = total_loss / float(max(1, config.gradient_accumulation_steps))
         scaled_loss.backward()
 

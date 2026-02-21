@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Callable, Dict, Iterable, Optional
 
 import torch
@@ -147,12 +148,18 @@ def evaluate(
             digit_targets = batch["digit_target_token_ids"].to(device)
             latent_count = batch["latent_count"].to(device)
 
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                compute_aux=True,
-                aux_seed=int(seed_base + batch_idx),
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if device.type == "cuda"
+                else nullcontext()
             )
+            with amp_ctx:
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    compute_aux=True,
+                    aux_seed=int(seed_base + batch_idx),
+                )
 
             preds = _extract_digit_token_predictions(
                 logits=out.logits_orig,
