@@ -16,7 +16,7 @@ class Phase1Config:
 
     min_delta: float = 0.01  # 1% improvement threshold
     stage_patience: tuple = (3, 3, 3, 3, 3, 3, 3, 5)
-    max_steps_first_stage: int = 2
+    max_steps_first_stage: int = 200
     permutation_loss_interval_batches: int = 8
 
 
