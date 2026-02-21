@@ -4,7 +4,7 @@ from dataclasses import dataclass
 class Phase1Config:
     # Training
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 32
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 2
@@ -19,9 +19,8 @@ class Phase1Config:
     max_steps_first_stage: int = 2
     permutation_loss_interval_batches: int = 8
 
-    # Downsampling
-    target_p0: float = 0.25
-    keep_prob_path: str = "probs.json"
+
+    keep_prob: tuple[float, ...] = (0.05, 0.1, 0.15, 0.75, 1.0)
 
     # Dataset (Hugging Face)
     dataset_name: str = "omrisap/GSM8k-Aug_qwen_62K_CoTsplitted"
@@ -29,7 +28,7 @@ class Phase1Config:
     dataset_eval_split: str = "eval"
 
     # Model
-    phase0_repo: str = "omrisap/LMMS_phase0"
+    base_model: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
     torch_dtype: str = "bfloat16"
 
     # Logging
