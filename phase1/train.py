@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -111,12 +112,24 @@ def _build_loader(
         max_length=config.max_length,
         answer_token=ANSWER_TOKEN,
     )
+    num_workers = max(0, int(getattr(config, "dataloader_num_workers", 0)))
+    pin_memory = bool(getattr(config, "dataloader_pin_memory", True))
+    prefetch_factor = max(1, int(getattr(config, "dataloader_prefetch_factor", 2)))
+    loader_kwargs = {
+        "batch_size": int(batch_size or config.batch_size),
+        "shuffle": shuffle,
+        "collate_fn": collator,
+        "drop_last": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     loader = DataLoader(
         ds,
-        batch_size=int(batch_size or config.batch_size),
-        shuffle=shuffle,
-        collate_fn=collator,
-        drop_last=False,
+        **loader_kwargs,
     )
     return loader, ds, collator
 
@@ -132,8 +145,18 @@ def _save_checkpoint(
     metrics: Optional[Dict[str, float]] = None,
 ) -> str:
     os.makedirs(config.log_dir, exist_ok=True)
-    ckpt_dir = os.path.join(config.log_dir, f"step_{optimizer_steps:08d}")
+    ckpt_dir = os.path.join(config.log_dir, "last_checkpoint")
+    if os.path.isdir(ckpt_dir):
+        shutil.rmtree(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Remove legacy per-step checkpoint directories from this run layout.
+    for name in os.listdir(config.log_dir):
+        if not name.startswith("step_"):
+            continue
+        path = os.path.join(config.log_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
 
     model.base_model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)

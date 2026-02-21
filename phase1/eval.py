@@ -100,12 +100,24 @@ def build_eval_loader(
         max_length=config.max_length,
         answer_token=ANSWER_TOKEN,
     )
+    num_workers = max(0, int(getattr(config, "eval_dataloader_num_workers", 0)))
+    pin_memory = bool(getattr(config, "dataloader_pin_memory", True))
+    prefetch_factor = max(1, int(getattr(config, "dataloader_prefetch_factor", 2)))
+    loader_kwargs = {
+        "batch_size": int(batch_size or config.batch_size),
+        "shuffle": False,
+        "collate_fn": collator,
+        "drop_last": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
     loader = DataLoader(
         ds,
-        batch_size=int(batch_size or config.batch_size),
-        shuffle=False,
-        collate_fn=collator,
-        drop_last=False,
+        **loader_kwargs,
     )
     return loader, ds, collator
 
