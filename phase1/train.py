@@ -152,10 +152,9 @@ def _save_checkpoint(
     return ckpt_dir
 
 
-def _preview_text(text: str, limit: int = 400) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
+def _preview_text(text: str) -> str:
+    return text
+
 
 
 def _print_stage_enter_example(
@@ -278,8 +277,8 @@ def _print_stage_enter_example(
     print("rendered answer_text:")
     print(answer_text)
     print("tokenized view (IDs and decoded strings):")
-    print("decoded prompt+answer_text (first ~400 chars):")
-    print(_preview_text(prompt_answer_decoded, limit=400))
+    print("decoded prompt+answer_text")
+    print(_preview_text(prompt_answer_decoded))
     print("substring around <ANSWER> incl. next 5 digits:")
     print(f"ids: {around_ids}")
     print(f"decoded: {around_decoded}")
