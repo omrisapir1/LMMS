@@ -10,7 +10,7 @@ from .dataset import LATENT_TOKEN
 
 
 PERM_TRUNCATE_RATIO = 0.5
-
+DO_FULL_TRUNCATE = 0.5
 
 @dataclass
 class Phase1Forward:
@@ -123,16 +123,23 @@ class Phase1CoconutModel(nn.Module):
         for positions in latent_positions:
             n = len(positions)
             if n <= 1:
-                enabled.append(False)
+                enabled.append(True)
                 orders.append([])
                 continue
             enabled.append(True)
             do_truncate = bool(
                 torch.rand((), generator=gen, device="cpu").item() < self.perm_truncate_ratio
             )
+
             if do_truncate:
-                m = max(1, (n + 1) // 2)
-                orders.append(list(range(m)))
+                do_full_truncate = bool(
+                    torch.rand((), generator=gen, device="cpu").item() < DO_FULL_TRUNCATE
+                )
+                if do_full_truncate:
+                    orders.append([])
+                else:
+                    m = max(1, (n + 1) // 2)
+                    orders.append(list(range(m)))
                 continue
             if n == 2:
                 orders.append([1, 0])
