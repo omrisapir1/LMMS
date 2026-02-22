@@ -185,7 +185,7 @@ def evaluate(
             total += int(match.numel())
 
             if out.logits_aux is not None:
-                eligible = out.aux_enabled_mask.to(device) & (latent_count >= 2)
+                eligible = out.aux_enabled_mask.to(device) & (latent_count >= 1)
                 if bool(eligible.any().item()):
                     preds_aux = _extract_digit_token_predictions(
                         logits=out.logits_aux,
