@@ -128,7 +128,7 @@ class Phase1CoconutModel(nn.Module):
             if n <= 1:
                 enabled.append(True)
                 orders.append([])
-                modes.append("none")
+                modes.append("full_remove_latents")
                 continue
             enabled.append(True)
             do_truncate = bool(
