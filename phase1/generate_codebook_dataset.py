@@ -86,7 +86,7 @@ def _parse_answer_int(answer) -> Optional[int]:
     return value
 
 
-def _build_input_for_k(
+def _build_base_case_for_k(
     *,
     ex: Example,
     k: int,
@@ -99,49 +99,117 @@ def _build_input_for_k(
     input_ids = list(enc["input_ids"])
     attention_mask = list(enc["attention_mask"])
 
-    input_ids.extend(ex.digit_token_ids)
-    attention_mask.extend([1] * 5)
-
-    if max_positions is not None and len(input_ids) > max_positions:
+    # Need room for 5 autoregressively generated digits.
+    if max_positions is not None and (len(input_ids) + 5) > max_positions:
         return None
 
     answer_positions = [i for i, t in enumerate(input_ids) if int(t) == int(answer_token_id)]
     if len(answer_positions) != 1:
         return None
     answer_pos = int(answer_positions[0])
-    if answer_pos + 5 >= len(input_ids):
-        return None
-
-    digit_position_indices = [answer_pos + i for i in range(5)]
-    digit_target_token_ids = [int(input_ids[answer_pos + 1 + i]) for i in range(5)]
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "digit_position_indices": digit_position_indices,
-        "digit_target_token_ids": digit_target_token_ids,
+        "answer_pos": int(answer_pos),
     }
 
 
-def _collate_cases(cases: List[Dict], pad_token_id: int) -> Dict[str, torch.Tensor]:
-    bsz = len(cases)
-    max_len = max(len(c["input_ids"]) for c in cases)
-    input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long)
-    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long)
-    digit_pos = torch.full((bsz, 5), -1, dtype=torch.long)
-    digit_targets = torch.full((bsz, 5), -100, dtype=torch.long)
+def rollout_digits_autoreg(
+    *,
+    model: Phase1CoconutModel,
+    tokenizer,
+    cases: List[Dict],
+    digit_token_ids: List[int],
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+    collect_latents: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    True autoregressive 5-digit rollout without teacher-forcing labels.
 
-    for i, c in enumerate(cases):
-        n = len(c["input_ids"])
-        input_ids[i, :n] = torch.tensor(c["input_ids"], dtype=torch.long)
-        attention_mask[i, :n] = torch.tensor(c["attention_mask"], dtype=torch.long)
-        digit_pos[i] = torch.tensor(c["digit_position_indices"], dtype=torch.long)
-        digit_targets[i] = torch.tensor(c["digit_target_token_ids"], dtype=torch.long)
+    Positional convention:
+    - digit_t token is at target_pos = answer_pos + t (1-indexed over digits),
+      i.e. positions answer_pos+1 ... answer_pos+5.
+    - digit_t is predicted from label_pos = target_pos - 1 by appending one
+      placeholder token per step and reading logits at that next-token slot.
+    """
+    if not cases:
+        empty = torch.empty((0, 5), dtype=torch.long, device=device)
+        return {
+            "pred_digit_token_ids": empty,
+            "pred_digit_values": empty,
+            "latent_vectors_orig": None,
+            "latent_vectors_orig_mask": None,
+        }
+
+    bsz = len(cases)
+    pad_token_id = int(tokenizer.pad_token_id)
+    placeholder_id = int(tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_token_id)
+
+    seq_ids: List[List[int]] = [list(c["input_ids"]) for c in cases]
+    seq_attn: List[List[int]] = [list(c["attention_mask"]) for c in cases]
+    answer_pos = [int(c["answer_pos"]) for c in cases]
+
+    digit_token_ids_t = torch.tensor(digit_token_ids, dtype=torch.long, device=device)
+    pred_token_ids = torch.full((bsz, 5), -100, dtype=torch.long, device=device)
+    pred_values = torch.full((bsz, 5), -1, dtype=torch.long, device=device)
+
+    latent_vecs_out: Optional[torch.Tensor] = None
+    latent_mask_out: Optional[torch.Tensor] = None
+
+    for t in range(5):
+        for b in range(bsz):
+            target_pos = int(answer_pos[b] + 1 + t)
+            if len(seq_ids[b]) != target_pos:
+                raise RuntimeError(
+                    f"Autoregressive rollout invariant violated at step {t}: "
+                    f"expected length {target_pos}, got {len(seq_ids[b])}."
+                )
+            seq_ids[b].append(placeholder_id)
+            seq_attn[b].append(1)
+
+        max_len = max(len(x) for x in seq_ids)
+        input_ids_t = torch.full((bsz, max_len), pad_token_id, dtype=torch.long, device=device)
+        attention_mask_t = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
+        digit_pos_t = torch.zeros((bsz, 5), dtype=torch.long, device=device)
+
+        for b in range(bsz):
+            n = len(seq_ids[b])
+            input_ids_t[b, :n] = torch.tensor(seq_ids[b], dtype=torch.long, device=device)
+            attention_mask_t[b, :n] = torch.tensor(seq_attn[b], dtype=torch.long, device=device)
+            label_pos = int(answer_pos[b] + t)
+            digit_pos_t[b, :] = label_pos
+
+        amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
+        with amp_ctx:
+            out = model(
+                input_ids=input_ids_t,
+                attention_mask=attention_mask_t,
+                digit_position_indices=digit_pos_t,
+                compute_aux=False,
+                collect_latents=bool(collect_latents and t == 0),
+            )
+
+        if collect_latents and t == 0:
+            latent_vecs_out = out.latent_vectors_orig
+            latent_mask_out = out.latent_vectors_orig_mask
+
+        logits_step = out.logits_orig[:, 0, :]  # [B,10]
+        pred_idx = logits_step.argmax(dim=-1)  # [B], class index 0..9
+        pred_tid = digit_token_ids_t.index_select(0, pred_idx)
+
+        pred_token_ids[:, t] = pred_tid
+        pred_values[:, t] = pred_idx
+
+        for b in range(bsz):
+            seq_ids[b][-1] = int(pred_tid[b].item())
+
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "digit_position_indices": digit_pos,
-        "digit_target_token_ids": digit_targets,
+        "pred_digit_token_ids": pred_token_ids,
+        "pred_digit_values": pred_values,
+        "latent_vectors_orig": latent_vecs_out,
+        "latent_vectors_orig_mask": latent_mask_out,
     }
 
 
@@ -221,9 +289,6 @@ def run(args: argparse.Namespace) -> None:
     if isinstance(max_positions, int) and max_positions <= 0:
         max_positions = None
 
-    pad_id = int(tokenizer.pad_token_id)
-    digit_token_ids_t = torch.tensor(digit_token_ids, dtype=torch.long, device=device)
-
     seen = 0
     solved = 0
     skipped_attempts = 0
@@ -232,6 +297,7 @@ def run(args: argparse.Namespace) -> None:
     buffer: List[Dict] = []
     k_hist = Counter()
     printed_dry = 0
+    printed_rollout_debug = False
 
     with torch.no_grad():
         for batch_id, start in enumerate(range(0, total_rows, int(args.batch_size)), start=1):
@@ -257,7 +323,7 @@ def run(args: argparse.Namespace) -> None:
                 cases: List[Dict] = []
                 map_local_to_ex: List[int] = []
                 for ex_idx in active:
-                    built = _build_input_for_k(
+                    built = _build_base_case_for_k(
                         ex=examples[ex_idx],
                         k=k,
                         tokenizer=tokenizer,
@@ -275,28 +341,61 @@ def run(args: argparse.Namespace) -> None:
                     active = []
                     break
 
-                collated = _collate_cases(cases, pad_token_id=pad_id)
-                input_ids = collated["input_ids"].to(device)
-                attention_mask = collated["attention_mask"].to(device)
-                digit_pos = collated["digit_position_indices"].to(device)
-                digit_targets = collated["digit_target_token_ids"].to(device)
+                if batch_id == 1 and not printed_rollout_debug:
+                    for local_idx in range(min(2, len(cases))):
+                        ex_idx = map_local_to_ex[local_idx]
+                        ex = examples[ex_idx]
+                        c = cases[local_idx]
+                        ans_pos = int(c["answer_pos"])
+                        seq = c["input_ids"]
+                        tail = tokenizer.decode(seq[max(0, len(seq) - 64):], skip_special_tokens=False)
+                        suffix_after_answer = seq[ans_pos + 1:]
+                        suffix_has_true_digit = any(
+                            int(tid) in set(int(x) for x in ex.digit_token_ids)
+                            for tid in suffix_after_answer
+                        )
+                        print(
+                            f"[rollout debug prompt] qid={ex.qid} k={k} "
+                            f"answer_pos={ans_pos} tail={tail!r} "
+                            f"suffix_len={len(suffix_after_answer)} suffix_has_true_digit={suffix_has_true_digit}"
+                        )
 
-                amp_ctx = _autocast_ctx(device=device, dtype=load_dtype)
-                with amp_ctx:
-                    out = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        digit_position_indices=digit_pos,
-                        compute_aux=False,
-                        collect_latents=True,
+                rollout = rollout_digits_autoreg(
+                    model=model,
+                    tokenizer=tokenizer,
+                    cases=cases,
+                    digit_token_ids=digit_token_ids,
+                    device=device,
+                    autocast_dtype=load_dtype,
+                    collect_latents=True,
+                )
+                pred_digit_token_ids = rollout["pred_digit_token_ids"]
+                pred_digit_values = rollout["pred_digit_values"]
+                latent_vecs_batch = rollout["latent_vectors_orig"]
+                latent_mask_batch = rollout["latent_vectors_orig_mask"]
+
+                if latent_vecs_batch is None or latent_mask_batch is None:
+                    raise RuntimeError(
+                        "rollout_digits_autoreg(collect_latents=True) did not return latent vectors."
                     )
-                if out.latent_vectors_orig is None or out.latent_vectors_orig_mask is None:
-                    raise RuntimeError("collect_latents=True but latent vectors were not returned.")
 
-                pred_digit_idx = out.logits_orig.argmax(dim=-1)
-                token_table = digit_token_ids_t.unsqueeze(0).expand(pred_digit_idx.size(0), -1)
-                preds_5 = torch.gather(token_table, 1, pred_digit_idx)
-                correct = (preds_5 == digit_targets).all(dim=1)
+                true_digit_targets = torch.tensor(
+                    [examples[ex_idx].digit_token_ids for ex_idx in map_local_to_ex],
+                    dtype=torch.long,
+                    device=device,
+                )
+                correct = (pred_digit_token_ids == true_digit_targets).all(dim=1)
+
+                if batch_id == 1 and not printed_rollout_debug:
+                    for local_idx in range(min(2, pred_digit_values.size(0))):
+                        ex_idx = map_local_to_ex[local_idx]
+                        ex = examples[ex_idx]
+                        pred_str = "".join(str(int(x)) for x in pred_digit_values[local_idx].tolist())
+                        true_str = "".join(str(int(x)) for x in ex.answer_digits)
+                        print(
+                            f"[rollout debug pred] qid={ex.qid} k={k} pred={pred_str} true={true_str}"
+                        )
+                    printed_rollout_debug = True
 
                 next_active: List[int] = []
                 for local_idx, ex_idx in enumerate(map_local_to_ex):
@@ -305,8 +404,8 @@ def run(args: argparse.Namespace) -> None:
                         continue
 
                     ex = examples[ex_idx]
-                    latent_vecs = out.latent_vectors_orig[local_idx]
-                    latent_mask = out.latent_vectors_orig_mask[local_idx]
+                    latent_vecs = latent_vecs_batch[local_idx]
+                    latent_mask = latent_mask_batch[local_idx]
                     if int(k) > int(latent_vecs.shape[0]):
                         skipped_attempts += 1
                         mark_skipped_example(ex_idx)
