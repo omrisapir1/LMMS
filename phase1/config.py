@@ -17,7 +17,7 @@ class Phase1Config:
     min_delta: float = 0.01  # 1% improvement threshold
     stage_patience: tuple = (2, 1, 1, 2, 1, 2, 1, 4)
     max_steps_first_stage: int = 20
-    permutation_loss_interval_batches: int = 2
+    permutation_loss_interval_batches: int = 8
 
 
     keep_prob: tuple[float, ...] = (0.05, 0.1, 0.15, 0.75, 1.0)
@@ -33,7 +33,7 @@ class Phase1Config:
 
     # Logging
     log_dir: str = "runs/phase1"
-    logg_loss_interval_batches: int = 1
+    logg_loss_interval_batches: int = 10
 
     # DataLoader
     dataloader_num_workers: int = 4
