@@ -35,31 +35,28 @@ class AnswerLoss:
         self,
         *,
         logits: torch.Tensor,
-        labels: torch.Tensor,
-        digit_mask: torch.Tensor,
-        digit_position_indices: torch.Tensor,
         digit_values: torch.Tensor,
         downsample_zeros: bool,
         seed: Optional[int] = None,
     ) -> AnswerLossOutput:
         if logits.ndim != 3:
-            raise ValueError("logits must have shape [B,T,V].")
-        if labels.ndim != 2:
-            raise ValueError("labels must have shape [B,T].")
-        if digit_mask.ndim != 2:
-            raise ValueError("digit_mask must have shape [B,T].")
-        if digit_position_indices.shape[-1] != 5:
-            raise ValueError("digit_position_indices must have shape [B,5].")
-        if digit_values.shape[-1] != 5:
+            raise ValueError("logits must have shape [B,5,10].")
+        if logits.shape[1] != 5 or logits.shape[2] != 10:
+            raise ValueError(f"logits must have shape [B,5,10], got {tuple(logits.shape)}.")
+        if digit_values.ndim != 2 or digit_values.shape[-1] != 5:
             raise ValueError("digit_values must have shape [B,5].")
+        if logits.shape[0] != digit_values.shape[0]:
+            raise ValueError("Batch size mismatch between logits and digit_values.")
+        if bool((digit_values < 0).any().item()) or bool((digit_values > 9).any().item()):
+            raise ValueError("digit_values must contain integers in [0,9].")
 
-        # CE per next-token position.
+        targets = digit_values.to(device=logits.device, dtype=torch.long)
+
         ce = F.cross_entropy(
-            logits.transpose(1, 2),
-            labels,
+            logits.reshape(-1, 10),
+            targets.reshape(-1),
             reduction="none",
-            ignore_index=-100,
-        )
+        ).view_as(targets)
 
         keep_mask_5 = self.sample_digit_keep_mask(
             digit_values=digit_values,
@@ -68,19 +65,7 @@ class AnswerLoss:
             device=logits.device,
         )
 
-        effective_mask = digit_mask.to(torch.bool).clone()
-        t = int(labels.shape[1])
-        for i in range(5):
-            pos_i = digit_position_indices[:, i]
-            valid_i = (pos_i >= 0) & (pos_i < t)
-            if not bool(valid_i.any().item()):
-                continue
-            drop_i = valid_i & (~keep_mask_5[:, i])
-            if bool(drop_i.any().item()):
-                row_idx = torch.nonzero(drop_i, as_tuple=False).squeeze(1)
-                col_idx = pos_i[row_idx]
-                effective_mask[row_idx, col_idx] = False
-
+        effective_mask = keep_mask_5.to(device=logits.device, dtype=torch.bool)
         contributing = int(effective_mask.sum().item())
         if contributing > 0:
             return AnswerLossOutput(
@@ -90,7 +75,7 @@ class AnswerLoss:
             )
 
         # Fallback: mean over original 5 digit positions (without downsampling).
-        base_mask = digit_mask.to(torch.bool)
+        base_mask = torch.ones_like(effective_mask, dtype=torch.bool)
         base_count = int(base_mask.sum().item())
         if base_count == 0:
             return AnswerLossOutput(
@@ -145,33 +130,10 @@ class AnswerLoss:
             keep_mask[:, i] = (~zero_mask) | draws
         return keep_mask
 
-
-def _select_digit_logits(
-    *,
-    logits: torch.Tensor,
-    digit_position_indices: torch.Tensor,
-    digit_token_ids: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Select full-vocab logits at the 5 answer-digit positions and project to 10 digits.
-    Returns [B,5,10].
-    """
-    if bool((digit_position_indices < 0).any().item()):
-        raise ValueError("digit_position_indices contains invalid positions (<0).")
-
-    bsz = logits.size(0)
-    batch_idx = torch.arange(bsz, device=logits.device).unsqueeze(1).expand(-1, 5)
-    pos = digit_position_indices.to(logits.device)
-    full = logits[batch_idx, pos]  # [B,5,V]
-    return full.index_select(-1, digit_token_ids.to(logits.device))
-
-
 def permutation_sensitivity_loss(
     *,
     logits_orig: torch.Tensor,
     logits_aux: torch.Tensor,
-    digit_position_indices: torch.Tensor,
-    digit_token_ids: torch.Tensor,
     eligible_mask: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -189,16 +151,15 @@ def permutation_sensitivity_loss(
     if not bool(valid.any().item()):
         return logits_orig.new_zeros(())
 
-    d_orig = _select_digit_logits(
-        logits=logits_orig,
-        digit_position_indices=digit_position_indices,
-        digit_token_ids=digit_token_ids,
-    )[valid]
-    d_aux = _select_digit_logits(
-        logits=logits_aux,
-        digit_position_indices=digit_position_indices,
-        digit_token_ids=digit_token_ids,
-    )[valid]
+    if logits_orig.ndim != 3 or logits_aux.ndim != 3:
+        raise ValueError("logits_orig/logits_aux must have shape [B,5,10].")
+    if logits_orig.shape[1:] != (5, 10):
+        raise ValueError("logits_orig must have shape [B,5,10].")
+    if logits_aux.shape != logits_orig.shape:
+        raise ValueError("logits_aux must match logits_orig shape [B,5,10].")
+
+    d_orig = logits_orig[valid]
+    d_aux = logits_aux[valid]
 
     p = F.softmax(d_orig, dim=-1).clamp_min(eps)
     q = F.softmax(d_aux, dim=-1).clamp_min(eps)

@@ -350,6 +350,8 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
     model = Phase1CoconutModel(
         base_model=base_model,
         latent_token_id=int(latent_token_id),
+        answer_token_id=int(answer_token_id),
+        digit_token_ids=digit_token_ids,
         perm_truncate_ratio=PERM_TRUNCATE_RATIO,
     ).to(device=device, dtype=torch.bfloat16)
 
@@ -405,8 +407,6 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
     running_perm = 0.0
     running_count = 0
 
-    digit_token_ids_t = torch.tensor(digit_token_ids, dtype=torch.long, device=device)
-
     while True:
         if max_optimizer_steps > 0 and optimizer_steps >= max_optimizer_steps:
             _log(f"Reached max_optimizer_steps={max_optimizer_steps}; stopping.", log_path)
@@ -426,8 +426,6 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
 
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        digit_mask = batch["digit_mask"].to(device)
         digit_pos = batch["digit_position_indices"].to(device)
         digit_values = batch["digit_values"].to(device)
         latent_count = batch["latent_count"].to(device)
@@ -446,15 +444,13 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
             out = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                digit_position_indices=digit_pos,
                 compute_aux=compute_perm,
                 aux_seed=int(config.seed * 10_000_019 + microbatch),
             )
 
             answer_out = answer_loss.compute(
                 logits=out.logits_orig,
-                labels=labels,
-                digit_mask=digit_mask,
-                digit_position_indices=digit_pos,
                 digit_values=digit_values,
                 downsample_zeros=True,
                 seed=int(config.seed * 1_000_003 + microbatch),
@@ -466,8 +462,6 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
                 perm_loss = permutation_sensitivity_loss(
                     logits_orig=out.logits_orig,
                     logits_aux=out.logits_aux,
-                    digit_position_indices=digit_pos,
-                    digit_token_ids=digit_token_ids_t,
                     eligible_mask=eligible,
                 )
 
