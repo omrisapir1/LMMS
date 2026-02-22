@@ -458,7 +458,7 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
 
             perm_loss = out.logits_orig.new_zeros(())
             if compute_perm and out.logits_aux is not None:
-                eligible = (latent_count >= 2) & out.aux_enabled_mask.to(device)
+                eligible = (latent_count >= 1) & out.aux_enabled_mask.to(device)
                 perm_loss = permutation_sensitivity_loss(
                     logits_orig=out.logits_orig,
                     logits_aux=out.logits_aux,
