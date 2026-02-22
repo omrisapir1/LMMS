@@ -33,7 +33,7 @@ class Phase1Config:
 
     # Logging
     log_dir: str = "runs/phase1"
-    logg_loss_interval_batches: int = 10
+    logg_loss_interval_batches: int = 1
 
     # DataLoader
     dataloader_num_workers: int = 4
