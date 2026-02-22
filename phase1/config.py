@@ -4,10 +4,10 @@ from dataclasses import dataclass
 class Phase1Config:
     # Training
     seed: int = 42
-    batch_size: int = 32
+    batch_size: int = 16
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2
 
     # Curriculum / stages
     max_thoughts: int = 8
@@ -16,7 +16,7 @@ class Phase1Config:
 
     min_delta: float = 0.01  # 1% improvement threshold
     stage_patience: tuple = (2, 1, 1, 2, 1, 2, 1, 4)
-    max_steps_first_stage: int = 10
+    max_steps_first_stage: int = 20
     permutation_loss_interval_batches: int = 8
 
 
