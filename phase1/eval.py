@@ -42,24 +42,15 @@ def make_stage_k_filter(stage: int) -> Callable[[int], bool]:
 def _extract_digit_token_predictions(
     *,
     logits: torch.Tensor,
-    digit_position_indices: torch.Tensor,
+    digit_token_ids: torch.Tensor,
 ) -> torch.Tensor:
-    token_preds = logits.argmax(dim=-1)  # [B,T]
-    if digit_position_indices.ndim != 2:
-        raise ValueError("digit_position_indices must have shape [B,5].")
-    if digit_position_indices.shape[0] != token_preds.shape[0]:
-        raise ValueError(
-            "digit_position_indices batch size does not match logits batch size."
-        )
-    t = int(token_preds.shape[1])
-    if bool((digit_position_indices < 0).any().item()) or bool((digit_position_indices >= t).any().item()):
-        bad = (digit_position_indices < 0) | (digit_position_indices >= t)
-        bad_count = int(bad.sum().item())
-        raise ValueError(
-            f"digit_position_indices out of bounds before gather: "
-            f"valid range is [0,{t - 1}], found {bad_count} invalid positions."
-        )
-    return torch.gather(token_preds, 1, digit_position_indices)
+    if logits.ndim != 3 or logits.shape[1:] != (5, 10):
+        raise ValueError(f"logits must have shape [B,5,10], got {tuple(logits.shape)}.")
+    if digit_token_ids.ndim != 1 or digit_token_ids.numel() != 10:
+        raise ValueError("digit_token_ids must be shape [10].")
+    digit_idx = logits.argmax(dim=-1)  # [B,5], values in [0,9]
+    token_table = digit_token_ids.to(logits.device).unsqueeze(0).expand(logits.size(0), -1)
+    return torch.gather(token_table, 1, digit_idx)
 
 
 def _limit_eval_records(records: Iterable[Dict], limit: int = MAX_EVAL_ROWS):
@@ -148,6 +139,17 @@ def evaluate(
     correct = 0
     total_perm = 0
     correct_perm = 0
+    digit_token_ids_cfg = getattr(model, "digit_token_ids", None)
+    if digit_token_ids_cfg is None:
+        digit_token_ids_cfg = []
+        for d in "0123456789":
+            ids = tokenizer.encode(d, add_special_tokens=False)
+            if len(ids) != 1:
+                raise RuntimeError(
+                    f"Digit tokenization check failed for '{d}': expected 1 token, got {ids}."
+                )
+            digit_token_ids_cfg.append(int(ids[0]))
+    digit_token_ids_t = torch.tensor(digit_token_ids_cfg, dtype=torch.long, device=device)
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -169,13 +171,14 @@ def evaluate(
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    digit_position_indices=digit_pos,
                     compute_aux=True,
                     aux_seed=int(seed_base + batch_idx),
                 )
 
             preds = _extract_digit_token_predictions(
                 logits=out.logits_orig,
-                digit_position_indices=digit_pos,
+                digit_token_ids=digit_token_ids_t,
             )
             match = (preds == digit_targets).all(dim=1)
             correct += int(match.sum().item())
@@ -186,7 +189,7 @@ def evaluate(
                 if bool(eligible.any().item()):
                     preds_aux = _extract_digit_token_predictions(
                         logits=out.logits_aux,
-                        digit_position_indices=digit_pos,
+                        digit_token_ids=digit_token_ids_t,
                     )
                     aux_match = (preds_aux == digit_targets).all(dim=1)
                     correct_perm += int(aux_match[eligible].sum().item())

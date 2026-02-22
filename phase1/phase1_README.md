@@ -385,6 +385,34 @@ Typical entrypoints:
 - `python -m phase1.train`
 - `python phase1/train.py`
 
+### Phase2 Codebook Dataset Generation
+
+Generate `(question, answer_digits, K_star, latent_vectors)` parquet shards from a trained Phase1 checkpoint:
+
+```bash
+python -m phase1.generate_codebook_dataset \
+  --ckpt_dir phase1/runs/phase1/last_checkpoint \
+  --dataset_name omrisap/GSM8k-Aug_qwen_62K_CoTsplitted \
+  --split train \
+  --output_dir phase1/codebook_data \
+  --k_max 20 \
+  --batch_size 8 \
+  --shard_size 1000
+```
+
+Dry run:
+
+```bash
+python -m phase1.generate_codebook_dataset \
+  --ckpt_dir phase1/runs/phase1/last_checkpoint \
+  --dataset_name omrisap/GSM8k-Aug_qwen_62K_CoTsplitted \
+  --split train \
+  --output_dir phase1/codebook_data_dry \
+  --k_max 20 \
+  --batch_size 8 \
+  --max_rows 32
+```
+
 ## Summary
 
 Phase 1 provides:
