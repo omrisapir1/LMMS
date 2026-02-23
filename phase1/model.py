@@ -9,8 +9,9 @@ import torch.nn as nn
 from .dataset import LATENT_TOKEN
 
 
-PERM_TRUNCATE_RATIO = 0.5
-DO_FULL_TRUNCATE = 0.5
+PERM_TRUNCATE_RATIO = 0.75
+DO_FULL_TRUNCATE = 0.4
+DO_TRUNCATE_TO_1 = 0.4
 
 @dataclass
 class Phase1Forward:
@@ -108,17 +109,20 @@ class Phase1CoconutModel(nn.Module):
         latent_positions: Sequence[Sequence[int]],
         *,
         seed: int,
-    ) -> tuple[List[List[int]], torch.Tensor, List[str]]:
+    ) -> tuple[List[List[int]], torch.Tensor, List[str], List[int]]:
         """
         Returns:
         - orders over latent-slot indices (not absolute token positions) per sample
         - aux_enabled_mask (n>=2)
         - aux_mode per sample:
           "permute" | "partial_truncate" | "full_remove_latents" | "none"
+        - keep_latent_count per sample:
+          number of latent slots retained in-sequence for aux mode.
         """
         enabled: List[bool] = []
         orders: List[List[int]] = []
         modes: List[str] = []
+        keep_counts: List[int] = []
 
         gen = torch.Generator(device="cpu")
         gen.manual_seed(int(seed))
@@ -129,6 +133,7 @@ class Phase1CoconutModel(nn.Module):
                 enabled.append(True)
                 orders.append([])
                 modes.append("full_remove_latents")
+                keep_counts.append(0)
                 continue
             enabled.append(True)
             do_truncate = bool(
@@ -142,18 +147,25 @@ class Phase1CoconutModel(nn.Module):
                 if do_full_truncate:
                     orders.append([])
                     modes.append("full_remove_latents")
+                    keep_counts.append(0)
+                elif bool(torch.rand((), generator=gen, device="cpu").item() < DO_TRUNCATE_TO_1):
+                    orders.append([0])
+                    modes.append("partial_truncate")
+                    keep_counts.append(1)
                 else:
                     m = max(1, (n + 1) // 2)
                     orders.append(list(range(m)))
                     modes.append("partial_truncate")
+                    keep_counts.append(m)
                 continue
             if n == 2:
                 orders.append([1, 0])
             else:
                 orders.append(list(reversed(range(n))))
             modes.append("permute")
+            keep_counts.append(n)
 
-        return orders, torch.tensor(enabled, dtype=torch.bool), modes
+        return orders, torch.tensor(enabled, dtype=torch.bool), modes, keep_counts
 
     def _build_no_latents_aux_batch(
         self,
@@ -255,6 +267,205 @@ class Phase1CoconutModel(nn.Module):
             raise RuntimeError("Remapped digit positions exceed no-latents sequence length.")
 
         return aux_input_ids, aux_attention_mask, aux_digit_pos, row_map
+
+    def _debug_validate_partial_latents_aux_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        latent_positions: Sequence[Sequence[int]],
+        row_map: torch.Tensor,
+        keep_latent_counts: Sequence[int],
+        aux_input_ids: torch.Tensor,
+        aux_attention_mask: torch.Tensor,
+        aux_latent_positions: Sequence[Sequence[int]],
+    ) -> None:
+        """
+        Debug-only invariants for partial-latents token-removal builder.
+        """
+        if int(row_map.numel()) != len(keep_latent_counts):
+            raise RuntimeError("partial-latents debug validation: keep counts length mismatch.")
+        extracted = self._extract_latent_positions(aux_input_ids, aux_attention_mask)
+        if len(extracted) != len(aux_latent_positions):
+            raise RuntimeError("partial-latents debug validation: latent row count mismatch.")
+        for i, b_t in enumerate(row_map.tolist()):
+            b = int(b_t)
+            keep_n = int(keep_latent_counts[i])
+            if keep_n < 1:
+                raise RuntimeError("partial-latents debug validation: keep_n must be >= 1.")
+            orig_lat_n = len(latent_positions[b])
+            if keep_n > orig_lat_n:
+                raise RuntimeError("partial-latents debug validation: keep_n exceeds original latent count.")
+            if len(aux_latent_positions[i]) != keep_n:
+                raise RuntimeError("partial-latents debug validation: aux latent count mismatch.")
+            if extracted[i] != list(aux_latent_positions[i]):
+                raise RuntimeError("partial-latents debug validation: extracted latent positions mismatch.")
+            old_valid = int(attention_mask[b].to(torch.long).sum().item())
+            new_valid = int(aux_attention_mask[i].to(torch.long).sum().item())
+            if keep_n < orig_lat_n and not (new_valid < old_valid):
+                raise RuntimeError(
+                    "partial-latents debug validation: expected shorter aux sequence after latent removal."
+                )
+
+    def _build_partial_latents_aux_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        digit_position_indices: torch.Tensor,
+        latent_positions: Sequence[Sequence[int]],
+        select_mask: torch.Tensor,
+        keep_latent_counts: Sequence[int],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[List[int]],
+        List[List[int]],
+    ]:
+        """
+        Build an auxiliary batch where only a prefix subset of latent tokens are kept
+        in-sequence and the remaining latent tokens are physically removed.
+
+        This differs from "fill truncation": dropped latent slots are not merely skipped
+        during latent fill; they are removed from valid tokens so the sequence shrinks.
+        """
+        if input_ids.ndim != 2 or attention_mask.ndim != 2:
+            raise ValueError("input_ids and attention_mask must be rank-2.")
+        if digit_position_indices.ndim != 2 or digit_position_indices.shape[1] != 5:
+            raise ValueError("digit_position_indices must have shape [B,5].")
+        if select_mask.ndim != 1 or select_mask.shape[0] != input_ids.shape[0]:
+            raise ValueError("select_mask must have shape [B].")
+
+        device = input_ids.device
+        row_map = torch.nonzero(select_mask.to(torch.bool), as_tuple=False).squeeze(1)
+        if row_map.numel() == 0:
+            raise ValueError("_build_partial_latents_aux_batch called with empty select_mask.")
+        if int(row_map.numel()) != len(keep_latent_counts):
+            raise ValueError("keep_latent_counts length must equal number of selected rows.")
+
+        aux_rows_tokens: List[List[int]] = []
+        aux_rows_digit_pos: List[List[int]] = []
+        aux_rows_latent_positions: List[List[int]] = []
+        keep_slot_maps: List[List[int]] = []
+        answer_counts: List[int] = []
+
+        for i, b_t in enumerate(row_map.tolist()):
+            b = int(b_t)
+            row_ids = input_ids[b]
+            row_attn = attention_mask[b].to(torch.long)
+            row_digit_pos = digit_position_indices[b].to(torch.long)
+            lat_pos = [int(p) for p in latent_positions[b]]
+            lat_n = len(lat_pos)
+            keep_n = int(keep_latent_counts[i])
+            if keep_n < 1:
+                raise RuntimeError("partial_truncate must keep at least one latent token.")
+            if keep_n > lat_n:
+                raise RuntimeError("keep_latent_count exceeds available latent count.")
+
+            kept_old_slots = list(range(keep_n))
+            kept_lat_old_idx = [int(lat_pos[s]) for s in kept_old_slots]
+            kept_lat_old_set = set(kept_lat_old_idx)
+            all_lat_old_set = set(lat_pos)
+            valid_idx = torch.nonzero(row_attn == 1, as_tuple=False).squeeze(1).tolist()
+
+            keep_old_idx: List[int] = []
+            for old_i_t in valid_idx:
+                old_i = int(old_i_t)
+                if old_i in all_lat_old_set and old_i not in kept_lat_old_set:
+                    continue
+                keep_old_idx.append(old_i)
+            if not keep_old_idx:
+                raise RuntimeError("No valid tokens remained after partial latent removal.")
+
+            old_to_new = {old_i: new_i for new_i, old_i in enumerate(keep_old_idx)}
+            remapped_digit_pos: List[int] = []
+            for old_p_t in row_digit_pos.tolist():
+                old_p = int(old_p_t)
+                if old_p not in old_to_new:
+                    raise RuntimeError(
+                        "Digit supervision position was removed while dropping latent tokens."
+                    )
+                remapped_digit_pos.append(int(old_to_new[old_p]))
+
+            remapped_kept_lat_pos: List[int] = []
+            for old_lat_idx in kept_lat_old_idx:
+                if old_lat_idx not in old_to_new:
+                    raise RuntimeError("Kept latent token index missing in remapped sequence.")
+                remapped_kept_lat_pos.append(int(old_to_new[old_lat_idx]))
+            if len(remapped_kept_lat_pos) != keep_n:
+                raise RuntimeError("Remapped kept latent positions length mismatch.")
+
+            kept_tokens = [int(row_ids[old_i].item()) for old_i in keep_old_idx]
+            if self.answer_token_id is not None:
+                answer_count = sum(1 for tid in kept_tokens if tid == int(self.answer_token_id))
+                answer_counts.append(answer_count)
+
+            keep_slot_maps.append(kept_old_slots)
+            aux_rows_tokens.append(kept_tokens)
+            aux_rows_digit_pos.append(remapped_digit_pos)
+            aux_rows_latent_positions.append(remapped_kept_lat_pos)
+
+        if self.answer_token_id is not None:
+            bad = [i for i, c in enumerate(answer_counts) if c != 1]
+            if bad:
+                raise RuntimeError(
+                    "Partial-latents aux batch must contain exactly one <ANSWER> per sample."
+                )
+
+        pad_token_id = int(getattr(self.base_model.config, "pad_token_id", 0) or 0)
+        b2 = int(row_map.numel())
+        s2 = max(len(x) for x in aux_rows_tokens)
+        aux_input_ids = torch.full((b2, s2), pad_token_id, dtype=torch.long, device=device)
+        aux_attention_mask = torch.zeros((b2, s2), dtype=torch.long, device=device)
+        aux_digit_pos = torch.full((b2, 5), -1, dtype=torch.long, device=device)
+
+        for i in range(b2):
+            n = len(aux_rows_tokens[i])
+            aux_input_ids[i, :n] = torch.tensor(aux_rows_tokens[i], dtype=torch.long, device=device)
+            aux_attention_mask[i, :n] = 1
+            aux_digit_pos[i] = torch.tensor(aux_rows_digit_pos[i], dtype=torch.long, device=device)
+
+        self._assert_right_padding(aux_attention_mask)
+        if bool((aux_digit_pos < 0).any().item()):
+            raise RuntimeError("Remapped digit positions contain invalid entries.")
+        max_valid = aux_attention_mask.sum(dim=1).to(torch.long) - 1
+        if bool((aux_digit_pos > max_valid.unsqueeze(1)).any().item()):
+            raise RuntimeError("Remapped digit positions exceed partial-latents sequence length.")
+
+        aux_latent_positions = self._extract_latent_positions(aux_input_ids, aux_attention_mask)
+        for i in range(len(aux_latent_positions)):
+            keep_n = int(keep_latent_counts[i])
+            if len(aux_latent_positions[i]) != keep_n:
+                raise RuntimeError(
+                    "Partial-latents aux batch latent count mismatch with keep_latent_count."
+                )
+            if list(aux_latent_positions[i]) != aux_rows_latent_positions[i]:
+                raise RuntimeError(
+                    "Partial-latents aux batch latent positions mismatch expected remap."
+                )
+
+        if __debug__:
+            self._debug_validate_partial_latents_aux_batch(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                latent_positions=latent_positions,
+                row_map=row_map,
+                keep_latent_counts=keep_latent_counts,
+                aux_input_ids=aux_input_ids,
+                aux_attention_mask=aux_attention_mask,
+                aux_latent_positions=aux_latent_positions,
+            )
+
+        return (
+            aux_input_ids,
+            aux_attention_mask,
+            aux_digit_pos,
+            row_map,
+            aux_latent_positions,
+            keep_slot_maps,
+        )
 
     def _get_lm_head(self) -> nn.Module:
         if hasattr(self.base_model, "get_output_embeddings"):
@@ -650,25 +861,48 @@ class Phase1CoconutModel(nn.Module):
         latent_vecs_aux_mask: Optional[torch.Tensor] = None
         aux_enabled = torch.zeros_like(latent_counts, dtype=torch.bool)
         if compute_aux:
-            aux_orders, aux_enabled_cpu, aux_modes = self._build_aux_orders(
+            aux_orders, aux_enabled_cpu, aux_modes, aux_keep_counts = self._build_aux_orders(
                 latent_positions=latent_positions,
                 seed=int(aux_seed),
             )
             aux_enabled = aux_enabled_cpu.to(device=input_ids.device)
             if bool(aux_enabled.any().item()):
                 device = input_ids.device
+                permute_mask = torch.tensor(
+                    [m == "permute" for m in aux_modes],
+                    dtype=torch.bool,
+                    device=device,
+                ) & aux_enabled
+                partial_remove_mask = torch.tensor(
+                    [m == "partial_truncate" for m in aux_modes],
+                    dtype=torch.bool,
+                    device=device,
+                ) & aux_enabled
                 full_remove_mask = torch.tensor(
                     [m == "full_remove_latents" for m in aux_modes],
                     dtype=torch.bool,
                     device=device,
                 ) & aux_enabled
-                normal_mask = aux_enabled & (~full_remove_mask)
 
                 logits_aux_full = logits_orig.new_zeros(logits_orig.shape)
                 computed_mask = torch.zeros_like(aux_enabled, dtype=torch.bool)
+                max_latents_all = max((len(x) for x in latent_positions), default=0)
+                hidden_size = int(self._embedding.weight.shape[1])
 
-                if bool(normal_mask.any().item()):
-                    row_idx = torch.nonzero(normal_mask, as_tuple=False).squeeze(1)
+                def ensure_aux_latent_storage() -> None:
+                    nonlocal latent_vecs_aux, latent_vecs_aux_mask
+                    if latent_vecs_aux is None:
+                        latent_vecs_aux = logits_orig.new_zeros(
+                            (input_ids.size(0), max_latents_all, hidden_size)
+                        )
+                        latent_vecs_aux_mask = torch.zeros(
+                            (input_ids.size(0), max_latents_all),
+                            dtype=torch.bool,
+                            device=device,
+                        )
+
+                if bool(permute_mask.any().item()):
+                    row_idx = torch.nonzero(permute_mask, as_tuple=False).squeeze(1)
                     sub_input_ids = input_ids.index_select(0, row_idx)
                     sub_attention_mask = attention_mask.index_select(0, row_idx)
                     sub_position_ids = position_ids.index_select(0, row_idx)
@@ -689,20 +923,57 @@ class Phase1CoconutModel(nn.Module):
                     computed_mask[row_idx] = True
 
                     if collect_latents:
-                        hidden_size = int(self._embedding.weight.shape[1])
-                        max_latents_all = max((len(x) for x in latent_positions), default=0)
-                        if latent_vecs_aux is None:
-                            latent_vecs_aux = logits_orig.new_zeros((input_ids.size(0), max_latents_all, hidden_size))
-                            latent_vecs_aux_mask = torch.zeros(
-                                (input_ids.size(0), max_latents_all),
-                                dtype=torch.bool,
-                                device=device,
-                            )
+                        ensure_aux_latent_storage()
                         if latent_vecs_sub is not None and latent_vecs_sub_mask is not None:
                             lat_n = int(latent_vecs_sub.shape[1])
                             if lat_n > 0:
                                 latent_vecs_aux[row_idx, :lat_n, :] = latent_vecs_sub
                                 latent_vecs_aux_mask[row_idx, :lat_n] = latent_vecs_sub_mask
+
+                if bool(partial_remove_mask.any().item()):
+                    partial_row_idx = torch.nonzero(partial_remove_mask, as_tuple=False).squeeze(1)
+                    keep_counts_partial = [int(aux_keep_counts[int(i)]) for i in partial_row_idx.tolist()]
+                    (
+                        part_input_ids,
+                        part_attention_mask,
+                        part_digit_pos,
+                        row_map,
+                        part_latent_positions,
+                        keep_slot_maps,
+                    ) = self._build_partial_latents_aux_batch(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        digit_position_indices=digit_pos,
+                        latent_positions=latent_positions,
+                        select_mask=partial_remove_mask,
+                        keep_latent_counts=keep_counts_partial,
+                    )
+                    part_position_ids = self._build_position_ids(part_attention_mask)
+                    part_orders = [list(range(len(x))) for x in part_latent_positions]
+                    logits_sub, latent_vecs_sub, latent_vecs_sub_mask = self._run_path(
+                        input_ids=part_input_ids,
+                        attention_mask=part_attention_mask,
+                        position_ids=part_position_ids,
+                        digit_position_indices=part_digit_pos,
+                        digit_token_ids=digit_ids_t,
+                        latent_positions=part_latent_positions,
+                        fill_orders=part_orders,
+                        collect_latents=collect_latents,
+                    )
+                    logits_aux_full.index_copy_(0, row_map, logits_sub)
+                    computed_mask[row_map] = True
+
+                    if collect_latents:
+                        ensure_aux_latent_storage()
+                        if latent_vecs_sub is not None and latent_vecs_sub_mask is not None:
+                            for local_i, orig_row_t in enumerate(row_map.tolist()):
+                                orig_row = int(orig_row_t)
+                                kept_slots = keep_slot_maps[local_i]
+                                keep_n = len(kept_slots)
+                                if keep_n <= 0:
+                                    continue
+                                latent_vecs_aux[orig_row, :keep_n, :] = latent_vecs_sub[local_i, :keep_n, :]
+                                latent_vecs_aux_mask[orig_row, :keep_n] = latent_vecs_sub_mask[local_i, :keep_n]
 
                 if bool(full_remove_mask.any().item()):
                     no_lat_input_ids, no_lat_attention_mask, no_lat_digit_pos, row_map = self._build_no_latents_aux_batch(
@@ -728,9 +999,11 @@ class Phase1CoconutModel(nn.Module):
                     logits_aux_full.index_copy_(0, row_map, logits_sub)
                     computed_mask[row_map] = True
 
+                aux_enabled = computed_mask
                 if bool(computed_mask.any().item()):
                     logits_aux = logits_aux_full
-                    aux_enabled = computed_mask
+                else:
+                    logits_aux = None
 
         return Phase1Forward(
             logits_orig=logits_orig,
