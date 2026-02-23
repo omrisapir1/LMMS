@@ -213,6 +213,120 @@ def rollout_digits_autoreg(
     }
 
 
+def rollout_digits_autoreg_kv_cache(
+    *,
+    model: Phase1CoconutModel,
+    tokenizer,
+    cases: List[Dict],
+    digit_token_ids: List[int],
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+    collect_latents: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Autoregressive 5-digit rollout using KV cache.
+    The legacy (non-KV) path is preserved in rollout_digits_autoreg.
+    """
+    if not cases:
+        empty = torch.empty((0, 5), dtype=torch.long, device=device)
+        return {
+            "pred_digit_token_ids": empty,
+            "pred_digit_values": empty,
+            "latent_vectors_orig": None,
+            "latent_vectors_orig_mask": None,
+        }
+
+    bsz = len(cases)
+    digit_token_ids_t = torch.tensor(digit_token_ids, dtype=torch.long, device=device)
+    pred_token_ids = torch.full((bsz, 5), -100, dtype=torch.long, device=device)
+    pred_values = torch.full((bsz, 5), -1, dtype=torch.long, device=device)
+
+    per_case_latents: List[torch.Tensor] = []
+    per_case_latent_masks: List[torch.Tensor] = []
+    one_token_attn = torch.ones((1, 1), dtype=torch.long, device=device)
+
+    for b, case in enumerate(cases):
+        input_ids_t = torch.tensor(case["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
+        attention_mask_t = torch.tensor(case["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
+        label_pos_t = torch.tensor([int(case["answer_pos"])], dtype=torch.long, device=device)
+
+        amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
+        with amp_ctx:
+            prefill = model.prefill_with_cache_for_rollout(
+                input_ids=input_ids_t,
+                attention_mask=attention_mask_t,
+                label_positions=label_pos_t,
+                digit_token_ids=digit_token_ids,
+                collect_latents=collect_latents,
+            )
+
+        logits_step = prefill["next_digit_logits"]  # [1,10]
+        past_key_values = prefill["past_key_values"]
+        next_position_ids = prefill["next_position_ids"]  # [1]
+
+        if collect_latents:
+            latent_vecs = prefill["latent_vectors_orig"]
+            latent_mask = prefill["latent_vectors_orig_mask"]
+            if latent_vecs is None or latent_mask is None:
+                raise RuntimeError(
+                    "prefill_with_cache_for_rollout(collect_latents=True) "
+                    "did not return latent vectors."
+                )
+            per_case_latents.append(latent_vecs[0])
+            per_case_latent_masks.append(latent_mask[0])
+
+        pred_idx = logits_step.argmax(dim=-1)  # [1]
+        pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [1]
+        pred_token_ids[b, 0] = pred_tid[0]
+        pred_values[b, 0] = pred_idx[0]
+
+        current_token_ids = pred_tid
+        current_attention_mask = attention_mask_t
+        for t in range(1, 5):
+            current_attention_mask = torch.cat([current_attention_mask, one_token_attn], dim=1)
+            amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
+            with amp_ctx:
+                dec = model.decode_next_with_cache_for_rollout(
+                    token_ids=current_token_ids,
+                    attention_mask_with_new_token=current_attention_mask,
+                    next_position_ids=next_position_ids,
+                    past_key_values=past_key_values,
+                    digit_token_ids=digit_token_ids,
+                )
+            logits_step = dec["next_digit_logits"]  # [1,10]
+            past_key_values = dec["past_key_values"]
+            next_position_ids = dec["next_position_ids"]
+
+            pred_idx = logits_step.argmax(dim=-1)  # [1]
+            pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [1]
+            pred_token_ids[b, t] = pred_tid[0]
+            pred_values[b, t] = pred_idx[0]
+            current_token_ids = pred_tid
+
+    latent_vecs_out: Optional[torch.Tensor] = None
+    latent_mask_out: Optional[torch.Tensor] = None
+    if collect_latents:
+        if len(per_case_latents) != bsz or len(per_case_latent_masks) != bsz:
+            raise RuntimeError("KV-cache rollout latent collection mismatch.")
+        hidden_size = int(model.base_model.get_input_embeddings().weight.shape[1])
+        max_latents = max((int(x.shape[0]) for x in per_case_latents), default=0)
+        lat_dtype = per_case_latents[0].dtype if per_case_latents else model.base_model.get_input_embeddings().weight.dtype
+        latent_vecs_out = torch.zeros((bsz, max_latents, hidden_size), dtype=lat_dtype, device=device)
+        latent_mask_out = torch.zeros((bsz, max_latents), dtype=torch.bool, device=device)
+        for b, (vecs, mask) in enumerate(zip(per_case_latents, per_case_latent_masks)):
+            n = int(vecs.shape[0])
+            if n > 0:
+                latent_vecs_out[b, :n, :] = vecs
+            latent_mask_out[b, :n] = mask[:n]
+
+    return {
+        "pred_digit_token_ids": pred_token_ids,
+        "pred_digit_values": pred_values,
+        "latent_vectors_orig": latent_vecs_out,
+        "latent_vectors_orig_mask": latent_mask_out,
+    }
+
+
 def _flush_shard(rows: List[Dict], output_dir: str, shard_idx: int) -> str:
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"part-{shard_idx:05d}.parquet")
@@ -275,7 +389,7 @@ def run(args: argparse.Namespace) -> None:
     ).to(device)
     model.eval()
     if hasattr(model.base_model, "config"):
-        model.base_model.config.use_cache = False
+        model.base_model.config.use_cache = bool(args.use_kv_cache)
 
     ds = load_dataset(args.dataset_name, split=args.split)
     total_rows = len(ds)
@@ -360,15 +474,26 @@ def run(args: argparse.Namespace) -> None:
                             f"suffix_len={len(suffix_after_answer)} suffix_has_true_digit={suffix_has_true_digit}"
                         )
 
-                rollout = rollout_digits_autoreg(
-                    model=model,
-                    tokenizer=tokenizer,
-                    cases=cases,
-                    digit_token_ids=digit_token_ids,
-                    device=device,
-                    autocast_dtype=load_dtype,
-                    collect_latents=True,
-                )
+                if args.use_kv_cache:
+                    rollout = rollout_digits_autoreg_kv_cache(
+                        model=model,
+                        tokenizer=tokenizer,
+                        cases=cases,
+                        digit_token_ids=digit_token_ids,
+                        device=device,
+                        autocast_dtype=load_dtype,
+                        collect_latents=True,
+                    )
+                else:
+                    rollout = rollout_digits_autoreg(
+                        model=model,
+                        tokenizer=tokenizer,
+                        cases=cases,
+                        digit_token_ids=digit_token_ids,
+                        device=device,
+                        autocast_dtype=load_dtype,
+                        collect_latents=True,
+                    )
                 pred_digit_token_ids = rollout["pred_digit_token_ids"]
                 pred_digit_values = rollout["pred_digit_values"]
                 latent_vecs_batch = rollout["latent_vectors_orig"]
@@ -487,6 +612,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_rows", default=0, type=int)
     p.add_argument("--shard_size", default=1000, type=int)
     p.add_argument("--eval_rows_limit", default=0, type=int)
+    p.add_argument(
+        "--use_kv_cache",
+        action="store_true",
+        help="Use KV-cache based autoregressive rollout for digit generation.",
+    )
     return p.parse_args()
 
 

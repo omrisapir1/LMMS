@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -266,6 +266,17 @@ class Phase1CoconutModel(nn.Module):
             raise RuntimeError("Could not resolve lm_head/output embeddings on base_model.")
         return head
 
+    def _get_backbone(self):
+        backbone = getattr(self.base_model, "model", None)
+        if backbone is None:
+            backbone = getattr(self.base_model, "transformer", None)
+        if backbone is None or not callable(backbone):
+            raise RuntimeError(
+                "Could not resolve transformer backbone on base_model. "
+                "Expected `.model` or `.transformer` for prefix latent execution."
+            )
+        return backbone
+
     def _resolve_digit_token_ids(
         self,
         *,
@@ -363,6 +374,46 @@ class Phase1CoconutModel(nn.Module):
         - one final full forward for hidden states, then restricted projection to digit logits
         """
         device = input_ids.device
+        backbone = self._get_backbone()
+        inputs_embeds, latent_vecs, latent_vec_mask = self._fill_latent_inputs_embeds(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            latent_positions=latent_positions,
+            fill_orders=fill_orders,
+            collect_latents=collect_latents,
+        )
+        bsz = int(inputs_embeds.shape[0])
+
+        final = backbone(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        hidden_last = final.last_hidden_state
+
+        batch_idx = torch.arange(bsz, dtype=torch.long, device=device).unsqueeze(1).expand(-1, 5)
+        digit_hidden = hidden_last[batch_idx, digit_position_indices]
+        digit_logits = self._project_hidden_to_token_subset(
+            hidden=digit_hidden,
+            token_ids=digit_token_ids,
+        )
+        return digit_logits, latent_vecs, latent_vec_mask
+
+    def _fill_latent_inputs_embeds(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        latent_positions: Sequence[Sequence[int]],
+        fill_orders: Sequence[Sequence[int]],
+        collect_latents: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        device = input_ids.device
         inputs_embeds = self._embedding(input_ids)
         bsz, _, hidden_size = inputs_embeds.shape
         max_steps = max((len(o) for o in fill_orders), default=0)
@@ -378,16 +429,7 @@ class Phase1CoconutModel(nn.Module):
                 device=device,
             )
 
-        # Use backbone forward to get last_hidden_state directly without
-        # requesting the full hidden-state stack from CausalLM outputs.
-        backbone = getattr(self.base_model, "model", None)
-        if backbone is None:
-            backbone = getattr(self.base_model, "transformer", None)
-        if backbone is None or not callable(backbone):
-            raise RuntimeError(
-                "Could not resolve transformer backbone on base_model. "
-                "Expected `.model` or `.transformer` for prefix latent execution."
-            )
+        backbone = self._get_backbone()
 
         for step_idx in range(max_steps):
             # Bucket samples by absolute latent position p for shared prefix forwards.
@@ -427,24 +469,136 @@ class Phase1CoconutModel(nn.Module):
                     slot_idx_t = torch.tensor(slot_indices, dtype=torch.long, device=device)
                     latent_vecs[row_idx, slot_idx_t, :] = fill_vecs
                     latent_vec_mask[row_idx, slot_idx_t] = True
+        return inputs_embeds, latent_vecs, latent_vec_mask
 
-        final = backbone(
+    def prefill_with_cache_for_rollout(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        label_positions: torch.Tensor,
+        digit_token_ids: Optional[Sequence[int]] = None,
+        collect_latents: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Prefill a batch once (with latent filling) and return:
+        - next_digit_logits: logits for the next token at `label_positions` [B,10]
+        - past_key_values: cache for incremental decoding
+        - next_position_ids: absolute positions for the next incremental token [B]
+        - optional latent vectors/mask for original path
+        """
+        if input_ids.ndim != 2 or attention_mask.ndim != 2:
+            raise ValueError("input_ids and attention_mask must be rank-2 tensors.")
+        bsz, seqlen = input_ids.shape
+        if attention_mask.shape != (bsz, seqlen):
+            raise ValueError("attention_mask must have shape [B,S] matching input_ids.")
+        if label_positions.ndim != 1 or label_positions.shape[0] != bsz:
+            raise ValueError("label_positions must have shape [B].")
+
+        attention_mask = attention_mask.to(input_ids.device)
+        self._assert_right_padding(attention_mask)
+        position_ids = self._build_position_ids(attention_mask)
+        digit_ids_t = self._resolve_digit_token_ids(
+            device=input_ids.device,
+            digit_token_ids=digit_token_ids,
+        )
+        latent_positions = self._extract_latent_positions(input_ids, attention_mask)
+        normal_orders = [list(range(len(x))) for x in latent_positions]
+
+        inputs_embeds, latent_vecs, latent_vec_mask = self._fill_latent_inputs_embeds(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            latent_positions=latent_positions,
+            fill_orders=normal_orders,
+            collect_latents=collect_latents,
+        )
+
+        backbone = self._get_backbone()
+        out = backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=False,
+            use_cache=True,
             output_hidden_states=False,
             return_dict=True,
         )
-        hidden_last = final.last_hidden_state
+        hidden_last = out.last_hidden_state
 
-        batch_idx = torch.arange(bsz, dtype=torch.long, device=device).unsqueeze(1).expand(-1, 5)
-        digit_hidden = hidden_last[batch_idx, digit_position_indices]
-        digit_logits = self._project_hidden_to_token_subset(
-            hidden=digit_hidden,
-            token_ids=digit_token_ids,
+        label_pos = label_positions.to(device=input_ids.device, dtype=torch.long)
+        if bool((label_pos < 0).any().item()) or bool((label_pos >= seqlen).any().item()):
+            raise ValueError("label_positions contains out-of-range values.")
+        attn_at_pos = torch.gather(attention_mask.to(torch.long), 1, label_pos.unsqueeze(1)).squeeze(1)
+        if bool((attn_at_pos == 0).any().item()):
+            raise ValueError("label_positions points to padding tokens.")
+
+        batch_idx = torch.arange(bsz, dtype=torch.long, device=input_ids.device)
+        next_hidden = hidden_last[batch_idx, label_pos, :].unsqueeze(1)
+        next_logits = self._project_hidden_to_token_subset(
+            hidden=next_hidden,
+            token_ids=digit_ids_t,
+        ).squeeze(1)
+        next_position_ids = attention_mask.to(torch.long).sum(dim=1)
+
+        return {
+            "next_digit_logits": next_logits,
+            "past_key_values": out.past_key_values,
+            "next_position_ids": next_position_ids,
+            "latent_vectors_orig": latent_vecs,
+            "latent_vectors_orig_mask": latent_vec_mask,
+        }
+
+    def decode_next_with_cache_for_rollout(
+        self,
+        *,
+        token_ids: torch.Tensor,
+        attention_mask_with_new_token: torch.Tensor,
+        next_position_ids: torch.Tensor,
+        past_key_values: Any,
+        digit_token_ids: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Consume one incremental token and return logits for the following token.
+        """
+        if token_ids.ndim != 1:
+            raise ValueError("token_ids must have shape [B].")
+        bsz = int(token_ids.shape[0])
+        if next_position_ids.ndim != 1 or int(next_position_ids.shape[0]) != bsz:
+            raise ValueError("next_position_ids must have shape [B].")
+        if attention_mask_with_new_token.ndim != 2 or int(attention_mask_with_new_token.shape[0]) != bsz:
+            raise ValueError("attention_mask_with_new_token must have shape [B,S].")
+
+        device = token_ids.device
+        token_ids_in = token_ids.to(device=device, dtype=torch.long).unsqueeze(1)
+        pos_ids = next_position_ids.to(device=device, dtype=torch.long).unsqueeze(1)
+        attn = attention_mask_with_new_token.to(device=device, dtype=torch.long)
+        self._assert_right_padding(attn)
+        digit_ids_t = self._resolve_digit_token_ids(
+            device=device,
+            digit_token_ids=digit_token_ids,
         )
-        return digit_logits, latent_vecs, latent_vec_mask
+
+        backbone = self._get_backbone()
+        out = backbone(
+            input_ids=token_ids_in,
+            attention_mask=attn,
+            position_ids=pos_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        hidden_last = out.last_hidden_state[:, -1:, :]
+        next_logits = self._project_hidden_to_token_subset(
+            hidden=hidden_last,
+            token_ids=digit_ids_t,
+        ).squeeze(1)
+
+        return {
+            "next_digit_logits": next_logits,
+            "past_key_values": out.past_key_values,
+            "next_position_ids": (next_position_ids.to(device=device, dtype=torch.long) + 1),
+        }
 
     def forward(
         self,
