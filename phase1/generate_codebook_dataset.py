@@ -617,6 +617,45 @@ def _debug_assert_rollout_parity(
             raise RuntimeError("Rollout parity mismatch: latent_vectors_orig_mask differs.")
 
 
+def _precompute_suffix_tokens_by_k(
+    *,
+    tokenizer,
+    k_max: int,
+    latent_token_id: int,
+    answer_token_id: int,
+) -> tuple[List[List[int]], List[List[int]]]:
+    """
+    Pre-tokenize suffix text once per k using the exact legacy surface form:
+    "<LATENT> ... <LATENT> <ANSWER>" (space-separated join).
+    This preserves tokenizer-specific whitespace/special-token behavior.
+    """
+    suffix_token_ids_by_k: List[List[int]] = []
+    suffix_attention_by_k: List[List[int]] = []
+    for k in range(int(k_max) + 1):
+        answer_text = " ".join([LATENT_TOKEN] * int(k) + [ANSWER_TOKEN])
+        enc = tokenizer(
+            answer_text,
+            add_special_tokens=False,
+            padding=False,
+            return_attention_mask=True,
+        )
+        ids = [int(x) for x in enc["input_ids"]]
+        attn = [int(x) for x in enc["attention_mask"]]
+        if len(ids) != len(attn):
+            raise RuntimeError("Suffix tokenization produced mismatched ids/attention lengths.")
+        if sum(1 for x in ids if int(x) == int(answer_token_id)) != 1:
+            raise RuntimeError(
+                f"Suffix tokenization must contain exactly one {ANSWER_TOKEN} token for k={k}."
+            )
+        if sum(1 for x in ids if int(x) == int(latent_token_id)) != int(k):
+            raise RuntimeError(
+                f"Suffix tokenization must contain exactly k={k} {LATENT_TOKEN} tokens."
+            )
+        suffix_token_ids_by_k.append(ids)
+        suffix_attention_by_k.append(attn)
+    return suffix_token_ids_by_k, suffix_attention_by_k
+
+
 def run(args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -661,11 +700,12 @@ def run(args: argparse.Namespace) -> None:
     if isinstance(max_positions, int) and max_positions <= 0:
         max_positions = None
 
-    suffix_token_ids_by_k = [
-        [int(latent_token_id)] * int(k) + [int(answer_token_id)]
-        for k in range(int(args.k_max) + 1)
-    ]
-    suffix_attention_by_k = [[1] * (int(k) + 1) for k in range(int(args.k_max) + 1)]
+    suffix_token_ids_by_k, suffix_attention_by_k = _precompute_suffix_tokens_by_k(
+        tokenizer=tokenizer,
+        k_max=int(args.k_max),
+        latent_token_id=int(latent_token_id),
+        answer_token_id=int(answer_token_id),
+    )
 
     seen = 0
     solved = 0
