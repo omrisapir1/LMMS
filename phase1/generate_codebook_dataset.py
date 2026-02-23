@@ -549,6 +549,8 @@ def _debug_assert_case_builder_parity(
             if old_case is None or new_case is None:
                 continue
             if old_case["input_ids"] != new_case["input_ids"]:
+                print(f"old_case['input_ids']:\n{old_case['input_ids']}")
+                print(f"new_case['input_ids']:\n{new_case['input_ids']}")
                 raise RuntimeError(f"Case-builder input_ids mismatch for qid={ex.qid}, k={k}.")
             if old_case["attention_mask"] != new_case["attention_mask"]:
                 raise RuntimeError(f"Case-builder attention_mask mismatch for qid={ex.qid}, k={k}.")
@@ -846,7 +848,7 @@ def run(args: argparse.Namespace) -> None:
                 correct = (pred_digit_token_ids == true_digit_targets).all(dim=1)
 
                 if batch_id == 1 and not printed_rollout_debug:
-                    for local_idx in range(min(50, pred_digit_values.size(0))):
+                    for local_idx in range(min(2, pred_digit_values.size(0))):
                         ex_idx = map_local_to_ex[local_idx]
                         ex = examples[ex_idx]
                         pred_str = "".join(str(int(x)) for x in pred_digit_values[local_idx].tolist())
