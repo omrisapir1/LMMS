@@ -796,7 +796,7 @@ def run(args: argparse.Namespace) -> None:
                         c = cases[local_idx]
                         ans_pos = int(c["answer_pos"])
                         seq = c["input_ids"]
-                        tail = tokenizer.decode(seq[max(0, len(seq) - 64):], skip_special_tokens=False)
+                        tail = tokenizer.decode(seq, skip_special_tokens=False)
                         suffix_after_answer = seq[ans_pos + 1:]
                         suffix_has_true_digit = any(
                             int(tid) in set(int(x) for x in ex.digit_token_ids)
@@ -854,7 +854,7 @@ def run(args: argparse.Namespace) -> None:
                         print(
                             f"[rollout debug pred] qid={ex.qid} k={k} pred={pred_str} true={true_str}"
                         )
-                    printed_rollout_debug = True
+                    # printed_rollout_debug = True
 
                 next_active: List[int] = []
                 for local_idx, ex_idx in enumerate(map_local_to_ex):
