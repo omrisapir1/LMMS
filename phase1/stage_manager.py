@@ -47,22 +47,11 @@ class StageManager:
             return False
         return self._advance_stage()
 
-    def update(self, *, val_acc: float, optimizer_steps: int, force_continue=False) -> StageUpdate:
+    def update(self, *, val_acc: float, optimizer_steps: int) -> StageUpdate:
         del optimizer_steps
         forced = False
         improved = False
         advanced = False
-        if force_continue:
-            advanced = self._advance_stage()
-
-            return StageUpdate(
-                stage=self.current_stage,
-                advanced=advanced,
-                forced_stage1_exit=forced,
-                improved=improved,
-                patience_counter=self.no_improve_count,
-                best_val_acc=self.best_val_acc,
-            )
 
         if self.best_val_acc is None:
             self.best_val_acc = float(val_acc)
