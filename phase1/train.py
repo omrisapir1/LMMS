@@ -526,7 +526,6 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
             update = stage_manager.update(
                 val_acc=metrics.acc,
                 optimizer_steps=optimizer_steps,
-                force_continue= stage_manager.current_stage < 8
             )
             if update.advanced:
                 reason = "forced-step" if update.forced_stage1_exit else "patience"
