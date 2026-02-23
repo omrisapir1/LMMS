@@ -97,7 +97,7 @@ def _build_base_case_for_k_legacy(
     answer_token_id: int,
     max_positions: Optional[int],
 ) -> Optional[Dict]:
-    answer_text = ' '.join([LATENT_TOKEN] * int(k) + [ANSWER_TOKEN])
+    answer_text = ''.join([LATENT_TOKEN] * int(k) + [ANSWER_TOKEN])
     enc = build_prompt(ex.question, answer_text, tokenizer)
     input_ids = list(enc["input_ids"])
     attention_mask = list(enc["attention_mask"])
