@@ -846,7 +846,7 @@ def run(args: argparse.Namespace) -> None:
                 correct = (pred_digit_token_ids == true_digit_targets).all(dim=1)
 
                 if batch_id == 1 and not printed_rollout_debug:
-                    for local_idx in range(min(2, pred_digit_values.size(0))):
+                    for local_idx in range(min(50, pred_digit_values.size(0))):
                         ex_idx = map_local_to_ex[local_idx]
                         ex = examples[ex_idx]
                         pred_str = "".join(str(int(x)) for x in pred_digit_values[local_idx].tolist())
