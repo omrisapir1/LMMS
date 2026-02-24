@@ -744,7 +744,7 @@ def _precompute_suffix_tokens_by_k(
     suffix_token_ids_by_k: List[List[int]] = []
     suffix_attention_by_k: List[List[int]] = []
     for k in range(int(k_max) + 1):
-        answer_text = " ".join([LATENT_TOKEN] * int(k) + [ANSWER_TOKEN])
+        answer_text = "\n".join([LATENT_TOKEN] * int(k) + [ANSWER_TOKEN])
         enc = tokenizer(
             answer_text,
             add_special_tokens=False,
