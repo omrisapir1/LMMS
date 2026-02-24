@@ -8,7 +8,7 @@ class Phase1Config:
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 2
-    answer_loss_weight: float = 0.2
+    answer_loss_weight: float = 0.5
     permutation_loss_weight: float = 1.0
 
     # Curriculum / stages
