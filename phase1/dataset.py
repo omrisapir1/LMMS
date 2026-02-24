@@ -77,7 +77,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
         # Replace last thought only
         for t in thoughts[:-1]:
             lines.append(t)
-        lines.append(LATENT_TOKEN + answer_token)
+        lines.append(LATENT_TOKEN +'\n' + answer_token)
         return "\n".join(lines)
 
     # num_latent >= 2
