@@ -10,8 +10,8 @@ from .dataset import LATENT_TOKEN
 
 
 PERM_TRUNCATE_RATIO = 0.75
-DO_FULL_TRUNCATE = 0.4
-DO_TRUNCATE_TO_1 = 0.4
+DO_FULL_TRUNCATE = 0.25
+DO_TRUNCATE_TO_1 = 0.3
 
 @dataclass
 class Phase1Forward:
