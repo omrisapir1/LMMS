@@ -393,7 +393,6 @@ def rollout_digits_autoreg_kv_cache(
         )
 
     max_base_len = int(base_lens_t.max().item())
-    max_final_len = max_base_len + 5
     input_ids_t = torch.full((bsz, max_base_len), int(tokenizer.pad_token_id), dtype=torch.long, device=device)
     attention_mask_t = torch.zeros((bsz, max_base_len), dtype=torch.long, device=device)
     for b, case in enumerate(cases):
@@ -425,7 +424,6 @@ def rollout_digits_autoreg_kv_cache(
             "did not return latent vectors."
         )
 
-    seq_col_idx = torch.arange(max_final_len, dtype=torch.long, device=device).unsqueeze(0)
     pred_idx = logits_step.argmax(dim=-1)  # [B]
     pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [B]
     pred_token_ids[:, 0] = pred_tid
@@ -433,7 +431,12 @@ def rollout_digits_autoreg_kv_cache(
     current_token_ids = pred_tid
 
     for t in range(1, 5):
-        # After consuming digit_{t-1}, effective length is base_len + t.
+        # Cache past length before this decode call is max_base_len + (t - 1),
+        # input length is 1, so mask length must be max_base_len + t.
+        attn_len = int(max_base_len + t)
+        seq_col_idx = torch.arange(attn_len, dtype=torch.long, device=device).unsqueeze(0)
+
+        # After consuming digit_{t-1}, effective non-pad tokens are base_len + t.
         current_lens = base_lens_t + int(t)
         current_attention_mask = (seq_col_idx < current_lens.unsqueeze(1)).to(dtype=torch.long)
 
