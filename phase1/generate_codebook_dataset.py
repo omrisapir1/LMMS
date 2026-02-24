@@ -365,7 +365,8 @@ def rollout_digits_autoreg_kv_cache(
     collect_latents: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
-    Autoregressive 5-digit rollout using batched KV cache.
+    Autoregressive 5-digit rollout using KV cache in base-length buckets.
+    Each bucket has a single past length, avoiding mixed-length cache alignment.
     """
     if not cases:
         empty = torch.empty((0, 5), dtype=torch.long, device=device)
@@ -377,87 +378,135 @@ def rollout_digits_autoreg_kv_cache(
         }
 
     bsz = len(cases)
+    pad_token_id = int(tokenizer.pad_token_id)
     digit_token_ids_t = torch.tensor(digit_token_ids, dtype=torch.long, device=device)
     pred_token_ids = torch.full((bsz, 5), -100, dtype=torch.long, device=device)
     pred_values = torch.full((bsz, 5), -1, dtype=torch.long, device=device)
 
-    base_lens_t = torch.tensor([len(c["input_ids"]) for c in cases], dtype=torch.long, device=device)
-    answer_pos_t = torch.tensor([int(c["answer_pos"]) for c in cases], dtype=torch.long, device=device)
-    expected_base_lens = answer_pos_t + 1
-    if bool((base_lens_t != expected_base_lens).any().item()):
-        bad_idx = int((base_lens_t != expected_base_lens).nonzero(as_tuple=False)[0].item())
-        raise RuntimeError(
-            "KV rollout invariant violated before prefill: "
-            f"expected base length {int(expected_base_lens[bad_idx].item())}, "
-            f"got {int(base_lens_t[bad_idx].item())}."
-        )
+    length_to_indices: Dict[int, List[int]] = {}
+    for i, c in enumerate(cases):
+        base_len = int(len(c["input_ids"]))
+        answer_pos = int(c["answer_pos"])
+        if base_len != (answer_pos + 1):
+            raise RuntimeError(
+                "KV rollout invariant violated before bucketing: "
+                f"expected base length {answer_pos + 1}, got {base_len}."
+            )
+        length_to_indices.setdefault(base_len, []).append(int(i))
 
-    max_base_len = int(base_lens_t.max().item())
-    input_ids_t = torch.full((bsz, max_base_len), int(tokenizer.pad_token_id), dtype=torch.long, device=device)
-    attention_mask_t = torch.zeros((bsz, max_base_len), dtype=torch.long, device=device)
-    for b, case in enumerate(cases):
-        ids = torch.tensor(case["input_ids"], dtype=torch.long, device=device)
-        attn = torch.tensor(case["attention_mask"], dtype=torch.long, device=device)
-        n = int(ids.numel())
-        input_ids_t[b, :n] = ids
-        attention_mask_t[b, :n] = attn
+    bucket_latent_payload: List[tuple[List[int], torch.Tensor, torch.Tensor]] = []
 
-    amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
-    with amp_ctx:
-        prefill = model.prefill_with_cache_for_rollout(
-            input_ids=input_ids_t,
-            attention_mask=attention_mask_t,
-            label_positions=answer_pos_t,
-            digit_token_ids=digit_token_ids,
-            collect_latents=collect_latents,
-        )
+    for base_len in sorted(length_to_indices.keys()):
+        bucket_indices = length_to_indices[base_len]
+        b2 = len(bucket_indices)
+        bucket_idx_t = torch.tensor(bucket_indices, dtype=torch.long, device=device)
 
-    logits_step = prefill["next_digit_logits"]  # [B,10]
-    past_key_values = prefill["past_key_values"]
-    next_position_ids = prefill["next_position_ids"]  # [B]
+        input_ids_t = torch.full((b2, int(base_len)), pad_token_id, dtype=torch.long, device=device)
+        attention_mask_t = torch.zeros((b2, int(base_len)), dtype=torch.long, device=device)
+        label_positions_t = torch.zeros((b2,), dtype=torch.long, device=device)
 
-    latent_vecs_out = prefill["latent_vectors_orig"]
-    latent_mask_out = prefill["latent_vectors_orig_mask"]
-    if collect_latents and (latent_vecs_out is None or latent_mask_out is None):
-        raise RuntimeError(
-            "prefill_with_cache_for_rollout(collect_latents=True) "
-            "did not return latent vectors."
-        )
-
-    pred_idx = logits_step.argmax(dim=-1)  # [B]
-    pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [B]
-    pred_token_ids[:, 0] = pred_tid
-    pred_values[:, 0] = pred_idx
-    current_token_ids = pred_tid
-
-    for t in range(1, 5):
-        # Cache past length before this decode call is max_base_len + (t - 1),
-        # input length is 1, so mask length must be max_base_len + t.
-        attn_len = int(max_base_len + t)
-        seq_col_idx = torch.arange(attn_len, dtype=torch.long, device=device).unsqueeze(0)
-
-        # After consuming digit_{t-1}, effective non-pad tokens are base_len + t.
-        current_lens = base_lens_t + int(t)
-        current_attention_mask = (seq_col_idx < current_lens.unsqueeze(1)).to(dtype=torch.long)
+        for local_i, global_i in enumerate(bucket_indices):
+            case = cases[int(global_i)]
+            ids = torch.tensor(case["input_ids"], dtype=torch.long, device=device)
+            attn = torch.tensor(case["attention_mask"], dtype=torch.long, device=device)
+            n = int(ids.numel())
+            if n != int(base_len):
+                raise RuntimeError(
+                    f"KV bucket invariant violated: expected bucket base length {base_len}, got {n}."
+                )
+            if not bool((attn == 1).all().item()):
+                raise RuntimeError(
+                    "KV prefill expects base case attention_mask to be all ones "
+                    "(no padding within bucket rows)."
+                )
+            input_ids_t[local_i, :n] = ids
+            attention_mask_t[local_i, :n] = attn
+            label_positions_t[local_i] = int(case["answer_pos"])
 
         amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
         with amp_ctx:
-            dec = model.decode_next_with_cache_for_rollout(
-                token_ids=current_token_ids,
-                attention_mask_with_new_token=current_attention_mask,
-                next_position_ids=next_position_ids,
-                past_key_values=past_key_values,
+            prefill = model.prefill_with_cache_for_rollout(
+                input_ids=input_ids_t,
+                attention_mask=attention_mask_t,
+                label_positions=label_positions_t,
                 digit_token_ids=digit_token_ids,
+                collect_latents=collect_latents,
             )
-        logits_step = dec["next_digit_logits"]  # [B,10]
-        past_key_values = dec["past_key_values"]
-        next_position_ids = dec["next_position_ids"]
 
-        pred_idx = logits_step.argmax(dim=-1)  # [B]
-        pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [B]
-        pred_token_ids[:, t] = pred_tid
-        pred_values[:, t] = pred_idx
+        logits_step = prefill["next_digit_logits"]  # [B2,10]
+        past_key_values = prefill["past_key_values"]
+        next_position_ids = prefill["next_position_ids"]  # [B2]
+
+        if collect_latents:
+            latent_vecs_sub = prefill["latent_vectors_orig"]
+            latent_mask_sub = prefill["latent_vectors_orig_mask"]
+            if latent_vecs_sub is None or latent_mask_sub is None:
+                raise RuntimeError(
+                    "prefill_with_cache_for_rollout(collect_latents=True) "
+                    "did not return latent vectors."
+                )
+            bucket_latent_payload.append((bucket_indices, latent_vecs_sub, latent_mask_sub))
+
+        pred_idx = logits_step.argmax(dim=-1)  # [B2]
+        pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [B2]
+        pred_token_ids[bucket_idx_t, 0] = pred_tid
+        pred_values[bucket_idx_t, 0] = pred_idx
         current_token_ids = pred_tid
+
+        for t in range(1, 5):
+            expected_next_pos = int(base_len + (t - 1))
+            if not bool((next_position_ids == expected_next_pos).all().item()):
+                raise RuntimeError(
+                    "KV cache position mismatch: "
+                    f"expected all next_position_ids={expected_next_pos}, "
+                    f"got {next_position_ids.tolist()}."
+                )
+
+            attn_len = int(base_len + t)
+            current_attention_mask = torch.ones((b2, attn_len), dtype=torch.long, device=device)
+            if int(current_attention_mask.shape[1]) != attn_len:
+                raise RuntimeError(
+                    "KV decode attention mask length mismatch: "
+                    f"expected {attn_len}, got {int(current_attention_mask.shape[1])}."
+                )
+
+            amp_ctx = _autocast_ctx(device=device, dtype=autocast_dtype)
+            with amp_ctx:
+                dec = model.decode_next_with_cache_for_rollout(
+                    token_ids=current_token_ids,
+                    attention_mask_with_new_token=current_attention_mask,
+                    next_position_ids=next_position_ids,
+                    past_key_values=past_key_values,
+                    digit_token_ids=digit_token_ids,
+                )
+            logits_step = dec["next_digit_logits"]  # [B2,10]
+            past_key_values = dec["past_key_values"]
+            next_position_ids = dec["next_position_ids"]
+
+            pred_idx = logits_step.argmax(dim=-1)  # [B2]
+            pred_tid = digit_token_ids_t.index_select(0, pred_idx)  # [B2]
+            pred_token_ids[bucket_idx_t, t] = pred_tid
+            pred_values[bucket_idx_t, t] = pred_idx
+            current_token_ids = pred_tid
+
+    latent_vecs_out: Optional[torch.Tensor] = None
+    latent_mask_out: Optional[torch.Tensor] = None
+    if collect_latents:
+        if not bucket_latent_payload:
+            raise RuntimeError("KV rollout latent collection expected non-empty payload.")
+        max_lat_n = max(int(lat.shape[1]) for _, lat, _ in bucket_latent_payload)
+        hidden_size = int(bucket_latent_payload[0][1].shape[2])
+        lat_dtype = bucket_latent_payload[0][1].dtype
+        latent_vecs_out = torch.zeros((bsz, max_lat_n, hidden_size), dtype=lat_dtype, device=device)
+        latent_mask_out = torch.zeros((bsz, max_lat_n), dtype=torch.bool, device=device)
+        for bucket_indices, latent_vecs_sub, latent_mask_sub in bucket_latent_payload:
+            idx_t = torch.tensor(bucket_indices, dtype=torch.long, device=device)
+            lat_n = int(latent_vecs_sub.shape[1])
+            if int(latent_vecs_sub.shape[2]) != hidden_size:
+                raise RuntimeError("Hidden size mismatch across KV buckets.")
+            if lat_n > 0:
+                latent_vecs_out[idx_t, :lat_n, :] = latent_vecs_sub
+                latent_mask_out[idx_t, :lat_n] = latent_mask_sub
 
     return {
         "pred_digit_token_ids": pred_token_ids,
@@ -552,8 +601,6 @@ def _debug_assert_case_builder_parity(
             if old_case is None or new_case is None:
                 continue
             if old_case["input_ids"] != new_case["input_ids"]:
-                print(f"old_case['input_ids']:\n{old_case['input_ids']}")
-                print(f"new_case['input_ids']:\n{new_case['input_ids']}")
                 raise RuntimeError(f"Case-builder input_ids mismatch for qid={ex.qid}, k={k}.")
             if old_case["attention_mask"] != new_case["attention_mask"]:
                 raise RuntimeError(f"Case-builder attention_mask mismatch for qid={ex.qid}, k={k}.")
@@ -620,6 +667,66 @@ def _debug_assert_rollout_parity(
     if legacy_mask is not None and fast_mask is not None:
         if not torch.equal(legacy_mask, fast_mask):
             raise RuntimeError("Rollout parity mismatch: latent_vectors_orig_mask differs.")
+
+
+def _debug_assert_kv_rollout_parity(
+    *,
+    model: Phase1CoconutModel,
+    tokenizer,
+    cases: Sequence[Dict],
+    digit_token_ids: Sequence[int],
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+) -> None:
+    if not cases:
+        return
+
+    non_kv = rollout_digits_autoreg(
+        model=model,
+        tokenizer=tokenizer,
+        cases=list(cases),
+        digit_token_ids=[int(x) for x in digit_token_ids],
+        device=device,
+        autocast_dtype=autocast_dtype,
+        collect_latents=True,
+    )
+    kv = rollout_digits_autoreg_kv_cache(
+        model=model,
+        tokenizer=tokenizer,
+        cases=list(cases),
+        digit_token_ids=[int(x) for x in digit_token_ids],
+        device=device,
+        autocast_dtype=autocast_dtype,
+        collect_latents=True,
+    )
+
+    if not torch.equal(non_kv["pred_digit_token_ids"], kv["pred_digit_token_ids"]):
+        raise RuntimeError("KV rollout parity mismatch: pred_digit_token_ids.")
+    if not torch.equal(non_kv["pred_digit_values"], kv["pred_digit_values"]):
+        raise RuntimeError("KV rollout parity mismatch: pred_digit_values.")
+
+    non_kv_lat = non_kv["latent_vectors_orig"]
+    kv_lat = kv["latent_vectors_orig"]
+    non_kv_mask = non_kv["latent_vectors_orig_mask"]
+    kv_mask = kv["latent_vectors_orig_mask"]
+    if (non_kv_lat is None) != (kv_lat is None):
+        raise RuntimeError("KV rollout parity mismatch: latent_vectors_orig None state differs.")
+    if (non_kv_mask is None) != (kv_mask is None):
+        raise RuntimeError("KV rollout parity mismatch: latent_vectors_orig_mask None state differs.")
+    if non_kv_lat is not None and kv_lat is not None:
+        if non_kv_lat.shape != kv_lat.shape:
+            raise RuntimeError("KV rollout parity mismatch: latent_vectors_orig shape differs.")
+        if autocast_dtype == torch.float32:
+            atol = 1e-6
+            rtol = 1e-5
+        else:
+            atol = 1e-3
+            rtol = 1e-2
+        if not torch.allclose(non_kv_lat, kv_lat, atol=atol, rtol=rtol):
+            raise RuntimeError("KV rollout parity mismatch: latent_vectors_orig values differ.")
+    if non_kv_mask is not None and kv_mask is not None:
+        if not torch.equal(non_kv_mask, kv_mask):
+            raise RuntimeError("KV rollout parity mismatch: latent_vectors_orig_mask differs.")
 
 
 def _precompute_suffix_tokens_by_k(
@@ -723,6 +830,7 @@ def run(args: argparse.Namespace) -> None:
     printed_rollout_debug = False
     checked_case_builder_parity = False
     checked_rollout_parity = False
+    checked_kv_rollout_parity = False
 
     with torch.no_grad():
         for batch_id, start in enumerate(range(0, total_rows, int(args.batch_size)), start=1):
@@ -793,6 +901,35 @@ def run(args: argparse.Namespace) -> None:
                         autocast_dtype=load_dtype,
                     )
                     checked_rollout_parity = True
+
+                if args.debug_parity_checks and not checked_kv_rollout_parity:
+                    kv_parity_cases: List[Dict] = []
+                    seen_lens: set[int] = set()
+                    selected_ids: set[int] = set()
+                    for c in cases:
+                        n = int(len(c["input_ids"]))
+                        if n not in seen_lens:
+                            kv_parity_cases.append(c)
+                            seen_lens.add(n)
+                            selected_ids.add(id(c))
+                    target_n = min(16, len(cases))
+                    for c in cases:
+                        if len(kv_parity_cases) >= target_n:
+                            break
+                        if id(c) in selected_ids:
+                            continue
+                        kv_parity_cases.append(c)
+                        selected_ids.add(id(c))
+
+                    _debug_assert_kv_rollout_parity(
+                        model=model,
+                        tokenizer=tokenizer,
+                        cases=kv_parity_cases,
+                        digit_token_ids=digit_token_ids,
+                        device=device,
+                        autocast_dtype=load_dtype,
+                    )
+                    checked_kv_rollout_parity = True
 
                 if batch_id == 1 and not printed_rollout_debug:
                     for local_idx in range(min(2, len(cases))):
