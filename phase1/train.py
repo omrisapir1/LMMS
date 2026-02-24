@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import shutil
@@ -306,6 +307,14 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
 
     os.makedirs(config.log_dir, exist_ok=True)
     log_path = os.path.join(config.log_dir, "train.log")
+    answer_loss_weight = float(getattr(config, "answer_loss_weight", 1.0))
+    permutation_loss_weight = float(getattr(config, "permutation_loss_weight", 1.0))
+    if not math.isfinite(answer_loss_weight) or not math.isfinite(permutation_loss_weight):
+        raise ValueError("Loss weights must be finite.")
+    _log(
+        f"Loss weights: answer={answer_loss_weight:.6f} permutation={permutation_loss_weight:.6f}",
+        log_path,
+    )
 
     _log(f"Loading dataset '{config.dataset_name}' ...", log_path)
     hf_ds = load_dataset(config.dataset_name)
@@ -432,6 +441,7 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
 
         compute_perm = (
             config.permutation_loss_interval_batches > 0
+            and permutation_loss_weight != 0.0
             and microbatch % config.permutation_loss_interval_batches == 0
         )
 
@@ -465,7 +475,7 @@ def train(config: Phase1Config, *, max_optimizer_steps: int = 0) -> None:
                     eligible_mask=eligible,
                 )
 
-            total_loss = answer_out.loss + perm_loss
+            total_loss = (answer_out.loss * answer_loss_weight) + (perm_loss * permutation_loss_weight)
         scaled_loss = total_loss / float(max(1, config.gradient_accumulation_steps))
         scaled_loss.backward()
 

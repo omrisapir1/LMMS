@@ -5,9 +5,11 @@ class Phase1Config:
     # Training
     seed: int = 42
     batch_size: int = 16
-    learning_rate: float = 5e-5
+    learning_rate: float = 2e-4
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 2
+    answer_loss_weight: float = 0.2
+    permutation_loss_weight: float = 1.0
 
     # Curriculum / stages
     max_thoughts: int = 8
