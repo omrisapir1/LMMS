@@ -85,7 +85,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
     assert left_latents <= K - 1
 
     # Left latents
-    lines.append(''.join([LATENT_TOKEN for _ in range(left_latents)]))
+    lines.append('\n'.join([LATENT_TOKEN for _ in range(left_latents)]))
 
     # Middle thoughts
     for t in thoughts[left_latents:-1]:
@@ -93,7 +93,7 @@ def format_answer(thoughts: List[str], K: int, num_latent: int, answer_token: st
 
     # Final latent + answer
 
-    return "\n".join(lines) + LATENT_TOKEN + answer_token
+    return "\n".join(lines) + '\n' + LATENT_TOKEN + '\n' + answer_token
 
 
 @dataclass
