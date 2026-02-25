@@ -865,7 +865,7 @@ def run(args: argparse.Namespace) -> None:
                     skipped_in_batch[ex_idx] = True
                     skipped_examples += 1
 
-            for k in range(0, int(args.k_max) + 1):
+            for k in range(1, int(args.k_max) + 1):
                 if not active:
                     break
 
