@@ -167,12 +167,14 @@ The dataset does not decide curriculum behavior. Curriculum is controlled by:
 
 Evaluation uses the following mapping:
 
-- For stages 1..2:
-  - `num_latent = min(stage, K-1)`
+- For stage 1:
+  - `num_latent = min(1, K-1)` (replace only the last thought)
   - exclude rows where `K == 1`
-- For stages 3..8:
-  - `num_latent = K`
-  - include all rows (including `K == 1`, which implies `num_latent = 1`)
+- For stages 2..8:
+  - fixed replacement budget: `num_latent = min(stage, K)`
+  - if `K <= stage`, the sample is fully latentized
+  - if `K > stage`, only `stage` thoughts are replaced
+  - include all rows from stage 3 onward (including `K == 1`)
 
 This logic is implemented by constructing `num_latent_fn(K)` and passing it into the dataset / collator.
 

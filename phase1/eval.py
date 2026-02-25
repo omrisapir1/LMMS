@@ -12,6 +12,7 @@ from .dataset import ANSWER_TOKEN, Phase1Collator, Phase1Dataset
 from .model import Phase1CoconutModel
 
 MAX_EVAL_ROWS = 500
+HARD_LATENT_STAGE = 3
 
 
 @dataclass
@@ -27,14 +28,17 @@ def make_stage_num_latent_fn(stage: int) -> Callable[[int], int]:
     if stage_i < 1 or stage_i > 8:
         raise ValueError(f"Stage must be in [1,8], got {stage_i}.")
 
-    if stage_i <= 2:
-        return lambda K: min(stage_i, max(0, int(K) - 1))
-    return lambda K: int(K)
+    # Stage 1 keeps the historical behavior: replace only the last thought.
+    if stage_i == 1:
+        return lambda K: min(1, max(0, int(K) - 1))
+    # Stage >= 2 uses a fixed replacement budget controlled by the stage.
+    return lambda K: min(stage_i, max(0, int(K)))
 
 
 def make_stage_k_filter(stage: int) -> Callable[[int], bool]:
     stage_i = int(stage)
-    if stage_i <= 2:
+    # Keep K==1 rows only after full-latent curriculum begins.
+    if stage_i < HARD_LATENT_STAGE:
         return lambda K: int(K) > 1
     return lambda K: True
 
