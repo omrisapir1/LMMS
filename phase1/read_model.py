@@ -28,5 +28,7 @@ print(f"Downloaded {REPO_ID} to {LOCAL_DIR}")
 #     max_rows=100,
 #     shard_size=100,
 #     eval_rows_limit=100,
+#     use_kv_cache=True,
+#     debug_parity_checks=False
 # )
 # run(args)
