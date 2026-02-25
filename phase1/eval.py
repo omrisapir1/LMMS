@@ -27,14 +27,14 @@ def make_stage_num_latent_fn(stage: int) -> Callable[[int], int]:
     if stage_i < 1 or stage_i > 8:
         raise ValueError(f"Stage must be in [1,8], got {stage_i}.")
 
-    if stage_i <= 7:
+    if stage_i <= 2:
         return lambda K: min(stage_i, max(0, int(K) - 1))
     return lambda K: int(K)
 
 
 def make_stage_k_filter(stage: int) -> Callable[[int], bool]:
     stage_i = int(stage)
-    if stage_i <= 7:
+    if stage_i <= 2:
         return lambda K: int(K) > 1
     return lambda K: True
 

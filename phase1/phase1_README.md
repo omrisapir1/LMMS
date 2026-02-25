@@ -167,10 +167,10 @@ The dataset does not decide curriculum behavior. Curriculum is controlled by:
 
 Evaluation uses the following mapping:
 
-- For stages 1..7:
+- For stages 1..2:
   - `num_latent = min(stage, K-1)`
   - exclude rows where `K == 1`
-- For stage 8:
+- For stages 3..8:
   - `num_latent = K`
   - include all rows (including `K == 1`, which implies `num_latent = 1`)
 
