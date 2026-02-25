@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+from typing import Dict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+try:
+    from .dataset import iter_valid_latent_rows
+    from .model import Codebook
+except ImportError:
+    from dataset import iter_valid_latent_rows  # type: ignore
+    from model import Codebook  # type: ignore
+
+
+def random_init_codebook(model: Codebook, *, seed: int = 42) -> Dict[str, int]:
+    device = model.embeddings.device
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    init = torch.randn(model.vocab_size, model.dim, generator=gen, device=device, dtype=torch.float32)
+    init = F.normalize(init, p=2, dim=-1, eps=1e-12)
+    model.initialize_embeddings(init)
+    return {"sampled_vectors": 0}
+
+
+def init_codebook_with_kmeans(
+    *,
+    model: Codebook,
+    input_dir: str,
+    dim: int,
+    sample_size: int = 500_000,
+    read_batch_size: int = 256,
+    fit_batch_size: int = 8_192,
+    seed: int = 42,
+) -> Dict[str, int]:
+    if sample_size <= 0:
+        raise ValueError("sample_size must be > 0")
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except ImportError as exc:  # pragma: no cover - depends on runtime env
+        raise RuntimeError(
+            "scikit-learn is required for k-means initialization. "
+            "Install scikit-learn or pass --no_kmeans."
+        ) from exc
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=model.vocab_size,
+        batch_size=max(model.vocab_size * 2, int(fit_batch_size)),
+        random_state=seed,
+        n_init="auto",
+        reassignment_ratio=0.01,
+    )
+
+    pending: list[np.ndarray] = []
+    pending_count = 0
+    seen_vectors = 0
+    fitted_once = False
+
+    def flush_pending(force: bool = False) -> None:
+        nonlocal pending_count, fitted_once
+        if pending_count == 0:
+            return
+        if not force and pending_count < fit_batch_size:
+            return
+        if not fitted_once and pending_count < model.vocab_size:
+            return
+        batch = np.concatenate(pending, axis=0).astype(np.float32, copy=False)
+        kmeans.partial_fit(batch)
+        fitted_once = True
+        pending.clear()
+        pending_count = 0
+
+    for row in iter_valid_latent_rows(input_dir, dim=dim, read_batch_size=read_batch_size):
+        if seen_vectors >= sample_size:
+            break
+        vecs = row.latent_vectors
+        remaining = sample_size - seen_vectors
+        if vecs.shape[0] > remaining:
+            vecs = vecs[:remaining]
+        # Align k-means geometry with cosine assignment by clustering on unit-norm latents.
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        vecs = vecs / np.maximum(norms, 1e-12)
+        vecs = np.ascontiguousarray(vecs, dtype=np.float32)
+        pending.append(vecs)
+        pending_count += int(vecs.shape[0])
+        seen_vectors += int(vecs.shape[0])
+        flush_pending(force=False)
+
+    flush_pending(force=True)
+
+    if not fitted_once:
+        raise RuntimeError(
+            f"Not enough valid vectors for k-means init: saw {seen_vectors}, need >= {model.vocab_size}"
+        )
+
+    centers = torch.from_numpy(kmeans.cluster_centers_.astype(np.float32))
+    centers = F.normalize(centers, p=2, dim=-1, eps=1e-12).to(model.embeddings.device)
+    model.initialize_embeddings(centers)
+    return {"sampled_vectors": int(seen_vectors)}
