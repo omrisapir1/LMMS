@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from huggingface_hub import HfApi, login
-from transformers import AutoModel, AutoTokenizer  # or AutoModelForCausalLM if relevant
+from transformers import AutoModelForCausalLM, AutoTokenizer  # or AutoModelForCausalLM if relevant
 import torch
 
 # ====== CONFIG ======
@@ -24,11 +24,7 @@ api.create_repo(repo_id=REPO_ID, private=PRIVATE, exist_ok=True)
 # 3) Load from local folder (choose the model class that matches your model)
 local_dir = Path(LOCAL_DIR)
 
-# If this is a causal LM, prefer:
-# from transformers import AutoModelForCausalLM
-# model = AutoModelForCausalLM.from_pretrained(local_dir)
-
-model = AutoModel.from_pretrained(local_dir,torch_dtype=torch.bfloat16,)
+model = AutoModelForCausalLM.from_pretrained(local_dir,torch_dtype=torch.bfloat16,)
 tokenizer = AutoTokenizer.from_pretrained(local_dir)
 
 # 4) Push model + tokenizer
