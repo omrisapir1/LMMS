@@ -13,7 +13,7 @@ class CodebookConfig:
     epochs: int = 3
     ema_decay: float = 0.995
     beta: float = 0.25
-    lambda_kl: float = 0.01
+    lambda_kl: float = 0.001
     kmeans_sample_size: int = 500_000
     no_kmeans: bool = False
     seed: int = 42
