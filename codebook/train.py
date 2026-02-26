@@ -12,7 +12,12 @@ except ImportError:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Phase2 EMA-VQ codebook")
-    p.add_argument("--input_dir", required=True, type=str)
+    p.add_argument(
+        "--input_dir",
+        required=True,
+        type=str,
+        help="Local parquet shard directory, or HF dataset ref (e.g. org/name or org/name:split)",
+    )
     p.add_argument("--output_dir", required=True, type=str)
     p.add_argument("--vocab_size", default=512, type=int)
     p.add_argument("--dim", default=1536, type=int)

@@ -90,6 +90,11 @@ python -m codebook.train \
   --output_dir /path/to/codebook_out
 ```
 
+`--input_dir` supports either:
+
+- local parquet shard directory (existing behavior), or
+- Hugging Face dataset reference, e.g. `omrisap/codebook_40K_ds` or `omrisap/codebook_40K_ds:train`
+
 Outputs:
 
 - `output_dir/codebook.pt`
