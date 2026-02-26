@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class CodebookConfig:
     input_dir: str
     output_dir: str
-    vocab_size: int = 512
+    vocab_size: int = 256
     dim: int = 1536
     batch_size: int = 2048  # sequences per step
     epochs: int = 3
