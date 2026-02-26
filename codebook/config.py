@@ -22,7 +22,7 @@ class CodebookConfig:
     read_batch_size: int = 256
     kmeans_fit_batch_size: int = 8_192
     export_quantize_chunk_size: int = 16_384
-    log_interval: int = 100
+    log_interval: int = 5
 
     # Fixed constants requested by the spec
     usage_laplace_alpha: float = 1.0
