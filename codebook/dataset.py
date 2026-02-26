@@ -37,6 +37,21 @@ def list_parquet_shards(input_dir: str) -> List[Path]:
     return shards
 
 
+def _is_local_parquet_dir(input_ref: str) -> bool:
+    return Path(input_ref).exists() and Path(input_ref).is_dir()
+
+
+def _parse_hf_dataset_ref(input_ref: str) -> Tuple[str, str]:
+    # Supports "repo_id" (defaults to train split) or "repo_id:split".
+    if ":" in input_ref:
+        dataset_id, split = input_ref.rsplit(":", 1)
+        dataset_id = dataset_id.strip()
+        split = split.strip()
+        if dataset_id and split:
+            return dataset_id, split
+    return input_ref.strip(), "train"
+
+
 def iter_parquet_rows(
     shard_path: Path,
     *,
@@ -47,6 +62,40 @@ def iter_parquet_rows(
         cols = record_batch.to_pydict()
         for i in range(record_batch.num_rows):
             yield {k: cols[k][i] for k in cols}
+
+
+def iter_hf_rows(
+    input_ref: str,
+    *,
+    read_batch_size: int = 256,
+) -> Iterator[Dict]:
+    del read_batch_size  # Streaming rows are handled by datasets' internal iterators.
+
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:  # pragma: no cover - depends on runtime env
+        raise RuntimeError(
+            "The 'datasets' package is required for Hugging Face dataset input. "
+            "Install it (e.g. pip install datasets)."
+        ) from exc
+
+    dataset_id, split = _parse_hf_dataset_ref(input_ref)
+    if not dataset_id:
+        raise FileNotFoundError(f"Input reference is empty: {input_ref!r}")
+
+    try:
+        ds = load_dataset(dataset_id, split=split, streaming=True)
+    except Exception as exc:  # pragma: no cover - network/runtime dependent
+        raise FileNotFoundError(
+            f"Input path does not exist locally and could not be loaded from Hugging Face: "
+            f"ref={input_ref!r}, dataset_id={dataset_id!r}, split={split!r}"
+        ) from exc
+
+    for row in ds:
+        if isinstance(row, dict):
+            yield row
+        else:  # pragma: no cover - defensive
+            yield dict(row)
 
 
 def _coerce_int(value: object, *, default: int = 0) -> int:
@@ -125,12 +174,20 @@ def iter_valid_latent_rows(
     dim: int,
     read_batch_size: int = 256,
 ) -> Iterator[LatentRow]:
-    for shard in list_parquet_shards(input_dir):
-        for row in iter_parquet_rows(shard, read_batch_size=read_batch_size):
-            parsed, _ = parse_latent_row(row, dim=dim)
-            if parsed is None:
-                continue
-            yield parsed
+    if _is_local_parquet_dir(input_dir):
+        for shard in list_parquet_shards(input_dir):
+            for row in iter_parquet_rows(shard, read_batch_size=read_batch_size):
+                parsed, _ = parse_latent_row(row, dim=dim)
+                if parsed is None:
+                    continue
+                yield parsed
+        return
+
+    for row in iter_hf_rows(input_dir, read_batch_size=read_batch_size):
+        parsed, _ = parse_latent_row(row, dim=dim)
+        if parsed is None:
+            continue
+        yield parsed
 
 
 def iter_sequence_batches(
