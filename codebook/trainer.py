@@ -108,7 +108,7 @@ class CodebookTrainer:
                     )
                     self.model.ema_update(latents, z_ids, eps=cfg.eps)
 
-                if global_step % cfg.log_interval == 0:
+                if global_step % cfg.log_interval == 0 or global_step == 1:
                     perplexity = float(metrics.perplexity.item())
                     print(
                         f"step={global_step} "
