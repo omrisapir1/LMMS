@@ -27,7 +27,7 @@ class SFTConfig:
     max_length: int = 2048
 
     # Objective weights
-    z_label_smoothing: float = 0.05
+    z_label_smoothing: float = 0.00
     w_z: float = 0.1
     w_answer: float = 0.5
     w_digits: float = 1.0
