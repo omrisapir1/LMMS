@@ -59,53 +59,6 @@ def _build_prompt(tokenizer, problem: str) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-class GrammarLogitsProcessor:
-    def __init__(
-        self,
-        *,
-        answer_token_id: int,
-        z_token_ids: Sequence[int],
-        digit_token_ids: Sequence[int],
-        k_max: int,
-        eos_token_id: int | None,
-    ) -> None:
-        self.answer_token_id = int(answer_token_id)
-        self.z_token_ids = set(int(x) for x in z_token_ids)
-        self.digit_token_ids = set(int(x) for x in digit_token_ids)
-        self.k_max = int(k_max)
-        self.eos_token_id = None if eos_token_id is None else int(eos_token_id)
-
-    def __call__(self, token_ids: List[int], logits):
-        answer_pos = -1
-        for i, tid in enumerate(token_ids):
-            if int(tid) == self.answer_token_id:
-                answer_pos = i
-
-        allowed: set[int]
-        if answer_pos < 0:
-            z_count = sum(1 for t in token_ids if int(t) in self.z_token_ids)
-            if z_count >= self.k_max:
-                allowed = {self.answer_token_id}
-            else:
-                allowed = set(self.z_token_ids)
-                allowed.add(self.answer_token_id)
-        else:
-            digits_after_answer = sum(1 for t in token_ids[answer_pos + 1 :] if int(t) in self.digit_token_ids)
-            if digits_after_answer >= 5:
-                if self.eos_token_id is not None and self.eos_token_id >= 0:
-                    allowed = {self.eos_token_id}
-                else:
-                    return logits
-            else:
-                allowed = self.digit_token_ids
-
-        original = logits.clone() if hasattr(logits, "clone") else logits.copy()
-        logits[:] = float("-inf")
-        for idx in allowed:
-            logits[idx] = original[idx]
-        return logits
-
-
 def evaluate_with_vllm(
     *,
     model_path: str,
@@ -177,13 +130,11 @@ def evaluate_with_vllm(
         return EvalMetrics(0.0, 0.0, 0.0, 1.0)
 
     prompts = [_build_prompt(tokenizer, x["problem"]) for x in items]
-    processor = GrammarLogitsProcessor(
-        answer_token_id=answer_token_id,
-        z_token_ids=z_token_ids,
-        digit_token_ids=digit_token_ids,
-        k_max=int(k_max),
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    allowed_token_ids = set(int(x) for x in z_token_ids)
+    allowed_token_ids.add(answer_token_id)
+    allowed_token_ids.update(int(x) for x in digit_token_ids)
+    if tokenizer.eos_token_id is not None and int(tokenizer.eos_token_id) >= 0:
+        allowed_token_ids.add(int(tokenizer.eos_token_id))
 
     max_new_tokens = int(k_max) + 1 + 5
     sampled_params = SamplingParams(
@@ -191,14 +142,14 @@ def evaluate_with_vllm(
         temperature=float(temperature),
         top_p=float(top_p),
         max_tokens=max_new_tokens,
-        logits_processors=[processor],
+        allowed_token_ids=sorted(allowed_token_ids),
     )
     greedy_params = SamplingParams(
         n=1,
         temperature=0.0,
         top_p=1.0,
         max_tokens=max_new_tokens,
-        logits_processors=[processor],
+        allowed_token_ids=sorted(allowed_token_ids),
     )
 
     sampled_outputs = llm.generate(prompts, sampled_params)
