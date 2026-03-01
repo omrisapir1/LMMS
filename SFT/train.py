@@ -435,7 +435,8 @@ def train(cfg: SFTConfig) -> str:
                 )
                 _log(f"saved periodic checkpoint {p}", log_path)
 
-            if step % int(cfg.eval_interval_steps) == 0:
+            eval_ready = (int(cfg.warmup_steps) <= 0) or (step >= int(cfg.warmup_steps))
+            if eval_ready and step % int(cfg.eval_interval_steps) == 0:
                 eval_model_path = _save_last(
                     run_dir=run_dir,
                     model=model,

@@ -22,12 +22,12 @@ class SFTConfig:
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
-    max_steps: int = 10_000
-    warmup_steps: int = 200
+    max_steps: int = 15_000
+    warmup_steps: int = 1500
     max_length: int = 2048
 
     # Objective weights
-    z_label_smoothing: float = 0.00
+    z_label_smoothing: float = 0.05
     w_z: float = 0.1
     w_answer: float = 0.5
     w_digits: float = 1.0
