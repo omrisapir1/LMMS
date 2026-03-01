@@ -11,15 +11,6 @@ accelerate==0.33.0
 tokenizers>=0.19.0,<0.21.0
 safetensors>=0.4.3
 
-# Blackwell (sm_120) requires a very recent CUDA build of PyTorch.
-# Install from nightly cu128 index in the active environment:
-#   pip install --pre -r requirement.txt
---pre
---index-url https://download.pytorch.org/whl/nightly/cu128
-torch
-torchvision
-torchaudio
---index-url https://pypi.org/simple
 
 # -----------------------------
 # Data / utils

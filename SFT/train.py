@@ -487,6 +487,7 @@ def train(cfg: SFTConfig) -> str:
                     ),
                     log_path,
                 )
+                _log(f"eval generations appended to {eval_jsonl}", log_path)
 
                 _append_metrics_csv(
                     metrics_csv,
