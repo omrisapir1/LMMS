@@ -449,6 +449,7 @@ def train(cfg: SFTConfig) -> str:
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
                 )
                 model.train(False)
+                torch.cuda.empty_cache()
                 metrics = evaluate_with_vllm(
                     model_path=eval_model_path,
                     records=eval_records,
