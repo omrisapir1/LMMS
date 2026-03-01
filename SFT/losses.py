@@ -19,6 +19,38 @@ class LossOutput:
     digit_exact_match: float
 
 
+def _debug_check_label_membership(
+    labels: torch.Tensor,
+    target_class: torch.Tensor,
+    z_allowed_ids: Sequence[int],
+    digit_allowed_ids: Sequence[int],
+) -> None:
+    z_allowed = set(int(x) for x in z_allowed_ids)
+    d_allowed = set(int(x) for x in digit_allowed_ids)
+
+    with torch.no_grad():
+        z_mask = (target_class == TARGET_Z) & (labels >= 0)
+        a_mask = (target_class == TARGET_ANSWER) & (labels >= 0)
+        d_mask = (target_class == TARGET_DIGIT) & (labels >= 0)
+
+        def first_bad(mask: torch.Tensor, allowed_set: set[int], name: str) -> bool:
+            if not bool(mask.any()):
+                return False
+            idx = mask.nonzero(as_tuple=False)
+            for k in range(min(50, idx.shape[0])):
+                b, t = int(idx[k, 0]), int(idx[k, 1])
+                y = int(labels[b, t])
+                if y not in allowed_set:
+                    print(f"[BAD {name}] b={b} t={t} label={y}")
+                    return True
+            return False
+
+        if first_bad(z_mask | a_mask, z_allowed, "Z/ANSWER"):
+            raise RuntimeError("Label not in z_allowed_ids")
+        if first_bad(d_mask, d_allowed, "DIGIT"):
+            raise RuntimeError("Label not in digit_allowed_ids")
+
+
 def _masked_clone(logits: torch.Tensor, allowed_ids: Sequence[int]) -> torch.Tensor:
     # logits: [N, V]
     out = torch.full_like(logits, float("-inf"))
@@ -94,6 +126,13 @@ def compute_weighted_loss(
     w_digits: float,
     z_label_smoothing: float,
 ) -> LossOutput:
+    _debug_check_label_membership(
+        labels=labels,
+        target_class=target_class,
+        z_allowed_ids=z_allowed_ids,
+        digit_allowed_ids=digit_allowed_ids,
+    )
+
     masked_logits = logits.clone()
     masked_logits = apply_restricted_mask_inplace(
         logits=masked_logits,

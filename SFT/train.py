@@ -362,28 +362,28 @@ def train(cfg: SFTConfig) -> str:
                     warmup_active=False,
                 )
                 _log(f"warmup ended at step={step}; full model unfrozen", log_path)
-                metrics = evaluate_with_vllm(
-                    model_path=eval_model_path,
-                    records=eval_records,
-                    pass_at_n=cfg.pass_at_n,
-                    k_max=cfg.k_max,
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    vocab_size=cfg.vocab_size,
-                    output_jsonl_path=eval_jsonl,
-                )
-
-                _log(
-                    "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
-                        step,
-                        cfg.pass_at_n,
-                        metrics.pass_at_n,
-                        metrics.greedy_exact_match,
-                        metrics.mean_z_len,
-                        metrics.no_answer_before_kmax_rate,
-                    ),
-                    log_path,
-                )
+                # metrics = evaluate_with_vllm(
+                #     model_path=eval_model_path,
+                #     records=eval_records,
+                #     pass_at_n=cfg.pass_at_n,
+                #     k_max=cfg.k_max,
+                #     temperature=cfg.temperature,
+                #     top_p=cfg.top_p,
+                #     vocab_size=cfg.vocab_size,
+                #     output_jsonl_path=eval_jsonl,
+                # )
+                #
+                # _log(
+                #     "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
+                #         step,
+                #         cfg.pass_at_n,
+                #         metrics.pass_at_n,
+                #         metrics.greedy_exact_match,
+                #         metrics.mean_z_len,
+                #         metrics.no_answer_before_kmax_rate,
+                #     ),
+                #     log_path,
+                # )
 
 
             if step % int(cfg.log_interval_steps) == 0:
