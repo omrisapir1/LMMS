@@ -197,14 +197,21 @@ def evaluate_with_vllm(
         writer = open(output_jsonl_path, "a", encoding="utf-8")
 
     try:
-        for row, sampled_out, greedy_out in zip(items, sampled_outputs, greedy_outputs):
+        for row, prompt, sampled_out, greedy_out in zip(items, prompts, sampled_outputs, greedy_outputs):
             target = row["answer_digits"]
             sample_correct = False
             row_z_lens: List[int] = []
             row_has_answer = False
+            sampled_generated_texts: List[str] = []
+            sampled_full_sequences: List[str] = []
+            sampled_token_ids: List[List[int]] = []
 
             for candidate in sampled_out.outputs:
                 toks = [int(x) for x in candidate.token_ids]
+                gen_text = tokenizer.decode(toks, skip_special_tokens=False)
+                sampled_generated_texts.append(gen_text)
+                sampled_full_sequences.append(prompt + gen_text)
+                sampled_token_ids.append(toks)
                 has_answer, ok, z_len = _extract_answer_stats(
                     token_ids=toks,
                     answer_token_id=answer_token_id,
@@ -219,8 +226,14 @@ def evaluate_with_vllm(
                     sample_correct = True
 
             greedy_correct = False
+            greedy_generated_text = ""
+            greedy_full_sequence = ""
+            greedy_token_ids: List[int] = []
             if greedy_out.outputs:
                 greedy_toks = [int(x) for x in greedy_out.outputs[0].token_ids]
+                greedy_token_ids = greedy_toks
+                greedy_generated_text = tokenizer.decode(greedy_toks, skip_special_tokens=False)
+                greedy_full_sequence = prompt + greedy_generated_text
                 _, greedy_correct, _ = _extract_answer_stats(
                     token_ids=greedy_toks,
                     answer_token_id=answer_token_id,
@@ -243,11 +256,18 @@ def evaluate_with_vllm(
                     json.dumps(
                         {
                             "question": row["question"],
+                            "prompt": prompt,
                             "target_digits": target,
                             "pass_hit": bool(sample_correct),
                             "greedy_hit": bool(greedy_correct),
                             "z_lens": row_z_lens,
                             "has_answer": bool(row_has_answer),
+                            "sampled_generated_texts": sampled_generated_texts,
+                            "sampled_full_sequences": sampled_full_sequences,
+                            "sampled_token_ids": sampled_token_ids,
+                            "greedy_generated_text": greedy_generated_text,
+                            "greedy_full_sequence": greedy_full_sequence,
+                            "greedy_token_ids": greedy_token_ids,
                         }
                     )
                     + "\n"
