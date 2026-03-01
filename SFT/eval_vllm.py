@@ -51,10 +51,10 @@ def _extract_answer_stats(
     return True, ok, z_len
 
 
-def _build_prompt(tokenizer, question: str) -> str:
+def _build_prompt(tokenizer, problem: str) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "user", "content": problem},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -152,7 +152,7 @@ def evaluate_with_vllm(
     items: List[Dict] = []
     labeled_items = 0
     for row in records:
-        q = row.get("question")
+        q = row.get("problem")
         if q is None:
             continue
         digits = row.get("answer_digits")
@@ -165,18 +165,18 @@ def evaluate_with_vllm(
                     labeled_items += 1
             except Exception:
                 target_digits = None
-        items.append({"question": str(q), "answer_digits": target_digits})
+        items.append({"problem": str(q), "answer_digits": target_digits})
 
     if not items:
         try:
             if writer is not None:
-                writer.write(json.dumps({"warning": "no eval items with a question field"}) + "\n")
+                writer.write(json.dumps({"warning": "no eval items with a problem field"}) + "\n")
         finally:
             if writer is not None:
                 writer.close()
         return EvalMetrics(0.0, 0.0, 0.0, 1.0)
 
-    prompts = [_build_prompt(tokenizer, x["question"]) for x in items]
+    prompts = [_build_prompt(tokenizer, x["problem"]) for x in items]
     processor = GrammarLogitsProcessor(
         answer_token_id=answer_token_id,
         z_token_ids=z_token_ids,
@@ -270,7 +270,7 @@ def evaluate_with_vllm(
                 writer.write(
                     json.dumps(
                         {
-                            "question": row["question"],
+                            "problem": row["problem"],
                             "prompt": prompt,
                             "target_digits": target,
                             "has_label": bool(has_label),
