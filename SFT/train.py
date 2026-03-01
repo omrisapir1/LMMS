@@ -266,6 +266,20 @@ def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
         writer.writerow(row)
 
 
+def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
+    if "input_ids" not in batch or "attention_mask" not in batch:
+        return
+    if int(batch["input_ids"].shape[0]) == 0:
+        return
+    ids = batch["input_ids"][0].detach().cpu()
+    mask = batch["attention_mask"][0].detach().cpu()
+    seq_len = int(mask.sum().item())
+    if seq_len <= 0:
+        return
+    text = tokenizer.decode(ids[:seq_len].tolist(), skip_special_tokens=False)
+    _log(f"[example@warmup_end step={step}] {text}", log_path)
+
+
 def train(cfg: SFTConfig) -> str:
     if not cfg.base_model_or_checkpoint.strip():
         raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
@@ -354,6 +368,7 @@ def train(cfg: SFTConfig) -> str:
             step += 1
 
             if step == int(cfg.warmup_steps):
+                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
                 for h in warmup_hooks:
                     h.remove()
                 warmup_hooks = _apply_warmup_freeze(
