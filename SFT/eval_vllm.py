@@ -24,7 +24,7 @@ def _extract_answer_stats(
     answer_token_id: int,
     z_token_id_set: set[int],
     digit_id_to_val: Dict[int, int],
-    target_digits: List[int],
+    target_digits: List[int] | None,
 ) -> tuple[bool, bool, int]:
     ans_pos = -1
     for i, tid in enumerate(token_ids):
@@ -47,7 +47,7 @@ def _extract_answer_stats(
         if len(digits) == 5:
             break
 
-    ok = len(digits) == 5 and digits == target_digits
+    ok = len(digits) == 5 and (target_digits is not None and digits == target_digits)
     return True, ok, z_len
 
 
@@ -144,18 +144,36 @@ def evaluate_with_vllm(
     z_token_id_set = set(z_token_ids)
     digit_id_to_val = {tid: i for i, tid in enumerate(digit_token_ids)}
 
+    writer = None
+    if output_jsonl_path:
+        Path(output_jsonl_path).parent.mkdir(parents=True, exist_ok=True)
+        writer = open(output_jsonl_path, "a", encoding="utf-8")
+
     items: List[Dict] = []
+    labeled_items = 0
     for row in records:
         q = row.get("question")
+        if q is None:
+            continue
         digits = row.get("answer_digits")
-        if q is None or digits is None:
-            continue
-        d = [int(x) for x in digits]
-        if len(d) != 5 or any(x < 0 or x > 9 for x in d):
-            continue
-        items.append({"question": str(q), "answer_digits": d})
+        target_digits = None
+        if digits is not None:
+            try:
+                d = [int(x) for x in digits]
+                if len(d) == 5 and not any(x < 0 or x > 9 for x in d):
+                    target_digits = d
+                    labeled_items += 1
+            except Exception:
+                target_digits = None
+        items.append({"question": str(q), "answer_digits": target_digits})
 
     if not items:
+        try:
+            if writer is not None:
+                writer.write(json.dumps({"warning": "no eval items with a question field"}) + "\n")
+        finally:
+            if writer is not None:
+                writer.close()
         return EvalMetrics(0.0, 0.0, 0.0, 1.0)
 
     prompts = [_build_prompt(tokenizer, x["question"]) for x in items]
@@ -191,14 +209,10 @@ def evaluate_with_vllm(
     z_lens: List[int] = []
     no_answer = 0
 
-    writer = None
-    if output_jsonl_path:
-        Path(output_jsonl_path).parent.mkdir(parents=True, exist_ok=True)
-        writer = open(output_jsonl_path, "a", encoding="utf-8")
-
     try:
         for row, prompt, sampled_out, greedy_out in zip(items, prompts, sampled_outputs, greedy_outputs):
             target = row["answer_digits"]
+            has_label = target is not None
             sample_correct = False
             row_z_lens: List[int] = []
             row_has_answer = False
@@ -242,14 +256,15 @@ def evaluate_with_vllm(
                     target_digits=target,
                 )
 
-            if sample_correct:
-                pass_hits += 1
-            if greedy_correct:
-                greedy_hits += 1
-            if row_z_lens:
-                z_lens.extend(row_z_lens)
-            if not row_has_answer:
-                no_answer += 1
+            if has_label:
+                if sample_correct:
+                    pass_hits += 1
+                if greedy_correct:
+                    greedy_hits += 1
+                if row_z_lens:
+                    z_lens.extend(row_z_lens)
+                if not row_has_answer:
+                    no_answer += 1
 
             if writer is not None:
                 writer.write(
@@ -258,6 +273,7 @@ def evaluate_with_vllm(
                             "question": row["question"],
                             "prompt": prompt,
                             "target_digits": target,
+                            "has_label": bool(has_label),
                             "pass_hit": bool(sample_correct),
                             "greedy_hit": bool(greedy_correct),
                             "z_lens": row_z_lens,
@@ -276,7 +292,9 @@ def evaluate_with_vllm(
         if writer is not None:
             writer.close()
 
-    total = len(items)
+    total = int(labeled_items)
+    if total <= 0:
+        return EvalMetrics(0.0, 0.0, 0.0, 1.0)
     mean_z = float(sum(z_lens) / len(z_lens)) if z_lens else 0.0
     return EvalMetrics(
         pass_at_n=float(pass_hits / total),
