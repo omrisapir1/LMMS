@@ -53,7 +53,7 @@ def _debug_check_label_membership(
 
 def _masked_clone(logits: torch.Tensor, allowed_ids: Sequence[int]) -> torch.Tensor:
     # logits: [N, V]
-    out = torch.full_like(logits, float("-inf"))
+    out = torch.full_like(logits, -1e4)
     allowed = torch.as_tensor(allowed_ids, device=logits.device, dtype=torch.long)
     out[:, allowed] = logits[:, allowed]
     return out
