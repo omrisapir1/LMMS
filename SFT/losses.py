@@ -67,18 +67,18 @@ def _mean_ce(
     y = labels[idx[:, 0], idx[:, 1]]
     with torch.no_grad():
         bad = torch.isneginf(x.gather(1, y.view(-1, 1))).view(-1)
-        # if bad.any():
-        j = int(bad.nonzero(as_tuple=False)[0].item())
-        b = int(idx[j, 0].item())
-        t = int(idx[j, 1].item())
-        yj = int(y[j].item())
-        print("CE=inf debug:")
-        print(f"  batch_idx={b} time_idx={t} label_id={yj}")
-        # show top-10 logits ids (after masking)
-        topv, topi = torch.topk(x[j], k=10)
-        print("  top_ids:", [int(i) for i in topi.tolist()])
-        print("  top_vals:", [float(v) for v in topv.tolist()])
-        raise RuntimeError("Found masked-out true label -> CE would be inf")
+        if bad.any():
+            j = int(bad.nonzero(as_tuple=False)[0].item())
+            b = int(idx[j, 0].item())
+            t = int(idx[j, 1].item())
+            yj = int(y[j].item())
+            print("CE=inf debug:")
+            print(f"  batch_idx={b} time_idx={t} label_id={yj}")
+            # show top-10 logits ids (after masking)
+            topv, topi = torch.topk(x[j], k=10)
+            print("  top_ids:", [int(i) for i in topi.tolist()])
+            print("  top_vals:", [float(v) for v in topv.tolist()])
+            raise RuntimeError("Found masked-out true label -> CE would be inf")
     return F.cross_entropy(x, y, reduction="mean", label_smoothing=label_smoothing)
 
 
