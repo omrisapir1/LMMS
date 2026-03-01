@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List
 
 from transformers import AutoTokenizer
 
@@ -18,37 +18,18 @@ class EvalMetrics:
     no_answer_before_kmax_rate: float
 
 
-def _extract_answer_stats(
-    *,
-    token_ids: List[int],
-    answer_token_id: int,
-    z_token_id_set: set[int],
-    digit_id_to_val: Dict[int, int],
-    target_digits: List[int] | None,
-) -> tuple[bool, bool, int]:
-    ans_pos = -1
+def find_first_answer_pos(token_ids: List[int], answer_token_id: int) -> int:
     for i, tid in enumerate(token_ids):
-        if int(tid) == answer_token_id:
-            ans_pos = i
-            break
+        if int(tid) == int(answer_token_id):
+            return i
+    return -1
 
-    if ans_pos < 0:
-        return False, False, 0
 
-    z_len = 0
-    for t in token_ids[:ans_pos]:
-        if t in z_token_id_set:
-            z_len += 1
-
-    digits = []
-    for t in token_ids[ans_pos + 1 :]:
-        if t in digit_id_to_val:
-            digits.append(digit_id_to_val[t])
-        if len(digits) == 5:
-            break
-
-    ok = len(digits) == 5 and (target_digits is not None and digits == target_digits)
-    return True, ok, z_len
+def truncate_phaseA_to_answer(token_ids: List[int], answer_token_id: int) -> tuple[List[int], bool]:
+    pos = find_first_answer_pos(token_ids, answer_token_id)
+    if pos < 0:
+        return list(token_ids), False
+    return list(token_ids[: pos + 1]), True
 
 
 def _build_prompt(tokenizer, problem: str) -> str:
@@ -57,6 +38,14 @@ def _build_prompt(tokenizer, problem: str) -> str:
         {"role": "user", "content": problem},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _phase_b_digits(token_ids: List[int], digit_id_to_val: Dict[int, int]) -> List[int]:
+    out: List[int] = []
+    for tid in token_ids:
+        if int(tid) in digit_id_to_val:
+            out.append(int(digit_id_to_val[int(tid)]))
+    return out
 
 
 def evaluate_with_vllm(
@@ -86,14 +75,14 @@ def evaluate_with_vllm(
     if answer_token_id < 0:
         raise RuntimeError("Tokenizer missing <ANSWER> token for evaluation.")
 
-    digit_token_ids = []
+    digit_token_ids: List[int] = []
     for d in "0123456789":
         ids = tokenizer.encode(d, add_special_tokens=False)
         if len(ids) != 1:
             raise RuntimeError(f"Digit tokenization check failed in eval for '{d}' -> {ids}")
         digit_token_ids.append(int(ids[0]))
 
-    llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True,gpu_memory_utilization=0.25)
+    llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.75)
     z_token_id_set = set(z_token_ids)
     digit_id_to_val = {tid: i for i, tid in enumerate(digit_token_ids)}
 
@@ -130,30 +119,112 @@ def evaluate_with_vllm(
         return EvalMetrics(0.0, 0.0, 0.0, 1.0)
 
     prompts = [_build_prompt(tokenizer, x["problem"]) for x in items]
-    allowed_token_ids = set(int(x) for x in z_token_ids)
-    allowed_token_ids.add(answer_token_id)
-    allowed_token_ids.update(int(x) for x in digit_token_ids)
-    if tokenizer.eos_token_id is not None and int(tokenizer.eos_token_id) >= 0:
-        allowed_token_ids.add(int(tokenizer.eos_token_id))
 
-    max_new_tokens = int(k_max) + 1 + 5
-    sampled_params = SamplingParams(
+    phase_a_sampled_params = SamplingParams(
         n=int(pass_at_n),
         temperature=float(temperature),
         top_p=float(top_p),
-        max_tokens=max_new_tokens,
-        allowed_token_ids=sorted(allowed_token_ids),
+        max_tokens=int(k_max) + 1,
+        allowed_token_ids=sorted(list(z_token_ids) + [answer_token_id]),
+        stop_token_ids=[answer_token_id],
     )
-    greedy_params = SamplingParams(
+    phase_a_greedy_params = SamplingParams(
         n=1,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=max_new_tokens,
-        allowed_token_ids=sorted(allowed_token_ids),
+        max_tokens=int(k_max) + 1,
+        allowed_token_ids=sorted(list(z_token_ids) + [answer_token_id]),
+        stop_token_ids=[answer_token_id],
+    )
+    phase_b_sampled_params = SamplingParams(
+        n=1,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        max_tokens=5,
+        allowed_token_ids=sorted(digit_token_ids),
+    )
+    phase_b_greedy_params = SamplingParams(
+        n=1,
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=5,
+        allowed_token_ids=sorted(digit_token_ids),
     )
 
-    sampled_outputs = llm.generate(prompts, sampled_params)
-    greedy_outputs = llm.generate(prompts, greedy_params)
+    sampled_phase_a_outputs = llm.generate(prompts, phase_a_sampled_params)
+    greedy_phase_a_outputs = llm.generate(prompts, phase_a_greedy_params)
+
+    sampled_phase_b_prompts: List[str] = []
+    sampled_phase_b_owner: List[tuple[int, int]] = []
+    sampled_phase_a_ids: List[List[List[int]]] = []
+    sampled_phase_a_texts: List[List[str]] = []
+    sampled_phase_a_has_answer: List[List[bool]] = []
+    sampled_phase_a_z_lens: List[List[int]] = []
+
+    for item_idx, (prompt, sampled_out) in enumerate(zip(prompts, sampled_phase_a_outputs)):
+        row_ids: List[List[int]] = []
+        row_texts: List[str] = []
+        row_has_answer: List[bool] = []
+        row_z_lens: List[int] = []
+        for cand_idx, candidate in enumerate(sampled_out.outputs):
+            raw_ids = [int(x) for x in candidate.token_ids]
+            trunc_ids, has_answer = truncate_phaseA_to_answer(raw_ids, answer_token_id)
+            row_ids.append(trunc_ids)
+            row_texts.append(tokenizer.decode(trunc_ids, skip_special_tokens=False))
+            row_has_answer.append(bool(has_answer))
+            if has_answer:
+                ans_pos = find_first_answer_pos(trunc_ids, answer_token_id)
+                z_len = sum(1 for t in trunc_ids[:ans_pos] if int(t) in z_token_id_set)
+                row_z_lens.append(int(z_len))
+                sampled_phase_b_prompts.append(prompt + row_texts[-1])
+                sampled_phase_b_owner.append((item_idx, cand_idx))
+            else:
+                row_z_lens.append(0)
+        sampled_phase_a_ids.append(row_ids)
+        sampled_phase_a_texts.append(row_texts)
+        sampled_phase_a_has_answer.append(row_has_answer)
+        sampled_phase_a_z_lens.append(row_z_lens)
+
+    sampled_phase_b_ids_by_owner: Dict[tuple[int, int], List[int]] = {}
+    sampled_phase_b_text_by_owner: Dict[tuple[int, int], str] = {}
+    if sampled_phase_b_prompts:
+        sampled_phase_b_outputs = llm.generate(sampled_phase_b_prompts, phase_b_sampled_params)
+        for owner, out in zip(sampled_phase_b_owner, sampled_phase_b_outputs):
+            phase_b_ids = [int(x) for x in out.outputs[0].token_ids] if out.outputs else []
+            sampled_phase_b_ids_by_owner[owner] = phase_b_ids
+            sampled_phase_b_text_by_owner[owner] = tokenizer.decode(phase_b_ids, skip_special_tokens=False)
+
+    greedy_phase_b_prompts: List[str] = []
+    greedy_phase_b_owner: List[int] = []
+    greedy_phase_a_ids: List[List[int]] = []
+    greedy_phase_a_texts: List[str] = []
+    greedy_phase_a_has_answer: List[bool] = []
+    greedy_phase_a_z_lens: List[int] = []
+
+    for item_idx, (prompt, greedy_out) in enumerate(zip(prompts, greedy_phase_a_outputs)):
+        raw_ids = [int(x) for x in greedy_out.outputs[0].token_ids] if greedy_out.outputs else []
+        trunc_ids, has_answer = truncate_phaseA_to_answer(raw_ids, answer_token_id)
+        phase_a_text = tokenizer.decode(trunc_ids, skip_special_tokens=False)
+        greedy_phase_a_ids.append(trunc_ids)
+        greedy_phase_a_texts.append(phase_a_text)
+        greedy_phase_a_has_answer.append(bool(has_answer))
+        if has_answer:
+            ans_pos = find_first_answer_pos(trunc_ids, answer_token_id)
+            z_len = sum(1 for t in trunc_ids[:ans_pos] if int(t) in z_token_id_set)
+            greedy_phase_a_z_lens.append(int(z_len))
+            greedy_phase_b_prompts.append(prompt + phase_a_text)
+            greedy_phase_b_owner.append(item_idx)
+        else:
+            greedy_phase_a_z_lens.append(0)
+
+    greedy_phase_b_ids_by_owner: Dict[int, List[int]] = {}
+    greedy_phase_b_text_by_owner: Dict[int, str] = {}
+    if greedy_phase_b_prompts:
+        greedy_phase_b_outputs = llm.generate(greedy_phase_b_prompts, phase_b_greedy_params)
+        for owner, out in zip(greedy_phase_b_owner, greedy_phase_b_outputs):
+            phase_b_ids = [int(x) for x in out.outputs[0].token_ids] if out.outputs else []
+            greedy_phase_b_ids_by_owner[owner] = phase_b_ids
+            greedy_phase_b_text_by_owner[owner] = tokenizer.decode(phase_b_ids, skip_special_tokens=False)
 
     pass_hits = 0
     greedy_hits = 0
@@ -161,59 +232,58 @@ def evaluate_with_vllm(
     no_answer = 0
 
     try:
-        for row, prompt, sampled_out, greedy_out in zip(items, prompts, sampled_outputs, greedy_outputs):
+        for i, (row, prompt) in enumerate(zip(items, prompts)):
             target = row["answer_digits"]
             has_label = target is not None
-            sample_correct = False
-            row_z_lens: List[int] = []
-            row_has_answer = False
-            sampled_generated_texts: List[str] = []
-            sampled_full_sequences: List[str] = []
-            sampled_token_ids: List[List[int]] = []
 
-            for candidate in sampled_out.outputs:
-                toks = [int(x) for x in candidate.token_ids]
-                gen_text = tokenizer.decode(toks, skip_special_tokens=False)
-                sampled_generated_texts.append(gen_text)
-                sampled_full_sequences.append(prompt + gen_text)
-                sampled_token_ids.append(toks)
-                has_answer, ok, z_len = _extract_answer_stats(
-                    token_ids=toks,
-                    answer_token_id=answer_token_id,
-                    z_token_id_set=z_token_id_set,
-                    digit_id_to_val=digit_id_to_val,
-                    target_digits=target,
+            sample_correct = False
+            row_has_answer = any(sampled_phase_a_has_answer[i]) if i < len(sampled_phase_a_has_answer) else False
+            sampled_candidates: List[Dict] = []
+
+            for cand_idx, phase_a_ids in enumerate(sampled_phase_a_ids[i]):
+                phase_a_text = sampled_phase_a_texts[i][cand_idx]
+                phase_a_has_answer = sampled_phase_a_has_answer[i][cand_idx]
+                phase_a_z_len = sampled_phase_a_z_lens[i][cand_idx]
+                phase_b_ids = sampled_phase_b_ids_by_owner.get((i, cand_idx), [])
+                phase_b_text = sampled_phase_b_text_by_owner.get((i, cand_idx), "")
+                full_sequence = prompt + phase_a_text + phase_b_text
+
+                if phase_a_has_answer:
+                    z_lens.append(int(phase_a_z_len))
+                    if has_label:
+                        digits_pred = _phase_b_digits(phase_b_ids, digit_id_to_val)
+                        if len(digits_pred) == 5 and digits_pred == target:
+                            sample_correct = True
+
+                sampled_candidates.append(
+                    {
+                        "phaseA_token_ids": phase_a_ids,
+                        "phaseA_text": phase_a_text,
+                        "phaseA_has_answer": bool(phase_a_has_answer),
+                        "phaseA_z_len": int(phase_a_z_len),
+                        "phaseB_token_ids": phase_b_ids if phase_a_has_answer else None,
+                        "phaseB_text": phase_b_text if phase_a_has_answer else "",
+                        "full_sequence": full_sequence,
+                    }
                 )
-                if has_answer:
-                    row_has_answer = True
-                    row_z_lens.append(z_len)
-                if ok:
-                    sample_correct = True
 
             greedy_correct = False
-            greedy_generated_text = ""
-            greedy_full_sequence = ""
-            greedy_token_ids: List[int] = []
-            if greedy_out.outputs:
-                greedy_toks = [int(x) for x in greedy_out.outputs[0].token_ids]
-                greedy_token_ids = greedy_toks
-                greedy_generated_text = tokenizer.decode(greedy_toks, skip_special_tokens=False)
-                greedy_full_sequence = prompt + greedy_generated_text
-                _, greedy_correct, _ = _extract_answer_stats(
-                    token_ids=greedy_toks,
-                    answer_token_id=answer_token_id,
-                    z_token_id_set=z_token_id_set,
-                    digit_id_to_val=digit_id_to_val,
-                    target_digits=target,
-                )
+            greedy_phase_a_ids_row = greedy_phase_a_ids[i]
+            greedy_phase_a_text_row = greedy_phase_a_texts[i]
+            greedy_has_answer = greedy_phase_a_has_answer[i]
+            greedy_phase_a_z_len_row = greedy_phase_a_z_lens[i]
+            greedy_phase_b_ids_row = greedy_phase_b_ids_by_owner.get(i, [])
+            greedy_phase_b_text_row = greedy_phase_b_text_by_owner.get(i, "")
+
+            if has_label and greedy_has_answer:
+                greedy_digits = _phase_b_digits(greedy_phase_b_ids_row, digit_id_to_val)
+                greedy_correct = len(greedy_digits) == 5 and greedy_digits == target
 
             if has_label:
                 if sample_correct:
                     pass_hits += 1
                 if greedy_correct:
                     greedy_hits += 1
-                if row_z_lens:
-                    z_lens.extend(row_z_lens)
                 if not row_has_answer:
                     no_answer += 1
 
@@ -227,14 +297,17 @@ def evaluate_with_vllm(
                             "has_label": bool(has_label),
                             "pass_hit": bool(sample_correct),
                             "greedy_hit": bool(greedy_correct),
-                            "z_lens": row_z_lens,
-                            "has_answer": bool(row_has_answer),
-                            "sampled_generated_texts": sampled_generated_texts,
-                            "sampled_full_sequences": sampled_full_sequences,
-                            "sampled_token_ids": sampled_token_ids,
-                            "greedy_generated_text": greedy_generated_text,
-                            "greedy_full_sequence": greedy_full_sequence,
-                            "greedy_token_ids": greedy_token_ids,
+                            "has_answer_before_kmax": bool(row_has_answer),
+                            "sampled_candidates": sampled_candidates,
+                            "greedy": {
+                                "phaseA_token_ids": greedy_phase_a_ids_row,
+                                "phaseA_text": greedy_phase_a_text_row,
+                                "phaseA_has_answer": bool(greedy_has_answer),
+                                "phaseA_z_len": int(greedy_phase_a_z_len_row),
+                                "phaseB_token_ids": greedy_phase_b_ids_row if greedy_has_answer else None,
+                                "phaseB_text": greedy_phase_b_text_row if greedy_has_answer else "",
+                                "full_sequence": prompt + greedy_phase_a_text_row + greedy_phase_b_text_row,
+                            },
                         }
                     )
                     + "\n"
