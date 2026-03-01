@@ -23,7 +23,7 @@ class SFTConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
     max_steps: int = 15_000
-    warmup_steps: int = 1500
+    warmup_steps: int = 200
     max_length: int = 2048
 
     # Objective weights
