@@ -48,6 +48,33 @@ def _phase_b_digits(token_ids: List[int], digit_id_to_val: Dict[int, int]) -> Li
     return out
 
 
+def _parse_target_digits(row: Dict) -> List[int] | None:
+    digits = row.get("answer_digits")
+    if digits is not None:
+        try:
+            d = [int(x) for x in digits]
+            if len(d) == 5 and not any(x < 0 or x > 9 for x in d):
+                return d
+        except Exception:
+            pass
+
+    final_answer = row.get("final_answer")
+    if final_answer is None:
+        return None
+    try:
+        text = str(final_answer).strip()
+        if text.startswith("+"):
+            text = text[1:]
+        if not text.isdigit():
+            return None
+        if len(text) < 1 or len(text) > 5:
+            return None
+        padded = text.zfill(5)
+        return [int(ch) for ch in padded]
+    except Exception:
+        return None
+
+
 def evaluate_with_vllm(
     *,
     model_path: str,
@@ -96,17 +123,12 @@ def evaluate_with_vllm(
     for row in records:
         q = row.get("problem")
         if q is None:
+            q = row.get("question")
+        if q is None:
             continue
-        digits = row.get("answer_digits")
-        target_digits = None
-        if digits is not None:
-            try:
-                d = [int(x) for x in digits]
-                if len(d) == 5 and not any(x < 0 or x > 9 for x in d):
-                    target_digits = d
-                    labeled_items += 1
-            except Exception:
-                target_digits = None
+        target_digits = _parse_target_digits(row)
+        if target_digits is not None:
+            labeled_items += 1
         items.append({"problem": str(q), "answer_digits": target_digits})
 
     if not items:
