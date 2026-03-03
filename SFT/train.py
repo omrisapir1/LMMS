@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .config import SFTConfig
 from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
 from .eval_vllm import evaluate_with_vllm
-from .losses import compute_weighted_loss
+from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 
 
 def _set_seed(seed: int) -> None:
@@ -266,6 +266,122 @@ def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
         writer.writerow(row)
 
 
+def _parse_prob_tuple(text: str) -> Tuple[float, float, float]:
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"expected 3 comma-separated probabilities, got: {text}")
+    vals = tuple(float(x) for x in parts)
+    s = vals[0] + vals[1] + vals[2]
+    if min(vals) < 0.0 or abs(s - 1.0) > 1e-6:
+        raise ValueError(f"cf_prob_tuple must be non-negative and sum to 1, got: {vals}")
+    return vals
+
+
+def _parse_range_tuple(text: str) -> Tuple[float, float]:
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"expected 2 comma-separated floats, got: {text}")
+    lo, hi = float(parts[0]), float(parts[1])
+    if not (0.0 <= lo <= hi):
+        raise ValueError(f"invalid range (expected 0 <= lo <= hi), got: {(lo, hi)}")
+    return lo, hi
+
+
+def _validate_cf_config(cfg: SFTConfig) -> None:
+    if int(cfg.cf_every_n_steps) <= 0:
+        raise ValueError("cf_every_n_steps must be > 0")
+    if float(cfg.cf_lambda) < 0.0:
+        raise ValueError("cf_lambda must be >= 0")
+    if float(cfg.cf_eps) <= 0.0:
+        raise ValueError("cf_eps must be > 0")
+    if int(cfg.cf_min_z_len) < 0:
+        raise ValueError("cf_min_z_len must be >= 0")
+    p_trunc, p_reverse, p_random = cfg.cf_prob_tuple
+    if min(float(p_trunc), float(p_reverse), float(p_random)) < 0.0:
+        raise ValueError("cf_prob_tuple probabilities must be non-negative")
+    if abs(float(p_trunc + p_reverse + p_random) - 1.0) > 1e-6:
+        raise ValueError("cf_prob_tuple must sum to 1")
+    lo, hi = cfg.cf_trunc_range
+    if not (0.0 <= float(lo) <= float(hi)):
+        raise ValueError("cf_trunc_range must satisfy 0 <= lo <= hi")
+
+
+def _sample_cf_variant(cfg: SFTConfig, rng: random.Random) -> str:
+    p_trunc, p_reverse, _ = cfg.cf_prob_tuple
+    u = float(rng.random())
+    if u < float(p_trunc):
+        return "truncate"
+    if u < float(p_trunc + p_reverse):
+        return "reverse"
+    return "random"
+
+
+def _build_counterfactual_batch(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    answer_token_id: int,
+    z_token_ids: Sequence[int],
+    pad_token_id: int,
+    cf_min_z_len: int,
+    variant_name: str,
+    trunc_range: Tuple[float, float],
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_ids_cf = input_ids.clone()
+    attention_mask_cf = attention_mask.clone()
+
+    z_set = set(int(x) for x in z_token_ids)
+    bsz, _ = input_ids.shape
+    eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
+    visible_z_counts = torch.zeros((bsz,), dtype=torch.long, device=input_ids.device)
+
+    lo, hi = float(trunc_range[0]), float(trunc_range[1])
+
+    for b in range(bsz):
+        valid_len = int(attention_mask[b].sum().item())
+        if valid_len <= 0:
+            continue
+        row = input_ids[b, :valid_len]
+        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
+        if int(ans_idx.numel()) == 0:
+            continue
+        ans_pos = int(ans_idx[0].item())
+        z_pos: List[int] = []
+        for j in range(ans_pos):
+            if int(row[j].item()) in z_set:
+                z_pos.append(j)
+        lz = len(z_pos)
+        if lz < int(cf_min_z_len):
+            continue
+
+        eligible_mask[b] = True
+
+        if variant_name == "reverse":
+            src = input_ids[b, z_pos].clone()
+            input_ids_cf[b, z_pos] = src.flip(0)
+            visible_z_counts[b] = int(lz)
+        elif variant_name == "random":
+            vals = [int(rng.choice(z_token_ids)) for _ in z_pos]
+            if vals:
+                input_ids_cf[b, z_pos] = torch.as_tensor(vals, dtype=input_ids.dtype, device=input_ids.device)
+            visible_z_counts[b] = int(lz)
+        elif variant_name == "truncate":
+            r = float(rng.uniform(lo, hi))
+            remove_count = int(math.ceil(r * lz))
+            keep_k = max(0, lz - remove_count)
+            remove_pos = z_pos[keep_k:]
+            if remove_pos:
+                remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long, device=input_ids.device)
+                input_ids_cf[b, remove_tensor] = int(pad_token_id)
+                attention_mask_cf[b, remove_tensor] = 0
+            visible_z_counts[b] = int(keep_k)
+        else:
+            raise ValueError(f"unknown counterfactual variant: {variant_name}")
+
+    return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts
+
+
 def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
     if "input_ids" not in batch or "attention_mask" not in batch:
         return
@@ -289,6 +405,7 @@ def train(cfg: SFTConfig) -> str:
         raise ValueError("config.eval_dataset_name is empty; fill with HF dataset path")
     if int(cfg.vocab_size) <= 0:
         raise ValueError("config.vocab_size must be > 0")
+    _validate_cf_config(cfg)
 
     _set_seed(cfg.seed)
 
@@ -322,6 +439,7 @@ def train(cfg: SFTConfig) -> str:
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
 
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    train_rng = random.Random(int(cfg.seed))
 
     step = 0
     micro = 0
@@ -330,6 +448,18 @@ def train(cfg: SFTConfig) -> str:
 
     _log(f"run_dir={run_dir}", log_path)
     _log(f"train_size={len(train_records)} eval_size={len(eval_records)}", log_path)
+    _log(
+        "counterfactual enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
+            bool(cfg.cf_enabled),
+            int(cfg.cf_every_n_steps),
+            tuple(float(x) for x in cfg.cf_prob_tuple),
+            float(cfg.cf_lambda),
+            float(cfg.cf_kl_margin),
+            int(cfg.cf_min_z_len),
+            tuple(float(x) for x in cfg.cf_trunc_range),
+        ),
+        log_path,
+    )
 
     warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
 
@@ -341,6 +471,18 @@ def train(cfg: SFTConfig) -> str:
             model.train()
             for k in ("input_ids", "attention_mask", "labels", "target_class"):
                 batch[k] = batch[k].to(device)
+
+            accum_steps = max(1, int(cfg.gradient_accumulation_steps))
+            will_step = ((micro + 1) % accum_steps) == 0
+            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % int(cfg.cf_every_n_steps)) == 0)
+            cf_applied = False
+            cf_variant_name = "none"
+            cf_loss_scalar = 0.0
+            cf_mean_sym_kl = 0.0
+            cf_mean_entropy = 0.0
+            cf_visible_z_mean = 0.0
+            cf_eligible_count = 0.0
+            cf_loss_value = torch.zeros((), dtype=torch.float32, device=device)
 
             with scaler_ctx:
                 out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
@@ -355,12 +497,68 @@ def train(cfg: SFTConfig) -> str:
                     w_digits=cfg.w_digits,
                     z_label_smoothing=cfg.z_label_smoothing,
                 )
-                loss = loss_out.total / max(1, int(cfg.gradient_accumulation_steps))
+                total_loss = loss_out.total
+
+                if cf_trigger:
+                    cf_variant_name = _sample_cf_variant(cfg, train_rng)
+                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        answer_token_id=answer_token_id,
+                        z_token_ids=z_token_ids,
+                        pad_token_id=int(tokenizer.pad_token_id),
+                        cf_min_z_len=int(cfg.cf_min_z_len),
+                        variant_name=cf_variant_name,
+                        trunc_range=cfg.cf_trunc_range,
+                        rng=train_rng,
+                    )
+                    cf_eligible_count = float(eligible_mask.float().sum().item())
+                    if cf_eligible_count > 0:
+                        cf_applied = True
+                        out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
+                        clean_digit_logits, digit_valid_mask = extract_digit_logits(
+                            logits=out.logits,
+                            target_class=batch["target_class"],
+                            digit_allowed_ids=digit_token_ids,
+                        )
+                        cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
+                            logits=out_cf.logits,
+                            target_class=batch["target_class"],
+                            digit_allowed_ids=digit_token_ids,
+                        )
+                        if clean_digit_logits.shape != cf_digit_logits.shape:
+                            raise RuntimeError(
+                                "counterfactual digit logits shape mismatch: "
+                                f"{tuple(clean_digit_logits.shape)} vs {tuple(cf_digit_logits.shape)}"
+                            )
+                        if digit_valid_mask.shape != cf_digit_valid_mask.shape or not bool(
+                            torch.equal(digit_valid_mask, cf_digit_valid_mask)
+                        ):
+                            raise RuntimeError("counterfactual digit mask mismatch")
+                        cf_out = compute_counterfactual_regularizer(
+                            clean_digit_logits=clean_digit_logits,
+                            cf_digit_logits=cf_digit_logits,
+                            digit_valid_mask=digit_valid_mask,
+                            eligible_mask=eligible_mask,
+                            variant_name=cf_variant_name,
+                            kl_margin=float(cfg.cf_kl_margin),
+                            eps=float(cfg.cf_eps),
+                        )
+                        cf_loss_value = cf_out.loss
+                        total_loss = total_loss + float(cfg.cf_lambda) * cf_loss_value
+                        cf_loss_scalar = float(cf_out.loss.detach().item())
+                        cf_mean_sym_kl = float(cf_out.mean_sym_kl)
+                        cf_mean_entropy = float(cf_out.mean_entropy)
+                        if cf_variant_name == "truncate":
+                            v = visible_z_counts[eligible_mask]
+                            cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
+
+                loss = total_loss / accum_steps
 
             loss.backward()
             micro += 1
 
-            if micro % max(1, int(cfg.gradient_accumulation_steps)) != 0:
+            if micro % accum_steps != 0:
                 continue
 
             optimizer.step()
@@ -384,7 +582,7 @@ def train(cfg: SFTConfig) -> str:
                 mean_z_len = float(batch["z_lens"].float().mean().item())
                 row = {
                     "step": float(step),
-                    "L_total": float(loss_out.total.detach().item()),
+                    "L_total": float(total_loss.detach().item()),
                     "L_z": float(loss_out.l_z.detach().item()),
                     "L_answer": float(loss_out.l_answer.detach().item()),
                     "L_digits": float(loss_out.l_digits.detach().item()),
@@ -392,10 +590,20 @@ def train(cfg: SFTConfig) -> str:
                     "digit_exact_match": float(loss_out.digit_exact_match),
                     "avg_z_len": float(mean_z_len),
                     "no_answer_before_kmax": 0.0,
+                    "cf_enabled": float(bool(cfg.cf_enabled)),
+                    "cf_applied": float(bool(cf_applied)),
+                    "cf_loss": float(cf_loss_scalar),
+                    "cf_variant_truncate": float(cf_variant_name == "truncate"),
+                    "cf_variant_reverse": float(cf_variant_name == "reverse"),
+                    "cf_variant_random": float(cf_variant_name == "random"),
+                    "cf_mean_sym_kl": float(cf_mean_sym_kl),
+                    "cf_mean_entropy": float(cf_mean_entropy),
+                    "cf_eligible_count": float(cf_eligible_count),
+                    "cf_visible_z_mean": float(cf_visible_z_mean),
                 }
                 _append_metrics_csv(metrics_csv, row)
                 _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f}".format(
+                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
                         row["L_z"],
@@ -404,6 +612,12 @@ def train(cfg: SFTConfig) -> str:
                         row["z_acc"],
                         row["digit_exact_match"],
                         row["avg_z_len"],
+                        int(bool(cfg.cf_enabled)),
+                        int(bool(cf_applied)),
+                        cf_variant_name,
+                        row["cf_loss"],
+                        row["cf_mean_sym_kl"],
+                        row["cf_mean_entropy"],
                     ),
                     log_path,
                 )
@@ -527,6 +741,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w_z", type=float, default=0.1)
     p.add_argument("--w_answer", type=float, default=0.5)
     p.add_argument("--w_digits", type=float, default=1.0)
+    p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cf_every_n_steps", type=int, default=4)
+    p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
+    p.add_argument("--cf_lambda", type=float, default=0.1)
+    p.add_argument("--cf_kl_margin", type=float, default=0.5)
+    p.add_argument("--cf_eps", type=float, default=1e-8)
+    p.add_argument("--cf_min_z_len", type=int, default=2)
+    p.add_argument("--cf_trunc_range", type=str, default="0.5,1.0")
 
     p.add_argument("--eval_interval_steps", type=int, default=500)
     p.add_argument("--pass_at_n", type=int, default=16)
@@ -547,6 +769,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
+    cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
     cfg = SFTConfig(
         base_model_or_checkpoint=args.base_model_or_checkpoint,
         train_dataset_name=args.train_dataset_name,
@@ -566,6 +790,14 @@ def main() -> None:
         w_z=args.w_z,
         w_answer=args.w_answer,
         w_digits=args.w_digits,
+        cf_enabled=bool(args.cf_enabled),
+        cf_every_n_steps=args.cf_every_n_steps,
+        cf_prob_tuple=cf_prob_tuple,
+        cf_lambda=args.cf_lambda,
+        cf_kl_margin=args.cf_kl_margin,
+        cf_eps=args.cf_eps,
+        cf_min_z_len=args.cf_min_z_len,
+        cf_trunc_range=cf_trunc_range,
         eval_interval_steps=args.eval_interval_steps,
         pass_at_n=args.pass_at_n,
         k_max=args.k_max,

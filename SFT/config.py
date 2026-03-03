@@ -32,6 +32,16 @@ class SFTConfig:
     w_answer: float = 1.0
     w_digits: float = 1.0
 
+    # Counterfactual dependence regularizer
+    cf_enabled: bool = True
+    cf_every_n_steps: int = 4
+    cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
+    cf_lambda: float = 0.1
+    cf_kl_margin: float = 0.5
+    cf_eps: float = 1e-8
+    cf_min_z_len: int = 2
+    cf_trunc_range: tuple[float, float] = (0.5, 1.0)
+
     # Evaluation / generation
     eval_interval_steps: int = 4000
     pass_at_n: int = 16
