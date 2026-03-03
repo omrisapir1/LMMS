@@ -33,7 +33,7 @@ class SFTConfig:
     w_digits: float = 1.0
 
     # Evaluation / generation
-    eval_interval_steps: int = 500
+    eval_interval_steps: int = 1000
     pass_at_n: int = 16
     k_max: int = 128
     temperature: float = 1.0
@@ -42,7 +42,7 @@ class SFTConfig:
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
     log_interval_steps: int = 20
-    save_interval_steps: int = 200
+    save_interval_steps: int = 2000
     save_every_steps: int = 2000
     keep_last_k: int = 3
     save_best: bool = True
