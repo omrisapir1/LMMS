@@ -58,67 +58,44 @@ def _debug_check_label_membership(
             raise RuntimeError("Label not in digit_allowed_ids")
 
 
-def _masked_clone(logits: torch.Tensor, allowed_ids: Sequence[int]) -> torch.Tensor:
-    # logits: [N, V]
-    out = torch.full_like(logits, -1e4)
-    allowed = torch.as_tensor(allowed_ids, device=logits.device, dtype=torch.long)
-    out[:, allowed] = logits[:, allowed]
-    return out
+def _build_inv_map(*, vocab_size: int, allowed_ids: Sequence[int], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    allowed_t = torch.as_tensor(list(allowed_ids), dtype=torch.long, device=device)
+    inv = torch.full((int(vocab_size),), -1, dtype=torch.long, device=device)
+    inv[allowed_t] = torch.arange(int(allowed_t.numel()), dtype=torch.long, device=device)
+    return allowed_t, inv
 
 
-def apply_restricted_mask_inplace(
+def _restricted_ce_for_positions(
     *,
-    logits: torch.Tensor,
-    target_class: torch.Tensor,
-    z_allowed_ids: Sequence[int],
-    digit_allowed_ids: Sequence[int],
-) -> torch.Tensor:
-    # logits/target_class shapes: [B, L, V] and [B, L]
-    z_or_answer = (target_class == TARGET_Z) | (target_class == TARGET_ANSWER)
-    digit = target_class == TARGET_DIGIT
+    logits: torch.Tensor,  # [B,L,V]
+    labels: torch.Tensor,  # [B,L]
+    idx: torch.Tensor,  # [N,2]
+    allowed_t: torch.Tensor,  # [K]
+    inv: torch.Tensor,  # [V] token-id -> [0..K-1] or -1
+    label_smoothing: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if int(idx.shape[0]) == 0:
+        zero = logits.new_zeros((), dtype=logits.dtype)
+        empty = torch.empty((0,), dtype=torch.long, device=logits.device)
+        return zero, empty, empty
 
-    if z_or_answer.any():
-        idx = z_or_answer.nonzero(as_tuple=False)
-        rows = logits[idx[:, 0], idx[:, 1], :]
-        masked = _masked_clone(rows, z_allowed_ids)
-        logits[idx[:, 0], idx[:, 1], :] = masked
-
-    if digit.any():
-        idx = digit.nonzero(as_tuple=False)
-        rows = logits[idx[:, 0], idx[:, 1], :]
-        masked = _masked_clone(rows, digit_allowed_ids)
-        logits[idx[:, 0], idx[:, 1], :] = masked
-
-    return logits
-
-
-def _mean_ce(
-    *,
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    mask: torch.Tensor,
-    label_smoothing: float = 0.0,
-) -> torch.Tensor:
-    if not mask.any():
-        return logits.new_zeros((), dtype=logits.dtype)
-    idx = mask.nonzero(as_tuple=False)
-    x = logits[idx[:, 0], idx[:, 1], :]
-    y = labels[idx[:, 0], idx[:, 1]]
-    with torch.no_grad():
-        bad = torch.isneginf(x.gather(1, y.view(-1, 1))).view(-1)
-        if bad.any():
-            j = int(bad.nonzero(as_tuple=False)[0].item())
-            b = int(idx[j, 0].item())
-            t = int(idx[j, 1].item())
-            yj = int(y[j].item())
-            print("CE=inf debug:")
-            print(f"  batch_idx={b} time_idx={t} label_id={yj}")
-            # show top-10 logits ids (after masking)
-            topv, topi = torch.topk(x[j], k=10)
-            print("  top_ids:", [int(i) for i in topi.tolist()])
-            print("  top_vals:", [float(v) for v in topv.tolist()])
-            raise RuntimeError("Found masked-out true label -> CE would be inf")
-    return F.cross_entropy(x, y, reduction="mean", label_smoothing=label_smoothing)
+    x_full = logits[idx[:, 0], idx[:, 1], :]  # [N,V]
+    x = x_full[:, allowed_t]  # [N,K]
+    y = labels[idx[:, 0], idx[:, 1]].long()  # [N]
+    y_small = inv[y]
+    if bool((y_small < 0).any()):
+        bad = (y_small < 0).nonzero(as_tuple=False).view(-1)
+        j = int(bad[0].item())
+        b = int(idx[j, 0].item())
+        t = int(idx[j, 1].item())
+        yj = int(y[j].item())
+        raise RuntimeError(
+            f"Restricted CE label mapping failed at b={b} t={t}: label_id={yj} "
+            f"not present in allowed ids of size {int(allowed_t.numel())}"
+        )
+    loss = F.cross_entropy(x, y_small, reduction="mean", label_smoothing=float(label_smoothing))
+    preds_small = x.argmax(dim=-1)
+    return loss, preds_small, y_small
 
 
 def compute_weighted_loss(
@@ -140,44 +117,50 @@ def compute_weighted_loss(
         digit_allowed_ids=digit_allowed_ids,
     )
 
-    masked_logits = logits.clone()
-    masked_logits = apply_restricted_mask_inplace(
-        logits=masked_logits,
-        target_class=target_class,
-        z_allowed_ids=z_allowed_ids,
-        digit_allowed_ids=digit_allowed_ids,
-    )
-
     z_mask = (target_class == TARGET_Z) & (labels >= 0)
     answer_mask = (target_class == TARGET_ANSWER) & (labels >= 0)
     digit_mask = (target_class == TARGET_DIGIT) & (labels >= 0)
+    vocab_size = int(logits.shape[-1])
+    z_allowed_t, z_inv = _build_inv_map(vocab_size=vocab_size, allowed_ids=z_allowed_ids, device=logits.device)
+    digit_allowed_t, digit_inv = _build_inv_map(
+        vocab_size=vocab_size, allowed_ids=digit_allowed_ids, device=logits.device
+    )
 
-    l_z = _mean_ce(
-        logits=masked_logits,
+    z_idx = z_mask.nonzero(as_tuple=False)
+    answer_idx = answer_mask.nonzero(as_tuple=False)
+    digit_idx = digit_mask.nonzero(as_tuple=False)
+
+    l_z, z_preds_small, z_y_small = _restricted_ce_for_positions(
+        logits=logits,
         labels=labels,
-        mask=z_mask,
+        idx=z_idx,
+        allowed_t=z_allowed_t,
+        inv=z_inv,
         label_smoothing=float(z_label_smoothing),
     )
-    l_answer = _mean_ce(
-        logits=masked_logits,
+    l_answer, _, _ = _restricted_ce_for_positions(
+        logits=logits,
         labels=labels,
-        mask=answer_mask,
+        idx=answer_idx,
+        allowed_t=z_allowed_t,
+        inv=z_inv,
         label_smoothing=0.0,
     )
-    l_digits = _mean_ce(
-        logits=masked_logits,
+    l_digits, _, _ = _restricted_ce_for_positions(
+        logits=logits,
         labels=labels,
-        mask=digit_mask,
+        idx=digit_idx,
+        allowed_t=digit_allowed_t,
+        inv=digit_inv,
         label_smoothing=0.0,
     )
 
     total = float(w_z) * l_z + float(w_answer) * l_answer + float(w_digits) * l_digits
 
     with torch.no_grad():
-        preds = masked_logits.argmax(dim=-1)
         z_acc = 0.0
-        if z_mask.any():
-            z_acc = float((preds[z_mask] == labels[z_mask]).float().mean().item())
+        if int(z_idx.shape[0]) > 0:
+            z_acc = float((z_preds_small == z_y_small).float().mean().item())
 
         digit_exact_match = 0.0
         if digit_mask.any():
@@ -190,8 +173,16 @@ def compute_weighted_loss(
                 n = int(row_mask.sum().item())
                 if n != 5:
                     continue
+                pos = row_mask.nonzero(as_tuple=False).view(-1)
+                x_full = logits[i, pos, :]  # [5,V]
+                x = x_full[:, digit_allowed_t]  # [5,10]
+                pred_small = x.argmax(dim=-1)
+                y = labels[i, pos].long()
+                y_small = digit_inv[y]
+                if bool((y_small < 0).any()):
+                    raise RuntimeError(f"Digit label mapping failed for row={i}")
                 total_rows += 1
-                if bool(torch.equal(preds[i][row_mask], labels[i][row_mask])):
+                if bool(torch.equal(pred_small, y_small)):
                     correct += 1
             if total_rows > 0:
                 digit_exact_match = float(correct / total_rows)

@@ -424,6 +424,10 @@ def train(cfg: SFTConfig) -> str:
         torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
     )
     model.to(device)
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
@@ -526,6 +530,7 @@ def train(cfg: SFTConfig) -> str:
                             target_class=batch["target_class"],
                             digit_allowed_ids=digit_token_ids,
                         )
+                        del out_cf
                         if clean_digit_logits.shape != cf_digit_logits.shape:
                             raise RuntimeError(
                                 "counterfactual digit logits shape mismatch: "
@@ -549,6 +554,12 @@ def train(cfg: SFTConfig) -> str:
                         cf_loss_scalar = float(cf_out.loss.detach().item())
                         cf_mean_sym_kl = float(cf_out.mean_sym_kl)
                         cf_mean_entropy = float(cf_out.mean_entropy)
+                        del cf_digit_logits
+                        del clean_digit_logits
+                        del cf_digit_valid_mask
+                        del digit_valid_mask
+                        del input_ids_cf
+                        del attention_mask_cf
                         if cf_variant_name == "truncate":
                             v = visible_z_counts[eligible_mask]
                             cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
