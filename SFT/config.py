@@ -19,7 +19,7 @@ class SFTConfig:
     seed: int = 42
     batch_size: int = 8
     eval_batch_size: int = 64
-    learning_rate: float = 5e-5
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
     max_steps: int = 60_000
@@ -28,7 +28,7 @@ class SFTConfig:
 
     # Objective weights
     z_label_smoothing: float = 0.00
-    w_z: float = 0.1
+    w_z: float = 0.01
     w_answer: float = 0.01
     w_digits: float = 1.0
 
