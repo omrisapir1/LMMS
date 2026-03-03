@@ -23,7 +23,7 @@ from .config import SFTConfig
 from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
 from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
-
+import gc
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -668,6 +668,8 @@ def train(cfg: SFTConfig) -> str:
                     output_jsonl_path=eval_jsonl,
                 )
 
+                gc.collect()
+                torch.cuda.empty_cache()
                 _log(
                     "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
                         step,
