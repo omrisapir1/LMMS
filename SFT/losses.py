@@ -19,6 +19,13 @@ class LossOutput:
     digit_exact_match: float
 
 
+@dataclass
+class CounterfactualLossOutput:
+    loss: torch.Tensor
+    mean_sym_kl: float
+    mean_entropy: float
+
+
 def _debug_check_label_membership(
     labels: torch.Tensor,
     target_class: torch.Tensor,
@@ -196,4 +203,94 @@ def compute_weighted_loss(
         l_digits=l_digits,
         z_acc=z_acc,
         digit_exact_match=digit_exact_match,
+    )
+
+
+def extract_digit_logits(
+    *,
+    logits: torch.Tensor,
+    target_class: torch.Tensor,
+    digit_allowed_ids: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz = int(logits.shape[0])
+    digit_id_tensor = torch.as_tensor(list(digit_allowed_ids), dtype=torch.long, device=logits.device)
+    max_digits = int((target_class == TARGET_DIGIT).sum(dim=1).max().item()) if bsz > 0 else 0
+    if max_digits <= 0:
+        shape = (bsz, 0, int(digit_id_tensor.shape[0]))
+        return logits.new_zeros(shape), torch.zeros((bsz, 0), dtype=torch.bool, device=logits.device)
+
+    out = logits.new_zeros((bsz, max_digits, int(digit_id_tensor.shape[0])))
+    valid = torch.zeros((bsz, max_digits), dtype=torch.bool, device=logits.device)
+    for b in range(bsz):
+        pos = (target_class[b] == TARGET_DIGIT).nonzero(as_tuple=False).view(-1)
+        if int(pos.numel()) == 0:
+            continue
+        row = logits[b, pos, :][:, digit_id_tensor]
+        n = int(row.shape[0])
+        out[b, :n, :] = row
+        valid[b, :n] = True
+    return out, valid
+
+
+def compute_counterfactual_regularizer(
+    *,
+    clean_digit_logits: torch.Tensor,
+    cf_digit_logits: torch.Tensor,
+    digit_valid_mask: torch.Tensor,
+    eligible_mask: torch.Tensor,
+    variant_name: str,
+    kl_margin: float,
+    eps: float,
+) -> CounterfactualLossOutput:
+    if clean_digit_logits.shape != cf_digit_logits.shape:
+        raise ValueError(
+            f"shape mismatch: clean={tuple(clean_digit_logits.shape)} cf={tuple(cf_digit_logits.shape)}"
+        )
+    if clean_digit_logits.ndim != 3:
+        raise ValueError(f"expected [B,T,10] logits, got ndim={clean_digit_logits.ndim}")
+
+    bsz = int(clean_digit_logits.shape[0])
+    if bsz == 0:
+        zero = clean_digit_logits.new_zeros(())
+        return CounterfactualLossOutput(loss=zero, mean_sym_kl=0.0, mean_entropy=0.0)
+
+    sample_mask = eligible_mask & digit_valid_mask.any(dim=1)
+    if not bool(sample_mask.any()):
+        zero = clean_digit_logits.new_zeros(())
+        return CounterfactualLossOutput(loss=zero, mean_sym_kl=0.0, mean_entropy=0.0)
+
+    p = F.softmax(clean_digit_logits.detach(), dim=-1).clamp(min=float(eps), max=1.0)
+    q = F.softmax(cf_digit_logits, dim=-1).clamp(min=float(eps), max=1.0)
+    log_p = torch.log(p)
+    log_q = torch.log(q)
+
+    kl_pq = (p * (log_p - log_q)).sum(dim=-1)  # [B,T]
+    kl_qp = (q * (log_q - log_p)).sum(dim=-1)  # [B,T]
+    sym_kl = kl_pq + kl_qp  # [B,T]
+    entropy = -(q * log_q).sum(dim=-1)  # [B,T]
+
+    pos_mask = digit_valid_mask.to(dtype=clean_digit_logits.dtype)
+    denom = pos_mask.sum(dim=1).clamp_min(1.0)
+    sym_kl_per_sample = (sym_kl * pos_mask).sum(dim=1) / denom
+    entropy_per_sample = (entropy * pos_mask).sum(dim=1) / denom
+
+    sample_w = sample_mask.to(dtype=clean_digit_logits.dtype)
+    sample_w_sum = sample_w.sum().clamp_min(1.0)
+
+    variant = str(variant_name).lower().strip()
+    if variant in ("truncate", "reverse"):
+        per_sample_loss = torch.relu(float(kl_margin) - sym_kl_per_sample)
+    elif variant == "random":
+        per_sample_loss = -entropy_per_sample
+    else:
+        raise ValueError(f"unknown counterfactual variant: {variant_name}")
+
+    loss = (per_sample_loss * sample_w).sum() / sample_w_sum
+    mean_sym_kl = float(((sym_kl_per_sample * sample_w).sum() / sample_w_sum).detach().item())
+    mean_entropy = float(((entropy_per_sample * sample_w).sum() / sample_w_sum).detach().item())
+
+    return CounterfactualLossOutput(
+        loss=loss,
+        mean_sym_kl=mean_sym_kl,
+        mean_entropy=mean_entropy,
     )
