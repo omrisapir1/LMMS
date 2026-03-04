@@ -21,9 +21,9 @@ class SFTConfig:
     eval_batch_size: int = 64
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     max_steps: int = 60_000
-    warmup_steps: int = 125
+    warmup_steps: int = 500
     max_length: int = 2048
 
     # Objective weights
@@ -44,7 +44,7 @@ class SFTConfig:
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
     # Evaluation / generation
-    eval_interval_steps: int = 500
+    eval_interval_steps: int = 1000
     pass_at_n: int = 16
     k_max: int = 128
     temperature: float = 1.0
