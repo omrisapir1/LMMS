@@ -419,7 +419,8 @@ def train(cfg: SFTConfig) -> str:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-Math-1.5B-Instruct',#
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.base_model_or_checkpoint,#
         torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
     )
     model.to(device)
