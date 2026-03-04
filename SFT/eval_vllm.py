@@ -123,7 +123,7 @@ def evaluate_with_vllm(
             raise RuntimeError(f"Digit tokenization check failed in eval for '{d}' -> {ids}")
         digit_token_ids.append(int(ids[0]))
 
-    llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.75)
+    llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.5)
     z_token_id_set = set(z_token_ids)
     digit_id_to_val = {tid: i for i, tid in enumerate(digit_token_ids)}
 
