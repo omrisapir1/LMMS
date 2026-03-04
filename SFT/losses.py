@@ -109,6 +109,7 @@ def compute_weighted_loss(
     w_answer: float,
     w_digits: float,
     z_label_smoothing: float,
+    keep_prob: Sequence[float],
 ) -> LossOutput:
     _debug_check_label_membership(
         labels=labels,
@@ -146,14 +147,71 @@ def compute_weighted_loss(
         inv=z_inv,
         label_smoothing=0.0,
     )
-    l_digits, _, _ = _restricted_ce_for_positions(
-        logits=logits,
-        labels=labels,
-        idx=digit_idx,
-        allowed_t=digit_allowed_t,
-        inv=digit_inv,
-        label_smoothing=0.0,
-    )
+    if len(keep_prob) != 5:
+        raise ValueError(f"keep_prob must have length 5, got {len(keep_prob)}")
+    if len(digit_allowed_ids) != 10:
+        raise ValueError("digit_allowed_ids must contain exactly 10 ids (digits 0-9)")
+    zero_token_id = int(digit_allowed_ids[0])
+
+    if int(digit_idx.shape[0]) == 0:
+        l_digits = logits.new_zeros((), dtype=logits.dtype)
+    else:
+        x_full = logits[digit_idx[:, 0], digit_idx[:, 1], :]  # [N,V]
+        x_digits = x_full[:, digit_allowed_t]  # [N,10]
+        y_digits = labels[digit_idx[:, 0], digit_idx[:, 1]].long()  # [N]
+        y_digits_small = digit_inv[y_digits]  # [N]
+        if bool((y_digits_small < 0).any()):
+            bad = (y_digits_small < 0).nonzero(as_tuple=False).view(-1)
+            j = int(bad[0].item())
+            b = int(digit_idx[j, 0].item())
+            t = int(digit_idx[j, 1].item())
+            yj = int(y_digits[j].item())
+            raise RuntimeError(
+                f"Digit CE label mapping failed at b={b} t={t}: label_id={yj} "
+                f"not present in digit allowed ids of size {int(digit_allowed_t.numel())}"
+            )
+
+        ce_per_pos = F.cross_entropy(x_digits, y_digits_small, reduction="none")  # [N]
+        keep_mask = torch.zeros_like(ce_per_pos, dtype=torch.bool)  # [N]
+        keep_prob_t = torch.as_tensor(list(keep_prob), dtype=torch.float32, device=logits.device)
+
+        # Build stochastic keep-mask per sample and per digit position.
+        for b in range(int(labels.shape[0])):
+            row_mask = digit_mask[b]
+            n = int(row_mask.sum().item())
+            if n <= 0:
+                continue
+            row_idx = (digit_idx[:, 0] == b).nonzero(as_tuple=False).view(-1)
+            if int(row_idx.numel()) != n:
+                raise RuntimeError(f"digit indexing mismatch for batch row {b}: expected {n}, got {int(row_idx.numel())}")
+            if n > int(keep_prob_t.numel()):
+                raise RuntimeError(f"digit count exceeds keep_prob length for row {b}: {n} > {int(keep_prob_t.numel())}")
+
+            row_y = y_digits[row_idx]
+            non_zero = row_y != zero_token_id
+            row_rand = torch.rand((n,), dtype=torch.float32, device=logits.device)
+            zero_keep = row_rand < keep_prob_t[:n]
+            row_keep = non_zero | zero_keep
+            keep_mask[row_idx] = row_keep
+
+            # Debug assertions for mask behavior.
+            if bool(non_zero.all()):
+                assert bool(row_keep.all()), "all non-zero digits must always be kept"
+            if bool((keep_prob_t[:n] == 1.0).any()):
+                assert bool(row_keep[(row_y == zero_token_id) & (keep_prob_t[:n] == 1.0)].all()), (
+                    "zero digit with keep_prob=1.0 must always be kept"
+                )
+            if bool((keep_prob_t[:n] == 0.0).any()):
+                assert not bool(row_keep[(row_y == zero_token_id) & (keep_prob_t[:n] == 0.0)].any()), (
+                    "zero digit with keep_prob=0.0 must always be dropped"
+                )
+
+        kept = keep_mask.to(dtype=ce_per_pos.dtype)
+        kept_count = kept.sum()
+        if float(kept_count.item()) <= 0.0:
+            l_digits = logits.new_zeros((), dtype=logits.dtype)
+        else:
+            l_digits = (ce_per_pos * kept).sum() / kept_count
 
     total = float(w_z) * l_z + float(w_answer) * l_answer + float(w_digits) * l_digits
 

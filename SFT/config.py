@@ -31,6 +31,7 @@ class SFTConfig:
     w_z: float = 1
     w_answer: float = 0.1
     w_digits: float = 1.0
+    keep_prob: tuple[float, ...] = (0.05, 0.1, 0.15, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True
