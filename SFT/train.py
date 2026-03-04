@@ -500,6 +500,7 @@ def train(cfg: SFTConfig) -> str:
                     w_answer=cfg.w_answer,
                     w_digits=cfg.w_digits,
                     z_label_smoothing=cfg.z_label_smoothing,
+                    keep_prob=cfg.keep_prob,
                 )
                 total_loss = loss_out.total
 
