@@ -208,6 +208,81 @@ def _extract_true_digits(sample: Dict[str, object], answer_digits_field: str, an
     return parse_final_answer_to_digits(sample.get(answer_field))
 
 
+def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
+    env = os.getenv("PPO_DEBUG_RESTRICTED_LOGITS_CHECK", "").strip().lower()
+    env_on = env in ("1", "true", "yes", "y", "on")
+    return bool(cfg.runtime.debug_restricted_logits_check) or env_on
+
+
+def _debug_restricted_logits_check_once(
+    *,
+    model,
+    tokenizer,
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    z_w: torch.Tensor,
+    d_w: torch.Tensor,
+    z_b: Optional[torch.Tensor],
+    d_b: Optional[torch.Tensor],
+    use_bf16: bool,
+) -> None:
+    device = next(model.parameters()).device
+    prompt = _build_prompt_text(tokenizer, "Compute 1+1.")
+    pack = tokenizer(prompt, add_special_tokens=False, return_attention_mask=True)
+    ids = list(pack.get("input_ids", []))
+    if not ids:
+        fallback_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        ids = [int(fallback_id)]
+    att = list(pack.get("attention_mask") or [1] * len(ids))
+
+    input_ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    attention_mask = torch.tensor(att, dtype=torch.long, device=device).unsqueeze(0)
+    pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
+
+    base_model = model.get_submodule(model.base_model_prefix)
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda" and bool(use_bf16)
+        else nullcontext()
+    )
+    with torch.no_grad():
+        with amp_ctx:
+            full = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            full_logits = full.logits[0, pos, :]
+
+            base = base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            h = base.last_hidden_state[0, pos, :]
+            z_logits_dbg = h @ z_w.t()
+            d_logits_dbg = h @ d_w.t()
+            if z_b is not None:
+                z_logits_dbg = z_logits_dbg + z_b
+            if d_b is not None:
+                d_logits_dbg = d_logits_dbg + d_b
+
+    full_z = full_logits.index_select(0, z_allowed_t)
+    full_d = full_logits.index_select(0, digit_allowed_t)
+    diff_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
+    diff_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
+    tol = 1e-2 if device.type == "cuda" and bool(use_bf16) else 1e-4
+    _log(f"Restricted-logits debug check | diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}")
+    if diff_z >= tol or diff_d >= tol:
+        raise RuntimeError(
+            f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
+            "Possible custom head/LN mismatch."
+        )
+
+
 def _action_stats_tensors(
     *,
     model,
@@ -284,6 +359,12 @@ def _action_stats_tensors_batched(
     trajs: Sequence[Trajectory],
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    z_id_to_local: torch.Tensor,
+    d_id_to_local: torch.Tensor,
+    z_w: torch.Tensor,
+    d_w: torch.Tensor,
+    z_b: Optional[torch.Tensor],
+    d_b: Optional[torch.Tensor],
     temperature: float,
     pad_token_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -310,22 +391,16 @@ def _action_stats_tensors_batched(
         input_ids[i, :L] = torch.tensor(seq, dtype=torch.long, device=device)
         attention_mask[i, :L] = torch.tensor(att, dtype=torch.long, device=device)
 
-    out = model(
+    base_model = model.get_submodule(model.base_model_prefix)
+    out = base_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         use_cache=False,
-        output_hidden_states=True,
+        output_hidden_states=False,
         return_dict=True,
     )
 
-    logits_all = out.logits  # [B,L,V]
-    hidden_all = out.hidden_states[-1]  # [B,L,H]
-    vocab_size = int(logits_all.size(-1))
-
-    z_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
-    d_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
-    z_id_to_local[z_allowed_t] = torch.arange(z_allowed_t.numel(), device=device, dtype=torch.long)
-    d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
+    hidden_all = out.last_hidden_state  # [B,L,H]
 
     logp_new_chunks: List[torch.Tensor] = []
     values_new_chunks: List[torch.Tensor] = []
@@ -359,9 +434,13 @@ def _action_stats_tensors_batched(
             bad_types = [traj.action_types[int(i)] for i in bad_idx.tolist()]
             raise RuntimeError(f"Found actions not in allowed set: ids={bad_ids}, types={bad_types}")
 
-        logits_steps = logits_all[b].index_select(0, state_positions)  # [T,V]
-        z_logits = logits_steps.index_select(-1, z_allowed_t).to(torch.float32) / float(temperature)  # [T,|Z|]
-        d_logits = logits_steps.index_select(-1, digit_allowed_t).to(torch.float32) / float(temperature)  # [T,|D|]
+        h_states = hidden_all[b].index_select(0, state_positions)  # [T,H]
+        z_logits = (h_states @ z_w.t()) / float(temperature)  # [T,|Z|]
+        d_logits = (h_states @ d_w.t()) / float(temperature)  # [T,|D|]
+        if z_b is not None:
+            z_logits = z_logits + z_b
+        if d_b is not None:
+            d_logits = d_logits + d_b
 
         z_logp = torch.log_softmax(z_logits, dim=-1)
         d_logp = torch.log_softmax(d_logits, dim=-1)
@@ -379,7 +458,6 @@ def _action_stats_tensors_batched(
         logp_vec = torch.where(is_digit, d_chosen, z_chosen)  # [T]
         ent_vec = torch.where(is_digit, d_ent, z_ent)  # [T]
 
-        h_states = hidden_all[b].index_select(0, state_positions)
         values = value_head(h_states.float()).squeeze(-1)
 
         logp_new_chunks.append(logp_vec)
@@ -950,6 +1028,32 @@ def train(cfg: Config) -> None:
 
     hidden_size = int(model.config.hidden_size)
     value_head = ValueHead(hidden_size=hidden_size).to(device)
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("Model output embeddings (LM head) are unavailable")
+    weight = lm_head.weight
+    bias = getattr(lm_head, "bias", None)
+    z_w = weight.index_select(0, z_allowed_t)
+    d_w = weight.index_select(0, digit_allowed_t)
+    z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
+    d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
+    vocab_size = int(lm_head.weight.size(0))
+    z_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+    d_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+    z_id_to_local[z_allowed_t] = torch.arange(z_allowed_t.numel(), device=device, dtype=torch.long)
+    d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
+    if _should_run_debug_restricted_logits_check(cfg):
+        _debug_restricted_logits_check_once(
+            model=model,
+            tokenizer=tokenizer,
+            z_allowed_t=z_allowed_t,
+            digit_allowed_t=digit_allowed_t,
+            z_w=z_w,
+            d_w=d_w,
+            z_b=z_b,
+            d_b=d_b,
+            use_bf16=cfg.runtime.use_bf16,
+        )
 
     params = list(model.parameters()) + list(value_head.parameters())
     optimizer = torch.optim.AdamW(
@@ -1161,6 +1265,12 @@ def train(cfg: Config) -> None:
                             trajs=batch_trajs,
                             z_allowed_t=z_allowed_t,
                             digit_allowed_t=digit_allowed_t,
+                            z_id_to_local=z_id_to_local,
+                            d_id_to_local=d_id_to_local,
+                            z_w=z_w,
+                            d_w=d_w,
+                            z_b=z_b,
+                            d_b=d_b,
                             temperature=cfg.rollout.temperature,
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                         )
