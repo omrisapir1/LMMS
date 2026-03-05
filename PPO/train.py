@@ -224,7 +224,6 @@ def _debug_restricted_logits_check_once(
     d_w: torch.Tensor,
     z_b: Optional[torch.Tensor],
     d_b: Optional[torch.Tensor],
-    use_bf16: bool,
 ) -> None:
     device = next(model.parameters()).device
     prompt = _build_prompt_text(tokenizer, "Compute 1+1.")
@@ -240,41 +239,35 @@ def _debug_restricted_logits_check_once(
     pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
 
     base_model = model.get_submodule(model.base_model_prefix)
-    amp_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if device.type == "cuda" and bool(use_bf16)
-        else nullcontext()
-    )
     with torch.no_grad():
-        with amp_ctx:
-            full = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-            full_logits = full.logits[0, pos, :]
+        full = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        full_logits = full.logits[0, pos, :].float()
 
-            base = base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-            h = base.last_hidden_state[0, pos, :]
-            z_logits_dbg = h @ z_w.t()
-            d_logits_dbg = h @ d_w.t()
-            if z_b is not None:
-                z_logits_dbg = z_logits_dbg + z_b
-            if d_b is not None:
-                d_logits_dbg = d_logits_dbg + d_b
+        base = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        h = base.last_hidden_state[0, pos, :].float()
+        z_logits_dbg = h @ z_w.float().t()
+        d_logits_dbg = h @ d_w.float().t()
+        if z_b is not None:
+            z_logits_dbg = z_logits_dbg + z_b.float()
+        if d_b is not None:
+            d_logits_dbg = d_logits_dbg + d_b.float()
 
     full_z = full_logits.index_select(0, z_allowed_t)
     full_d = full_logits.index_select(0, digit_allowed_t)
     diff_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
     diff_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
-    tol = 1e-2 if device.type == "cuda" and bool(use_bf16) else 1e-4
+    tol = 1e-3
     _log(f"Restricted-logits debug check | diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}")
     if diff_z >= tol or diff_d >= tol:
         raise RuntimeError(
@@ -1052,7 +1045,6 @@ def train(cfg: Config) -> None:
             d_w=d_w,
             z_b=z_b,
             d_b=d_b,
-            use_bf16=cfg.runtime.use_bf16,
         )
 
     params = list(model.parameters()) + list(value_head.parameters())
