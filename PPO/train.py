@@ -180,8 +180,8 @@ def _sample_action_from_allowed_logits(
 
     logits = allowed_logits / float(temperature)
     logp = torch.log_softmax(logits, dim=-1)
-    probs = torch.softmax(logits, dim=-1)
-    entropy = float((-(probs * torch.log(probs.clamp_min(1e-12))).sum()).item())
+    probs = logp.exp()
+    entropy = float((-(probs * logp).sum()).item())
     if greedy:
         local_idx = int(torch.argmax(logits, dim=-1).item())
     else:
@@ -260,7 +260,7 @@ def _action_stats_tensors(
 
         allowed_logits = logits_all[pos].index_select(0, allowed_t) / float(temperature)
         log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
-        probs_allowed = torch.softmax(allowed_logits, dim=-1)
+        probs_allowed = log_probs_allowed.exp()
 
         local_matches = torch.nonzero(allowed_t == action_id, as_tuple=False)
         if local_matches.numel() == 0:
@@ -268,7 +268,7 @@ def _action_stats_tensors(
         local_idx = int(local_matches[0].item())
 
         logp_list.append(log_probs_allowed[local_idx])
-        entropy_list.append((-(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum()))
+        entropy_list.append((-(probs_allowed * log_probs_allowed).sum()))
 
     h_states = hidden_all.index_select(0, state_positions)
     values = value_head(h_states.float()).squeeze(-1)
@@ -318,8 +318,14 @@ def _action_stats_tensors_batched(
         return_dict=True,
     )
 
-    logits_all = out.logits.to(torch.float32)  # [B,L,V]
+    logits_all = out.logits  # [B,L,V]
     hidden_all = out.hidden_states[-1]  # [B,L,H]
+    vocab_size = int(logits_all.size(-1))
+
+    z_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+    d_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+    z_id_to_local[z_allowed_t] = torch.arange(z_allowed_t.numel(), device=device, dtype=torch.long)
+    d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
 
     logp_new_chunks: List[torch.Tensor] = []
     values_new_chunks: List[torch.Tensor] = []
@@ -341,32 +347,44 @@ def _action_stats_tensors_batched(
             dtype=torch.long,
         )
 
-        logp_list: List[torch.Tensor] = []
-        ent_list: List[torch.Tensor] = []
-        for i in range(t_steps):
-            pos = int(state_positions[i].item())
-            action_id = int(traj.actions[i])
-            action_type = str(traj.action_types[i])
-            allowed_t = digit_allowed_t if action_type == "digit" else z_allowed_t
+        act_ids = torch.tensor(traj.actions, dtype=torch.long, device=device)  # [T]
+        is_digit = torch.tensor([t == "digit" for t in traj.action_types], dtype=torch.bool, device=device)  # [T]
 
-            allowed_logits = logits_all[b, pos].index_select(0, allowed_t) / float(temperature)
-            log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
-            probs_allowed = torch.softmax(allowed_logits, dim=-1)
+        local_z = z_id_to_local[act_ids]  # [T]
+        local_d = d_id_to_local[act_ids]  # [T]
+        invalid = torch.where(is_digit, local_d < 0, local_z < 0)
+        if bool(invalid.any()):
+            bad_idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)[:8]
+            bad_ids = act_ids.index_select(0, bad_idx).tolist()
+            bad_types = [traj.action_types[int(i)] for i in bad_idx.tolist()]
+            raise RuntimeError(f"Found actions not in allowed set: ids={bad_ids}, types={bad_types}")
 
-            local_matches = torch.nonzero(allowed_t == action_id, as_tuple=False)
-            if local_matches.numel() == 0:
-                raise RuntimeError(f"Action id {action_id} not in allowed set for type={action_type}")
-            local_idx = int(local_matches[0].item())
+        logits_steps = logits_all[b].index_select(0, state_positions)  # [T,V]
+        z_logits = logits_steps.index_select(-1, z_allowed_t).to(torch.float32) / float(temperature)  # [T,|Z|]
+        d_logits = logits_steps.index_select(-1, digit_allowed_t).to(torch.float32) / float(temperature)  # [T,|D|]
 
-            logp_list.append(log_probs_allowed[local_idx])
-            ent_list.append((-(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum()))
+        z_logp = torch.log_softmax(z_logits, dim=-1)
+        d_logp = torch.log_softmax(d_logits, dim=-1)
+
+        z_probs = z_logp.exp()
+        d_probs = d_logp.exp()
+        z_ent = -(z_probs * z_logp).sum(dim=-1)  # [T]
+        d_ent = -(d_probs * d_logp).sum(dim=-1)  # [T]
+
+        local_z_safe = local_z.clamp_min(0)
+        local_d_safe = local_d.clamp_min(0)
+        z_chosen = z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
+        d_chosen = d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
+
+        logp_vec = torch.where(is_digit, d_chosen, z_chosen)  # [T]
+        ent_vec = torch.where(is_digit, d_ent, z_ent)  # [T]
 
         h_states = hidden_all[b].index_select(0, state_positions)
         values = value_head(h_states.float()).squeeze(-1)
 
-        logp_new_chunks.append(torch.stack(logp_list, dim=0))
+        logp_new_chunks.append(logp_vec)
         values_new_chunks.append(values)
-        entropy_chunks.append(torch.stack(ent_list, dim=0))
+        entropy_chunks.append(ent_vec)
         logp_old_chunks.append(torch.tensor(traj.logp_old, dtype=torch.float32, device=device))
         adv_chunks.append(torch.tensor(traj.advantages_norm, dtype=torch.float32, device=device))
         ret_chunks.append(torch.tensor(traj.returns, dtype=torch.float32, device=device))
@@ -904,6 +922,8 @@ def train(cfg: Config) -> None:
         trust_remote_code=bool(cfg.model.trust_remote_code),
     )
     model.to(device)
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
     model.train()
 
     action_scope = validate_action_scope(cfg.rollout.action_scope)
