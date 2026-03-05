@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import os
 import shutil
 import threading
@@ -44,6 +45,12 @@ class VLLMRolloutEngine:
         self._sampling_params_cls = None
         # NEW: serialize vLLM generate/swap/rebuild operations.
         self._vllm_lock = threading.RLock()
+        # NEW: vLLM worker-native weight transfer state.
+        self._wt_inited = False
+        self._wt_obj = None
+        self._wt_obj_label = None
+        self._wt_update_method = None
+        self._wt_debug_logged = False
 
         self._init_engine(model_ref=init_ckpt)
 
@@ -74,6 +81,8 @@ class VLLMRolloutEngine:
             elif "CUDA_VISIBLE_DEVICES" in os.environ:
                 del os.environ["CUDA_VISIBLE_DEVICES"]
         self._model_ref = model_ref
+        self._debug_list_weight_sync_apis()
+        self._maybe_init_weight_transfer()
 
     def _destroy_engine(self) -> None:
         if self._llm is None:
@@ -200,56 +209,198 @@ class VLLMRolloutEngine:
         self._destroy_engine()
         self._init_engine(model_ref=ckpt_dir)
 
-    # NEW: best-effort hot swap using vLLM engine reload/load_weights hooks.
-    def _hot_swap_from_hf_checkpoint(self, ckpt_dir: str) -> bool:
-        with self._vllm_lock:
-            if self._llm is None:
-                return False
-            engine = getattr(self._llm, "llm_engine", None)
-            if engine is None:
-                return False
+    def _iter_weight_sync_objects(self):
+        if self._llm is None:
+            return
+        engine = getattr(self._llm, "llm_engine", None)
+        if engine is None:
+            return
+        seen = set()
 
-            candidates = []
-            candidates.append((engine, "reload_model"))
-            for obj_name in ("model_executor", "executor"):
-                obj = getattr(engine, obj_name, None)
-                if obj is None:
-                    continue
-                candidates.append((obj, "reload_model"))
-            for obj_name in ("model_executor", "executor"):
-                obj = getattr(engine, obj_name, None)
-                if obj is None:
-                    continue
-                candidates.append((obj, "load_weights"))
+        def _add(label: str, obj):
+            if obj is None:
+                return
+            oid = id(obj)
+            if oid in seen:
+                return
+            seen.add(oid)
+            yield (label, obj)
 
-            last_error = None
-            last_attempt = None
-            for obj, meth in candidates:
-                fn = getattr(obj, meth, None)
-                if fn is None:
-                    continue
-                # Signature differs across vLLM versions/builds; try a few simple forms.
+        roots = [("llm_engine", engine)]
+        for attr in ("model_executor", "executor", "core_client"):
+            roots.append((f"llm_engine.{attr}", getattr(engine, attr, None)))
+
+        queue = []
+        for label, obj in roots:
+            for item in _add(label, obj):
+                queue.append(item)
+                yield item
+
+        for label, obj in list(queue):
+            for child_attr in (
+                "model_executor",
+                "executor",
+                "core_client",
+                "engine_core",
+                "model_runner",
+                "worker",
+                "workers",
+            ):
+                child = getattr(obj, child_attr, None)
+                for item in _add(f"{label}.{child_attr}", child):
+                    yield item
+
+    def _debug_list_weight_sync_apis(self) -> None:
+        if self._wt_debug_logged:
+            return
+        self._wt_debug_logged = True
+        matches = ("weight", "transfer", "update", "reload", "sync")
+        for label, obj in self._iter_weight_sync_objects() or []:
+            try:
+                attrs = [
+                    name
+                    for name in dir(obj)
+                    if any(tok in name.lower() for tok in matches)
+                ]
+            except Exception:
+                continue
+            if attrs:
+                attrs_str = ", ".join(sorted(attrs))
+                self._log(f"vLLM weight-sync APIs on {label} ({obj.__class__.__name__}): {attrs_str}")
+
+    def _maybe_init_weight_transfer(self) -> None:
+        self._wt_inited = False
+        self._wt_obj = None
+        self._wt_obj_label = None
+        self._wt_update_method = None
+
+        candidates = list(self._iter_weight_sync_objects() or [])
+        if not candidates:
+            self._log("vLLM weight transfer unavailable: llm_engine not found")
+            return
+
+        for label, obj in candidates:
+            init_fn = getattr(obj, "init_weight_transfer_engine", None)
+            update_name = None
+            if callable(getattr(obj, "update_weights", None)):
+                update_name = "update_weights"
+            elif callable(getattr(obj, "reload_weights", None)):
+                update_name = "reload_weights"
+            if update_name is None:
+                continue
+
+            if callable(init_fn):
+                init_ok = False
+                last_error = None
                 for args, kwargs in (
-                    ((ckpt_dir,), {}),
-                    (tuple(), {"model": ckpt_dir}),
-                    (tuple(), {"model_path": ckpt_dir}),
-                    (tuple(), {"checkpoint": ckpt_dir}),
-                    (tuple(), {"checkpoint_path": ckpt_dir}),
+                    (tuple(), {}),
+                    (tuple(), {"model": self._model_ref}),
+                    (tuple(), {"model_path": self._model_ref}),
+                    (tuple(), {"checkpoint_path": self._model_ref}),
                 ):
                     try:
-                        fn(*args, **kwargs)
-                        self._log(f"vLLM hot swap succeeded via {obj.__class__.__name__}.{meth}")
-                        return True
+                        init_fn(*args, **kwargs)
+                        init_ok = True
+                        self._log(f"vLLM weight transfer initialized via {label}.init_weight_transfer_engine")
+                        break
                     except TypeError as exc:
-                        last_attempt = f"{obj.__class__.__name__}.{meth}"
                         last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
                         continue
                     except Exception as exc:
-                        last_attempt = f"{obj.__class__.__name__}.{meth}"
                         last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
                         continue
-            if last_error is not None:
-                self._log(f"vLLM hot swap failed; last attempt={last_attempt}; error={last_error}")
+                if not init_ok:
+                    self._log(
+                        f"vLLM init_weight_transfer_engine failed on {label}; "
+                        f"last_error={last_error}"
+                    )
+                    continue
+            else:
+                self._log(f"vLLM weight transfer uses {label}.{update_name} without explicit init")
+
+            self._wt_inited = True
+            self._wt_obj = obj
+            self._wt_obj_label = label
+            self._wt_update_method = update_name
+            self._log(f"vLLM weight transfer ready: {label}.{update_name}")
+            return
+
+        self._log("vLLM weight transfer unavailable: no update_weights/reload_weights target found")
+
+    def _build_weight_update_payload(self, model):
+        helper_modules = (
+            "vllm.examples.offline_inference.rlhf_utils",
+            "vllm.examples.rlhf_utils",
+            "examples.offline_inference.rlhf_utils",
+        )
+        helper_function_names = (
+            "build_weight_update_payload",
+            "prepare_weight_update_payload",
+            "prepare_weight_update",
+            "pack_weights_for_update",
+            "get_weight_update_payload",
+        )
+        for mod_name in helper_modules:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+            for fn_name in helper_function_names:
+                fn = getattr(mod, fn_name, None)
+                if not callable(fn):
+                    continue
+                for arg in (model, model.state_dict()):
+                    try:
+                        payload = fn(arg)
+                        self._log(f"vLLM weight payload prepared via {mod_name}.{fn_name}")
+                        return payload
+                    except Exception:
+                        continue
+
+        # Fallback: explicit named tensor payload for update_weights-style APIs.
+        return [(k, v.detach().cpu()) for k, v in model.state_dict().items()]
+
+    # NEW: in-place hot-swap from live torch model using vLLM 0.16 worker-native APIs.
+    def _hot_swap_from_torch_model(self, model) -> bool:
+        with self._vllm_lock:
+            if self._llm is None or not self._wt_inited or self._wt_obj is None:
+                return False
+            update_name = self._wt_update_method
+            if not update_name:
+                return False
+            fn = getattr(self._wt_obj, update_name, None)
+            if not callable(fn):
+                self._log(f"vLLM weight transfer object lost callable method: {self._wt_obj_label}.{update_name}")
+                return False
+
+            payload = self._build_weight_update_payload(model)
+            attempts = (
+                ((payload,), {}),
+                (tuple(), {"weights": payload}),
+                (tuple(), {"named_tensors": payload}),
+                (tuple(), {"state_dict": model.state_dict()}),
+                (tuple(), {"model": model}),
+            )
+
+            last_error = None
+            for args, kwargs in attempts:
+                try:
+                    fn(*args, **kwargs)
+                    self._log(
+                        "vLLM hot swap succeeded via "
+                        f"{self._wt_obj.__class__.__name__}.{update_name}"
+                    )
+                    return True
+                except TypeError as exc:
+                    last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
+                    continue
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
+                    continue
+            self._log(
+                "vLLM hot swap failed via "
+                f"{self._wt_obj_label}.{update_name}; last_error={last_error}"
+            )
         return False
 
     def maybe_sync_from_torch(self, model, tokenizer, update_idx: int) -> bool:
@@ -257,15 +408,14 @@ class VLLMRolloutEngine:
         if not should_sync:
             return False
 
-        # NEW: export synchronously to avoid save_pretrained() on a background thread.
+        # Preferred path: in-place worker-native weight update (no engine rebuild).
+        if self._hot_swap_from_torch_model(model):
+            return True
+
+        # Fallback path: checkpoint export + full rebuild.
         self._log("vLLM checkpoint export started")
         ckpt_dir = self._atomic_export_checkpoint(model, tokenizer, update_idx=int(update_idx))
         self._log("vLLM checkpoint ready")
-
-        # NEW: swap only at rollout boundary; fallback to rebuild on failure.
-        if self._hot_swap_from_hf_checkpoint(ckpt_dir):
-            self._log("vLLM hot swap succeeded")
-            return True
 
         with self._vllm_lock:
             self._rebuild_from_checkpoint(ckpt_dir)
