@@ -888,12 +888,6 @@ def _collect_rollouts_vllm_batch(
             else:
                 z_prefix = seq_raw
 
-        if not logged_example:
-            logger(
-                f"vLLM Z example | finish_reason={finish_reason} | stop_reason={stop_reason} | "
-                f"answer_in_token_ids={answer_in_tokens} | has_answer={has_answer}"
-            )
-            logged_example = True
 
         if has_answer:
             z_prefix_by_idx[i] = z_prefix
@@ -1098,27 +1092,28 @@ def train(cfg: Config) -> None:
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise RuntimeError("Model output embeddings (LM head) are unavailable")
-    weight = lm_head.weight
-    bias = getattr(lm_head, "bias", None)
-    z_w = weight.index_select(0, z_allowed_t)
-    d_w = weight.index_select(0, digit_allowed_t)
-    z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
-    d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
     vocab_size = int(lm_head.weight.size(0))
     z_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
     d_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
     z_id_to_local[z_allowed_t] = torch.arange(z_allowed_t.numel(), device=device, dtype=torch.long)
     d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
     if _should_run_debug_restricted_logits_check(cfg):
+        with torch.no_grad():
+            weight = lm_head.weight
+            bias = getattr(lm_head, "bias", None)
+            z_w_dbg = weight.index_select(0, z_allowed_t).detach()
+            d_w_dbg = weight.index_select(0, digit_allowed_t).detach()
+            z_b_dbg = bias.index_select(0, z_allowed_t).detach() if bias is not None else None
+            d_b_dbg = bias.index_select(0, digit_allowed_t).detach() if bias is not None else None
         _debug_restricted_logits_check_once(
             model=model,
             tokenizer=tokenizer,
             z_allowed_t=z_allowed_t,
             digit_allowed_t=digit_allowed_t,
-            z_w=z_w,
-            d_w=d_w,
-            z_b=z_b,
-            d_b=d_b,
+            z_w=z_w_dbg,
+            d_w=d_w_dbg,
+            z_b=z_b_dbg,
+            d_b=d_b_dbg,
         )
 
     params = list(model.parameters()) + list(value_head.parameters())
