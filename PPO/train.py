@@ -6,7 +6,6 @@ import json
 import os
 import random
 import shutil
-import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -427,11 +426,9 @@ def _action_stats_tensors_batched(
     temperature: float,
     pad_token_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    t0 = time.perf_counter()
     device = next(model.parameters()).device
     if not trajs:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        _log(f"_action_stats_tensors_batched took {(time.perf_counter() - t0) * 1000.0:.1f} ms")
         return empty, empty, empty, empty, empty, empty
 
     seqs: List[List[int]] = []
@@ -539,10 +536,9 @@ def _action_stats_tensors_batched(
 
     if not logp_new_chunks:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        _log(f"_action_stats_tensors_batched took {(time.perf_counter() - t0) * 1000.0:.1f} ms")
         return empty, empty, empty, empty, empty, empty
 
-    out_tensors = (
+    return (
         torch.cat(logp_new_chunks, dim=0),
         torch.cat(values_new_chunks, dim=0),
         torch.cat(entropy_chunks, dim=0),
@@ -550,8 +546,6 @@ def _action_stats_tensors_batched(
         torch.cat(adv_chunks, dim=0),
         torch.cat(ret_chunks, dim=0),
     )
-    _log(f"_action_stats_tensors_batched took {(time.perf_counter() - t0) * 1000.0:.1f} ms")
-    return out_tensors
 
 
 def _validate_actions_in_allowed(
@@ -852,7 +846,6 @@ def _collect_rollouts_vllm_batch(
     reward_rng: torch.Generator,
     logger,
 ) -> List[Trajectory]:
-    t0 = time.perf_counter()
     supports_token_prompts = vllm_engine.supports_prompt_token_ids()
     prompt_texts = [str(x["prompt_text"]) for x in prepared]
     prompt_ids_batch = [list(map(int, x["prompt_ids"])) for x in prepared]
@@ -975,7 +968,6 @@ def _collect_rollouts_vllm_batch(
         )
         trajectories.append(traj)
 
-    logger(f"_collect_rollouts_vllm_batch took {(time.perf_counter() - t0) * 1000.0:.1f} ms")
     return trajectories
 
 
