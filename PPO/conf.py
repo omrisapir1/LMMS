@@ -28,7 +28,7 @@ class RolloutConfig:
     digit_greedy: bool = True
     action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
-    vllm_sync_every: int = 8
+    vllm_sync_every: int = 2
     vllm_batch_size: int = 128
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
