@@ -241,16 +241,41 @@ def _debug_restricted_logits_check_once(
         attention_mask = torch.tensor(att, dtype=torch.long, device=device).unsqueeze(0)
         pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
 
+        base_model = model.get_submodule(model.base_model_prefix)
+
         with torch.no_grad():
             full = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
-                output_hidden_states=True,
                 return_dict=True,
             )
             full_logits = full.logits[0, pos, :].float()
-            h = full.hidden_states[-1][0, pos, :].float()
+
+            # IMPORTANT: use post-final-norm hidden state (matches what lm_head sees)
+            base = base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            h = base.last_hidden_state[0, pos, :].float()
+
+            full_h_pre = None
+            try:
+                full2 = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                full_h_pre = full2.hidden_states[-1][0, pos, :].float()
+                pre_post = float((full_h_pre - h).abs().max().item())
+                _log(f"Hidden pre/post norm max diff: {pre_post:.6f}")
+            except Exception:
+                pass
 
             z_logits_dbg = h @ z_w.float().t()
             d_logits_dbg = h @ d_w.float().t()
@@ -268,7 +293,7 @@ def _debug_restricted_logits_check_once(
         if diff_z >= tol or diff_d >= tol:
             raise RuntimeError(
                 f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
-                "Possible custom head / tied-weights / final-norm mismatch."
+                "Mismatch suggests projection path differs from lm_head(hidden) on base.last_hidden_state."
             )
     finally:
         model.train(was_training)
