@@ -1082,10 +1082,10 @@ def train(cfg: Config) -> None:
             tokenizer=tokenizer,
             z_allowed_t=z_allowed_t,
             digit_allowed_t=digit_allowed_t,
-            z_w=z_w,
-            d_w=d_w,
-            z_b=z_b,
-            d_b=d_b,
+            # z_w=z_w,
+            # d_w=d_w,
+            # z_b=z_b,
+            # d_b=d_b,
         )
 
     params = list(model.parameters()) + list(value_head.parameters())
