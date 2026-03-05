@@ -49,7 +49,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.01
-    ppo_epochs: int = 4
+    ppo_epochs: int = 1
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
