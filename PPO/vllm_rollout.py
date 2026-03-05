@@ -231,11 +231,11 @@ class VLLMRolloutEngine:
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
             token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
-            outs = self._llm.generate(token_prompts, sp)
+            outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
         else:
             if prompts is None:
                 raise RuntimeError("generate_z requires text prompts when prompt_token_ids are unsupported")
-            outs = self._llm.generate(list(prompts), sp)
+            outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
         rows: List[Dict[str, object]] = []
         for o in outs:
             out0 = o.outputs[0]
@@ -269,9 +269,9 @@ class VLLMRolloutEngine:
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
             token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
-            outs = self._llm.generate(token_prompts, sp)
+            outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
         else:
             if prompts is None:
                 raise RuntimeError("generate_digits requires text prompts when prompt_token_ids are unsupported")
-            outs = self._llm.generate(list(prompts), sp)
+            outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
         return [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
