@@ -246,7 +246,7 @@ def _action_stats_tensors(
         dtype=torch.long,
     )
 
-    logits_all = out.logits[0].to(torch.float32)
+    logits_all = out.logits[0]
     hidden_all = out.hidden_states[-1][0]
 
     logp_list: List[torch.Tensor] = []
