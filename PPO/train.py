@@ -213,19 +213,32 @@ def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
     env_on = env in ("1", "true", "yes", "y", "on")
     return bool(cfg.runtime.debug_restricted_logits_check) or env_on
 import torch.nn.functional as F
-
 def _debug_restricted_logits_check_once(
     *,
     model,
     tokenizer,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    z_w: torch.Tensor,
+    d_w: torch.Tensor,
+    z_b: Optional[torch.Tensor],
+    d_b: Optional[torch.Tensor],
     use_bf16: bool = True,
 ) -> None:
+    """
+    Debug invariant we actually care about:
+      restricted_proj(h) == lm_head(h) sliced to the same allowed ids
+
+    NOTE:
+      Some models (incl. Qwen2.5 variants) can produce `model(...).logits`
+      via a path that doesn't exactly equal `lm_head(base.last_hidden_state)`.
+      So we log full-vs-lm_head for awareness, but we DO NOT fail on it.
+    """
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
     try:
+        # Build a tiny prompt
         prompt = _build_prompt_text(tokenizer, "Compute 1+1.")
         pack = tokenizer(prompt, add_special_tokens=False, return_attention_mask=True)
         ids = list(pack.get("input_ids", []))
@@ -243,6 +256,7 @@ def _debug_restricted_logits_check_once(
         if lm_head is None:
             raise RuntimeError("Model output embeddings (LM head) are unavailable")
 
+        # Use same compute dtype as lm_head weights (usually bf16 on GPU)
         compute_dtype = lm_head.weight.dtype
         amp_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -251,16 +265,7 @@ def _debug_restricted_logits_check_once(
         )
 
         with torch.no_grad(), amp_ctx:
-            # 1) full logits from model forward
-            full = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-            full_logits = full.logits[0, pos, :]  # compute dtype
-
-            # 2) hidden state (post-final-norm) from base model
+            # Get post-final-norm hidden states from base model (what lm_head usually consumes)
             base = base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -268,55 +273,78 @@ def _debug_restricted_logits_check_once(
                 output_hidden_states=False,
                 return_dict=True,
             )
-            h = base.last_hidden_state[0, pos, :].to(compute_dtype)
+            h = base.last_hidden_state[0, pos, :].to(compute_dtype)  # [H]
 
-            # 3) logits via lm_head(h) (whatever the model actually uses)
-            lh_logits = lm_head(h)  # [V] compute dtype
+            # lm_head logits at this position (ground truth for our restricted projection)
+            lm_logits = lm_head(h)  # [V]
 
-            # 4) restricted logits via slicing *current* lm_head weights + F.linear
-            W = lm_head.weight  # [V,H]
-            b = getattr(lm_head, "bias", None)  # often None
+            # Our restricted projection logits
+            z_logits_dbg = h @ z_w.to(compute_dtype).t()
+            d_logits_dbg = h @ d_w.to(compute_dtype).t()
+            if z_b is not None:
+                z_logits_dbg = z_logits_dbg + z_b.to(compute_dtype)
+            if d_b is not None:
+                d_logits_dbg = d_logits_dbg + d_b.to(compute_dtype)
 
-            z_w = W.index_select(0, z_allowed_t)
-            d_w = W.index_select(0, digit_allowed_t)
-            z_b = b.index_select(0, z_allowed_t) if b is not None else None
-            d_b = b.index_select(0, digit_allowed_t) if b is not None else None
+            # Slice lm_head to allowed sets
+            lm_z = lm_logits.index_select(0, z_allowed_t)
+            lm_d = lm_logits.index_select(0, digit_allowed_t)
 
-            z_logits_dbg = F.linear(h, z_w, z_b)  # [|Z|]
-            d_logits_dbg = F.linear(h, d_w, d_b)  # [|D|]
+            # Compare in fp32 for stable diff reporting
+            lmhead_vs_dbg_z = float((lm_z.float() - z_logits_dbg.float()).abs().max().item())
+            lmhead_vs_dbg_d = float((lm_d.float() - d_logits_dbg.float()).abs().max().item())
 
-            # slices from full logits + from lm_head(h)
-            full_z = full_logits.index_select(0, z_allowed_t)
-            full_d = full_logits.index_select(0, digit_allowed_t)
-            lh_z = lh_logits.index_select(0, z_allowed_t)
-            lh_d = lh_logits.index_select(0, digit_allowed_t)
+            # Optional: log how model(...).logits compares to lm_head(h) (awareness only)
+            full_vs_lmhead = None
+            full_vs_dbg_z = None
+            full_vs_dbg_d = None
+            try:
+                full = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                full_logits = full.logits[0, pos, :]  # [V] (compute dtype)
+                full_vs_lmhead = float((full_logits.float() - lm_logits.float()).abs().max().item())
+                full_z = full_logits.index_select(0, z_allowed_t)
+                full_d = full_logits.index_select(0, digit_allowed_t)
+                full_vs_dbg_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
+                full_vs_dbg_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
+            except Exception:
+                pass
 
-        # compare in fp32
-        diff_full_vs_lh = float((full_logits.float() - lh_logits.float()).abs().max().item())
-        diff_full_vs_dbg_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
-        diff_lh_vs_dbg_z   = float((lh_z.float()   - z_logits_dbg.float()).abs().max().item())
-        diff_full_vs_dbg_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
-        diff_lh_vs_dbg_d   = float((lh_d.float()   - d_logits_dbg.float()).abs().max().item())
-
-        _log(
-            "Restricted-logits debug check | "
-            f"dtype={str(compute_dtype)} | "
-            f"full_vs_lmhead={diff_full_vs_lh:.6f} | "
-            f"full_vs_dbg_z={diff_full_vs_dbg_z:.6f} | lmhead_vs_dbg_z={diff_lh_vs_dbg_z:.6f} | "
-            f"full_vs_dbg_d={diff_full_vs_dbg_d:.6f} | lmhead_vs_dbg_d={diff_lh_vs_dbg_d:.6f}"
-        )
-
-        # Decide pass/fail based on the *right* equality:
-        # We only really require dbg == lm_head(h) slices.
+        # Tolerances
         tol = 2e-3 if (device.type == "cuda" and compute_dtype == torch.bfloat16) else 1e-4
-        if diff_lh_vs_dbg_z >= tol or diff_lh_vs_dbg_d >= tol:
-            raise RuntimeError(
-                "Restricted projection mismatch vs lm_head(h) too large: "
-                f"lmhead_vs_dbg_z={diff_lh_vs_dbg_z:.6f}, lmhead_vs_dbg_d={diff_lh_vs_dbg_d:.6f}, tol={tol:.6f}"
+
+        # Log everything
+        if full_vs_lmhead is None:
+            _log(
+                "Restricted-logits debug check | "
+                f"dtype={str(compute_dtype)} | "
+                f"lmhead_vs_dbg_z={lmhead_vs_dbg_z:.6f} | lmhead_vs_dbg_d={lmhead_vs_dbg_d:.6f} | "
+                f"tol={tol:.6f}"
             )
+        else:
+            _log(
+                "Restricted-logits debug check | "
+                f"dtype={str(compute_dtype)} | "
+                f"full_vs_lmhead={full_vs_lmhead:.6f} | "
+                f"full_vs_dbg_z={float(full_vs_dbg_z):.6f} | full_vs_dbg_d={float(full_vs_dbg_d):.6f} | "
+                f"lmhead_vs_dbg_z={lmhead_vs_dbg_z:.6f} | lmhead_vs_dbg_d={lmhead_vs_dbg_d:.6f} | "
+                f"tol={tol:.6f}"
+            )
+
+        # The ONLY correctness condition we enforce:
+        if lmhead_vs_dbg_z >= tol or lmhead_vs_dbg_d >= tol:
+            raise RuntimeError(
+                "Restricted projection mismatch vs lm_head(h) too large "
+                f"(lmhead_vs_dbg_z={lmhead_vs_dbg_z:.6f}, lmhead_vs_dbg_d={lmhead_vs_dbg_d:.6f}, tol={tol:.6f}). "
+                "This indicates your restricted projection path is not equivalent to lm_head on the same hidden state."
+            )
+
     finally:
         model.train(was_training)
-
 def _action_stats_tensors(
     *,
     model,
