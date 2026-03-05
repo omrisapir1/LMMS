@@ -72,7 +72,7 @@ class TrainConfig:
 @dataclass
 class RuntimeConfig:
     use_bf16: bool = True
-    debug_restricted_logits_check: bool = True
+    debug_restricted_logits_check: bool = False
 
 
 @dataclass
