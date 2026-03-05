@@ -423,10 +423,6 @@ def _action_stats_tensors_batched(
     digit_allowed_t: torch.Tensor,
     z_id_to_local: torch.Tensor,
     d_id_to_local: torch.Tensor,
-    z_w: torch.Tensor,
-    d_w: torch.Tensor,
-    z_b: Optional[torch.Tensor],
-    d_b: Optional[torch.Tensor],
     temperature: float,
     pad_token_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -463,6 +459,15 @@ def _action_stats_tensors_batched(
     )
 
     hidden_all = out.last_hidden_state  # [B,L,H]
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("Model output embeddings (LM head) are unavailable")
+    weight = lm_head.weight
+    z_w = weight.index_select(0, z_allowed_t)  # [|Z|,H]
+    d_w = weight.index_select(0, digit_allowed_t)  # [|D|,H]
+    bias = getattr(lm_head, "bias", None)
+    z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
+    d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
 
     logp_new_chunks: List[torch.Tensor] = []
     values_new_chunks: List[torch.Tensor] = []
@@ -1328,10 +1333,6 @@ def train(cfg: Config) -> None:
                             digit_allowed_t=digit_allowed_t,
                             z_id_to_local=z_id_to_local,
                             d_id_to_local=d_id_to_local,
-                            z_w=z_w,
-                            d_w=d_w,
-                            z_b=z_b,
-                            d_b=d_b,
                             temperature=cfg.rollout.temperature,
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                         )
