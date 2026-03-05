@@ -10,6 +10,8 @@ def test_default_rollout_contract_values() -> None:
     cfg = Config()
     assert cfg.rollout.action_scope == "ppo_only_z_tokens"
     assert abs(cfg.rollout.top_p - 0.95) < 1e-12
+    assert cfg.rollout.vllm_enabled is True
+    assert cfg.rollout.vllm_sync_every == 4
 
 
 def test_action_scope_validation() -> None:
