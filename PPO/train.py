@@ -277,6 +277,114 @@ def _action_stats_tensors(
     return logp, values, entropy
 
 
+def _action_stats_tensors_batched(
+    *,
+    model,
+    value_head: ValueHead,
+    trajs: Sequence[Trajectory],
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    temperature: float,
+    pad_token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = next(model.parameters()).device
+    if not trajs:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        return empty, empty, empty, empty, empty, empty
+
+    seqs: List[List[int]] = []
+    atts: List[List[int]] = []
+    for t in trajs:
+        seq = list(t.prompt_ids) + list(t.actions)
+        att = list(t.prompt_attention_mask) + [1] * len(t.actions)
+        seqs.append(seq)
+        atts.append(att)
+
+    max_len = max(len(s) for s in seqs)
+    bsz = len(seqs)
+    input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
+
+    for i, (seq, att) in enumerate(zip(seqs, atts)):
+        L = len(seq)
+        input_ids[i, :L] = torch.tensor(seq, dtype=torch.long, device=device)
+        attention_mask[i, :L] = torch.tensor(att, dtype=torch.long, device=device)
+
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    logits_all = out.logits.to(torch.float32)  # [B,L,V]
+    hidden_all = out.hidden_states[-1]  # [B,L,H]
+
+    logp_new_chunks: List[torch.Tensor] = []
+    values_new_chunks: List[torch.Tensor] = []
+    entropy_chunks: List[torch.Tensor] = []
+    logp_old_chunks: List[torch.Tensor] = []
+    adv_chunks: List[torch.Tensor] = []
+    ret_chunks: List[torch.Tensor] = []
+
+    for b, traj in enumerate(trajs):
+        t_steps = len(traj.actions)
+        if t_steps == 0:
+            continue
+
+        p_len = len(traj.prompt_ids)
+        state_positions = torch.arange(
+            p_len - 1,
+            p_len - 1 + t_steps,
+            device=device,
+            dtype=torch.long,
+        )
+
+        logp_list: List[torch.Tensor] = []
+        ent_list: List[torch.Tensor] = []
+        for i in range(t_steps):
+            pos = int(state_positions[i].item())
+            action_id = int(traj.actions[i])
+            action_type = str(traj.action_types[i])
+            allowed_t = digit_allowed_t if action_type == "digit" else z_allowed_t
+
+            allowed_logits = logits_all[b, pos].index_select(0, allowed_t) / float(temperature)
+            log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
+            probs_allowed = torch.softmax(allowed_logits, dim=-1)
+
+            local_matches = torch.nonzero(allowed_t == action_id, as_tuple=False)
+            if local_matches.numel() == 0:
+                raise RuntimeError(f"Action id {action_id} not in allowed set for type={action_type}")
+            local_idx = int(local_matches[0].item())
+
+            logp_list.append(log_probs_allowed[local_idx])
+            ent_list.append((-(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum()))
+
+        h_states = hidden_all[b].index_select(0, state_positions)
+        values = value_head(h_states.float()).squeeze(-1)
+
+        logp_new_chunks.append(torch.stack(logp_list, dim=0))
+        values_new_chunks.append(values)
+        entropy_chunks.append(torch.stack(ent_list, dim=0))
+        logp_old_chunks.append(torch.tensor(traj.logp_old, dtype=torch.float32, device=device))
+        adv_chunks.append(torch.tensor(traj.advantages_norm, dtype=torch.float32, device=device))
+        ret_chunks.append(torch.tensor(traj.returns, dtype=torch.float32, device=device))
+
+    if not logp_new_chunks:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        return empty, empty, empty, empty, empty, empty
+
+    return (
+        torch.cat(logp_new_chunks, dim=0),
+        torch.cat(values_new_chunks, dim=0),
+        torch.cat(entropy_chunks, dim=0),
+        torch.cat(logp_old_chunks, dim=0),
+        torch.cat(adv_chunks, dim=0),
+        torch.cat(ret_chunks, dim=0),
+    )
+
+
 def _validate_actions_in_allowed(
     *,
     actions: Sequence[int],
@@ -1019,13 +1127,7 @@ def train(cfg: Config) -> None:
                 random.shuffle(order)
                 for start in range(0, len(order), cfg.ppo.minibatch_size):
                     batch_idx = order[start : start + cfg.ppo.minibatch_size]
-
-                    logp_new_chunks: List[torch.Tensor] = []
-                    values_new_chunks: List[torch.Tensor] = []
-                    entropy_chunks: List[torch.Tensor] = []
-                    logp_old_chunks: List[torch.Tensor] = []
-                    adv_chunks: List[torch.Tensor] = []
-                    ret_chunks: List[torch.Tensor] = []
+                    batch_trajs = [trajectories[idx] for idx in batch_idx]
 
                     amp_ctx = (
                         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -1033,36 +1135,15 @@ def train(cfg: Config) -> None:
                         else nullcontext()
                     )
                     with amp_ctx:
-                        for idx in batch_idx:
-                            traj = trajectories[idx]
-                            logp_new_t, values_new_t, entropy_t = _recompute_trajectory(
-                                model=model,
-                                value_head=value_head,
-                                traj=traj,
-                                z_allowed_t=z_allowed_t,
-                                digit_allowed_t=digit_allowed_t,
-                                temperature=cfg.rollout.temperature,
-                            )
-
-                            logp_new_chunks.append(logp_new_t)
-                            values_new_chunks.append(values_new_t)
-                            entropy_chunks.append(entropy_t)
-                            logp_old_chunks.append(
-                                torch.tensor(traj.logp_old, dtype=logp_new_t.dtype, device=logp_new_t.device)
-                            )
-                            adv_chunks.append(
-                                torch.tensor(traj.advantages_norm, dtype=logp_new_t.dtype, device=logp_new_t.device)
-                            )
-                            ret_chunks.append(
-                                torch.tensor(traj.returns, dtype=logp_new_t.dtype, device=logp_new_t.device)
-                            )
-
-                        logp_new = torch.cat(logp_new_chunks, dim=0)
-                        values_new = torch.cat(values_new_chunks, dim=0)
-                        entropy_new = torch.cat(entropy_chunks, dim=0)
-                        logp_old = torch.cat(logp_old_chunks, dim=0)
-                        advantages = torch.cat(adv_chunks, dim=0)
-                        returns = torch.cat(ret_chunks, dim=0)
+                        logp_new, values_new, entropy_new, logp_old, advantages, returns = _action_stats_tensors_batched(
+                            model=model,
+                            value_head=value_head,
+                            trajs=batch_trajs,
+                            z_allowed_t=z_allowed_t,
+                            digit_allowed_t=digit_allowed_t,
+                            temperature=cfg.rollout.temperature,
+                            pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
+                        )
 
                         policy_loss, clipfrac = clipped_policy_loss(
                             logp_new=logp_new,
