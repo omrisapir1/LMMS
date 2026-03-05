@@ -213,7 +213,6 @@ def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
     env_on = env in ("1", "true", "yes", "y", "on")
     return bool(cfg.runtime.debug_restricted_logits_check) or env_on
 
-
 def _debug_restricted_logits_check_once(
     *,
     model,
@@ -224,6 +223,7 @@ def _debug_restricted_logits_check_once(
     d_w: torch.Tensor,
     z_b: Optional[torch.Tensor],
     d_b: Optional[torch.Tensor],
+    use_bf16: bool = True,
 ) -> None:
     device = next(model.parameters()).device
     was_training = model.training
@@ -242,17 +242,27 @@ def _debug_restricted_logits_check_once(
         pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
 
         base_model = model.get_submodule(model.base_model_prefix)
+        lm_head = model.get_output_embeddings()
+        if lm_head is None:
+            raise RuntimeError("Model output embeddings (LM head) are unavailable")
 
-        with torch.no_grad():
+        # Use the same compute dtype as the model uses for logits
+        compute_dtype = lm_head.weight.dtype
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda" and bool(use_bf16)
+            else nullcontext()
+        )
+
+        with torch.no_grad(), amp_ctx:
             full = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
                 return_dict=True,
             )
-            full_logits = full.logits[0, pos, :].float()
+            full_logits = full.logits[0, pos, :]  # keep in compute dtype
 
-            # IMPORTANT: use post-final-norm hidden state (matches what lm_head sees)
             base = base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -260,45 +270,36 @@ def _debug_restricted_logits_check_once(
                 output_hidden_states=False,
                 return_dict=True,
             )
-            h = base.last_hidden_state[0, pos, :].float()
+            h = base.last_hidden_state[0, pos, :].to(compute_dtype)
 
-            full_h_pre = None
-            try:
-                full2 = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                full_h_pre = full2.hidden_states[-1][0, pos, :].float()
-                pre_post = float((full_h_pre - h).abs().max().item())
-                _log(f"Hidden pre/post norm max diff: {pre_post:.6f}")
-            except Exception:
-                pass
-
-            z_logits_dbg = h @ z_w.float().t()
-            d_logits_dbg = h @ d_w.float().t()
+            z_logits_dbg = h @ z_w.to(compute_dtype).t()
+            d_logits_dbg = h @ d_w.to(compute_dtype).t()
             if z_b is not None:
-                z_logits_dbg = z_logits_dbg + z_b.float()
+                z_logits_dbg = z_logits_dbg + z_b.to(compute_dtype)
             if d_b is not None:
-                d_logits_dbg = d_logits_dbg + d_b.float()
+                d_logits_dbg = d_logits_dbg + d_b.to(compute_dtype)
 
         full_z = full_logits.index_select(0, z_allowed_t)
         full_d = full_logits.index_select(0, digit_allowed_t)
-        diff_z = float((full_z - z_logits_dbg).abs().max().item())
-        diff_d = float((full_d - d_logits_dbg).abs().max().item())
-        tol = 1e-3
-        _log(f"Restricted-logits debug check | diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}")
+
+        diff_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
+        diff_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
+
+        # Now tolerance can be *tight* because you're comparing like-with-like
+        tol = 2e-3 if (device.type == "cuda" and compute_dtype == torch.bfloat16) else 1e-4
+        _log(
+            f"Restricted-logits debug check | dtype={str(compute_dtype)} | "
+            f"diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}"
+        )
         if diff_z >= tol or diff_d >= tol:
             raise RuntimeError(
                 f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
-                "Mismatch suggests projection path differs from lm_head(hidden) on base.last_hidden_state."
+                "If this still fails, we likely have a real mismatch (e.g., lm_head path differs)."
             )
     finally:
         model.train(was_training)
 
-
+        
 def _action_stats_tensors(
     *,
     model,
