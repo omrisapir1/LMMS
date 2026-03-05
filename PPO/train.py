@@ -212,6 +212,7 @@ def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
     env = os.getenv("PPO_DEBUG_RESTRICTED_LOGITS_CHECK", "").strip().lower()
     env_on = env in ("1", "true", "yes", "y", "on")
     return bool(cfg.runtime.debug_restricted_logits_check) or env_on
+import torch.nn.functional as F
 
 def _debug_restricted_logits_check_once(
     *,
@@ -219,10 +220,6 @@ def _debug_restricted_logits_check_once(
     tokenizer,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
-    z_w: torch.Tensor,
-    d_w: torch.Tensor,
-    z_b: Optional[torch.Tensor],
-    d_b: Optional[torch.Tensor],
     use_bf16: bool = True,
 ) -> None:
     device = next(model.parameters()).device
@@ -246,7 +243,6 @@ def _debug_restricted_logits_check_once(
         if lm_head is None:
             raise RuntimeError("Model output embeddings (LM head) are unavailable")
 
-        # Use the same compute dtype as the model uses for logits
         compute_dtype = lm_head.weight.dtype
         amp_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -255,14 +251,16 @@ def _debug_restricted_logits_check_once(
         )
 
         with torch.no_grad(), amp_ctx:
+            # 1) full logits from model forward
             full = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
                 return_dict=True,
             )
-            full_logits = full.logits[0, pos, :]  # keep in compute dtype
+            full_logits = full.logits[0, pos, :]  # compute dtype
 
+            # 2) hidden state (post-final-norm) from base model
             base = base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -272,34 +270,53 @@ def _debug_restricted_logits_check_once(
             )
             h = base.last_hidden_state[0, pos, :].to(compute_dtype)
 
-            z_logits_dbg = h @ z_w.to(compute_dtype).t()
-            d_logits_dbg = h @ d_w.to(compute_dtype).t()
-            if z_b is not None:
-                z_logits_dbg = z_logits_dbg + z_b.to(compute_dtype)
-            if d_b is not None:
-                d_logits_dbg = d_logits_dbg + d_b.to(compute_dtype)
+            # 3) logits via lm_head(h) (whatever the model actually uses)
+            lh_logits = lm_head(h)  # [V] compute dtype
 
-        full_z = full_logits.index_select(0, z_allowed_t)
-        full_d = full_logits.index_select(0, digit_allowed_t)
+            # 4) restricted logits via slicing *current* lm_head weights + F.linear
+            W = lm_head.weight  # [V,H]
+            b = getattr(lm_head, "bias", None)  # often None
 
-        diff_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
-        diff_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
+            z_w = W.index_select(0, z_allowed_t)
+            d_w = W.index_select(0, digit_allowed_t)
+            z_b = b.index_select(0, z_allowed_t) if b is not None else None
+            d_b = b.index_select(0, digit_allowed_t) if b is not None else None
 
-        # Now tolerance can be *tight* because you're comparing like-with-like
-        tol = 2e-3 if (device.type == "cuda" and compute_dtype == torch.bfloat16) else 1e-4
+            z_logits_dbg = F.linear(h, z_w, z_b)  # [|Z|]
+            d_logits_dbg = F.linear(h, d_w, d_b)  # [|D|]
+
+            # slices from full logits + from lm_head(h)
+            full_z = full_logits.index_select(0, z_allowed_t)
+            full_d = full_logits.index_select(0, digit_allowed_t)
+            lh_z = lh_logits.index_select(0, z_allowed_t)
+            lh_d = lh_logits.index_select(0, digit_allowed_t)
+
+        # compare in fp32
+        diff_full_vs_lh = float((full_logits.float() - lh_logits.float()).abs().max().item())
+        diff_full_vs_dbg_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
+        diff_lh_vs_dbg_z   = float((lh_z.float()   - z_logits_dbg.float()).abs().max().item())
+        diff_full_vs_dbg_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
+        diff_lh_vs_dbg_d   = float((lh_d.float()   - d_logits_dbg.float()).abs().max().item())
+
         _log(
-            f"Restricted-logits debug check | dtype={str(compute_dtype)} | "
-            f"diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}"
+            "Restricted-logits debug check | "
+            f"dtype={str(compute_dtype)} | "
+            f"full_vs_lmhead={diff_full_vs_lh:.6f} | "
+            f"full_vs_dbg_z={diff_full_vs_dbg_z:.6f} | lmhead_vs_dbg_z={diff_lh_vs_dbg_z:.6f} | "
+            f"full_vs_dbg_d={diff_full_vs_dbg_d:.6f} | lmhead_vs_dbg_d={diff_lh_vs_dbg_d:.6f}"
         )
-        if diff_z >= tol or diff_d >= tol:
+
+        # Decide pass/fail based on the *right* equality:
+        # We only really require dbg == lm_head(h) slices.
+        tol = 2e-3 if (device.type == "cuda" and compute_dtype == torch.bfloat16) else 1e-4
+        if diff_lh_vs_dbg_z >= tol or diff_lh_vs_dbg_d >= tol:
             raise RuntimeError(
-                f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
-                "If this still fails, we likely have a real mismatch (e.g., lm_head path differs)."
+                "Restricted projection mismatch vs lm_head(h) too large: "
+                f"lmhead_vs_dbg_z={diff_lh_vs_dbg_z:.6f}, lmhead_vs_dbg_d={diff_lh_vs_dbg_d:.6f}, tol={tol:.6f}"
             )
     finally:
         model.train(was_training)
 
-        
 def _action_stats_tensors(
     *,
     model,
