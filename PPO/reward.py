@@ -11,14 +11,30 @@ def parse_final_answer_to_digits(raw: object) -> Optional[List[int]]:
     text = str(raw).strip()
     if not text:
         return None
-    try:
-        value = int(text)
-    except (TypeError, ValueError):
+    if text.startswith("+"):
+        text = text[1:]
+    if (not text) or (not text.isdigit()) or len(text) > 5:
         return None
+    return [int(ch) for ch in text.zfill(5)]
 
-    if value < 0 or value > 99999:
+
+def parse_answer_digits(raw: object) -> Optional[List[int]]:
+    if raw is None:
         return None
-    return [int(ch) for ch in f"{value:05d}"]
+    if not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) != 5:
+        return None
+    out: List[int] = []
+    for x in raw:
+        try:
+            v = int(x)
+        except (TypeError, ValueError):
+            return None
+        if v < 0 or v > 9:
+            return None
+        out.append(v)
+    return out
 
 
 def sample_keep_mask(
@@ -44,23 +60,23 @@ def sample_keep_mask(
 
 def compute_reward(
     *,
-    pred_digits: Sequence[int],
+    pred_digits: Optional[Sequence[int]],
     true_digits: Sequence[int],
-    terminated_by_answer: bool,
+    terminated_reason: str,
     partial_scale: float,
     keep_prob: Sequence[float],
     length_penalty: float,
+    reward_if_max_len: float,
     num_generated_tokens: int,
     generator: Optional[torch.Generator],
 ) -> Dict[str, object]:
-    if len(pred_digits) != 5 or len(true_digits) != 5:
-        raise ValueError("pred_digits and true_digits must have length 5")
+    if len(true_digits) != 5:
+        raise ValueError("true_digits must have length 5")
 
-    exact_match = all(int(a) == int(b) for a, b in zip(pred_digits, true_digits))
-
-    if not terminated_by_answer:
+    is_complete_answer = terminated_reason == "answer_with_5_digits"
+    if not is_complete_answer:
         return {
-            "reward_full": 1 if exact_match else 0,
+            "reward_full": 0,
             "partial_scale": float(partial_scale),
             "keep_prob": [float(x) for x in keep_prob],
             "applied_mask": [0, 0, 0, 0, 0],
@@ -68,10 +84,15 @@ def compute_reward(
             "correct_count": 0,
             "reward_partial": 0.0,
             "length_penalty": float(length_penalty),
-            "reward": 0.0,
-            "reward_final": 0.0,
-            "exact_match": exact_match,
+            "reward_if_max_len": float(reward_if_max_len),
+            "reward": float(reward_if_max_len),
+            "reward_final": float(reward_if_max_len),
+            "exact_match": False,
         }
+    if pred_digits is None or len(pred_digits) != 5:
+        raise ValueError("pred_digits must have length 5 when terminated_reason=answer_with_5_digits")
+
+    exact_match = all(int(a) == int(b) for a, b in zip(pred_digits, true_digits))
 
     if exact_match:
         reward = 1.0
@@ -101,6 +122,7 @@ def compute_reward(
         "correct_count": int(correct_count),
         "reward_partial": float(partial),
         "length_penalty": float(length_penalty),
+        "reward_if_max_len": float(reward_if_max_len),
         "reward": float(reward),
         "reward_final": float(reward_final),
         "exact_match": exact_match,

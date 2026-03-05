@@ -15,15 +15,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from PPO.conf import Config, DEFAULT_SET_ALLOWED_PREFIXES
-from PPO.masking import build_allowed_token_ids
+from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
 from PPO.ppo_math import clipped_policy_loss, explained_variance, value_mse_loss
-from PPO.reward import compute_reward, parse_final_answer_to_digits
+from PPO.reward import compute_reward, parse_answer_digits, parse_final_answer_to_digits
+from PPO.rollout_contract import is_ppo_action, validate_action_scope
 from PPO.rollout_logger import RolloutLogger
-from z_pipeline.phase23.model import UnifiedZSoftModel
-from z_pipeline.phase23.utils import build_prompt, set_seed
+from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single
+from phase1.dataset import SYSTEM_PROMPT
 
 
 class ValueHead(nn.Module):
@@ -34,7 +35,6 @@ class ValueHead(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_size, 1),
         )
-        # Explicitly zero-init final layer for stable early PPO updates.
         nn.init.zeros_(self.net[2].weight)
         nn.init.zeros_(self.net[2].bias)
 
@@ -51,30 +51,40 @@ class Trajectory:
         prompt_ids: List[int],
         prompt_attention_mask: List[int],
         actions: List[int],
+        action_types: List[str],
         logp_old: List[float],
         values_old: List[float],
         entropy_old: List[float],
         terminated_by: str,
-        digit_logits: List[List[float]],
-        digit_probs: List[List[float]],
-        digit_pred: List[int],
+        generated_z_ids: List[int],
+        generated_digit_ids: List[int],
+        digit_logits: Optional[List[List[float]]],
+        digit_probs: Optional[List[List[float]]],
+        digit_pred: Optional[List[int]],
         digit_true: List[int],
         reward_info: Dict[str, object],
+        num_generated_total: int,
+        num_digits_generated: int,
     ) -> None:
         self.sample_id = sample_id
         self.question = question
         self.prompt_ids = prompt_ids
         self.prompt_attention_mask = prompt_attention_mask
         self.actions = actions
+        self.action_types = action_types
         self.logp_old = logp_old
         self.values_old = values_old
         self.entropy_old = entropy_old
         self.terminated_by = terminated_by
+        self.generated_z_ids = generated_z_ids
+        self.generated_digit_ids = generated_digit_ids
         self.digit_logits = digit_logits
         self.digit_probs = digit_probs
         self.digit_pred = digit_pred
         self.digit_true = digit_true
         self.reward_info = reward_info
+        self.num_generated_total = int(num_generated_total)
+        self.num_digits_generated = int(num_digits_generated)
 
         self.returns = [float(self.reward_info["reward_final"])] * len(actions)
         self.advantages = [float(self.reward_info["reward_final"]) - float(v) for v in values_old]
@@ -86,55 +96,11 @@ def _log(msg: str) -> None:
     print(f"{ts} | {msg}")
 
 
-def _resolve_checkpoint_path(init_ckpt: str) -> str:
-    if os.path.isdir(init_ckpt):
-        return init_ckpt
-
-    try:
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(repo_id=init_ckpt)
-    except Exception:
-        # Fall back to direct path/repo usage in from_phase1.
-        return init_ckpt
-
-
-def _load_phase23_bundle(cfg: Config, device: torch.device):
-    ckpt_ref = _resolve_checkpoint_path(cfg.model.init_ckpt)
-    state_path = os.path.join(ckpt_ref, "phase23_state.pt")
-    config_path = os.path.join(ckpt_ref, "config.json")
-
-    if os.path.isdir(ckpt_ref) and os.path.exists(state_path) and os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            phase23_cfg = json.load(f)
-        model_cfg = phase23_cfg.get("model", {})
-        bundle = UnifiedZSoftModel.from_phase1(
-            phase1_dir=model_cfg["phase1_dir"],
-            v_z=int(model_cfg.get("v_z", cfg.model.v_z_fallback)),
-            device=device,
-            torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-            z_prefix=str(model_cfg.get("z_prefix", cfg.model.z_prefix)),
-            latent_token=str(model_cfg.get("latent_token", "<|latent|>")),
-            answer_token=str(model_cfg.get("answer_token", cfg.model.answer_token)),
-        )
-        state = torch.load(state_path, map_location="cpu")
-        bundle.model.load_state_dict(state, strict=True)
-
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(ckpt_ref, trust_remote_code=True)
-            bundle.tokenizer = tokenizer
-        except Exception:
-            pass
-        return bundle
-
-    return UnifiedZSoftModel.from_phase1(
-        phase1_dir=cfg.model.init_ckpt,
-        v_z=cfg.model.v_z_fallback,
-        device=device,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        z_prefix=cfg.model.z_prefix,
-        answer_token=cfg.model.answer_token,
-    )
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -163,38 +129,63 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _make_rng(seed: int, device: torch.device) -> torch.Generator:
-    del device
-    # Reward-mask RNG is used by CPU-side torch.rand in reward.py.
-    # Keep it CPU-backed to avoid generator/device mismatches.
+def _make_rng(seed: int) -> torch.Generator:
     g = torch.Generator(device="cpu")
     g.manual_seed(int(seed))
     return g
 
 
-def _compute_digit_outputs(phase23: UnifiedZSoftModel, seq_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    attention_mask = torch.ones_like(seq_ids)
-    core = phase23._core_model()
-    out = core(
-        input_ids=seq_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        output_hidden_states=False,
-        return_dict=True,
+def _build_prompt_text(tokenizer, question: str) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
-    hidden_last = out.last_hidden_state[0]
 
-    answer_mask = seq_ids[0] == phase23.answer_token_id
-    if bool(answer_mask.any()):
-        pos = int(torch.argmax(answer_mask.to(torch.int64)).item())
+
+def _nucleus_sample_from_probs(probs: torch.Tensor, top_p: float) -> int:
+    if top_p >= 1.0:
+        return int(torch.multinomial(probs, num_samples=1).item())
+
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    cum_probs = torch.cumsum(sorted_probs, dim=-1)
+    keep = cum_probs <= top_p
+    keep[0] = True
+    kept_probs = sorted_probs * keep.to(dtype=sorted_probs.dtype)
+    kept_sum = kept_probs.sum()
+    if float(kept_sum.item()) <= 0.0:
+        kept_probs = sorted_probs
+        kept_sum = kept_probs.sum()
+    kept_probs = kept_probs / kept_sum
+    sampled_in_sorted = int(torch.multinomial(kept_probs, num_samples=1).item())
+    return int(sorted_idx[sampled_in_sorted].item())
+
+
+def _sample_action_from_allowed_logits(
+    allowed_logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+    greedy: bool,
+) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
+    if temperature <= 0:
+        raise ValueError("rollout.temperature must be > 0")
+    if top_p <= 0 or top_p > 1:
+        raise ValueError("rollout.top_p must be in (0, 1]")
+
+    logits = allowed_logits / float(temperature)
+    logp = torch.log_softmax(logits, dim=-1)
+    probs = torch.softmax(logits, dim=-1)
+    entropy = float((-(probs * torch.log(probs.clamp_min(1e-12))).sum()).item())
+    if greedy:
+        local_idx = int(torch.argmax(logits, dim=-1).item())
     else:
-        pos = int(seq_ids.size(1) - 1)
-
-    h = hidden_last[pos]
-    digit_logits = torch.stack([head(h) for head in phase23.digit_heads], dim=0)
-    digit_probs = torch.softmax(digit_logits, dim=-1)
-    digit_pred = torch.argmax(digit_logits, dim=-1)
-    return digit_logits, digit_probs, digit_pred
+        local_idx = _nucleus_sample_from_probs(probs, top_p=top_p)
+    return local_idx, logp, probs, entropy
 
 
 def _forward_last_with_cache(core, input_ids, attention_mask, past_key_values):
@@ -203,76 +194,39 @@ def _forward_last_with_cache(core, input_ids, attention_mask, past_key_values):
         attention_mask=attention_mask,
         use_cache=True,
         past_key_values=past_key_values,
-        output_hidden_states=False,
+        output_hidden_states=True,
         return_dict=True,
     )
 
 
-def _allowed_logits_from_hidden(
-    phase23: UnifiedZSoftModel,
-    hidden: torch.Tensor,
-    allowed_idx: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Compute logits only for allowed token ids.
-    hidden: [N,H]
-    returns: [N,A]
-    """
-    if hidden.dim() != 2:
-        raise ValueError("hidden must be [N,H]")
-    head = phase23._get_lm_head()
-    weight = head.weight.index_select(0, allowed_idx)
-    h = hidden.to(dtype=weight.dtype)
-    logits = h @ weight.t()
-    bias = getattr(head, "bias", None)
-    if bias is not None:
-        logits = logits + bias.index_select(0, allowed_idx).to(device=logits.device, dtype=logits.dtype)
-    return logits
-
-
-def _compute_digit_outputs_with_attention(
-    phase23: UnifiedZSoftModel,
-    seq_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    core = phase23._core_model()
-    out = core(
-        input_ids=seq_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        output_hidden_states=False,
-        return_dict=True,
-    )
-    hidden_last = out.last_hidden_state[0]
-
-    answer_mask = (seq_ids[0] == phase23.answer_token_id) & (attention_mask[0] == 1)
-    if bool(answer_mask.any()):
-        pos = int(torch.argmax(answer_mask.to(torch.int64)).item())
-    else:
-        pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
-
-    h = hidden_last[pos]
-    digit_logits = torch.stack([head(h) for head in phase23.digit_heads], dim=0)
-    digit_probs = torch.softmax(digit_logits, dim=-1)
-    digit_pred = torch.argmax(digit_logits, dim=-1)
-    return digit_logits, digit_probs, digit_pred
+def _extract_true_digits(sample: Dict[str, object], answer_digits_field: str, answer_field: str) -> Optional[List[int]]:
+    if answer_digits_field in sample:
+        parsed = parse_answer_digits(sample.get(answer_digits_field))
+        if parsed is not None:
+            return parsed
+    return parse_final_answer_to_digits(sample.get(answer_field))
 
 
 def _rollout_one(
     *,
-    phase23: UnifiedZSoftModel,
+    model,
     value_head: ValueHead,
     tokenizer,
     question: str,
     true_digits: Sequence[int],
-    allowed_token_ids: Sequence[int],
+    z_token_ids: Sequence[int],
+    digit_token_ids: Sequence[int],
+    answer_token_id: int,
     max_new_tokens: int,
     temperature: float,
+    top_p: float,
+    action_scope: str,
+    digit_greedy: bool,
     reward_cfg,
     reward_rng: torch.Generator,
     sample_id: str,
 ) -> Trajectory:
-    prompt = build_prompt(tokenizer, question)
+    prompt = _build_prompt_text(tokenizer, question)
     prompt_pack = tokenizer(prompt, add_special_tokens=False, return_attention_mask=True)
     prompt_ids = prompt_pack["input_ids"]
     prompt_attn = prompt_pack.get("attention_mask")
@@ -281,46 +235,85 @@ def _rollout_one(
     if not prompt_ids:
         raise RuntimeError("Prompt tokenization produced an empty sequence")
 
-    device = next(phase23.parameters()).device
+    device = next(model.parameters()).device
     seq = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     seq_attn = torch.tensor(prompt_attn, dtype=torch.long, device=device).unsqueeze(0)
-    allowed_idx_t = torch.tensor(list(allowed_token_ids), dtype=torch.long, device=device)
 
+    z_allowed_t = torch.tensor(list(z_token_ids) + [int(answer_token_id)], dtype=torch.long, device=device)
+    digit_allowed_t = torch.tensor(list(digit_token_ids), dtype=torch.long, device=device)
+
+    actions: List[int] = []
+    action_types: List[str] = []
     logp_old: List[float] = []
     values_old: List[float] = []
     entropy_old: List[float] = []
-    actions: List[int] = []
+
+    generated_z_ids: List[int] = []
+    generated_digit_ids: List[int] = []
+    digit_logits_rows: List[List[float]] = []
+    digit_probs_rows: List[List[float]] = []
+
+    phase = "z"
     terminated_by = "max_new_tokens"
 
-    core = phase23._core_model()
-
     with torch.no_grad():
-        out0 = core(
+        out0 = model(
             input_ids=seq,
             attention_mask=seq_attn,
             use_cache=True,
-            output_hidden_states=False,
+            output_hidden_states=True,
             return_dict=True,
         )
         past = out0.past_key_values
-        valid_pos = (seq_attn.sum(dim=1) - 1).clamp(min=0)
-        bidx = torch.arange(seq.size(0), device=device)
-        h_last = out0.last_hidden_state[bidx, valid_pos, :]
+        last_logits = out0.logits[:, -1, :].squeeze(0)
+        h_last = out0.hidden_states[-1][:, -1, :].squeeze(0)
 
         for _step in range(max_new_tokens):
-            allowed_logits = _allowed_logits_from_hidden(phase23, h_last, allowed_idx_t).squeeze(0)
-            allowed_logits = allowed_logits / float(temperature)
-            logp_allowed = torch.log_softmax(allowed_logits, dim=-1)
-            allowed_probs = torch.softmax(allowed_logits, dim=-1)
-            entropy = -(allowed_probs * torch.log(allowed_probs.clamp_min(1e-12))).sum()
-            sampled_local = int(torch.multinomial(allowed_probs, num_samples=1).item())
-            action = int(allowed_idx_t[sampled_local].item())
+            if phase == "z":
+                allowed_t = z_allowed_t
+                local_idx, logp_allowed, _probs_allowed, entropy = _sample_action_from_allowed_logits(
+                    last_logits.index_select(0, allowed_t),
+                    temperature=temperature,
+                    top_p=top_p,
+                    greedy=False,
+                )
+                action = int(allowed_t[local_idx].item())
 
-            v = value_head(h_last.float()).squeeze(-1)
-            logp_old.append(float(logp_allowed[sampled_local].item()))
-            values_old.append(float(v.item()))
-            entropy_old.append(float(entropy.item()))
-            actions.append(int(action))
+                v = value_head(h_last.float().unsqueeze(0)).squeeze(-1)
+                actions.append(action)
+                action_types.append("answer" if action == int(answer_token_id) else "z")
+                logp_old.append(float(logp_allowed[local_idx].item()))
+                values_old.append(float(v.item()))
+                entropy_old.append(float(entropy))
+
+                if action == int(answer_token_id):
+                    phase = "digits"
+                else:
+                    generated_z_ids.append(action)
+            else:
+                allowed_t = digit_allowed_t
+                local_idx, _logp_allowed, probs_allowed, _entropy = _sample_action_from_allowed_logits(
+                    last_logits.index_select(0, allowed_t),
+                    temperature=temperature,
+                    top_p=top_p,
+                    greedy=bool(digit_greedy),
+                )
+                action = int(allowed_t[local_idx].item())
+                generated_digit_ids.append(action)
+                digit_logits_rows.append(last_logits.index_select(0, allowed_t).float().cpu().tolist())
+                digit_probs_rows.append(probs_allowed.float().cpu().tolist())
+
+                if is_ppo_action(action_scope, "digits"):
+                    v = value_head(h_last.float().unsqueeze(0)).squeeze(-1)
+                    actions.append(action)
+                    action_types.append("digit")
+                    logp_old.append(float(torch.log(probs_allowed[local_idx].clamp_min(1e-12)).item()))
+                    values_old.append(float(v.item()))
+                    entropy_old.append(float((-(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum()).item()))
+
+                if len(generated_digit_ids) == 5:
+                    terminated_by = "answer_with_5_digits"
+                    break
 
             action_t = torch.tensor([[int(action)]], dtype=torch.long, device=device)
             seq = torch.cat([seq, action_t], dim=1)
@@ -328,33 +321,35 @@ def _rollout_one(
                 [seq_attn, torch.ones((1, 1), dtype=seq_attn.dtype, device=device)],
                 dim=1,
             )
-            if int(action) == int(phase23.answer_token_id):
-                terminated_by = "answer"
-                break
+
             out1 = _forward_last_with_cache(
-                core=core,
+                core=model,
                 input_ids=action_t,
                 attention_mask=seq_attn,
                 past_key_values=past,
             )
             past = out1.past_key_values
-            h_last = out1.last_hidden_state[:, -1, :]
+            last_logits = out1.logits[:, -1, :].squeeze(0)
+            h_last = out1.hidden_states[-1][:, -1, :].squeeze(0)
 
-        digit_logits_t, digit_probs_t, digit_pred_t = _compute_digit_outputs_with_attention(
-            phase23=phase23,
-            seq_ids=seq,
-            attention_mask=seq_attn,
-        )
+        else:
+            if phase == "digits" and len(generated_digit_ids) < 5:
+                terminated_by = "max_new_tokens_during_digits"
 
-    pred_digits = [int(x) for x in digit_pred_t.tolist()]
+    pred_digits: Optional[List[int]] = None
+    if terminated_by == "answer_with_5_digits":
+        digit_id_to_digit = {int(tok_id): i for i, tok_id in enumerate(digit_token_ids)}
+        pred_digits = [int(digit_id_to_digit[x]) for x in generated_digit_ids]
+
     reward_info = compute_reward(
         pred_digits=pred_digits,
         true_digits=true_digits,
-        terminated_by_answer=(terminated_by == "answer"),
+        terminated_reason=terminated_by,
         partial_scale=reward_cfg.partial_scale,
         keep_prob=reward_cfg.keep_prob,
         length_penalty=reward_cfg.length_penalty,
-        num_generated_tokens=len(actions),
+        reward_if_max_len=reward_cfg.reward_if_max_len,
+        num_generated_tokens=int(seq.size(1) - len(prompt_ids)),
         generator=reward_rng,
     )
 
@@ -364,15 +359,20 @@ def _rollout_one(
         prompt_ids=prompt_ids,
         prompt_attention_mask=prompt_attn,
         actions=actions,
+        action_types=action_types,
         logp_old=logp_old,
         values_old=values_old,
         entropy_old=entropy_old,
         terminated_by=terminated_by,
-        digit_logits=digit_logits_t.float().cpu().tolist(),
-        digit_probs=digit_probs_t.float().cpu().tolist(),
+        generated_z_ids=generated_z_ids,
+        generated_digit_ids=generated_digit_ids,
+        digit_logits=digit_logits_rows if pred_digits is not None else None,
+        digit_probs=digit_probs_rows if pred_digits is not None else None,
         digit_pred=pred_digits,
         digit_true=[int(x) for x in true_digits],
         reward_info=reward_info,
+        num_generated_total=int(seq.size(1) - len(prompt_ids)),
+        num_digits_generated=len(generated_digit_ids),
     )
 
 
@@ -393,27 +393,25 @@ def _normalize_advantages(trajectories: Sequence[Trajectory]) -> None:
 
 
 def _recompute_trajectory(
-    phase23: UnifiedZSoftModel,
+    model,
     value_head: ValueHead,
     traj: Trajectory,
-    allowed_idx_t: torch.Tensor,
-    allowed_id_to_local: Dict[int, int],
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
     temperature: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = next(phase23.parameters()).device
+    device = next(model.parameters()).device
     seq_ids = torch.tensor(traj.prompt_ids + traj.actions, dtype=torch.long, device=device).unsqueeze(0)
     full_attn_list = list(traj.prompt_attention_mask) + [1] * len(traj.actions)
     attn = torch.tensor(full_attn_list, dtype=torch.long, device=device).unsqueeze(0)
 
-    core = phase23._core_model()
-    out = core(
+    out = model(
         input_ids=seq_ids,
         attention_mask=attn,
         use_cache=False,
-        output_hidden_states=False,
+        output_hidden_states=True,
         return_dict=True,
     )
-    hidden = out.last_hidden_state[0]  # [L,H]
 
     p_len = len(traj.prompt_ids)
     t_steps = len(traj.actions)
@@ -421,36 +419,45 @@ def _recompute_trajectory(
         empty = torch.empty((0,), dtype=torch.float32, device=device)
         return empty, empty, empty
 
-    full_attn = attn.squeeze(0).to(torch.long)  # [L]
+    full_attn = attn.squeeze(0).to(torch.long)
     if not bool(torch.all(full_attn == 1)):
         raise RuntimeError(
-            "Sparse attention masks not supported in PPO v1; "
-            "expected all-ones attention for unpadded sequences."
+            "Sparse attention masks not supported in PPO v1; expected all-ones attention for unpadded sequences."
         )
+
     state_positions = torch.arange(
         p_len - 1,
         p_len - 1 + t_steps,
         device=device,
         dtype=torch.long,
     )
+    logits_all = out.logits[0].to(torch.float32)
+    hidden_all = out.hidden_states[-1][0]
 
-    h_states = hidden.index_select(0, state_positions)  # [T,H]
-    logits_allowed = _allowed_logits_from_hidden(phase23, h_states, allowed_idx_t).to(torch.float32)  # [T,A]
-    logits_allowed = logits_allowed / float(temperature)
+    logp_new_list: List[torch.Tensor] = []
+    entropy_list: List[torch.Tensor] = []
+    for i in range(t_steps):
+        pos = int(state_positions[i].item())
+        action_id = int(traj.actions[i])
+        action_type = traj.action_types[i]
+        allowed_t = digit_allowed_t if action_type == "digit" else z_allowed_t
 
-    log_probs_allowed = torch.log_softmax(logits_allowed, dim=-1)
-    probs_allowed = torch.softmax(logits_allowed, dim=-1)
-    entropy = -(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum(dim=-1)  # [T]
+        allowed_logits = logits_all[pos].index_select(0, allowed_t) / float(temperature)
+        log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
+        probs_allowed = torch.softmax(allowed_logits, dim=-1)
 
-    action_pos_list = [int(allowed_id_to_local.get(int(a), -1)) for a in traj.actions]
-    action_pos = torch.tensor(action_pos_list, dtype=torch.long, device=device)
-    if (action_pos < 0).any():
-        actions_t = torch.tensor(traj.actions, dtype=torch.long, device=device)
-        bad = actions_t[action_pos < 0][:10].tolist()
-        raise RuntimeError(f"Found action ids not in allowed set: {bad}")
+        local_matches = torch.nonzero(allowed_t == action_id, as_tuple=False)
+        if local_matches.numel() == 0:
+            raise RuntimeError(f"Action id {action_id} not in allowed set for type={action_type}")
+        local_idx = int(local_matches[0].item())
 
-    logp_new = log_probs_allowed.gather(1, action_pos.view(-1, 1)).squeeze(1)  # [T]
-    values = value_head(h_states.float()).squeeze(-1)  # [T]
+        logp_new_list.append(log_probs_allowed[local_idx])
+        entropy_list.append((-(probs_allowed * torch.log(probs_allowed.clamp_min(1e-12))).sum()))
+
+    h_states = hidden_all.index_select(0, state_positions)
+    values = value_head(h_states.float()).squeeze(-1)
+    logp_new = torch.stack(logp_new_list, dim=0)
+    entropy = torch.stack(entropy_list, dim=0)
     return logp_new, values, entropy
 
 
@@ -458,7 +465,7 @@ def _save_checkpoint(
     *,
     output_dir: str,
     step: int,
-    phase23: UnifiedZSoftModel,
+    model,
     value_head: ValueHead,
     tokenizer,
     cfg: Config,
@@ -466,14 +473,13 @@ def _save_checkpoint(
     ckpt_dir = os.path.join(output_dir, "checkpoints", f"step_{step:04d}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    phase23.base.save_pretrained(os.path.join(ckpt_dir, "model"))
+    model.save_pretrained(os.path.join(ckpt_dir, "model"))
     tokenizer.save_pretrained(os.path.join(ckpt_dir, "tokenizer"))
     with open(os.path.join(ckpt_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
 
     torch.save(
         {
-            "phase23_state_dict": phase23.state_dict(),
             "value_head_state_dict": value_head.state_dict(),
         },
         os.path.join(ckpt_dir, "ppo_state.pt"),
@@ -489,8 +495,7 @@ def _rotate_checkpoints(output_dir: str, keep_last: int) -> None:
 
 
 def train(cfg: Config) -> None:
-    set_seed(cfg.train.seed)
-    random.seed(cfg.train.seed)
+    _set_seed(cfg.train.seed)
 
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     os.makedirs(os.path.join(cfg.train.output_dir, "rollouts"), exist_ok=True)
@@ -498,26 +503,43 @@ def train(cfg: Config) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
-    bundle = _load_phase23_bundle(cfg, device=device)
-    tokenizer = bundle.tokenizer
-    phase23 = bundle.model
-    phase23.train()
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model.init_ckpt,
+        use_fast=True,
+        trust_remote_code=bool(cfg.model.trust_remote_code),
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model.init_ckpt,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+        trust_remote_code=bool(cfg.model.trust_remote_code),
+    )
+    model.to(device)
+    model.train()
 
-    allowed_token_ids = build_allowed_token_ids(tokenizer, answer_token=cfg.model.answer_token)
-    answer_token_id = int(allowed_token_ids[-1])
-    z_token_ids = allowed_token_ids[:-1]
-    if set(int(x) for x in z_token_ids) != set(int(x) for x in phase23.z_token_ids):
-        raise RuntimeError("Tokenizer-introspected Z token ids do not match model.z_token_ids")
-    if int(answer_token_id) != int(phase23.answer_token_id):
-        raise RuntimeError("Tokenizer answer token id does not match model.answer_token_id")
-    _log(f"Allowed Z tokens: {len(z_token_ids)} | answer_token_id={answer_token_id}")
-    allowed_idx_t = torch.tensor(list(allowed_token_ids), dtype=torch.long, device=device)
-    allowed_id_to_local = {int(tok_id): i for i, tok_id in enumerate(allowed_token_ids)}
+    action_scope = validate_action_scope(cfg.rollout.action_scope)
 
-    hidden_size = int(phase23._core_model().config.hidden_size)
+    z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
+    if not z_token_ids:
+        raise RuntimeError("No Z tokens found in tokenizer (checked lowercase <z_i> then uppercase <Z_i>)")
+    if z_style == "upper":
+        _log("WARNING: using uppercase <Z_i> tokens fallback; lowercase <z_i> not found")
+
+    answer_token_id = resolve_answer_token_id(tokenizer, answer_token=cfg.model.answer_token)
+    validate_answer_token_single(tokenizer, cfg.model.answer_token, answer_token_id)
+    digit_token_ids = resolve_digit_token_ids(tokenizer)
+
+    z_allowed_t = torch.tensor(list(z_token_ids) + [int(answer_token_id)], dtype=torch.long, device=device)
+    digit_allowed_t = torch.tensor(list(digit_token_ids), dtype=torch.long, device=device)
+
+    _log(
+        f"Action scope={action_scope} | Z tokens={len(z_token_ids)} ({z_style}) | "
+        f"answer_token_id={answer_token_id}"
+    )
+
+    hidden_size = int(model.config.hidden_size)
     value_head = ValueHead(hidden_size=hidden_size).to(device)
 
-    params = list(phase23.parameters()) + list(value_head.parameters())
+    params = list(model.parameters()) + list(value_head.parameters())
     optimizer = torch.optim.AdamW(
         params,
         lr=cfg.train.lr,
@@ -530,7 +552,7 @@ def train(cfg: Config) -> None:
     if len(ds) == 0:
         raise RuntimeError("Training dataset is empty")
 
-    reward_rng = _make_rng(cfg.train.seed + 17, device=device)
+    reward_rng = _make_rng(cfg.train.seed + 17)
     rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
 
     ds_index = 0
@@ -543,19 +565,28 @@ def train(cfg: Config) -> None:
             ds_index += 1
 
             question = str(sample[cfg.data.question_field])
-            true_digits = parse_final_answer_to_digits(sample[cfg.data.answer_field])
+            true_digits = _extract_true_digits(
+                sample=sample,
+                answer_digits_field=cfg.data.answer_digits_field,
+                answer_field=cfg.data.answer_field,
+            )
             if true_digits is None:
                 continue
 
             traj = _rollout_one(
-                phase23=phase23,
+                model=model,
                 value_head=value_head,
                 tokenizer=tokenizer,
                 question=question,
                 true_digits=true_digits,
-                allowed_token_ids=allowed_token_ids,
+                z_token_ids=z_token_ids,
+                digit_token_ids=digit_token_ids,
+                answer_token_id=answer_token_id,
                 max_new_tokens=cfg.rollout.max_new_tokens,
                 temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+                action_scope=action_scope,
+                digit_greedy=cfg.rollout.digit_greedy,
                 reward_cfg=cfg.reward,
                 reward_rng=reward_rng,
                 sample_id=f"u{update}_i{len(trajectories)}",
@@ -577,11 +608,17 @@ def train(cfg: Config) -> None:
         roll_rows: List[Dict[str, object]] = []
         for traj in trajectories:
             row = {
+                "schema_version": 2,
                 "id": traj.sample_id,
+                "question": traj.question,
                 "input_ids": traj.prompt_ids,
-                "generated_ids": traj.actions,
+                "generated_z_ids": traj.generated_z_ids,
+                "generated_z_tokens": tokenizer.convert_ids_to_tokens(traj.generated_z_ids),
+                "generated_digit_ids": traj.generated_digit_ids,
+                "generated_digit_tokens": tokenizer.convert_ids_to_tokens(traj.generated_digit_ids),
                 "terminated_by": traj.terminated_by,
-                "num_generated": len(traj.actions),
+                "num_generated": traj.num_generated_total,
+                "num_digits_generated": traj.num_digits_generated,
                 "digit_logits": traj.digit_logits,
                 "digit_probs": traj.digit_probs,
                 "digit_pred": traj.digit_pred,
@@ -594,12 +631,13 @@ def train(cfg: Config) -> None:
                 "correct_count": traj.reward_info["correct_count"],
                 "reward_partial": traj.reward_info["reward_partial"],
                 "length_penalty": traj.reward_info["length_penalty"],
+                "reward_if_max_len": traj.reward_info["reward_if_max_len"],
                 "reward_final": traj.reward_info["reward_final"],
                 "actions": traj.actions,
+                "action_types": traj.action_types,
                 "logp_old": traj.logp_old,
                 "entropy": traj.entropy_old,
                 "values": traj.values_old,
-                "question": traj.question,
             }
             if cfg.logging.log_action_tokens:
                 row["action_tokens"] = tokenizer.convert_ids_to_tokens(traj.actions)
@@ -618,7 +656,7 @@ def train(cfg: Config) -> None:
         order = list(range(len(trajectories)))
         random.shuffle(order)
 
-        for epoch in range(cfg.ppo.ppo_epochs):
+        for _epoch in range(cfg.ppo.ppo_epochs):
             random.shuffle(order)
             for start in range(0, len(order), cfg.ppo.minibatch_size):
                 batch_idx = order[start : start + cfg.ppo.minibatch_size]
@@ -639,11 +677,11 @@ def train(cfg: Config) -> None:
                     for idx in batch_idx:
                         traj = trajectories[idx]
                         logp_new_t, values_new_t, entropy_t = _recompute_trajectory(
-                            phase23=phase23,
+                            model=model,
                             value_head=value_head,
                             traj=traj,
-                            allowed_idx_t=allowed_idx_t,
-                            allowed_id_to_local=allowed_id_to_local,
+                            z_allowed_t=z_allowed_t,
+                            digit_allowed_t=digit_allowed_t,
                             temperature=cfg.rollout.temperature,
                         )
 
@@ -701,8 +739,9 @@ def train(cfg: Config) -> None:
         exact_rate = float(
             sum(1 for t in trajectories if bool(t.reward_info.get("exact_match", False)))
         ) / float(len(trajectories))
-        answer_rate = float(sum(1 for t in trajectories if t.terminated_by == "answer")) / float(len(trajectories))
-        avg_len = float(sum(len(t.actions) for t in trajectories)) / float(len(trajectories))
+        answered = sum(1 for t in trajectories if t.terminated_by == "answer_with_5_digits")
+        answer_rate = float(answered) / float(len(trajectories))
+        avg_len = float(sum(t.num_generated_total for t in trajectories)) / float(len(trajectories))
 
         old_values = torch.tensor([v for t in trajectories for v in t.values_old], dtype=torch.float32)
         old_returns = torch.tensor([r for t in trajectories for r in t.returns], dtype=torch.float32)
@@ -721,6 +760,7 @@ def train(cfg: Config) -> None:
                     f"avg_len={avg_len:.2f}",
                     f"entropy={ent_acc / denom:.4f}",
                     f"clipfrac={clip_acc / denom:.4f}",
+                    f"policy_loss={pol_acc / denom:.4f}",
                     f"value_loss={val_acc / denom:.4f}",
                     f"explained_var={ev:.4f}",
                     f"rollouts={rollout_path}",
@@ -732,7 +772,7 @@ def train(cfg: Config) -> None:
             _save_checkpoint(
                 output_dir=cfg.train.output_dir,
                 step=update,
-                phase23=phase23,
+                model=model,
                 value_head=value_head,
                 tokenizer=tokenizer,
                 cfg=cfg,

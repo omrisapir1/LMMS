@@ -2,27 +2,38 @@ from __future__ import annotations
 
 import torch
 
-from PPO.reward import compute_reward, parse_final_answer_to_digits
+from PPO.reward import compute_reward, parse_answer_digits, parse_final_answer_to_digits
 
 
 def test_parse_final_answer_digits() -> None:
     assert parse_final_answer_to_digits("42") == [0, 0, 0, 4, 2]
+    assert parse_final_answer_to_digits("+42") == [0, 0, 0, 4, 2]
+    assert parse_final_answer_to_digits("00123") == [0, 0, 1, 2, 3]
     assert parse_final_answer_to_digits("-3") is None
     assert parse_final_answer_to_digits("abc") is None
+    assert parse_final_answer_to_digits("123456") is None
 
 
-def test_reward_for_max_len_termination_is_zero() -> None:
+def test_parse_answer_digits_supports_ints_and_strings() -> None:
+    assert parse_answer_digits([0, 1, 2, 3, 4]) == [0, 1, 2, 3, 4]
+    assert parse_answer_digits(["0", "1", "2", "3", "4"]) == [0, 1, 2, 3, 4]
+    assert parse_answer_digits([1, 2, 3]) is None
+    assert parse_answer_digits([0, 1, 2, 3, 12]) is None
+
+
+def test_reward_for_max_len_termination_uses_config() -> None:
     out = compute_reward(
-        pred_digits=[1, 2, 3, 4, 5],
+        pred_digits=None,
         true_digits=[1, 2, 3, 4, 5],
-        terminated_by_answer=False,
+        terminated_reason="max_new_tokens",
         partial_scale=0.5,
         keep_prob=(0.02, 0.05, 0.1, 0.5, 1.0),
         length_penalty=0.01,
+        reward_if_max_len=0.17,
         num_generated_tokens=20,
         generator=torch.Generator().manual_seed(0),
     )
-    assert out["reward_final"] == 0.0
+    assert out["reward_final"] == 0.17
 
 
 def test_partial_reward_mask_sampled_once() -> None:
@@ -30,10 +41,11 @@ def test_partial_reward_mask_sampled_once() -> None:
     out = compute_reward(
         pred_digits=[0, 1, 2, 3, 4],
         true_digits=[0, 1, 9, 0, 4],
-        terminated_by_answer=True,
+        terminated_reason="answer_with_5_digits",
         partial_scale=0.5,
         keep_prob=(1.0, 1.0, 1.0, 1.0, 1.0),
         length_penalty=0.0,
+        reward_if_max_len=0.0,
         num_generated_tokens=3,
         generator=gen,
     )

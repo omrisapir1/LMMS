@@ -3,9 +3,11 @@
 This phase fine-tunes the **Phase3 SFT discrete Z-token model** using **PPO**.
 
 The model reasons by generating discrete `<z_i>` tokens and terminates with `<ANSWER>`.  
-Digit prediction is performed using the **LM head restricted to digit tokens `{0..9}`** (Phase-B decoding).
+Digit prediction uses the LM head restricted to digit tokens `{0..9}`.
+Depending on `action_scope`, digit tokens may either:
+- be decoded only for reward computation (`ppo_only_z_tokens`)
+- or be treated as PPO actions (`ppo_full`)
 
-This stage directly optimizes expected answer reward under sampling and is aligned with `pass@N` evaluation.
 
 ---
 
@@ -243,40 +245,72 @@ Total loss:
 L = L_policy + c_v * L_value + c_ent * L_entropy
 ```
 
-### Digit Gradient Mode (Configurable)
 
-We support two update modes controlled by a config flag:
+### PPO Action Scope (Configurable)
 
-```text
-digit_backprop_mode: "ppo_only" | "ppo_plus_supervised"
-```
+The PPO update can operate over two different action scopes controlled by:
 
-#### Mode A — "ppo_only" (Standard PPO)
+action_scope: "ppo_only_z_tokens" | "ppo_full"
 
-Digit logits are recomputed during update.
+---
 
-Reward is treated as a scalar.
+#### Mode A — "ppo_only_z_tokens" (Recommended)
 
-No gradient flows through digit prediction.
+PPO optimizes only the reasoning program tokens:
 
-Gradients flow only through:
+    <z_i> tokens
+    <ANSWER>
 
-- Policy log-probs
-- Value head
+Digits are **not treated as PPO actions**.
 
-This is standard PPO and recommended initially.
+After rollout terminates:
 
-#### Mode B — "ppo_plus_supervised"
+- If `<ANSWER>` was emitted, the model predicts the 5 digits using the LM head
+- Digit tokens are restricted to `{0..9}`
 
-Digit logits are recomputed during update.
+These digit predictions are used **only to compute the reward**.
 
-In addition to PPO loss, we optionally add:
+Gradients do **not** propagate through the digit decoding stage.
 
-A supervised digit CE loss.
+Advantages:
 
-Gradients flow through digit decoding stage.
+- Lower variance PPO signal
+- Stable credit assignment
+- PPO learns only the reasoning program
 
-This hybrid mode can stabilize learning but mixes RL and supervised signals.
+This is the recommended starting mode.
+
+---
+
+#### Mode B — "ppo_full"
+
+PPO treats **all generated tokens as actions**, including digits.
+
+The action space becomes:
+
+    <z_i> tokens
+    <ANSWER>
+    digit tokens {0..9}
+
+Rollout proceeds as:
+
+1. Generate Z tokens
+2. Emit `<ANSWER>`
+3. Generate 5 digit tokens autoregressively
+
+PPO policy loss is applied to **all tokens**, including digits.
+
+Advantages:
+
+- Matches standard RLHF training
+- Allows PPO to directly optimize digit prediction
+
+Disadvantages:
+
+- Higher reward variance
+- More unstable early training
+- Harder credit assignment between Z program and digits
+
 
 ### Masking Requirements
 

@@ -6,10 +6,9 @@ from typing import Any, Dict, Sequence, Tuple
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/LMMS_phase23_step_2500_128"
+    init_ckpt: str = "./runs/sft/last"
     answer_token: str = "<ANSWER>"
-    z_prefix: str = "Z_"
-    v_z_fallback: int = 128
+    trust_remote_code: bool = False
 
 
 @dataclass
@@ -17,13 +16,17 @@ class DataConfig:
     dataset_name: str = "omrisap/LMMS_numina_250K"
     train_split: str = "train"
     question_field: str = "problem"
+    answer_digits_field: str = "answer_digits"
     answer_field: str = "final_answer"
 
 
 @dataclass
 class RolloutConfig:
-    max_new_tokens: int = 64*4
+    max_new_tokens: int = 64*8
     temperature: float = 1.0
+    top_p: float = 0.95
+    digit_greedy: bool = True
+    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     episodes_per_batch: int = 128
     max_tokens_per_batch: int = 4096*4
 
