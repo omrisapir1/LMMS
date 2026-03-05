@@ -226,54 +226,52 @@ def _debug_restricted_logits_check_once(
     d_b: Optional[torch.Tensor],
 ) -> None:
     device = next(model.parameters()).device
-    prompt = _build_prompt_text(tokenizer, "Compute 1+1.")
-    pack = tokenizer(prompt, add_special_tokens=False, return_attention_mask=True)
-    ids = list(pack.get("input_ids", []))
-    if not ids:
-        fallback_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        ids = [int(fallback_id)]
-    att = list(pack.get("attention_mask") or [1] * len(ids))
+    was_training = model.training
+    model.eval()
+    try:
+        prompt = _build_prompt_text(tokenizer, "Compute 1+1.")
+        pack = tokenizer(prompt, add_special_tokens=False, return_attention_mask=True)
+        ids = list(pack.get("input_ids", []))
+        if not ids:
+            fallback_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+            ids = [int(fallback_id)]
+        att = list(pack.get("attention_mask") or [1] * len(ids))
 
-    input_ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    attention_mask = torch.tensor(att, dtype=torch.long, device=device).unsqueeze(0)
-    pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
+        input_ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+        attention_mask = torch.tensor(att, dtype=torch.long, device=device).unsqueeze(0)
+        pos = int((attention_mask[0].sum() - 1).clamp(min=0).item())
 
-    base_model = model.get_submodule(model.base_model_prefix)
-    with torch.no_grad():
-        full = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        full_logits = full.logits[0, pos, :].float()
+        with torch.no_grad():
+            full = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            full_logits = full.logits[0, pos, :].float()
+            h = full.hidden_states[-1][0, pos, :].float()
 
-        base = base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-        h = base.last_hidden_state[0, pos, :].float()
-        z_logits_dbg = h @ z_w.float().t()
-        d_logits_dbg = h @ d_w.float().t()
-        if z_b is not None:
-            z_logits_dbg = z_logits_dbg + z_b.float()
-        if d_b is not None:
-            d_logits_dbg = d_logits_dbg + d_b.float()
+            z_logits_dbg = h @ z_w.float().t()
+            d_logits_dbg = h @ d_w.float().t()
+            if z_b is not None:
+                z_logits_dbg = z_logits_dbg + z_b.float()
+            if d_b is not None:
+                d_logits_dbg = d_logits_dbg + d_b.float()
 
-    full_z = full_logits.index_select(0, z_allowed_t)
-    full_d = full_logits.index_select(0, digit_allowed_t)
-    diff_z = float((full_z.float() - z_logits_dbg.float()).abs().max().item())
-    diff_d = float((full_d.float() - d_logits_dbg.float()).abs().max().item())
-    tol = 1e-3
-    _log(f"Restricted-logits debug check | diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}")
-    if diff_z >= tol or diff_d >= tol:
-        raise RuntimeError(
-            f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
-            "Possible custom head/LN mismatch."
-        )
+        full_z = full_logits.index_select(0, z_allowed_t)
+        full_d = full_logits.index_select(0, digit_allowed_t)
+        diff_z = float((full_z - z_logits_dbg).abs().max().item())
+        diff_d = float((full_d - d_logits_dbg).abs().max().item())
+        tol = 1e-3
+        _log(f"Restricted-logits debug check | diff_z={diff_z:.6f} | diff_d={diff_d:.6f} | tol={tol:.6f}")
+        if diff_z >= tol or diff_d >= tol:
+            raise RuntimeError(
+                f"Restricted projection mismatch too large (diff_z={diff_z:.6f}, diff_d={diff_d:.6f}, tol={tol:.6f}). "
+                "Possible custom head / tied-weights / final-norm mismatch."
+            )
+    finally:
+        model.train(was_training)
 
 
 def _action_stats_tensors(
