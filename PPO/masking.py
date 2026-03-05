@@ -6,20 +6,35 @@ from typing import List, Sequence, Tuple
 import torch
 
 
-_Z_TOKEN_RE = re.compile(r"^<Z_(\d+)>$")
+_Z_TOKEN_RE_LOWER = re.compile(r"^<z_(\d+)>$")
+_Z_TOKEN_RE_UPPER = re.compile(r"^<Z_(\d+)>$")
+
+
+def introspect_z_token_ids_and_style(tokenizer) -> Tuple[List[int], str]:
+    vocab = tokenizer.get_vocab()
+    indexed_lower: List[Tuple[int, int]] = []
+    indexed_upper: List[Tuple[int, int]] = []
+    for tok, tok_id in vocab.items():
+        m_lower = _Z_TOKEN_RE_LOWER.match(tok)
+        if m_lower is not None:
+            indexed_lower.append((int(m_lower.group(1)), int(tok_id)))
+            continue
+        m_upper = _Z_TOKEN_RE_UPPER.match(tok)
+        if m_upper is not None:
+            indexed_upper.append((int(m_upper.group(1)), int(tok_id)))
+
+    if indexed_lower:
+        indexed_lower.sort(key=lambda x: x[0])
+        return [tok_id for _, tok_id in indexed_lower], "lower"
+    if indexed_upper:
+        indexed_upper.sort(key=lambda x: x[0])
+        return [tok_id for _, tok_id in indexed_upper], "upper"
+    return [], "none"
 
 
 def introspect_z_token_ids(tokenizer) -> List[int]:
-    vocab = tokenizer.get_vocab()
-    indexed: List[Tuple[int, int]] = []
-    for tok, tok_id in vocab.items():
-        m = _Z_TOKEN_RE.match(tok)
-        if m is None:
-            continue
-        indexed.append((int(m.group(1)), int(tok_id)))
-
-    indexed.sort(key=lambda x: x[0])
-    return [tok_id for _, tok_id in indexed]
+    ids, _style = introspect_z_token_ids_and_style(tokenizer)
+    return ids
 
 
 def resolve_answer_token_id(tokenizer, answer_token: str = "<ANSWER>") -> int:
