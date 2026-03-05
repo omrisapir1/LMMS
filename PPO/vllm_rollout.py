@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import os
 import shutil
 import time
@@ -97,8 +96,6 @@ class VLLMRolloutEngine:
     ):
         if self._sampling_params_cls is None:
             raise RuntimeError("vLLM SamplingParams class is not initialized")
-        sig = inspect.signature(self._sampling_params_cls.__init__)
-        params = sig.parameters
 
         kwargs: Dict[str, Any] = {
             "max_tokens": int(max_tokens),
@@ -106,26 +103,37 @@ class VLLMRolloutEngine:
             "top_p": 1.0 if greedy else float(top_p),
             "n": 1,
         }
-        if min_tokens is not None and "min_tokens" in params:
+        if min_tokens is not None:
             kwargs["min_tokens"] = int(min_tokens)
+        kwargs_with_stop = dict(kwargs)
         if stop_on_answer:
-            if "stop_token_ids" in params:
-                kwargs["stop_token_ids"] = [int(self.answer_token_id)]
-            elif "stop" in params:
-                kwargs["stop"] = [str(self.tokenizer.convert_ids_to_tokens(int(self.answer_token_id)))]
+            try:
+                kwargs_with_stop["stop_token_ids"] = [int(self.answer_token_id)]
+                _ = self._sampling_params_cls(**kwargs_with_stop)
+            except TypeError:
+                kwargs_with_stop = dict(kwargs)
+                kwargs_with_stop["stop"] = [str(self.tokenizer.convert_ids_to_tokens(int(self.answer_token_id)))]
+                try:
+                    _ = self._sampling_params_cls(**kwargs_with_stop)
+                except TypeError:
+                    kwargs_with_stop = dict(kwargs)
 
-        # Version-adaptive allowed-token restriction. We intentionally avoid logits processors.
-        if "allowed_token_ids" in params:
-            kwargs["allowed_token_ids"] = list(int(x) for x in allowed_token_ids)
-        elif "allowed_token_ids_list" in params:
-            kwargs["allowed_token_ids_list"] = [list(int(x) for x in allowed_token_ids)]
-        else:
-            raise RuntimeError(
-                "This vLLM version does not expose allowed-token-id sampling params; "
-                "cannot enforce PPO FSM without logits processors."
+        try:
+            return self._sampling_params_cls(
+                **kwargs_with_stop,
+                allowed_token_ids=[int(x) for x in allowed_token_ids],
             )
-
-        return self._sampling_params_cls(**kwargs)
+        except TypeError:
+            try:
+                return self._sampling_params_cls(
+                    **kwargs_with_stop,
+                    allowed_token_ids_list=[[int(x) for x in allowed_token_ids]],
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "This vLLM version does not expose allowed-token-id sampling params; "
+                    "cannot enforce PPO FSM without logits processors."
+                ) from exc
 
     def supports_prompt_token_ids(self) -> bool:
         # vLLM 0.14 accepts token prompts via TokensPrompt dicts in prompts list,
