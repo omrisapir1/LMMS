@@ -50,7 +50,7 @@ class PPOConfig:
     c_v: float = 0.5
     c_ent: float = 0.01
     ppo_epochs: int = 4
-    minibatch_size: int = 32
+    minibatch_size: int = 16
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
 
