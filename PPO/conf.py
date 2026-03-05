@@ -6,14 +6,14 @@ from typing import Any, Dict, Sequence, Tuple
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "./runs/sft/last"
+    init_ckpt: str = "omrisap/SFT_Z_model"
     answer_token: str = "<ANSWER>"
-    trust_remote_code: bool = False
+    trust_remote_code: bool = True
 
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "omrisap/LMMS_numina_250K"
+    dataset_name: str = "omrisap/LMMS_PPO_200K"
     train_split: str = "train"
     question_field: str = "problem"
     answer_digits_field: str = "answer_digits"
