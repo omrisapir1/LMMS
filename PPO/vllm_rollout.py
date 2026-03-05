@@ -240,17 +240,13 @@ class VLLMRolloutEngine:
                         fn(*args, **kwargs)
                         self._log(f"vLLM hot swap succeeded via {obj.__class__.__name__}.{meth}")
                         return True
-                    except TypeError:
+                    except TypeError as exc:
                         last_attempt = f"{obj.__class__.__name__}.{meth}"
-                        last_error = TypeError(
-                            f"TypeError for args={args}, kwargs={kwargs}"
-                        )
+                        last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
                         continue
-                    except Exception:
+                    except Exception as exc:
                         last_attempt = f"{obj.__class__.__name__}.{meth}"
-                        last_error = Exception(
-                            f"Exception for args={args}, kwargs={kwargs}"
-                        )
+                        last_error = f"{type(exc).__name__}: {exc}; args={args}, kwargs={kwargs}"
                         continue
             if last_error is not None:
                 self._log(f"vLLM hot swap failed; last attempt={last_attempt}; error={last_error}")
