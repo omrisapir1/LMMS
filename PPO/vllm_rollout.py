@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import shutil
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
@@ -41,6 +42,8 @@ class VLLMRolloutEngine:
         self._model_ref = init_ckpt
         self._llm = None
         self._sampling_params_cls = None
+        # NEW: serialize vLLM generate/swap/rebuild operations.
+        self._vllm_lock = threading.RLock()
 
         self._init_engine(model_ref=init_ckpt)
 
@@ -197,17 +200,80 @@ class VLLMRolloutEngine:
         self._destroy_engine()
         self._init_engine(model_ref=ckpt_dir)
 
+    # NEW: best-effort hot swap using vLLM engine reload/load_weights hooks.
+    def _hot_swap_from_hf_checkpoint(self, ckpt_dir: str) -> bool:
+        with self._vllm_lock:
+            if self._llm is None:
+                return False
+            engine = getattr(self._llm, "llm_engine", None)
+            if engine is None:
+                return False
+
+            candidates = []
+            candidates.append((engine, "reload_model"))
+            for obj_name in ("model_executor", "executor"):
+                obj = getattr(engine, obj_name, None)
+                if obj is None:
+                    continue
+                candidates.append((obj, "reload_model"))
+            for obj_name in ("model_executor", "executor"):
+                obj = getattr(engine, obj_name, None)
+                if obj is None:
+                    continue
+                candidates.append((obj, "load_weights"))
+
+            last_error = None
+            last_attempt = None
+            for obj, meth in candidates:
+                fn = getattr(obj, meth, None)
+                if fn is None:
+                    continue
+                # Signature differs across vLLM versions/builds; try a few simple forms.
+                for args, kwargs in (
+                    ((ckpt_dir,), {}),
+                    (tuple(), {"model": ckpt_dir}),
+                    (tuple(), {"model_path": ckpt_dir}),
+                    (tuple(), {"checkpoint": ckpt_dir}),
+                    (tuple(), {"checkpoint_path": ckpt_dir}),
+                ):
+                    try:
+                        fn(*args, **kwargs)
+                        self._log(f"vLLM hot swap succeeded via {obj.__class__.__name__}.{meth}")
+                        return True
+                    except TypeError:
+                        last_attempt = f"{obj.__class__.__name__}.{meth}"
+                        last_error = TypeError(
+                            f"TypeError for args={args}, kwargs={kwargs}"
+                        )
+                        continue
+                    except Exception:
+                        last_attempt = f"{obj.__class__.__name__}.{meth}"
+                        last_error = Exception(
+                            f"Exception for args={args}, kwargs={kwargs}"
+                        )
+                        continue
+            if last_error is not None:
+                self._log(f"vLLM hot swap failed; last attempt={last_attempt}; error={last_error}")
+        return False
+
     def maybe_sync_from_torch(self, model, tokenizer, update_idx: int) -> bool:
         should_sync = int(update_idx) == 1 or (int(update_idx) % self.sync_every == 0)
         if not should_sync:
             return False
 
-        if self._try_runtime_weight_sync(model):
+        # NEW: export synchronously to avoid save_pretrained() on a background thread.
+        self._log("vLLM checkpoint export started")
+        ckpt_dir = self._atomic_export_checkpoint(model, tokenizer, update_idx=int(update_idx))
+        self._log("vLLM checkpoint ready")
+
+        # NEW: swap only at rollout boundary; fallback to rebuild on failure.
+        if self._hot_swap_from_hf_checkpoint(ckpt_dir):
+            self._log("vLLM hot swap succeeded")
             return True
 
-        ckpt_dir = self._atomic_export_checkpoint(model, tokenizer, update_idx=int(update_idx))
-        self._rebuild_from_checkpoint(ckpt_dir)
-        self._log(f"vLLM engine rebuilt from latest policy checkpoint: {ckpt_dir}")
+        with self._vllm_lock:
+            self._rebuild_from_checkpoint(ckpt_dir)
+        self._log(f"vLLM fallback engine rebuild: {ckpt_dir}")
         return True
 
     def generate_z(
@@ -231,11 +297,13 @@ class VLLMRolloutEngine:
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
             token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
-            outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
+            with self._vllm_lock:
+                outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
         else:
             if prompts is None:
                 raise RuntimeError("generate_z requires text prompts when prompt_token_ids are unsupported")
-            outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
+            with self._vllm_lock:
+                outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
         rows: List[Dict[str, object]] = []
         for o in outs:
             out0 = o.outputs[0]
@@ -269,9 +337,11 @@ class VLLMRolloutEngine:
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
             token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
-            outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
+            with self._vllm_lock:
+                outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
         else:
             if prompts is None:
                 raise RuntimeError("generate_digits requires text prompts when prompt_token_ids are unsupported")
-            outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
+            with self._vllm_lock:
+                outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
         return [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
