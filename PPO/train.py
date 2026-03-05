@@ -835,7 +835,6 @@ def train(cfg: Config) -> None:
     vllm_engine: Optional[VLLMRolloutEngine] = None
     if cfg.rollout.vllm_enabled:
         vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
-        vllm_kwargs.setdefault("device", "cuda:1")
         vllm_engine = VLLMRolloutEngine(
             init_ckpt=cfg.model.init_ckpt,
             tokenizer=tokenizer,
