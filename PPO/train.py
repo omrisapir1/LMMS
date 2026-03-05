@@ -573,11 +573,12 @@ def _collect_rollouts_vllm_batch(
     answer_token_id: int,
     digit_token_ids: Sequence[int],
     reward_rng: torch.Generator,
+    logger,
 ) -> List[Trajectory]:
     supports_token_prompts = vllm_engine.supports_prompt_token_ids()
     prompt_texts = [str(x["prompt_text"]) for x in prepared]
     prompt_ids_batch = [list(map(int, x["prompt_ids"])) for x in prepared]
-    z_gens = vllm_engine.generate_z(
+    z_gen_rows = vllm_engine.generate_z(
         prompts=prompt_texts,
         prompt_token_ids=prompt_ids_batch if supports_token_prompts else None,
         max_new_tokens=cfg.rollout.max_new_tokens,
@@ -590,16 +591,47 @@ def _collect_rollouts_vllm_batch(
     digit_prompt_ids_batch: List[List[int]] = []
     digit_prompt_texts: List[str] = []
 
-    for i, toks in enumerate(z_gens):
-        seq = [int(x) for x in toks][: int(cfg.rollout.max_new_tokens)]
-        if int(answer_token_id) in seq:
-            pos = seq.index(int(answer_token_id))
-            seq = seq[: pos + 1]
+    logged_example = False
+    for i, row in enumerate(z_gen_rows):
+        seq_raw = [int(x) for x in list(row.get("token_ids", []))][: int(cfg.rollout.max_new_tokens)]
+        stop_reason = row.get("stop_reason")
+        finish_reason = row.get("finish_reason")
+
+        answer_in_tokens = int(answer_token_id) in seq_raw
+        if answer_in_tokens:
+            pos = seq_raw.index(int(answer_token_id))
+            seq = seq_raw[: pos + 1]
             assert seq[-1] == int(answer_token_id), "Z-phase sequence must truncate at first <ANSWER>"
             z_prefix = seq[:pos]
+            has_answer = True
+        else:
+            has_answer = False
+            if stop_reason is not None:
+                try:
+                    has_answer = int(stop_reason) == int(answer_token_id)
+                except Exception:
+                    has_answer = False
+            if has_answer:
+                pos = len(seq_raw)
+                z_prefix = seq_raw
+            else:
+                z_prefix = seq_raw
+
+        if not logged_example:
+            logger(
+                f"vLLM Z example | finish_reason={finish_reason} | stop_reason={stop_reason} | "
+                f"answer_in_token_ids={answer_in_tokens} | has_answer={has_answer}"
+            )
+            logged_example = True
+
+        if has_answer:
             z_prefix_by_idx[i] = z_prefix
             with_answer_idx.append(i)
             digit_prompt_ids = list(map(int, prepared[i]["prompt_ids"])) + z_prefix + [int(answer_token_id)]
+            assert digit_prompt_ids[-1] == int(answer_token_id)
+            prepared_prompt_ids = list(map(int, prepared[i]["prompt_ids"]))
+            if int(answer_token_id) not in prepared_prompt_ids:
+                assert int(answer_token_id) not in digit_prompt_ids[:-1]
             digit_prompt_ids_batch.append(digit_prompt_ids)
             if not supports_token_prompts:
                 digit_prompt_texts.append(
@@ -610,10 +642,11 @@ def _collect_rollouts_vllm_batch(
                     )
                 )
         else:
-            z_prefix_by_idx[i] = seq
+            z_prefix_by_idx[i] = z_prefix
 
     digit_map: Dict[int, List[int]] = {}
     if with_answer_idx:
+        digit_allowed_set = set(int(x) for x in digit_token_ids)
         digit_gens = vllm_engine.generate_digits(
             prompts=digit_prompt_texts if not supports_token_prompts else None,
             prompt_token_ids=digit_prompt_ids_batch if supports_token_prompts else None,
@@ -622,7 +655,13 @@ def _collect_rollouts_vllm_batch(
             greedy=bool(cfg.rollout.digit_greedy),
         )
         for j, idx in enumerate(with_answer_idx):
-            digit_map[idx] = [int(x) for x in digit_gens[j][:5]]
+            digits = [int(x) for x in digit_gens[j]]
+            if len(digits) != 5:
+                raise RuntimeError(f"Digit rollout must return exactly 5 tokens, got {len(digits)}")
+            bad = [d for d in digits if int(d) not in digit_allowed_set]
+            if bad:
+                raise RuntimeError(f"Digit rollout contains tokens outside digit set: {bad}")
+            digit_map[idx] = digits
 
     trajectories: List[Trajectory] = []
     for i, item in enumerate(prepared):
@@ -743,7 +782,7 @@ def train(cfg: Config) -> None:
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     os.makedirs(os.path.join(cfg.train.output_dir, "rollouts"), exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -761,8 +800,7 @@ def train(cfg: Config) -> None:
 
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
-        _log("WARNING: rollout.digit_greedy=True is incompatible with ppo_full; forcing digit_greedy=False")
-        cfg.rollout.digit_greedy = False
+        raise ValueError("digit_greedy=True is incompatible with ppo_full")
 
     z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -796,6 +834,8 @@ def train(cfg: Config) -> None:
 
     vllm_engine: Optional[VLLMRolloutEngine] = None
     if cfg.rollout.vllm_enabled:
+        vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
+        vllm_kwargs.setdefault("device", "cuda:1")
         vllm_engine = VLLMRolloutEngine(
             init_ckpt=cfg.model.init_ckpt,
             tokenizer=tokenizer,
@@ -803,7 +843,7 @@ def train(cfg: Config) -> None:
             z_allowed_token_ids=z_allowed_t.tolist(),
             digit_allowed_token_ids=digit_allowed_t.tolist(),
             trust_remote_code=bool(cfg.model.trust_remote_code),
-            engine_kwargs=cfg.rollout.vllm_engine_kwargs,
+            engine_kwargs=vllm_kwargs,
             output_dir=cfg.train.output_dir,
             tmp_ckpt_dir=(
                 cfg.rollout.vllm_tmp_ckpt_dir
@@ -882,6 +922,7 @@ def train(cfg: Config) -> None:
                         answer_token_id=int(answer_token_id),
                         digit_token_ids=digit_token_ids,
                         reward_rng=reward_rng,
+                        logger=_log,
                     )
                 else:
                     batch_trajs = [

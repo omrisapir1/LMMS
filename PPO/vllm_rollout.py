@@ -62,7 +62,15 @@ class VLLMRolloutEngine:
         kwargs.setdefault("trust_remote_code", self.trust_remote_code)
 
         self._sampling_params_cls = SamplingParams
-        self._llm = LLM(model=model_ref, tokenizer=model_ref, **kwargs)
+        prev = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        try:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+            self._llm = LLM(model=model_ref, tokenizer=model_ref, **kwargs)
+        finally:
+            if prev is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev
+            elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
         self._model_ref = model_ref
 
     def _destroy_engine(self) -> None:
@@ -120,13 +128,9 @@ class VLLMRolloutEngine:
         return self._sampling_params_cls(**kwargs)
 
     def supports_prompt_token_ids(self) -> bool:
-        if self._llm is None:
-            return False
-        try:
-            sig = inspect.signature(self._llm.generate)
-        except Exception:
-            return False
-        return "prompt_token_ids" in sig.parameters
+        # vLLM 0.14 accepts token prompts via TokensPrompt dicts in prompts list,
+        # even when generate() signature does not expose prompt_token_ids kwarg.
+        return True
 
     def _try_runtime_weight_sync(self, model) -> bool:
         if self._llm is None:
@@ -206,7 +210,7 @@ class VLLMRolloutEngine:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
-    ) -> List[List[int]]:
+    ) -> List[Dict[str, object]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
         sp = self._build_sampling_params(
@@ -218,12 +222,23 @@ class VLLMRolloutEngine:
             stop_on_answer=True,
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
-            outs = self._llm.generate(prompt_token_ids=[list(map(int, x)) for x in prompt_token_ids], sampling_params=sp)
+            token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
+            outs = self._llm.generate(token_prompts, sp)
         else:
             if prompts is None:
                 raise RuntimeError("generate_z requires text prompts when prompt_token_ids are unsupported")
             outs = self._llm.generate(list(prompts), sp)
-        return [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
+        rows: List[Dict[str, object]] = []
+        for o in outs:
+            out0 = o.outputs[0]
+            rows.append(
+                {
+                    "token_ids": list(getattr(out0, "token_ids", []) or []),
+                    "stop_reason": getattr(out0, "stop_reason", None),
+                    "finish_reason": getattr(out0, "finish_reason", None),
+                }
+            )
+        return rows
 
     def generate_digits(
         self,
@@ -245,7 +260,8 @@ class VLLMRolloutEngine:
             greedy=bool(greedy),
         )
         if prompt_token_ids is not None and self.supports_prompt_token_ids():
-            outs = self._llm.generate(prompt_token_ids=[list(map(int, x)) for x in prompt_token_ids], sampling_params=sp)
+            token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
+            outs = self._llm.generate(token_prompts, sp)
         else:
             if prompts is None:
                 raise RuntimeError("generate_digits requires text prompts when prompt_token_ids are unsupported")
