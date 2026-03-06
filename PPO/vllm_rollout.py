@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import socket
+import inspect
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -209,15 +210,16 @@ class VLLMRolloutEngine:
         worker_world_size = int(self._resolve_world_size())
         self._wt_world_size = int(worker_world_size + self._wt_rank_offset)
 
-        trainer_init_info = self._nccl_weight_transfer_init_info_cls(
+        trainer_init_info = self._build_nccl_init_info(
             master_address=self._wt_master_address,
             master_port=self._wt_master_port,
             world_size=self._wt_world_size,
+            rank_offset=0,
         )
 
         self._wt_group = self._nccl_engine_cls.trainer_init(asdict(trainer_init_info))
 
-        worker_init_info = self._nccl_weight_transfer_init_info_cls(
+        worker_init_info = self._build_nccl_init_info(
             master_address=self._wt_master_address,
             master_port=self._wt_master_port,
             rank_offset=self._wt_rank_offset,
@@ -228,6 +230,27 @@ class VLLMRolloutEngine:
 
         self._wt_ready = True
         self._log("weight transfer initialized")
+
+    def _build_nccl_init_info(
+        self,
+        *,
+        master_address: str,
+        master_port: int,
+        world_size: int,
+        rank_offset: int,
+    ):
+        cls = self._nccl_weight_transfer_init_info_cls
+        if cls is None:
+            raise RuntimeError("vLLM NCCLWeightTransferInitInfo is not available")
+        params = inspect.signature(cls).parameters
+        kwargs: Dict[str, Any] = {
+            "master_address": str(master_address),
+            "master_port": int(master_port),
+            "world_size": int(world_size),
+        }
+        if "rank_offset" in params:
+            kwargs["rank_offset"] = int(rank_offset)
+        return cls(**kwargs)
 
     @staticmethod
     def _resolve_master_ip() -> str:
