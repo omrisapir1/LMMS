@@ -6,6 +6,7 @@ import json
 import os
 import random
 import shutil
+import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -27,6 +28,22 @@ from PPO.rollout_logger import RolloutLogger
 from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single
 from PPO.vllm_rollout import VLLMRolloutEngine
 from phase1.dataset import SYSTEM_PROMPT
+
+_REWARD_TIME_ACC_SEC: float = 0.0
+
+
+def _reset_reward_timing_acc() -> None:
+    global _REWARD_TIME_ACC_SEC
+    _REWARD_TIME_ACC_SEC = 0.0
+
+
+def _add_reward_timing_acc(delta_sec: float) -> None:
+    global _REWARD_TIME_ACC_SEC
+    _REWARD_TIME_ACC_SEC += float(delta_sec)
+
+
+def _get_reward_timing_acc() -> float:
+    return float(_REWARD_TIME_ACC_SEC)
 
 
 class ValueHead(nn.Module):
@@ -698,6 +715,7 @@ def _rollout_one_torch(
         temperature=temperature,
     )
 
+    _t_reward0 = time.perf_counter()
     reward_info = compute_reward(
         pred_digits=pred_digits,
         true_digits=true_digits,
@@ -709,6 +727,7 @@ def _rollout_one_torch(
         num_generated_tokens=int(seq.size(1) - len(prompt_ids)),
         generator=reward_rng,
     )
+    _add_reward_timing_acc(time.perf_counter() - _t_reward0)
 
     return Trajectory(
         sample_id=sample_id,
@@ -797,6 +816,7 @@ def _build_trajectory_from_vllm_tokens(
         id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
         pred_digits = [int(id2d[x]) for x in generated_digit_ids]
 
+    _t_reward0 = time.perf_counter()
     reward_info = compute_reward(
         pred_digits=pred_digits,
         true_digits=true_digits,
@@ -808,6 +828,7 @@ def _build_trajectory_from_vllm_tokens(
         num_generated_tokens=len(generated_z_ids) + (1 if has_answer else 0) + len(generated_digit_ids),
         generator=reward_rng,
     )
+    _add_reward_timing_acc(time.perf_counter() - _t_reward0)
 
     return Trajectory(
         sample_id=sample_id,
@@ -1170,13 +1191,20 @@ def train(cfg: Config) -> None:
     ds_index = 0
     try:
         for update in range(1, cfg.train.updates + 1):
+            _t_update0 = time.perf_counter()
+            _reset_reward_timing_acc()
+
+            t_sync_sec = 0.0
             if vllm_engine is not None:
+                _t_sync0 = time.perf_counter()
                 synced = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=update)
+                t_sync_sec += time.perf_counter() - _t_sync0
                 if synced:
                     _log(f"vLLM policy sync complete at update={update}")
 
             trajectories: List[Trajectory] = []
             token_budget = 0
+            _t_rollout0 = time.perf_counter()
 
             while len(trajectories) < cfg.rollout.episodes_per_batch:
                 remaining = cfg.rollout.episodes_per_batch - len(trajectories)
@@ -1263,6 +1291,7 @@ def train(cfg: Config) -> None:
                         break
                 if token_budget >= int(cfg.rollout.max_tokens_per_batch):
                     break
+            t_rollout_sec = time.perf_counter() - _t_rollout0
 
             if not trajectories:
                 raise RuntimeError("No trajectories collected for PPO update")
@@ -1310,6 +1339,7 @@ def train(cfg: Config) -> None:
 
             rollout_path = rollout_logger.write_step(step=update, rows=roll_rows)
 
+            _t_backprop0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             minibatch_count = 0
 
@@ -1374,6 +1404,7 @@ def train(cfg: Config) -> None:
                 torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            t_backprop_sec = time.perf_counter() - _t_backprop0
 
             rewards = torch.tensor([float(t.reward_info["reward_final"]) for t in trajectories], dtype=torch.float32)
             exact_rate = float(
@@ -1388,6 +1419,8 @@ def train(cfg: Config) -> None:
             ev = explained_variance(y_pred=old_values, y_true=old_returns)
 
             denom = max(minibatch_count, 1)
+            t_reward_sec = _get_reward_timing_acc()
+            t_total_sec = time.perf_counter() - _t_update0
             _log(
                 " | ".join(
                     [
@@ -1404,6 +1437,11 @@ def train(cfg: Config) -> None:
                         f"value_loss={val_acc / denom:.4f}",
                         f"explained_var={ev:.4f}",
                         f"rollouts={rollout_path}",
+                        f"t_sync={t_sync_sec:.3f}s",
+                        f"t_rollout={t_rollout_sec:.3f}s",
+                        f"t_reward={t_reward_sec:.3f}s",
+                        f"t_backprop={t_backprop_sec:.3f}s",
+                        f"t_update={t_total_sec:.3f}s",
                     ]
                 )
             )
