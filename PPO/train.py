@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from glob import glob
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from PPO.conf import Config, DEFAULT_SET_ALLOWED_PREFIXES
+from PPO.hf_rollout import HFRolloutEngine
 from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
 from PPO.ppo_math import clipped_policy_loss, explained_variance, value_mse_loss
 from PPO.reward import compute_reward, parse_answer_digits, parse_final_answer_to_digits
@@ -836,7 +837,7 @@ def _collect_rollouts_vllm_batch(
     model,
     value_head: ValueHead,
     tokenizer,
-    vllm_engine: VLLMRolloutEngine,
+    vllm_engine: Any,
     prepared: Sequence[Dict[str, object]],
     cfg: Config,
     z_allowed_t: torch.Tensor,
@@ -1125,9 +1126,21 @@ def train(cfg: Config) -> None:
         eps=cfg.train.eps,
     )
 
-    vllm_engine: Optional[VLLMRolloutEngine] = None
-    if cfg.rollout.vllm_enabled:
+    rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
+    vllm_engine: Optional[Any] = None
+    if rollout_backend == "hf":
+        vllm_engine = HFRolloutEngine(
+            tokenizer=tokenizer,
+            answer_token_id=int(answer_token_id),
+            z_allowed_token_ids=z_allowed_t.tolist(),
+            digit_allowed_token_ids=digit_allowed_t.tolist(),
+            sync_every=int(cfg.rollout.vllm_sync_every),
+            logger=_log,
+        )
+    elif cfg.rollout.vllm_enabled:
         vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
+        vllm_kwargs.setdefault("tensor_parallel_size", int(cfg.rollout.vllm_tp_size))
+        vllm_seed = int(cfg.rollout.vllm_seed) if cfg.rollout.vllm_seed is not None else int(cfg.train.seed)
         vllm_engine = VLLMRolloutEngine(
             init_ckpt=cfg.model.init_ckpt,
             tokenizer=tokenizer,
@@ -1143,7 +1156,7 @@ def train(cfg: Config) -> None:
                 else os.path.join(cfg.train.output_dir, "vllm_ckpt_latest")
             ),
             sync_every=int(cfg.rollout.vllm_sync_every),
-            seed=int(cfg.train.seed),
+            seed=vllm_seed,
             logger=_log,
         )
 
