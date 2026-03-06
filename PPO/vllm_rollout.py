@@ -73,12 +73,7 @@ class VLLMRolloutEngine:
                 WeightTransferInitRequest,
                 WeightTransferUpdateRequest,
             )
-            from vllm.distributed.weight_transfer.nccl_engine import (
-                NCCLTrainerSendWeightsArgs,
-                NCCLWeightTransferEngine,
-                NCCLWeightTransferInitInfo,
-                NCCLWeightTransferUpdateInfo,
-            )
+            from vllm.distributed.weight_transfer import nccl_engine as _nccl_engine_mod
         except Exception as exc:
             raise RuntimeError(
                 "vLLM rollout is enabled but vLLM weight-sync APIs are unavailable"
@@ -88,10 +83,20 @@ class VLLMRolloutEngine:
         self._sampling_params_cls = SamplingParams
         self._weight_transfer_init_request_cls = WeightTransferInitRequest
         self._weight_transfer_update_request_cls = WeightTransferUpdateRequest
-        self._nccl_engine_cls = NCCLWeightTransferEngine
-        self._nccl_trainer_send_weights_args_cls = NCCLTrainerSendWeightsArgs
-        self._nccl_weight_transfer_init_info_cls = NCCLWeightTransferInitInfo
-        self._nccl_weight_transfer_update_info_cls = NCCLWeightTransferUpdateInfo
+        self._nccl_engine_cls = getattr(_nccl_engine_mod, "NCCLWeightTransferEngine", None)
+        self._nccl_weight_transfer_init_info_cls = getattr(_nccl_engine_mod, "NCCLWeightTransferInitInfo", None)
+        self._nccl_weight_transfer_update_info_cls = getattr(_nccl_engine_mod, "NCCLWeightTransferUpdateInfo", None)
+        self._nccl_trainer_send_weights_args_cls = getattr(_nccl_engine_mod, "NCCLTrainerSendWeightsArgs", None)
+        if self._nccl_engine_cls is None:
+            raise RuntimeError("vLLM NCCLWeightTransferEngine is not available")
+        if self._nccl_weight_transfer_init_info_cls is None:
+            raise RuntimeError("vLLM NCCLWeightTransferInitInfo is not available")
+        if self._nccl_weight_transfer_update_info_cls is None:
+            raise RuntimeError("vLLM NCCLWeightTransferUpdateInfo is not available")
+        if self._nccl_trainer_send_weights_args_cls is None:
+            self._log("vLLM weight sync: using legacy trainer_send_weights signature (no NCCLTrainerSendWeightsArgs)")
+        else:
+            self._log("vLLM weight sync: using NCCLTrainerSendWeightsArgs signature")
 
         kwargs = dict(self._engine_kwargs)
         kwargs.setdefault("seed", self.seed)
@@ -334,8 +339,29 @@ class VLLMRolloutEngine:
         worker_thread = threading.Thread(target=_driver_update_call, daemon=True)
         worker_thread.start()
 
-        send_args = self._nccl_trainer_send_weights_args_cls(group=self._wt_group, packed=packed)
-        self._nccl_engine_cls.trainer_send_weights(staged_named, trainer_args=send_args)
+        if self._nccl_trainer_send_weights_args_cls is not None:
+            send_args = self._nccl_trainer_send_weights_args_cls(group=self._wt_group, packed=packed)
+            self._nccl_engine_cls.trainer_send_weights(staged_named, trainer_args=send_args)
+        else:
+            sent = False
+            last_exc: Optional[Exception] = None
+            for args, kwargs in (
+                ((staged_named,), {"group": self._wt_group, "packed": packed}),
+                ((staged_named, self._wt_group), {"packed": packed}),
+                ((staged_named, self._wt_group, packed), {}),
+                (tuple(), {"weights": staged_named, "group": self._wt_group, "packed": packed}),
+            ):
+                try:
+                    self._nccl_engine_cls.trainer_send_weights(*args, **kwargs)
+                    sent = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            if not sent:
+                raise RuntimeError(
+                    "vLLM trainer_send_weights call failed for all known signatures"
+                ) from last_exc
 
         worker_thread.join()
         if len(update_exc) > 0:
