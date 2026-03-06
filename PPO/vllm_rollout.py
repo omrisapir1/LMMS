@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import socket
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -203,13 +204,8 @@ class VLLMRolloutEngine:
         if not hasattr(self._llm, "init_weight_transfer_engine"):
             raise RuntimeError("vLLM LLM.init_weight_transfer_engine is not available")
 
-        try:
-            from vllm.utils import get_ip, get_open_port
-        except Exception as exc:
-            raise RuntimeError("Failed importing vLLM network utils for weight transfer init") from exc
-
-        self._wt_master_address = str(get_ip())
-        self._wt_master_port = int(get_open_port())
+        self._wt_master_address = str(self._resolve_master_ip())
+        self._wt_master_port = int(self._resolve_open_port())
         worker_world_size = int(self._resolve_world_size())
         self._wt_world_size = int(worker_world_size + self._wt_rank_offset)
 
@@ -232,6 +228,52 @@ class VLLMRolloutEngine:
 
         self._wt_ready = True
         self._log("weight transfer initialized")
+
+    @staticmethod
+    def _resolve_master_ip() -> str:
+        # vLLM moved network helpers across versions; use whichever exists first.
+        try:
+            from vllm.utils import get_ip as _get_ip  # type: ignore
+            return str(_get_ip())
+        except Exception:
+            pass
+        try:
+            from vllm.utils.network import get_ip as _get_ip  # type: ignore
+            return str(_get_ip())
+        except Exception:
+            pass
+
+        # Last-resort fallback when vLLM helper APIs are unavailable.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            return str(ip) if ip else "127.0.0.1"
+        except Exception:
+            return "127.0.0.1"
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _resolve_open_port() -> int:
+        try:
+            from vllm.utils import get_open_port as _get_open_port  # type: ignore
+            return int(_get_open_port())
+        except Exception:
+            pass
+        try:
+            from vllm.utils.network import get_open_port as _get_open_port  # type: ignore
+            return int(_get_open_port())
+        except Exception:
+            pass
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("", 0))
+            sock.listen(1)
+            return int(sock.getsockname()[1])
+        finally:
+            sock.close()
 
     def _build_sampling_params(
         self,
