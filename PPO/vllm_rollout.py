@@ -217,16 +217,33 @@ class VLLMRolloutEngine:
             rank_offset=0,
         )
 
-        self._wt_group = self._nccl_engine_cls.trainer_init(asdict(trainer_init_info))
-
         worker_init_info = self._build_nccl_init_info(
             master_address=self._wt_master_address,
             master_port=self._wt_master_port,
             rank_offset=self._wt_rank_offset,
             world_size=self._wt_world_size,
         )
+        trainer_exc: List[BaseException] = []
+
+        def _trainer_init_call() -> None:
+            try:
+                self._wt_group = self._nccl_engine_cls.trainer_init(asdict(trainer_init_info))
+            except BaseException as exc:
+                trainer_exc.append(exc)
+
+        # Some vLLM versions block trainer_init until workers join.
+        trainer_thread = threading.Thread(target=_trainer_init_call, daemon=True)
+        trainer_thread.start()
         init_req = self._weight_transfer_init_request_cls(init_info=asdict(worker_init_info))
         self._llm.init_weight_transfer_engine(init_req)
+        trainer_thread.join()
+        if len(trainer_exc) > 0:
+            raise RuntimeError(
+                f"vLLM trainer_init failed during weight transfer setup: "
+                f"{type(trainer_exc[0]).__name__}: {trainer_exc[0]}"
+            ) from trainer_exc[0]
+        if self._wt_group is None:
+            raise RuntimeError("vLLM trainer_init did not produce a valid NCCL group")
 
         self._wt_ready = True
         self._log("weight transfer initialized")
