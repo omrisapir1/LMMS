@@ -54,7 +54,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.01
-    ppo_epochs: int = 1
+    ppo_epochs: int = 2
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
@@ -62,7 +62,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-6
+    lr: float = 5e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
