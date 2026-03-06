@@ -1069,7 +1069,8 @@ def train(cfg: Config) -> None:
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     os.makedirs(os.path.join(cfg.train.output_dir, "rollouts"), exist_ok=True)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch_device_cfg = str(getattr(cfg.rollout, "torch_device", "cuda:0")).strip()
+    device = torch.device(torch_device_cfg if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1161,6 +1162,12 @@ def train(cfg: Config) -> None:
     elif cfg.rollout.vllm_enabled:
         vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
         vllm_kwargs.setdefault("tensor_parallel_size", int(cfg.rollout.vllm_tp_size))
+        vllm_kwargs.setdefault("weight_transfer_device", str(device))
+        if int(cfg.rollout.vllm_tp_size) == 1:
+            vllm_cvd = str(getattr(cfg.rollout, "vllm_cuda_visible_devices", "")).strip()
+            if vllm_cvd:
+                vllm_kwargs.setdefault("cuda_visible_devices", vllm_cvd)
+                _log(f"vLLM CUDA_VISIBLE_DEVICES={vllm_kwargs['cuda_visible_devices']}")
         vllm_seed = int(cfg.rollout.vllm_seed) if cfg.rollout.vllm_seed is not None else int(cfg.train.seed)
         vllm_engine = VLLMRolloutEngine(
             init_ckpt=cfg.model.init_ckpt,

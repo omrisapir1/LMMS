@@ -35,6 +35,8 @@ class RolloutConfig:
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
+    torch_device: str = "cuda:0"
+    vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 128
     max_tokens_per_batch: int = 4096*4
 

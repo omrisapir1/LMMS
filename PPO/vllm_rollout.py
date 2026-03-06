@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import socket
 import inspect
+import os
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -65,6 +66,7 @@ class VLLMRolloutEngine:
         self._wt_packed = bool(self._engine_kwargs.pop("weight_transfer_packed", False))
         self._wt_transfer_device = str(self._engine_kwargs.pop("weight_transfer_device", "cuda:0"))
         self._wt_rank_offset = int(self._engine_kwargs.pop("weight_transfer_rank_offset", 1))
+        self._cuda_visible_devices = self._engine_kwargs.pop("cuda_visible_devices", None)
         self._init_engine(self._model_ref)
 
     def _init_engine(self, init_ckpt: str) -> None:
@@ -106,6 +108,9 @@ class VLLMRolloutEngine:
         kwargs.setdefault("distributed_executor_backend", "ray")
         kwargs.setdefault("load_format", "dummy")
         kwargs.setdefault("weight_transfer_config", WeightTransferConfig(backend="nccl"))
+        if self._cuda_visible_devices is not None and str(self._cuda_visible_devices).strip():
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self._cuda_visible_devices)
+            self._log(f"vLLM init with CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 
         try:
             self._llm = LLM(model=init_ckpt, tokenizer=init_ckpt, **kwargs)
