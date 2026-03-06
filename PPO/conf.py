@@ -22,7 +22,7 @@ class DataConfig:
 
 @dataclass
 class RolloutConfig:
-    backend: str = "vllm"  # "vllm" | "hf"
+    backend: str = "hf"  # "vllm" | "hf"
     max_new_tokens: int = 64*8
     temperature: float = 1.0
     top_p: float = 0.95
