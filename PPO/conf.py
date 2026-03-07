@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
+MAX_TOKENS = 512
+BACH_SIZE = 1
+
 @dataclass
 class ModelConfig:
     init_ckpt: str = "omrisap/SFT_Z_model"
@@ -23,14 +26,14 @@ class DataConfig:
 @dataclass
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
-    max_new_tokens: int = 64*8
+    max_new_tokens: int = MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 0.95
     digit_greedy: bool = False
     action_scope: str = "ppo_full"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
-    vllm_batch_size: int = 1
+    vllm_batch_size: int = BACH_SIZE
     vllm_tp_size: int = 1
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
@@ -38,7 +41,7 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 1
-    max_tokens_per_batch: int = 4096*4
+    max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
 
 
 @dataclass

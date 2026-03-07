@@ -1382,6 +1382,23 @@ def train(cfg: Config) -> None:
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                         )
 
+                        with torch.no_grad():
+                            log_ratio = (logp_new - logp_old)
+                            ratio = log_ratio.exp()
+                            _log(
+                                "DBG "
+                                f"T={logp_new.numel()} "
+                                f"adv_mean={advantages.mean().item():+.6f} adv_std={advantages.std(unbiased=False).item():.6f} "
+                                f"adv_norm_mean={advantages.mean().item():+.6f} "  # (advantages here is already advantages_norm from traj)
+                                f"logp_diff_max={log_ratio.abs().max().item():.6e} "
+                                f"ratio_mean={ratio.mean().item():.6f} ratio_min={ratio.min().item():.6f} ratio_max={ratio.max().item():.6f}"
+                            )
+                            t = trajectories[0]
+                            _log(f"DBG raw_adv_mean={sum(t.advantages) / len(t.advantages):+.6f} "
+                                 f"norm_adv_mean={sum(t.advantages_norm) / len(t.advantages_norm):+.6f}")
+
+
+
                         policy_loss, clipfrac = clipped_policy_loss(
                             logp_new=logp_new,
                             logp_old=logp_old,
