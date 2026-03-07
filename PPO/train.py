@@ -1300,6 +1300,17 @@ def train(cfg: Config) -> None:
                     break
             t_rollout_sec = time.perf_counter() - _t_rollout0
 
+            _debug_compare_logp_entropy_single_traj(
+                model=model,
+                value_head=value_head,
+                tokenizer=tokenizer,
+                traj=trajectories[0],
+                z_allowed_t=z_allowed_t,
+                digit_allowed_t=digit_allowed_t,
+                temperature=cfg.rollout.temperature,
+                n=_PPO_DEBUG_LOGITS_COMPARE_N,
+            )
+
             if not trajectories:
                 raise RuntimeError("No trajectories collected for PPO update")
 
@@ -1578,7 +1589,83 @@ def _debug_print_policy_details(
 
 
 
+_PPO_DEBUG_LOGITS_COMPARE = os.getenv("PPO_DEBUG_LOGITS_COMPARE", "").strip().lower() in ("1","true","yes","y","on")
+_PPO_DEBUG_LOGITS_COMPARE_N = int(os.getenv("PPO_DEBUG_LOGITS_COMPARE_N", "12"))
 
+def _debug_compare_logp_entropy_single_traj(
+    *,
+    model,
+    value_head,
+    tokenizer,
+    traj: Trajectory,
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    temperature: float,
+    n: int,
+) -> None:
+    """
+    Recompute per-step logp + entropy from torch logits on prompt+actions and compare to traj.logp_old/entropy_old.
+    This validates logits->probs->logp and entropy definitions are implemented correctly.
+    """
+    device = next(model.parameters()).device
+    if len(traj.actions) == 0:
+        _log("DBG_LOGITS: empty traj")
+        return
+
+    # Build full sequence = prompt + actions
+    seq_ids = torch.tensor(list(traj.prompt_ids) + list(traj.actions), dtype=torch.long, device=device).unsqueeze(0)
+    att = torch.tensor(list(traj.prompt_attention_mask) + [1] * len(traj.actions), dtype=torch.long, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        out = model(
+            input_ids=seq_ids,
+            attention_mask=att,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        logits_all = out.logits[0]  # [L,V]
+
+    p_len = len(traj.prompt_ids)
+    T = len(traj.actions)
+    n_show = min(int(n), T)
+
+    # positions where action i is predicted (same logic as _action_stats_tensors)
+    state_positions = torch.arange(p_len - 1, p_len - 1 + T, device=device, dtype=torch.long)
+
+    _log(f"DBG_LOGITS traj={traj.sample_id} T={T} show={n_show}")
+
+    for i in range(n_show):
+        pos = int(state_positions[i].item())
+        aid = int(traj.actions[i])
+        atype = str(traj.action_types[i])
+        allowed_t = digit_allowed_t if atype == "digit" else z_allowed_t
+
+        allowed_logits = logits_all[pos].index_select(0, allowed_t) / float(temperature)
+        logp_allowed = torch.log_softmax(allowed_logits, dim=-1)
+        probs = logp_allowed.exp()
+        probs_sum = float(probs.sum().item())
+        ent = float((-(probs * logp_allowed).sum()).item())
+
+        # find local index
+        m = torch.nonzero(allowed_t == aid, as_tuple=False)
+        if m.numel() == 0:
+            _log(f"DBG_LOGITS i={i} ERROR action_id not in allowed set! type={atype} id={aid}")
+            continue
+        local_idx = int(m[0].item())
+        lp = float(logp_allowed[local_idx].item())
+
+        lp_old = float(traj.logp_old[i])
+        ent_old = float(traj.entropy_old[i])
+
+        tok = tokenizer.convert_ids_to_tokens([aid])[0]
+        _log(
+            "DBG_LOGITS_TOK "
+            f"i={i:03d} type={atype:<6s} tok={tok:<10s} "
+            f"logp_old={lp_old:+.6f} logp_re={lp:+.6f} |d|={abs(lp_old-lp):.3e} "
+            f"ent_old={ent_old:+.6f} ent_re={ent:+.6f} |d|={abs(ent_old-ent):.3e} "
+            f"probs_sum={probs_sum:.6f} p[min/max]={float(probs.min().item()):.3e}/{float(probs.max().item()):.3e}"
+        )
 
 
 
