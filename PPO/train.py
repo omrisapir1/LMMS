@@ -1383,6 +1383,18 @@ def train(cfg: Config) -> None:
                         )
 
                         with torch.no_grad():
+                            lens = [len(t.actions) for t in batch_trajs]
+                            _log(f"DBG_POLICY_SHAPES T={logp_old.numel()} sum_lens={sum(lens)} lens={lens}")
+                            # show boundaries
+                            off = 0
+                            for j, t in enumerate(batch_trajs[:8]):
+                                tok0 = tokenizer.convert_ids_to_tokens([int(t.actions[0])])[
+                                    0] if t.actions else "<EMPTY>"
+                                _log(
+                                    f"DBG_POLICY_BOUND j={j} off={off} len={len(t.actions)} first_tok={tok0} first_type={t.action_types[0] if t.action_types else '?'}")
+                                off += len(t.actions)
+
+
                             log_ratio = (logp_new - logp_old)
                             ratio = log_ratio.exp()
                             _log(
