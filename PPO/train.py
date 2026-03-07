@@ -1397,8 +1397,15 @@ def train(cfg: Config) -> None:
                             _log(f"DBG raw_adv_mean={sum(t.advantages) / len(t.advantages):+.6f} "
                                  f"norm_adv_mean={sum(t.advantages_norm) / len(t.advantages_norm):+.6f}")
 
-
-
+                        _debug_print_policy_details(
+                            tokenizer=tokenizer,
+                            batch_trajs=batch_trajs,
+                            logp_old=logp_old,
+                            logp_new=logp_new,
+                            advantages=advantages,
+                            clip_range=cfg.ppo.clip_range,
+                            n=1,
+                        )
                         policy_loss, clipfrac = clipped_policy_loss(
                             logp_new=logp_new,
                             logp_old=logp_old,
@@ -1483,6 +1490,77 @@ def train(cfg: Config) -> None:
     finally:
         if vllm_engine is not None:
             vllm_engine.close()
+
+
+def _debug_print_policy_details(
+    *,
+    tokenizer,
+    batch_trajs: Sequence[Trajectory],
+    logp_old: torch.Tensor,
+    logp_new: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_range: float,
+    n: int,
+) -> None:
+    """
+    Prints first `n` tokens across the concatenated batch:
+      token, type, logp_old/new, diff, ratio, adv, and whether ratio is clipped.
+    Assumes logp_* and advantages are the concatenated vectors returned by _action_stats_tensors_batched.
+    """
+    try:
+        # Flatten actions/types in the same order we concatenated chunks in _action_stats_tensors_batched:
+        flat_actions: List[int] = []
+        flat_types: List[str] = []
+        for t in batch_trajs:
+            flat_actions.extend(list(map(int, t.actions)))
+            flat_types.extend(list(map(str, t.action_types)))
+
+        T = int(logp_old.numel())
+        n_show = min(int(n), T)
+
+        lr = (logp_new - logp_old)
+        ratio = lr.exp()
+
+        # PPO clip indicator
+        lo = 1.0 - float(clip_range)
+        hi = 1.0 + float(clip_range)
+        clipped = (ratio < lo) | (ratio > hi)
+
+        _log(
+            "DBG_POLICY "
+            f"T={T} "
+            f"ratio[min/mean/max]={float(ratio.min().item()):.6f}/{float(ratio.mean().item()):.6f}/{float(ratio.max().item()):.6f} "
+            f"logp_diff_max={float(lr.abs().max().item()):.6e} "
+            f"adv[mean/std]={float(advantages.mean().item()):+.6f}/{float(advantages.std(unbiased=False).item()):.6f} "
+            f"clipfrac_est={float(clipped.float().mean().item()):.6f}"
+        )
+
+        for i in range(n_show):
+            aid = int(flat_actions[i]) if i < len(flat_actions) else -1
+            atype = str(flat_types[i]) if i < len(flat_types) else "?"
+            tok = tokenizer.convert_ids_to_tokens([aid])[0] if aid >= 0 else "<?>"
+
+            _log(
+                "DBG_POLICY_TOK "
+                f"i={i:03d} "
+                f"type={atype:<6s} "
+                f"tok={tok:<10s} "
+                f"logp_old={float(logp_old[i].item()):+.6f} "
+                f"logp_new={float(logp_new[i].item()):+.6f} "
+                f"diff={float(lr[i].item()):+.6e} "
+                f"ratio={float(ratio[i].item()):.6f} "
+                f"adv={float(advantages[i].item()):+.6f} "
+                f"clipped={bool(clipped[i].item())}"
+            )
+    except Exception as e:
+        _log(f"DBG_POLICY_ERROR: {type(e).__name__}: {e}")
+
+
+
+
+
+
+
 
 
 def main() -> None:
