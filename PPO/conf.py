@@ -4,8 +4,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
-MAX_TOKENS = 512
-BACH_SIZE = 8
+MAX_TOKENS = 256
+BACH_SIZE = 64
 
 @dataclass
 class ModelConfig:
@@ -40,7 +40,7 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    episodes_per_batch: int = 8
+    episodes_per_batch: int = 64
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
 
 
@@ -48,7 +48,7 @@ class RolloutConfig:
 class RewardConfig:
     partial_scale: float = 0.5
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.0
+    length_penalty: float = 0.001
     reward_if_max_len: float = 0.0
 
 
@@ -56,8 +56,8 @@ class RewardConfig:
 class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
-    c_ent: float = 0.01
-    ppo_epochs: int = 1
+    c_ent: float = 0.001
+    ppo_epochs: int = 2
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
