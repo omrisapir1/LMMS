@@ -30,14 +30,14 @@ class RolloutConfig:
     action_scope: str = "ppo_full"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
-    vllm_batch_size: int = 128
+    vllm_batch_size: int = 1
     vllm_tp_size: int = 1
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    episodes_per_batch: int = 128
+    episodes_per_batch: int = 1
     max_tokens_per_batch: int = 4096*4
 
 
@@ -54,7 +54,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.01
-    ppo_epochs: int = 2
+    ppo_epochs: int = 1
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
