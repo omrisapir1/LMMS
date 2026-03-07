@@ -1646,6 +1646,7 @@ def _debug_compare_logp_entropy_single_traj(
         probs = logp_allowed.exp()
         probs_sum = float(probs.sum().item())
         ent = float((-(probs * logp_allowed).sum()).item())
+        _log(f"DBG_ALLOWED i={i} type={atype} allowed_size={int(allowed_t.numel())}")
 
         # find local index
         m = torch.nonzero(allowed_t == aid, as_tuple=False)
