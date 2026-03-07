@@ -21,7 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from PPO.conf import Config, DEFAULT_SET_ALLOWED_PREFIXES
 from PPO.hf_rollout import HFRolloutEngine
 from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
-from PPO.ppo_math import clipped_policy_loss, explained_variance, value_mse_loss
+from PPO.ppo_math import explained_variance
 from PPO.reward import compute_reward, parse_answer_digits, parse_final_answer_to_digits
 from PPO.rollout_contract import is_ppo_action, validate_action_scope
 from PPO.rollout_logger import RolloutLogger
@@ -443,11 +443,20 @@ def _action_stats_tensors_batched(
     d_id_to_local: torch.Tensor,
     temperature: float,
     pad_token_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     device = next(model.parameters()).device
     if not trajs:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        return empty, empty, empty, empty, empty, empty
+        empty_l = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty, empty, empty, empty, empty, empty_l
 
     seqs: List[List[int]] = []
     atts: List[List[int]] = []
@@ -493,9 +502,11 @@ def _action_stats_tensors_batched(
     logp_old_chunks: List[torch.Tensor] = []
     adv_chunks: List[torch.Tensor] = []
     ret_chunks: List[torch.Tensor] = []
+    lengths: List[int] = []
 
     for b, traj in enumerate(trajs):
         t_steps = len(traj.actions)
+        lengths.append(t_steps)
         if t_steps == 0:
             continue
 
@@ -554,7 +565,7 @@ def _action_stats_tensors_batched(
 
     if not logp_new_chunks:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        return empty, empty, empty, empty, empty, empty
+        return empty, empty, empty, empty, empty, empty, torch.tensor(lengths, dtype=torch.long, device=device)
 
     return (
         torch.cat(logp_new_chunks, dim=0),
@@ -563,6 +574,7 @@ def _action_stats_tensors_batched(
         torch.cat(logp_old_chunks, dim=0),
         torch.cat(adv_chunks, dim=0),
         torch.cat(ret_chunks, dim=0),
+        torch.tensor(lengths, dtype=torch.long, device=device),
     )
 
 
@@ -1370,7 +1382,15 @@ def train(cfg: Config) -> None:
                         else nullcontext()
                     )
                     with amp_ctx:
-                        logp_new, values_new, entropy_new, logp_old, advantages, returns = _action_stats_tensors_batched(
+                        (
+                            logp_new,
+                            values_new,
+                            entropy_new,
+                            logp_old,
+                            advantages,
+                            returns,
+                            lengths,
+                        ) = _action_stats_tensors_batched(
                             model=model,
                             value_head=value_head,
                             trajs=batch_trajs,
@@ -1382,14 +1402,42 @@ def train(cfg: Config) -> None:
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                         )
 
-                        policy_loss, clipfrac = clipped_policy_loss(
-                            logp_new=logp_new,
-                            logp_old=logp_old,
-                            advantages=advantages,
-                            clip_range=cfg.ppo.clip_range,
-                        )
-                        v_loss = value_mse_loss(values=values_new, returns=returns)
-                        entropy_loss = -entropy_new.mean()
+                        lengths_list = [int(x) for x in lengths.tolist()]
+                        total_tokens = int(sum(lengths_list))
+                        if int(logp_new.numel()) != total_tokens:
+                            raise RuntimeError(
+                                f"Token count mismatch: T={int(logp_new.numel())}, sum(lengths)={total_tokens}"
+                            )
+
+                        log_ratio = logp_new - logp_old
+                        ratio = torch.exp(log_ratio)
+                        ratio_clipped = torch.clamp(ratio, 1.0 - cfg.ppo.clip_range, 1.0 + cfg.ppo.clip_range)
+                        pg1 = ratio * advantages
+                        pg2 = ratio_clipped * advantages
+                        policy_loss_tok = -torch.min(pg1, pg2)
+                        lo = 1.0 - cfg.ppo.clip_range
+                        hi = 1.0 + cfg.ppo.clip_range
+                        clipped_tok = ((ratio < lo) | (ratio > hi)).float()
+                        value_loss_tok = (values_new - returns).pow(2)
+
+                        policy_split = torch.split(policy_loss_tok, lengths_list)
+                        clip_split = torch.split(clipped_tok, lengths_list)
+                        value_split = torch.split(value_loss_tok, lengths_list)
+                        entropy_split = torch.split(entropy_new, lengths_list)
+
+                        policy_means = [chunk.mean() for chunk, L in zip(policy_split, lengths_list) if L > 0]
+                        clip_means = [chunk.mean() for chunk, L in zip(clip_split, lengths_list) if L > 0]
+                        value_means = [chunk.mean() for chunk, L in zip(value_split, lengths_list) if L > 0]
+                        entropy_means = [chunk.mean() for chunk, L in zip(entropy_split, lengths_list) if L > 0]
+
+                        if not policy_means:
+                            continue
+
+                        policy_loss = torch.stack(policy_means).mean()
+                        clipfrac = torch.stack(clip_means).mean()
+                        v_loss = torch.stack(value_means).mean()
+                        entropy_mean = torch.stack(entropy_means).mean()
+                        entropy_loss = -entropy_mean
 
                         loss = policy_loss + cfg.ppo.c_v * v_loss + cfg.ppo.c_ent * entropy_loss
                         loss = loss / float(cfg.train.grad_accum_steps)
@@ -1399,7 +1447,7 @@ def train(cfg: Config) -> None:
 
                     pol_acc += float(policy_loss.detach().item())
                     val_acc += float(v_loss.detach().item())
-                    ent_acc += float(entropy_new.detach().mean().item())
+                    ent_acc += float(entropy_mean.detach().item())
                     clip_acc += float(clipfrac.detach().item())
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
