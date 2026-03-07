@@ -97,7 +97,7 @@ class VLLMRolloutEngine:
             raise RuntimeError("vLLM NCCLWeightTransferInitInfo is not available")
         if self._nccl_weight_transfer_update_info_cls is None:
             raise RuntimeError("vLLM NCCLWeightTransferUpdateInfo is not available")
-        if self._nccl_trainer_send_weights_args_cls is None:
+        if self._nccl_trainer_send_weights_args_cls:
             self._log("vLLM weight sync: using legacy trainer_send_weights signature (no NCCLTrainerSendWeightsArgs)")
         else:
             self._log("vLLM weight sync: using NCCLTrainerSendWeightsArgs signature")
@@ -401,11 +401,11 @@ class VLLMRolloutEngine:
 
         total_bytes = int(sum(t.numel() * t.element_size() for _, t in staged_named))
         first_device = str(staged_named[0][1].device) if len(staged_named) > 0 else "n/a"
-        self._log(
-            "vLLM weight sync send: "
-            f"num_tensors={len(staged_named)} total_bytes={total_bytes} "
-            f"first_device={first_device} packed={packed}"
-        )
+        # self._log(
+        #     "vLLM weight sync send: "
+        #     f"num_tensors={len(staged_named)} total_bytes={total_bytes} "
+        #     f"first_device={first_device} packed={packed}"
+        # )
 
         update_info = self._nccl_weight_transfer_update_info_cls(
             names=[name for name, _ in staged_named],
