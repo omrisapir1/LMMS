@@ -29,8 +29,8 @@ class RolloutConfig:
     max_new_tokens: int = MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 0.95
-    digit_greedy: bool = False
-    action_scope: str = "ppo_full"  # "ppo_only_z_tokens" | "ppo_full"
+    digit_greedy: bool = True
+    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
@@ -70,7 +70,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 1000
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 1
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 200
