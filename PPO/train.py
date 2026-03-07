@@ -1383,6 +1383,15 @@ def train(cfg: Config) -> None:
                         )
 
                         with torch.no_grad():
+                            for j, t in enumerate(batch_trajs):
+                                from collections import Counter
+                                c = Counter(t.action_types)
+                                tail_n = min(10, len(t.actions))
+                                tail_tokens = tokenizer.convert_ids_to_tokens(t.actions[-tail_n:])
+                                tail_types = t.action_types[-tail_n:]
+                                _log(f"DBG_TYPES j={j} counts={dict(c)} tail={list(zip(tail_types, tail_tokens))}")
+
+
                             lens = [len(t.actions) for t in batch_trajs]
                             _log(f"DBG_POLICY_SHAPES T={logp_old.numel()} sum_lens={sum(lens)} lens={lens}")
                             # show boundaries
