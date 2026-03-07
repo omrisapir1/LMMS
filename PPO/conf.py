@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 
 MAX_TOKENS = 512
-BACH_SIZE = 1
+BACH_SIZE = 8
 
 @dataclass
 class ModelConfig:
@@ -40,7 +40,7 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    episodes_per_batch: int = 1
+    episodes_per_batch: int = 8
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
 
 
