@@ -1218,8 +1218,8 @@ def train(cfg: Config) -> None:
                 _t_sync0 = time.perf_counter()
                 synced = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=update)
                 t_sync_sec += time.perf_counter() - _t_sync0
-                if synced:
-                    _log(f"vLLM policy sync complete at update={update}")
+                # if synced:
+                #     _log(f"vLLM policy sync complete at update={update}")
 
             trajectories: List[Trajectory] = []
             token_budget = 0

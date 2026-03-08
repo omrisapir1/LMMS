@@ -472,7 +472,7 @@ class VLLMRolloutEngine:
             try:
                 self._update_weights_in_place_once(named)
                 self._update_fail_streak = 0
-                self._log("vLLM weights updated in-place via LLM.update_weights")
+                # self._log("vLLM weights updated in-place via LLM.update_weights")
                 return True
             except Exception as exc1:
                 self._update_fail_streak += 1
@@ -481,7 +481,7 @@ class VLLMRolloutEngine:
             try:
                 self._update_weights_in_place_once(named)
                 self._update_fail_streak = 0
-                self._log("vLLM weights updated in-place via LLM.update_weights")
+                # self._log("vLLM weights updated in-place via LLM.update_weights")
                 return True
             except Exception as exc2:
                 self._update_fail_streak += 1
