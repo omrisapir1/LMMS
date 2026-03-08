@@ -29,7 +29,7 @@ class RolloutConfig:
     max_new_tokens: int = MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 0.95
-    digit_greedy: bool = True
+    digit_greedy: bool = False
     action_scope: str = "ppo_full"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
