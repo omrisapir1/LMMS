@@ -70,7 +70,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 1
+    grad_accum_steps: int = 4
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 1000
