@@ -69,11 +69,11 @@ class TrainConfig:
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
-    updates: int = 1000
+    updates: int = 10000
     grad_accum_steps: int = 1
     seed: int = 42
     output_dir: str = "./runs/ppo"
-    save_every: int = 200
+    save_every: int = 1000
     keep_last: int = 3
 
 
