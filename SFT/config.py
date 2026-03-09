@@ -25,6 +25,7 @@ class SFTConfig:
     max_steps: int = 60_000
     warmup_steps: int = 500
     max_length: int = 2048
+    torch_device: str = "cuda:0"
 
     # Objective weights
     z_label_smoothing: float = 0.2
@@ -49,6 +50,7 @@ class SFTConfig:
     k_max: int = 128
     temperature: float = 1.0
     top_p: float = 0.95
+    vllm_cuda_visible_devices: str = "1"
 
     # Logging / checkpointing
     run_root: str = "runs/sft_z"

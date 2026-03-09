@@ -417,7 +417,10 @@ def train(cfg: SFTConfig) -> str:
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device(str(cfg.torch_device))
+    else:
+        device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.base_model_or_checkpoint,#
@@ -452,6 +455,10 @@ def train(cfg: SFTConfig) -> str:
 
     _log(f"run_dir={run_dir}", log_path)
     _log(f"train_size={len(train_records)} eval_size={len(eval_records)}", log_path)
+    _log(
+        f"torch_device={device} vllm_cuda_visible_devices={cfg.vllm_cuda_visible_devices}",
+        log_path,
+    )
     _log(
         "counterfactual enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
@@ -677,6 +684,7 @@ def train(cfg: SFTConfig) -> str:
                     temperature=cfg.temperature,
                     top_p=cfg.top_p,
                     vocab_size=cfg.vocab_size,
+                    vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
                     output_jsonl_path=eval_jsonl,
                 )
 
@@ -750,6 +758,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_length", type=int, default=2048)
+    p.add_argument("--torch_device", type=str, default="cuda:0")
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
@@ -769,6 +778,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k_max", type=int, default=128)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.95)
+    p.add_argument("--vllm_cuda_visible_devices", type=str, default="1")
 
     p.add_argument("--run_root", type=str, default="runs/sft_z")
     p.add_argument("--log_interval_steps", type=int, default=20)
@@ -800,6 +810,7 @@ def main() -> None:
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         max_length=args.max_length,
+        torch_device=args.torch_device,
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
         w_answer=args.w_answer,
@@ -817,6 +828,7 @@ def main() -> None:
         k_max=args.k_max,
         temperature=args.temperature,
         top_p=args.top_p,
+        vllm_cuda_visible_devices=args.vllm_cuda_visible_devices,
         run_root=args.run_root,
         log_interval_steps=args.log_interval_steps,
         save_interval_steps=args.save_interval_steps,

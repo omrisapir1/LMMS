@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,7 @@ def evaluate_with_vllm(
     temperature: float,
     top_p: float,
     vocab_size: int,
+    vllm_cuda_visible_devices: str | None = None,
     output_jsonl_path: str | None = None,
 ) -> EvalMetrics:
     try:
@@ -123,7 +125,16 @@ def evaluate_with_vllm(
             raise RuntimeError(f"Digit tokenization check failed in eval for '{d}' -> {ids}")
         digit_token_ids.append(int(ids[0]))
 
-    llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.5)
+    old_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if vllm_cuda_visible_devices is not None and str(vllm_cuda_visible_devices).strip():
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_cuda_visible_devices)
+    try:
+        llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.95)
+    finally:
+        if old_cuda_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible_devices
     z_token_id_set = set(z_token_ids)
     digit_id_to_val = {tid: i for i, tid in enumerate(digit_token_ids)}
 
