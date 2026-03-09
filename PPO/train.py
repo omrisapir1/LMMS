@@ -30,6 +30,12 @@ from PPO.vllm_rollout import VLLMRolloutEngine
 from phase1.dataset import SYSTEM_PROMPT
 
 _REWARD_TIME_ACC_SEC: float = 0.0
+_RUN_LOG_PATH: Optional[str] = None
+
+
+def _set_run_log_path(path: str) -> None:
+    global _RUN_LOG_PATH
+    _RUN_LOG_PATH = path
 
 
 def _reset_reward_timing_acc() -> None:
@@ -112,7 +118,11 @@ class Trajectory:
 
 def _log(msg: str) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
-    print(f"{ts} | {msg}")
+    line = f"{ts} | {msg}"
+    print(line)
+    if _RUN_LOG_PATH:
+        with open(_RUN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def _set_seed(seed: int) -> None:
@@ -1080,6 +1090,8 @@ def train(cfg: Config) -> None:
 
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     os.makedirs(os.path.join(cfg.train.output_dir, "rollouts"), exist_ok=True)
+    _set_run_log_path(os.path.join(cfg.train.output_dir, "train.log"))
+    _log(f"Run log file: {os.path.abspath(os.path.join(cfg.train.output_dir, 'train.log'))}")
 
     torch_device_cfg = str(getattr(cfg.rollout, "torch_device", "cuda:0")).strip()
     device = torch.device(torch_device_cfg if torch.cuda.is_available() else "cpu")
@@ -1365,6 +1377,7 @@ def train(cfg: Config) -> None:
             pol_acc = 0.0
             val_acc = 0.0
             ent_acc = 0.0
+            ent_loss_acc = 0.0
             clip_acc = 0.0
 
             order = list(range(len(trajectories)))
@@ -1448,6 +1461,7 @@ def train(cfg: Config) -> None:
                     pol_acc += float(policy_loss.detach().item())
                     val_acc += float(v_loss.detach().item())
                     ent_acc += float(entropy_mean.detach().item())
+                    ent_loss_acc += float(entropy_loss.detach().item())
                     clip_acc += float(clipfrac.detach().item())
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
@@ -1487,6 +1501,7 @@ def train(cfg: Config) -> None:
                         f"answer_rate={answer_rate:.4f}",
                         f"avg_len={avg_len:.2f}",
                         f"entropy={ent_acc / denom:.4f}",
+                        f"entropy_loss={ent_loss_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
