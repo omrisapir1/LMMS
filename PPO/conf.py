@@ -23,6 +23,9 @@ class DataConfig:
     answer_field: str = "final_answer"
 
 
+MAX_TOKENS = 256
+BACH_SIZE = 64
+
 @dataclass
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
