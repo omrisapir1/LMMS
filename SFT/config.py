@@ -29,7 +29,7 @@ class SFTConfig:
     # Objective weights
     z_label_smoothing: float = 0.2
     w_z: float = 1
-    w_answer: float = 0.1
+    w_answer: float = 0.5
     w_digits: float = 1.0
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
