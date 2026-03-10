@@ -49,7 +49,7 @@ class RolloutConfig:
 class RewardConfig:
     partial_scale: float = 0.5
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.01
+    length_penalty: float = 0.001
     reward_if_max_len: float = 0.0
 
 
@@ -59,7 +59,7 @@ class PPOConfig:
     c_v: float = 0.5
     c_ent: float = 0.000
     kl_coef: float = 0.02
-    update_ref_model_each_steps: int = 1000000
+    update_ref_model_each_steps: int = 3
     ppo_epochs: int = 2
     minibatch_size: int = 16
     max_grad_norm: float = 1.0

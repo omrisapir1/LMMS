@@ -111,7 +111,8 @@ def compute_reward(
         partial = max(0.0, min(1.0, partial))
         reward = partial
 
-    reward_final = max(0.0, float(reward) - float(length_penalty) * float(num_generated_tokens))
+    # reward_final = max(0.0, float(reward) - float(length_penalty) * float(num_generated_tokens))
+    reward_final = float(reward) - float(length_penalty) * float(num_generated_tokens)
 
     return {
         "reward_full": 1 if exact_match else 0,
