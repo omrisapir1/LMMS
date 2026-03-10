@@ -59,7 +59,7 @@ class PPOConfig:
     c_v: float = 0.5
     c_ent: float = 0.000
     kl_coef: float = 0.02
-    update_ref_model_each_steps: int = 3
+    update_ref_model_each_steps: int = 500
     ppo_epochs: int = 2
     minibatch_size: int = 16
     max_grad_norm: float = 1.0
