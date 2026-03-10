@@ -23,8 +23,6 @@ class DataConfig:
     answer_field: str = "final_answer"
 
 
-MAX_TOKENS = 256
-BACH_SIZE = 64
 
 @dataclass
 class RolloutConfig:
@@ -61,7 +59,7 @@ class PPOConfig:
     c_v: float = 0.5
     c_ent: float = 0.001
     kl_coef: float = 0.02
-    update_ref_model_each_steps: int = 100
+    update_ref_model_each_steps: int = 1000000
     ppo_epochs: int = 2
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
@@ -70,7 +68,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-5
+    lr: float = 3e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
