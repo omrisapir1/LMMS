@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import os
 import random
@@ -445,6 +446,7 @@ def _action_stats_tensors(
 def _action_stats_tensors_batched(
     *,
     model,
+    ref_model,
     value_head: ValueHead,
     trajs: Sequence[Trajectory],
     z_allowed_t: torch.Tensor,
@@ -461,12 +463,13 @@ def _action_stats_tensors_batched(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
     device = next(model.parameters()).device
     if not trajs:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
         empty_l = torch.empty((0,), dtype=torch.long, device=device)
-        return empty, empty, empty, empty, empty, empty, empty_l
+        return empty, empty, empty, empty, empty, empty, empty, empty_l
 
     seqs: List[List[int]] = []
     atts: List[List[int]] = []
@@ -506,7 +509,28 @@ def _action_stats_tensors_batched(
     z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
     d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
 
+    ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
+    with torch.no_grad():
+        ref_out = ref_base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+    ref_hidden_all = ref_out.last_hidden_state  # [B,L,H]
+    ref_lm_head = ref_model.get_output_embeddings()
+    if ref_lm_head is None:
+        raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
+    ref_weight = ref_lm_head.weight
+    ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
+    ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
+    ref_bias = getattr(ref_lm_head, "bias", None)
+    ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
+    ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
+
     logp_new_chunks: List[torch.Tensor] = []
+    logp_ref_chunks: List[torch.Tensor] = []
     values_new_chunks: List[torch.Tensor] = []
     entropy_chunks: List[torch.Tensor] = []
     logp_old_chunks: List[torch.Tensor] = []
@@ -516,9 +540,9 @@ def _action_stats_tensors_batched(
 
     for b, traj in enumerate(trajs):
         t_steps = len(traj.actions)
-        lengths.append(t_steps)
         if t_steps == 0:
             continue
+        lengths.append(t_steps)
 
         p_len = len(traj.prompt_ids)
         state_positions = torch.arange(
@@ -564,9 +588,25 @@ def _action_stats_tensors_batched(
         logp_vec = torch.where(is_digit, d_chosen, z_chosen)  # [T]
         ent_vec = torch.where(is_digit, d_ent, z_ent)  # [T]
 
+        with torch.no_grad():
+            ref_h_states = ref_hidden_all[b].index_select(0, state_positions)  # [T,H]
+            ref_z_logits = (ref_h_states @ ref_z_w.t()) / float(temperature)  # [T,|Z|]
+            ref_d_logits = (ref_h_states @ ref_d_w.t()) / float(temperature)  # [T,|D|]
+            if ref_z_b is not None:
+                ref_z_logits = ref_z_logits + ref_z_b
+            if ref_d_b is not None:
+                ref_d_logits = ref_d_logits + ref_d_b
+
+            ref_z_logp = torch.log_softmax(ref_z_logits, dim=-1)
+            ref_d_logp = torch.log_softmax(ref_d_logits, dim=-1)
+            ref_z_chosen = ref_z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
+            ref_d_chosen = ref_d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
+            logp_ref_vec = torch.where(is_digit, ref_d_chosen, ref_z_chosen)  # [T]
+
         values = value_head(h_states.float()).squeeze(-1)
 
         logp_new_chunks.append(logp_vec)
+        logp_ref_chunks.append(logp_ref_vec)
         values_new_chunks.append(values)
         entropy_chunks.append(ent_vec)
         logp_old_chunks.append(torch.tensor(traj.logp_old, dtype=torch.float32, device=device))
@@ -575,10 +615,11 @@ def _action_stats_tensors_batched(
 
     if not logp_new_chunks:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        return empty, empty, empty, empty, empty, empty, torch.tensor(lengths, dtype=torch.long, device=device)
+        return empty, empty, empty, empty, empty, empty, empty, torch.tensor(lengths, dtype=torch.long, device=device)
 
     return (
         torch.cat(logp_new_chunks, dim=0),
+        torch.cat(logp_ref_chunks, dim=0),
         torch.cat(values_new_chunks, dim=0),
         torch.cat(entropy_chunks, dim=0),
         torch.cat(logp_old_chunks, dim=0),
@@ -1111,6 +1152,11 @@ def train(cfg: Config) -> None:
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
+    ref_model = copy.deepcopy(model)
+    ref_model.to(device)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
 
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
@@ -1379,6 +1425,8 @@ def train(cfg: Config) -> None:
             ent_acc = 0.0
             ent_loss_acc = 0.0
             clip_acc = 0.0
+            kl_acc = 0.0
+            kl_pen_acc = 0.0
 
             order = list(range(len(trajectories)))
             random.shuffle(order)
@@ -1397,6 +1445,7 @@ def train(cfg: Config) -> None:
                     with amp_ctx:
                         (
                             logp_new,
+                            logp_ref,
                             values_new,
                             entropy_new,
                             logp_old,
@@ -1405,6 +1454,7 @@ def train(cfg: Config) -> None:
                             lengths,
                         ) = _action_stats_tensors_batched(
                             model=model,
+                            ref_model=ref_model,
                             value_head=value_head,
                             trajs=batch_trajs,
                             z_allowed_t=z_allowed_t,
@@ -1422,26 +1472,37 @@ def train(cfg: Config) -> None:
                                 f"Token count mismatch: T={int(logp_new.numel())}, sum(lengths)={total_tokens}"
                             )
 
-                        log_ratio = logp_new - logp_old
+                        logp_new_f = logp_new.float()
+                        logp_old_f = logp_old.float()
+                        logp_ref_f = logp_ref.float()
+                        advantages_f = advantages.float()
+                        values_new_f = values_new.float()
+                        returns_f = returns.float()
+                        entropy_new_f = entropy_new.float()
+
+                        log_ratio = logp_new_f - logp_old_f
                         ratio = torch.exp(log_ratio)
                         ratio_clipped = torch.clamp(ratio, 1.0 - cfg.ppo.clip_range, 1.0 + cfg.ppo.clip_range)
-                        pg1 = ratio * advantages
-                        pg2 = ratio_clipped * advantages
+                        pg1 = ratio * advantages_f
+                        pg2 = ratio_clipped * advantages_f
                         policy_loss_tok = -torch.min(pg1, pg2)
+                        kl_tok = logp_new_f - logp_ref_f
                         lo = 1.0 - cfg.ppo.clip_range
                         hi = 1.0 + cfg.ppo.clip_range
                         clipped_tok = ((ratio < lo) | (ratio > hi)).float()
-                        value_loss_tok = (values_new - returns).pow(2)
+                        value_loss_tok = (values_new_f - returns_f).pow(2)
 
-                        policy_split = torch.split(policy_loss_tok, lengths_list)
+                        ppo_loss_split = torch.split(policy_loss_tok, lengths_list)
                         clip_split = torch.split(clipped_tok, lengths_list)
                         value_split = torch.split(value_loss_tok, lengths_list)
-                        entropy_split = torch.split(entropy_new, lengths_list)
+                        entropy_split = torch.split(entropy_new_f, lengths_list)
+                        kl_split = torch.split(kl_tok, lengths_list)
 
-                        policy_means = [chunk.mean() for chunk, L in zip(policy_split, lengths_list) if L > 0]
+                        policy_means = [chunk.mean() for chunk, L in zip(ppo_loss_split, lengths_list) if L > 0]
                         clip_means = [chunk.mean() for chunk, L in zip(clip_split, lengths_list) if L > 0]
                         value_means = [chunk.mean() for chunk, L in zip(value_split, lengths_list) if L > 0]
                         entropy_means = [chunk.mean() for chunk, L in zip(entropy_split, lengths_list) if L > 0]
+                        kl_means = [chunk.mean() for chunk, L in zip(kl_split, lengths_list) if L > 0]
 
                         if not policy_means:
                             continue
@@ -1450,9 +1511,11 @@ def train(cfg: Config) -> None:
                         clipfrac = torch.stack(clip_means).mean()
                         v_loss = torch.stack(value_means).mean()
                         entropy_mean = torch.stack(entropy_means).mean()
+                        kl_mean = torch.stack(kl_means).mean()
+                        kl_penalty = float(cfg.ppo.kl_coef) * kl_mean
                         entropy_loss = -entropy_mean
 
-                        loss = policy_loss + cfg.ppo.c_v * v_loss + cfg.ppo.c_ent * entropy_loss
+                        loss = policy_loss + kl_penalty + cfg.ppo.c_v * v_loss + cfg.ppo.c_ent * entropy_loss
                         loss = loss / float(cfg.train.grad_accum_steps)
 
                     loss.backward()
@@ -1463,6 +1526,8 @@ def train(cfg: Config) -> None:
                     ent_acc += float(entropy_mean.detach().item())
                     ent_loss_acc += float(entropy_loss.detach().item())
                     clip_acc += float(clipfrac.detach().item())
+                    kl_acc += float(kl_mean.detach().item())
+                    kl_pen_acc += float(kl_penalty.detach().item())
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
                         torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
@@ -1474,6 +1539,13 @@ def train(cfg: Config) -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             t_backprop_sec = time.perf_counter() - _t_backprop0
+
+            ref_refresh_every = max(int(cfg.ppo.update_ref_model_each_steps), 1)
+            if update % ref_refresh_every == 0:
+                ref_model.load_state_dict(model.state_dict())
+                ref_model.eval()
+                for p in ref_model.parameters():
+                    p.requires_grad_(False)
 
             rewards = torch.tensor([float(t.reward_info["reward_final"]) for t in trajectories], dtype=torch.float32)
             exact_rate = float(
@@ -1501,6 +1573,8 @@ def train(cfg: Config) -> None:
                         f"answer_rate={answer_rate:.4f}",
                         f"avg_len={avg_len:.2f}",
                         f"entropy={ent_acc / denom:.4f}",
+                        f"kl={kl_acc / denom:.4f}",
+                        f"kl_penalty={kl_pen_acc / denom:.4f}",
                         f"entropy_loss={ent_loss_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
