@@ -58,22 +58,22 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.001
-    kl_coef: float = 0.2
+    kl_coef: float = 0.02
     update_ref_model_each_steps: int = 1000000
-    ppo_epochs: int = 2
-    minibatch_size: int = 32
+    ppo_epochs: int = 3
+    minibatch_size: int = 16
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-5
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 1
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 1000
