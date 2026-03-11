@@ -58,7 +58,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.000
-    kl_coef: float = 0.00
+    kl_coef: float = 0.2
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 2
     minibatch_size: int = 16
