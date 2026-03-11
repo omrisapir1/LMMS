@@ -58,7 +58,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.5
     c_ent: float = 0.000
-    kl_coef: float = 0.02
+    kl_coef: float = 0.00
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 2
     minibatch_size: int = 16
@@ -68,7 +68,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 2e-5
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
