@@ -1100,22 +1100,21 @@ def _select_ce_trajectory_indices(
     if frac <= 0.0:
         return []
     frac = min(frac, 1.0)
-    cap = int(math.ceil(frac * len(batch_trajs)))
-    if cap <= 0:
-        return []
-    cap = min(cap, len(batch_trajs))
 
     valid = [i for i, t in enumerate(batch_trajs) if _traj_has_valid_ce_target(t)]
     if not valid:
         return []
-    if cap > len(valid):
-        cap = len(valid)
-    if cap <= 0:
-        return []
 
     mode = str(ce_mode).strip().lower()
     if mode == "random":
-        picked = random.sample(valid, k=cap)
+        # Random mode uses minibatch-size-based cap.
+        k = int(math.ceil(frac * len(batch_trajs)))
+        if k <= 0:
+            return []
+        k = min(k, len(valid))
+        if k <= 0:
+            return []
+        picked = random.sample(valid, k=k)
         picked.sort()
         return picked
 
@@ -1126,7 +1125,11 @@ def _select_ce_trajectory_indices(
     success = [i for i in valid if bool(batch_trajs[i].reward_info.get("exact_match", False))]
     if not success:
         return []
-    k = min(cap, len(success))
+    # successful_traces mode scales by number of successful trajectories.
+    k = int(math.ceil(frac * len(success)))
+    if k <= 0:
+        return []
+    k = min(k, len(success))
     picked = random.sample(success, k=k)
     picked.sort()
     return picked
