@@ -4,6 +4,7 @@ import argparse
 import ast
 import copy
 import json
+import math
 import os
 import random
 import shutil
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -241,7 +243,8 @@ def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
     env = os.getenv("PPO_DEBUG_RESTRICTED_LOGITS_CHECK", "").strip().lower()
     env_on = env in ("1", "true", "yes", "y", "on")
     return bool(cfg.runtime.debug_restricted_logits_check) or env_on
-import torch.nn.functional as F
+
+
 def _debug_restricted_logits_check_once(
     *,
     model,
@@ -1072,6 +1075,165 @@ def _normalize_advantages(trajectories: Sequence[Trajectory]) -> None:
         t.advantages_norm = [(a - mean) / denom for a in t.advantages]
 
 
+def _traj_has_valid_ce_target(
+    traj: Trajectory,
+    *,
+    expected_digits: int = 5,
+) -> bool:
+    if "answer" not in traj.action_types:
+        return False
+    if len(traj.digit_true) != int(expected_digits):
+        return False
+    return all(0 <= int(d) <= 9 for d in traj.digit_true)
+
+
+def _select_ce_trajectory_indices(
+    *,
+    batch_trajs: Sequence[Trajectory],
+    batch_frac_to_apply_ce: float,
+    ce_mode: str,
+) -> List[int]:
+    if not batch_trajs:
+        return []
+
+    frac = float(batch_frac_to_apply_ce)
+    if frac <= 0.0:
+        return []
+    frac = min(frac, 1.0)
+    k = int(math.ceil(frac * len(batch_trajs)))
+    if k <= 0:
+        return []
+    k = min(k, len(batch_trajs))
+
+    valid = [i for i, t in enumerate(batch_trajs) if _traj_has_valid_ce_target(t)]
+    if not valid:
+        return []
+    if k > len(valid):
+        k = len(valid)
+    if k <= 0:
+        return []
+
+    mode = str(ce_mode).strip().lower()
+    if mode == "random":
+        picked = random.sample(valid, k=k)
+        picked.sort()
+        return picked
+
+    if mode != "successful_traces":
+        raise ValueError(f"Unsupported ppo.ce_mode={ce_mode!r}; expected 'successful_traces' or 'random'")
+
+    success = [i for i in valid if bool(batch_trajs[i].reward_info.get("exact_match", False))]
+    success_sorted = sorted(
+        success,
+        key=lambda i: float(batch_trajs[i].reward_info.get("reward_final", 0.0)),
+        reverse=True,
+    )
+
+    selected: List[int] = list(success_sorted[:k])
+    if len(selected) < k:
+        selected_set = set(selected)
+        remaining = [i for i in valid if i not in selected_set]
+        remaining_sorted = sorted(
+            remaining,
+            key=lambda i: float(batch_trajs[i].reward_info.get("reward_final", 0.0)),
+            reverse=True,
+        )
+        selected.extend(remaining_sorted[: (k - len(selected))])
+
+    selected = sorted(selected)
+    return selected
+
+
+def _compute_digit_ce_for_minibatch(
+    *,
+    model,
+    batch_trajs: Sequence[Trajectory],
+    selected_indices: Sequence[int],
+    digit_token_ids: Sequence[int],
+    answer_token_id: int,
+    pad_token_id: int,
+) -> Tuple[Optional[torch.Tensor], int]:
+    if not selected_indices:
+        return None, 0
+
+    device = next(model.parameters()).device
+    ce_inputs: List[List[int]] = []
+    ce_targets_local: List[List[int]] = []
+
+    for idx in selected_indices:
+        traj = batch_trajs[int(idx)]
+        if not _traj_has_valid_ce_target(traj):
+            continue
+
+        try:
+            target_token_ids = [int(digit_token_ids[int(d)]) for d in traj.digit_true]
+        except Exception:
+            continue
+
+        prefix = list(traj.prompt_ids) + list(traj.generated_z_ids) + [int(answer_token_id)]
+        if not prefix:
+            continue
+        ce_inputs.append(prefix + target_token_ids)
+        ce_targets_local.append([int(d) for d in traj.digit_true])
+
+    if not ce_inputs:
+        return None, 0
+
+    max_len = max(len(x) for x in ce_inputs)
+    bsz = len(ce_inputs)
+
+    input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
+
+    prefix_lens: List[int] = []
+    for i, seq in enumerate(ce_inputs):
+        L = len(seq)
+        input_ids[i, :L] = torch.tensor(seq, dtype=torch.long, device=device)
+        attention_mask[i, :L] = 1
+        prefix_lens.append(L - len(ce_targets_local[i]))
+
+    base_model = model.get_submodule(model.base_model_prefix)
+    out = base_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    hidden = out.last_hidden_state  # [B,L,H]
+
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("Model output embeddings (LM head) are unavailable")
+
+    digit_allowed_t = torch.tensor(list(digit_token_ids), dtype=torch.long, device=device)
+    d_w = lm_head.weight.index_select(0, digit_allowed_t)
+    d_b = None
+    if getattr(lm_head, "bias", None) is not None:
+        d_b = lm_head.bias.index_select(0, digit_allowed_t)
+
+    per_traj_losses: List[torch.Tensor] = []
+    for b in range(bsz):
+        prefix_len = int(prefix_lens[b])
+        target_local = torch.tensor(ce_targets_local[b], dtype=torch.long, device=device)
+        state_positions = torch.arange(
+            prefix_len - 1,
+            prefix_len - 1 + target_local.numel(),
+            device=device,
+            dtype=torch.long,
+        )
+        h = hidden[b].index_select(0, state_positions)
+        logits = h @ d_w.t()
+        if d_b is not None:
+            logits = logits + d_b
+        per_traj_losses.append(F.cross_entropy(logits, target_local, reduction="mean"))
+
+    if not per_traj_losses:
+        return None, 0
+
+    return torch.stack(per_traj_losses).mean(), len(per_traj_losses)
+
+
 def _recompute_trajectory(
     model,
     value_head: ValueHead,
@@ -1161,6 +1323,13 @@ def train(cfg: Config) -> None:
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
         raise ValueError("digit_greedy=True is incompatible with ppo_full")
+    ce_mode = str(cfg.ppo.ce_mode).strip().lower()
+    if ce_mode not in ("successful_traces", "random"):
+        raise ValueError(
+            f"Unsupported ppo.ce_mode={cfg.ppo.ce_mode!r}; expected 'successful_traces' or 'random'"
+        )
+    if float(cfg.ppo.batch_frac_to_apply_ce) < 0.0:
+        raise ValueError("ppo.batch_frac_to_apply_ce must be >= 0")
 
     z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -1427,6 +1596,9 @@ def train(cfg: Config) -> None:
             clip_acc = 0.0
             kl_acc = 0.0
             kl_pen_acc = 0.0
+            ce_acc = 0.0
+            ce_weighted_acc = 0.0
+            ce_traj_acc = 0
 
             order = list(range(len(trajectories)))
             random.shuffle(order)
@@ -1515,7 +1687,33 @@ def train(cfg: Config) -> None:
                         kl_penalty = float(cfg.ppo.kl_coef) * kl_mean
                         entropy_loss = -entropy_mean
 
-                        loss = policy_loss + kl_penalty + cfg.ppo.c_v * v_loss + cfg.ppo.c_ent * entropy_loss
+                        ce_loss = torch.zeros((), dtype=torch.float32, device=logp_new_f.device)
+                        ce_used = 0
+                        if bool(cfg.ppo.apply_ce):
+                            ce_selected = _select_ce_trajectory_indices(
+                                batch_trajs=batch_trajs,
+                                batch_frac_to_apply_ce=float(cfg.ppo.batch_frac_to_apply_ce),
+                                ce_mode=ce_mode,
+                            )
+                            ce_out, ce_used = _compute_digit_ce_for_minibatch(
+                                model=model,
+                                batch_trajs=batch_trajs,
+                                selected_indices=ce_selected,
+                                digit_token_ids=digit_token_ids,
+                                answer_token_id=int(answer_token_id),
+                                pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
+                            )
+                            if ce_out is not None:
+                                ce_loss = ce_out.float()
+
+                        ce_weighted = float(cfg.ppo.alpha_sft) * ce_loss
+                        loss = (
+                            policy_loss
+                            + kl_penalty
+                            + cfg.ppo.c_v * v_loss
+                            + cfg.ppo.c_ent * entropy_loss
+                            + ce_weighted
+                        )
                         loss = loss / float(cfg.train.grad_accum_steps)
 
                     loss.backward()
@@ -1528,6 +1726,9 @@ def train(cfg: Config) -> None:
                     clip_acc += float(clipfrac.detach().item())
                     kl_acc += float(kl_mean.detach().item())
                     kl_pen_acc += float(kl_penalty.detach().item())
+                    ce_acc += float(ce_loss.detach().item())
+                    ce_weighted_acc += float(ce_weighted.detach().item())
+                    ce_traj_acc += int(ce_used)
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
                         torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
@@ -1579,6 +1780,11 @@ def train(cfg: Config) -> None:
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
+                        f"ce_loss={ce_acc / denom:.4f}",
+                        f"ce_weighted={ce_weighted_acc / denom:.4f}",
+                        f"ce_trajs={ce_traj_acc}",
+                        f"ce_mode={ce_mode}",
+                        f"ce_on={int(bool(cfg.ppo.apply_ce))}",
                         f"explained_var={ev:.4f}",
                         f"rollouts={rollout_path}",
                         f"t_sync={t_sync_sec:.3f}s",
