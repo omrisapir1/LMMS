@@ -60,7 +60,7 @@ class PPOConfig:
     c_ent: float = 0.000
     kl_coef: float = 0.00
     apply_ce: bool = True
-    alpha_sft: float = 0.05
+    alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "successful_traces"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
