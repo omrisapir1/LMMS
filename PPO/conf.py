@@ -64,7 +64,7 @@ class PPOConfig:
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "successful_traces"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
-    ppo_epochs: int = 2
+    ppo_epochs: int = 1
     minibatch_size: int = 16
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
@@ -72,7 +72,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 5e-6
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
