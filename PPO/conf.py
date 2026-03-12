@@ -62,7 +62,7 @@ class PPOConfig:
     apply_ce: bool = True
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
-    ce_mode: str = "successful_traces"  # "successful_traces" | "random"
+    ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 1
     minibatch_size: int = 16
