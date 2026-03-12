@@ -1592,6 +1592,15 @@ def train(cfg: Config) -> None:
 
             order = list(range(len(trajectories)))
             random.shuffle(order)
+            ce_selected_global: set[int] = set()
+            if bool(cfg.ppo.apply_ce):
+                ce_selected_global = set(
+                    _select_ce_trajectory_indices(
+                        batch_trajs=trajectories,
+                        batch_frac_to_apply_ce=float(cfg.ppo.batch_frac_to_apply_ce),
+                        ce_mode=ce_mode,
+                    )
+                )
 
             for _epoch in range(cfg.ppo.ppo_epochs):
                 random.shuffle(order)
@@ -1679,12 +1688,12 @@ def train(cfg: Config) -> None:
 
                         ce_loss = torch.zeros((), dtype=torch.float32, device=logp_new_f.device)
                         ce_used = 0
-                        if bool(cfg.ppo.apply_ce):
-                            ce_selected = _select_ce_trajectory_indices(
-                                batch_trajs=batch_trajs,
-                                batch_frac_to_apply_ce=float(cfg.ppo.batch_frac_to_apply_ce),
-                                ce_mode=ce_mode,
-                            )
+                        if bool(cfg.ppo.apply_ce) and ce_selected_global:
+                            ce_selected_global_in_batch = [int(i) for i in batch_idx if int(i) in ce_selected_global]
+                            batch_local_pos = {int(global_i): local_i for local_i, global_i in enumerate(batch_idx)}
+                            ce_selected = [
+                                int(batch_local_pos[gidx]) for gidx in ce_selected_global_in_batch if gidx in batch_local_pos
+                            ]
                             ce_out, ce_used = _compute_digit_ce_for_minibatch(
                                 model=model,
                                 batch_trajs=batch_trajs,
@@ -1695,6 +1704,8 @@ def train(cfg: Config) -> None:
                             )
                             if ce_out is not None:
                                 ce_loss = ce_out.float()
+                                for gidx in ce_selected_global_in_batch:
+                                    ce_selected_global.discard(int(gidx))
 
                         ce_weighted = float(cfg.ppo.alpha_sft) * ce_loss
                         loss = (
