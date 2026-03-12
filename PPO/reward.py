@@ -112,7 +112,7 @@ def compute_reward(
             partial = float(partial_scale) * (float(correct_count) / float(applied_count))
         partial = max(0.0, min(1.0, partial))
         reward = partial
-        length_reward = - float(length_penalty) * float(num_generated_tokens)
+        length_reward = float(length_penalty) * float(num_generated_tokens)
 
     # reward_final = max(0.0, float(reward) - float(length_penalty) * float(num_generated_tokens))
     # reward_final = float(reward) - float(length_penalty) * float(num_generated_tokens)
