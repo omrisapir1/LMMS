@@ -1100,48 +1100,36 @@ def _select_ce_trajectory_indices(
     if frac <= 0.0:
         return []
     frac = min(frac, 1.0)
-    k = int(math.ceil(frac * len(batch_trajs)))
-    if k <= 0:
+    cap = int(math.ceil(frac * len(batch_trajs)))
+    if cap <= 0:
         return []
-    k = min(k, len(batch_trajs))
+    cap = min(cap, len(batch_trajs))
 
     valid = [i for i, t in enumerate(batch_trajs) if _traj_has_valid_ce_target(t)]
     if not valid:
         return []
-    if k > len(valid):
-        k = len(valid)
-    if k <= 0:
+    if cap > len(valid):
+        cap = len(valid)
+    if cap <= 0:
         return []
 
     mode = str(ce_mode).strip().lower()
     if mode == "random":
-        picked = random.sample(valid, k=k)
+        picked = random.sample(valid, k=cap)
         picked.sort()
         return picked
 
     if mode != "successful_traces":
         raise ValueError(f"Unsupported ppo.ce_mode={ce_mode!r}; expected 'successful_traces' or 'random'")
 
+    # Successful traces are exact-match only; no fallback to non-exact trajectories.
     success = [i for i in valid if bool(batch_trajs[i].reward_info.get("exact_match", False))]
-    success_sorted = sorted(
-        success,
-        key=lambda i: float(batch_trajs[i].reward_info.get("reward_final", 0.0)),
-        reverse=True,
-    )
-
-    selected: List[int] = list(success_sorted[:k])
-    if len(selected) < k:
-        selected_set = set(selected)
-        remaining = [i for i in valid if i not in selected_set]
-        remaining_sorted = sorted(
-            remaining,
-            key=lambda i: float(batch_trajs[i].reward_info.get("reward_final", 0.0)),
-            reverse=True,
-        )
-        selected.extend(remaining_sorted[: (k - len(selected))])
-
-    selected = sorted(selected)
-    return selected
+    if not success:
+        return []
+    k = min(cap, len(success))
+    picked = random.sample(success, k=k)
+    picked.sort()
+    return picked
 
 
 def _compute_digit_ce_for_minibatch(
@@ -1597,8 +1585,7 @@ def train(cfg: Config) -> None:
             kl_acc = 0.0
             kl_pen_acc = 0.0
             ce_acc = 0.0
-            ce_weighted_acc = 0.0
-            ce_traj_acc = 0
+            ce_examples_acc = 0
 
             order = list(range(len(trajectories)))
             random.shuffle(order)
@@ -1727,8 +1714,7 @@ def train(cfg: Config) -> None:
                     kl_acc += float(kl_mean.detach().item())
                     kl_pen_acc += float(kl_penalty.detach().item())
                     ce_acc += float(ce_loss.detach().item())
-                    ce_weighted_acc += float(ce_weighted.detach().item())
-                    ce_traj_acc += int(ce_used)
+                    ce_examples_acc += int(ce_used)
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
                         torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
@@ -1781,10 +1767,7 @@ def train(cfg: Config) -> None:
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
                         f"ce_loss={ce_acc / denom:.4f}",
-                        f"ce_weighted={ce_weighted_acc / denom:.4f}",
-                        f"ce_trajs={ce_traj_acc}",
-                        f"ce_mode={ce_mode}",
-                        f"ce_on={int(bool(cfg.ppo.apply_ce))}",
+                        f"ce_examples={ce_examples_acc}",
                         f"explained_var={ev:.4f}",
                         f"rollouts={rollout_path}",
                         f"t_sync={t_sync_sec:.3f}s",
