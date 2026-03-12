@@ -39,6 +39,7 @@ def parse_answer_digits(raw: object) -> Optional[List[int]]:
 
 def sample_keep_mask(
     true_digits: Sequence[int],
+    pred_digits: Sequence[int],
     keep_prob: Sequence[float],
     generator: Optional[torch.Generator],
 ) -> List[int]:
@@ -48,8 +49,8 @@ def sample_keep_mask(
         raise ValueError("keep_prob must have length 5")
 
     mask: List[int] = []
-    for idx, digit in enumerate(true_digits):
-        if int(digit) != 0:
+    for idx, (true_digit, pred_digit) in enumerate(zip(true_digits, pred_digits)):
+        if int(true_digit) != 0 or int(pred_digit) != 0:
             mask.append(1)
             continue
         p = float(keep_prob[idx])
@@ -100,8 +101,9 @@ def compute_reward(
         applied_mask = [1, 1, 1, 1, 1]
         applied_count = 5
         correct_count = 5
+        length_reward = 0.0
     else:
-        applied_mask = sample_keep_mask(true_digits=true_digits, keep_prob=keep_prob, generator=generator)
+        applied_mask = sample_keep_mask(true_digits=true_digits, pred_digits=pred_digits, keep_prob=keep_prob, generator=generator)
         applied_count = int(sum(applied_mask))
         correct_count = int(sum(m * int(int(p) == int(t)) for m, p, t in zip(applied_mask, pred_digits, true_digits)))
         if applied_count == 0:
@@ -110,9 +112,11 @@ def compute_reward(
             partial = float(partial_scale) * (float(correct_count) / float(applied_count))
         partial = max(0.0, min(1.0, partial))
         reward = partial
+        length_reward = - float(length_penalty) * float(num_generated_tokens)
 
     # reward_final = max(0.0, float(reward) - float(length_penalty) * float(num_generated_tokens))
-    reward_final = float(reward) - float(length_penalty) * float(num_generated_tokens)
+    # reward_final = float(reward) - float(length_penalty) * float(num_generated_tokens)
+    reward_final = float(reward) - length_reward
 
     return {
         "reward_full": 1 if exact_match else 0,
