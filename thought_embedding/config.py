@@ -16,6 +16,7 @@ class ThoughtEmbeddingConfig:
     input_expected_answer_field: Optional[str] = "expected_answer"
     input_id_field: Optional[str] = "id"
     input_qid_field: Optional[str] = "qid"
+    max_samples: int = 400
 
     # Model
     model_name: str = "Qwen/Qwen3-Embedding-0.6B"
@@ -88,6 +89,8 @@ def validate_config(cfg: ThoughtEmbeddingConfig) -> None:
         raise ConfigError("save_float_dtype must be 'float16' or 'float32'.")
     if cfg.batch_size <= 0:
         raise ConfigError("batch_size must be positive.")
+    if cfg.max_samples < 0:
+        raise ConfigError("max_samples must be >= 0.")
     if cfg.shard_size <= 0:
         raise ConfigError("shard_size must be positive.")
     if cfg.max_model_len <= 0:

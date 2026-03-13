@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input_expected_answer_field", default="expected_answer")
     p.add_argument("--input_id_field", default="id")
     p.add_argument("--input_qid_field", default="qid")
+    p.add_argument("--max_samples", type=int, default=0)
 
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.9)
