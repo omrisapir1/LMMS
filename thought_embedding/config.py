@@ -10,8 +10,8 @@ class ThoughtEmbeddingConfig:
     dataset_name: str = "your_dataset_name"
     train_split: str = "train"
     eval_split: Optional[str] = None
-    input_question_field: str = "question"
-    input_solution_field: str = "solution"
+    input_question_field: str = "problem"
+    input_solution_field: str = "generated_solution"
     input_answer_field: Optional[str] = "answer"
     input_expected_answer_field: Optional[str] = "expected_answer"
     input_id_field: Optional[str] = "id"
