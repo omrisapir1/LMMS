@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -16,7 +18,7 @@ from thought_embedding.io_utils import (
     save_manifest,
     write_parquet_shard,
 )
-from thought_embedding.prompts import PromptBuildResult, PromptError, build_state_prompt_for_thought
+from thought_embedding.prompts import PromptError, build_state_prompt_for_thought
 from thought_embedding.split_logic import split_thoughts
 
 logger = logging.getLogger(__name__)
@@ -77,7 +79,14 @@ def run_pipeline(
     skipped_rows = 0
     failed_rows = 0
 
+    # Phase A: CPU-side preprocessing for the entire selected dataset.
+    # Build thoughts, prompts, and tokenization metadata up front.
+    preprocess_start = time.perf_counter()
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] Preprocess start")
+
     for row_idx, row in enumerate(dataset):
+        if cfg.max_samples > 0 and row_idx >= cfg.max_samples:
+            break
         processed_rows += 1
         try:
             key = _row_key(row, row_idx, cfg)
@@ -176,45 +185,35 @@ def run_pipeline(
                 skipped_rows += 1
                 continue
 
-            while len(pending) >= cfg.batch_size:
-                _flush_pending_batch(
-                    cfg,
-                    pending,
-                    row_buffers,
-                    output_rows,
-                    completed_keys,
-                    local_embedder,
-                )
-
             if processed_rows % cfg.log_every_n_examples == 0:
                 logger.info(
-                    "Processed %s rows | completed=%s | skipped=%s | pending=%s",
+                    "Preprocessed %s rows | accepted=%s | skipped=%s | pending_prompts=%s",
                     processed_rows,
-                    len(completed_keys),
+                    len(row_buffers),
                     skipped_rows,
                     len(pending),
                 )
-
-            if len(output_rows) >= cfg.shard_size:
-                write_parquet_shard(output_rows, output_dir, next_shard_idx)
-                next_shard_idx += 1
-                written_rows += len(output_rows)
-                output_rows.clear()
-
-            if (written_rows + len(output_rows)) % cfg.save_every_n_examples == 0:
-                manifest = {
-                    "completed_keys": sorted(completed_keys),
-                    "processed_rows": processed_rows,
-                    "written_rows": written_rows,
-                    "next_shard_idx": next_shard_idx,
-                }
-                save_manifest(output_dir, manifest)
 
         except Exception as exc:
             logger.exception("Row %s failed: %s", row_idx, exc)
             failed_rows += 1
             continue
 
+    logger.info(
+        "Preprocessing complete | rows_seen=%s | rows_ready=%s | total_prompts=%s | skipped=%s | failed=%s",
+        processed_rows,
+        len(row_buffers),
+        len(pending),
+        skipped_rows,
+        failed_rows,
+    )
+    preprocess_elapsed = time.perf_counter() - preprocess_start
+    print(
+        f"[{datetime.now().isoformat(timespec='seconds')}] "
+        f"Preprocess end | elapsed_sec={preprocess_elapsed:.2f}"
+    )
+
+    # Phase B: Embedding-only batches. No prompt building/tokenization work here.
     while pending:
         _flush_pending_batch(
             cfg,
@@ -224,6 +223,21 @@ def run_pipeline(
             completed_keys,
             local_embedder,
         )
+
+        if len(output_rows) >= cfg.shard_size:
+            write_parquet_shard(output_rows, output_dir, next_shard_idx)
+            next_shard_idx += 1
+            written_rows += len(output_rows)
+            output_rows.clear()
+
+            if written_rows % cfg.save_every_n_examples == 0:
+                manifest = {
+                    "completed_keys": sorted(completed_keys),
+                    "processed_rows": processed_rows,
+                    "written_rows": written_rows,
+                    "next_shard_idx": next_shard_idx,
+                }
+                save_manifest(output_dir, manifest)
 
     if output_rows:
         write_parquet_shard(output_rows, output_dir, next_shard_idx)
