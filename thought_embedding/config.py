@@ -13,6 +13,7 @@ class ThoughtEmbeddingConfig:
     input_question_field: str = "question"
     input_solution_field: str = "solution"
     input_answer_field: Optional[str] = "answer"
+    input_expected_answer_field: Optional[str] = "expected_answer"
     input_id_field: Optional[str] = "id"
     input_qid_field: Optional[str] = "qid"
 
