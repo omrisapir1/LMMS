@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input_question_field", default="question")
     p.add_argument("--input_solution_field", default="solution")
     p.add_argument("--input_answer_field", default="answer")
+    p.add_argument("--input_expected_answer_field", default="expected_answer")
     p.add_argument("--input_id_field", default="id")
     p.add_argument("--input_qid_field", default="qid")
 

@@ -35,6 +35,7 @@ class RowBuffer:
     row_index: int
     question: str
     answer: Any
+    expected_answer: Any
     thoughts: list[str]
     state_vectors: list[Optional[list[float]]]
     was_truncated: bool = False
@@ -113,6 +114,11 @@ def run_pipeline(
                 continue
 
             answer = row.get(cfg.input_answer_field) if cfg.input_answer_field else None
+            expected_answer = (
+                row.get(cfg.input_expected_answer_field)
+                if cfg.input_expected_answer_field
+                else None
+            )
             source_id = None
             if cfg.input_id_field and row.get(cfg.input_id_field) is not None:
                 source_id = str(row[cfg.input_id_field])
@@ -124,6 +130,7 @@ def run_pipeline(
                 row_index=row_idx,
                 question=question,
                 answer=answer,
+                expected_answer=expected_answer,
                 thoughts=thoughts,
                 state_vectors=[None] * len(thoughts),
                 source_id=source_id,
@@ -345,6 +352,7 @@ def _finalize_row(cfg: ThoughtEmbeddingConfig, row_buf: RowBuffer) -> dict[str, 
         "id": row_buf.source_id,
         "question": row_buf.question,
         "answer": row_buf.answer,
+        "expected_answer": row_buf.expected_answer,
         "thoughts": row_buf.thoughts,
         "num_thoughts": len(row_buf.thoughts),
         "state_vectors": state_vectors,
