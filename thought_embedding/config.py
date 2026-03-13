@@ -16,7 +16,7 @@ class ThoughtEmbeddingConfig:
     input_expected_answer_field: Optional[str] = "expected_answer"
     input_id_field: Optional[str] = "id"
     input_qid_field: Optional[str] = "qid"
-    max_samples: int = 400
+    max_samples: int = 0
 
     # Model
     model_name: str = "Qwen/Qwen3-Embedding-0.6B"
