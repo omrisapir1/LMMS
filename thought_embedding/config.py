@@ -40,9 +40,9 @@ class ThoughtEmbeddingConfig:
     )
 
     # Batching / performance
-    batch_size: int = 64 * 20
+    batch_size: int = 64 * 200
     gpu_memory_utilization: float = 0.9
-    max_num_seqs: int = 128 * 20
+    max_num_seqs: int = 128 * 200
 
     # Output
     output_dir: str = "runs/thought_embedding"
