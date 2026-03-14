@@ -7,14 +7,16 @@ from dataclasses import dataclass
 class CodebookConfig:
     input_dir: str
     output_dir: str
-    vocab_size: int = 256
-    dim: int = 1536
-    batch_size: int = 2048  # sequences per step
+    vocab_size: int = 1024
+    dim: int = 1024
+    batch_size: int = 128  # max sequences per step
+    max_vectors_per_batch: int = 8_192
     epochs: int = 3
-    ema_decay: float = 0.995
+    ema_decay: float = 0.99
     beta: float = 0.25
     lambda_kl: float = 0.001
     kmeans_sample_size: int = 500_000
+    kmeans_max_vectors_per_sequence: int = 32
     no_kmeans: bool = False
     seed: int = 42
 

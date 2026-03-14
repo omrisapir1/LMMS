@@ -25,6 +25,8 @@ class SequenceBatch:
     latents: torch.Tensor  # [N, dim], float32
     sequence_count: int
     vector_count: int
+    max_k_in_batch: int
+    avg_k_in_batch: float
 
 
 def list_parquet_shards(input_dir: str) -> List[Path]:
@@ -193,37 +195,66 @@ def iter_valid_latent_rows(
 def iter_sequence_batches(
     input_dir: str,
     *,
-    batch_size: int,
+    max_vectors_per_batch: int,
     dim: int,
     read_batch_size: int = 256,
+    max_sequences_per_batch: int | None = None,
 ) -> Iterator[SequenceBatch]:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be > 0")
+    if max_vectors_per_batch <= 0:
+        raise ValueError("max_vectors_per_batch must be > 0")
+    if max_sequences_per_batch is not None and max_sequences_per_batch <= 0:
+        raise ValueError("max_sequences_per_batch must be > 0 when provided")
 
     seq_latents: List[np.ndarray] = []
+    seq_lengths: List[int] = []
+    vector_count = 0
     for row in iter_valid_latent_rows(input_dir, dim=dim, read_batch_size=read_batch_size):
-        seq_latents.append(row.latent_vectors)
-        if len(seq_latents) < batch_size:
-            continue
-        yield _pack_batch(seq_latents, dim=dim)
-        seq_latents.clear()
+        row_latents = row.latent_vectors
+        row_vectors = int(row_latents.shape[0])
+
+        if seq_latents:
+            would_exceed_vectors = vector_count + row_vectors > max_vectors_per_batch
+            reached_sequence_cap = (
+                max_sequences_per_batch is not None and len(seq_latents) >= max_sequences_per_batch
+            )
+            if would_exceed_vectors or reached_sequence_cap:
+                yield _pack_batch(seq_latents, seq_lengths, dim=dim)
+                seq_latents.clear()
+                seq_lengths.clear()
+                vector_count = 0
+
+        seq_latents.append(row_latents)
+        seq_lengths.append(row_vectors)
+        vector_count += row_vectors
 
     if seq_latents:
-        yield _pack_batch(seq_latents, dim=dim)
+        yield _pack_batch(seq_latents, seq_lengths, dim=dim)
 
 
-def _pack_batch(seq_latents: List[np.ndarray], *, dim: int) -> SequenceBatch:
+def _pack_batch(seq_latents: List[np.ndarray], seq_lengths: List[int], *, dim: int) -> SequenceBatch:
     if not seq_latents:
         empty = torch.zeros((0, dim), dtype=torch.float32)
-        return SequenceBatch(latents=empty, sequence_count=0, vector_count=0)
+        return SequenceBatch(
+            latents=empty,
+            sequence_count=0,
+            vector_count=0,
+            max_k_in_batch=0,
+            avg_k_in_batch=0.0,
+        )
 
     flat = np.concatenate(seq_latents, axis=0)
     if flat.ndim != 2 or flat.shape[1] != dim:
         raise RuntimeError(f"Invalid packed latent shape: {tuple(flat.shape)}")
 
+    vector_count = int(flat.shape[0])
+    sequence_count = len(seq_latents)
+    max_k_in_batch = max(seq_lengths) if seq_lengths else 0
+    avg_k_in_batch = float(vector_count / sequence_count) if sequence_count > 0 else 0.0
     latents = torch.from_numpy(flat.astype(np.float32, copy=False))
     return SequenceBatch(
         latents=latents,
-        sequence_count=len(seq_latents),
-        vector_count=int(flat.shape[0]),
+        sequence_count=sequence_count,
+        vector_count=vector_count,
+        max_k_in_batch=max_k_in_batch,
+        avg_k_in_batch=avg_k_in_batch,
     )

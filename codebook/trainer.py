@@ -54,7 +54,7 @@ class CodebookTrainer:
 
         print(
             f"[init] device={self.device.type} dim={cfg.dim} vocab={cfg.vocab_size} "
-            f"batch_size(sequences)={cfg.batch_size} epochs={cfg.epochs}"
+            f"max_vectors_per_batch={cfg.max_vectors_per_batch} max_sequences_per_batch={cfg.batch_size} epochs={cfg.epochs}"
         )
         print("[target] healthy run usually shows perplexity > 100 and dead_fraction trending < 0.2")
 
@@ -70,6 +70,7 @@ class CodebookTrainer:
                 read_batch_size=cfg.read_batch_size,
                 fit_batch_size=cfg.kmeans_fit_batch_size,
                 seed=cfg.seed,
+                kmeans_max_vectors_per_sequence=cfg.kmeans_max_vectors_per_sequence,
             )
             print(
                 f"[init] kmeans complete sampled_vectors={init_stats['sampled_vectors']} "
@@ -85,7 +86,8 @@ class CodebookTrainer:
             print(f"[epoch {epoch + 1}/{cfg.epochs}] starting")
             for batch in iter_sequence_batches(
                 cfg.input_dir,
-                batch_size=cfg.batch_size,
+                max_vectors_per_batch=cfg.max_vectors_per_batch,
+                max_sequences_per_batch=cfg.batch_size,
                 dim=cfg.dim,
                 read_batch_size=cfg.read_batch_size,
             ):
@@ -167,6 +169,9 @@ class CodebookTrainer:
                     perplexity = float(metrics.perplexity.item())
                     print(
                         f"step={global_step} "
+                        f"seqs={batch.sequence_count} "
+                        f"vecs={batch.vector_count} "
+                        f"avg_k={batch.avg_k_in_batch:.2f} "
                         f"total_loss={float(metrics.total_loss.item()):.6f} "
                         f"vq_loss={float(metrics.vq_loss.item()):.6f} "
                         f"commit_loss={float(metrics.commit_loss.item()):.6f} "
