@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 @dataclass
 class CodebookConfig:
-    input_dir: str
-    output_dir: str
+    input_dir: str = "omrisap/nvidia-math-vectorized"
+    output_dir: str = "runs/codebook"
     vocab_size: int = 1024
     dim: int = 1024
     batch_size: int = 128  # max sequences per step

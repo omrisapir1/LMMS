@@ -99,7 +99,25 @@ class CodebookTrainer:
 
                 latents = batch.latents.to(self.device, dtype=torch.float32, non_blocking=True)
                 should_log = global_step % cfg.log_interval == 0 or global_step == 1
-                diagnostics: dict[str, float] = {}
+                diagnostics: dict[str, float] = {
+                    "cos_sim_mean": float("nan"),
+                    "cos_sim_std": float("nan"),
+                    "cos_sim_p50": float("nan"),
+                    "cos_sim_p90": float("nan"),
+                    "margin_mean": float("nan"),
+                    "margin_std": float("nan"),
+                    "margin_p50": float("nan"),
+                    "margin_p90": float("nan"),
+                    "latent_norm_mean": float("nan"),
+                    "latent_norm_std": float("nan"),
+                    "unique_z_per_sequence_mean": float("nan"),
+                    "unique_z_per_sequence_p50": float("nan"),
+                    "unique_z_per_sequence_p90": float("nan"),
+                    "unique_z_ratio_per_sequence_mean": float("nan"),
+                    "unique_z_ratio_per_sequence_p50": float("nan"),
+                    "unique_z_ratio_per_sequence_p90": float("nan"),
+                    "repeat_frac_mean": float("nan"),
+                }
 
                 with torch.no_grad():
                     z_ids, quantized = self.model(latents)
@@ -114,20 +132,7 @@ class CodebookTrainer:
                     if should_log:
                         x_norm = F.normalize(latents, p=2, dim=-1, eps=1e-12)
                         q_norm = F.normalize(quantized, p=2, dim=-1, eps=1e-12)
-                        if x_norm.shape[0] == 0:
-                            diagnostics = {
-                                "cos_sim_mean": float("nan"),
-                                "cos_sim_std": float("nan"),
-                                "cos_sim_p50": float("nan"),
-                                "cos_sim_p90": float("nan"),
-                                "margin_mean": float("nan"),
-                                "margin_std": float("nan"),
-                                "margin_p50": float("nan"),
-                                "margin_p90": float("nan"),
-                                "latent_norm_mean": float("nan"),
-                                "latent_norm_std": float("nan"),
-                            }
-                        else:
+                        if x_norm.shape[0] > 0:
                             cos_sim = (x_norm * q_norm).sum(dim=-1)
                             cos_quantiles = torch.quantile(
                                 cos_sim,
@@ -151,7 +156,7 @@ class CodebookTrainer:
                             )
 
                             latent_norm = latents.norm(dim=-1)
-                            diagnostics = {
+                            diagnostics.update({
                                 "cos_sim_mean": float(cos_sim.mean().item()),
                                 "cos_sim_std": float(cos_sim.std(unbiased=False).item()),
                                 "cos_sim_p50": float(cos_quantiles[0].item()),
@@ -162,7 +167,54 @@ class CodebookTrainer:
                                 "margin_p90": float(margin_quantiles[1].item()),
                                 "latent_norm_mean": float(latent_norm.mean().item()),
                                 "latent_norm_std": float(latent_norm.std(unbiased=False).item()),
-                            }
+                            })
+
+                            unique_counts: list[float] = []
+                            unique_ratios: list[float] = []
+                            repeat_fracs: list[float] = []
+                            start = 0
+                            for k in batch.sequence_lengths:
+                                if k <= 1:
+                                    unique_counts.append(1.0)
+                                    unique_ratios.append(1.0)
+                                    repeat_fracs.append(0.0)
+                                    start += max(k, 0)
+                                    continue
+                                seq_ids = z_ids[start : start + k]
+                                unique_z = float(torch.unique(seq_ids).numel())
+                                unique_counts.append(unique_z)
+                                unique_ratios.append(unique_z / float(k))
+                                repeat_fracs.append(
+                                    float((seq_ids[1:] == seq_ids[:-1]).float().mean().item())
+                                )
+                                start += k
+
+                            if start != int(z_ids.shape[0]):
+                                raise RuntimeError(
+                                    f"Sequence boundary mismatch: consumed={start} vs z_ids={int(z_ids.shape[0])}"
+                                )
+
+                            if unique_counts:
+                                uq = torch.tensor(unique_counts, dtype=torch.float32, device=z_ids.device)
+                                uq_q = torch.quantile(
+                                    uq,
+                                    torch.tensor([0.5, 0.9], device=uq.device, dtype=uq.dtype),
+                                )
+                                ur = torch.tensor(unique_ratios, dtype=torch.float32, device=z_ids.device)
+                                ur_q = torch.quantile(
+                                    ur,
+                                    torch.tensor([0.5, 0.9], device=ur.device, dtype=ur.dtype),
+                                )
+                                rf = torch.tensor(repeat_fracs, dtype=torch.float32, device=z_ids.device)
+                                diagnostics.update({
+                                    "unique_z_per_sequence_mean": float(uq.mean().item()),
+                                    "unique_z_per_sequence_p50": float(uq_q[0].item()),
+                                    "unique_z_per_sequence_p90": float(uq_q[1].item()),
+                                    "unique_z_ratio_per_sequence_mean": float(ur.mean().item()),
+                                    "unique_z_ratio_per_sequence_p50": float(ur_q[0].item()),
+                                    "unique_z_ratio_per_sequence_p90": float(ur_q[1].item()),
+                                    "repeat_frac_mean": float(rf.mean().item()),
+                                })
                     self.model.ema_update(latents, z_ids, eps=cfg.eps)
 
                 if should_log:
@@ -172,6 +224,13 @@ class CodebookTrainer:
                         f"seqs={batch.sequence_count} "
                         f"vecs={batch.vector_count} "
                         f"avg_k={batch.avg_k_in_batch:.2f} "
+                        f"uniq_seq_mean={diagnostics['unique_z_per_sequence_mean']:.2f} "
+                        f"uniq_seq_p50={diagnostics['unique_z_per_sequence_p50']:.2f} "
+                        f"uniq_seq_p90={diagnostics['unique_z_per_sequence_p90']:.2f} "
+                        f"uniq_ratio_mean={diagnostics['unique_z_ratio_per_sequence_mean']:.2f} "
+                        f"uniq_ratio_p50={diagnostics['unique_z_ratio_per_sequence_p50']:.2f} "
+                        f"uniq_ratio_p90={diagnostics['unique_z_ratio_per_sequence_p90']:.2f} "
+                        f"repeat_frac={diagnostics['repeat_frac_mean']:.2f} "
                         f"total_loss={float(metrics.total_loss.item()):.6f} "
                         f"vq_loss={float(metrics.vq_loss.item()):.6f} "
                         f"commit_loss={float(metrics.commit_loss.item()):.6f} "
