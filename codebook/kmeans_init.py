@@ -24,6 +24,18 @@ def random_init_codebook(model: Codebook, *, seed: int = 42) -> Dict[str, int]:
     return {"sampled_vectors": 0}
 
 
+def _subsample_sequence_vectors(
+    vecs: np.ndarray, max_vectors: int, rng: np.random.Generator
+) -> np.ndarray:
+    if max_vectors <= 0:
+        raise ValueError("max_vectors must be > 0")
+    if vecs.shape[0] <= max_vectors:
+        return np.ascontiguousarray(vecs, dtype=np.float32)
+    indices = rng.choice(vecs.shape[0], size=max_vectors, replace=False)
+    sampled = vecs[indices]
+    return np.ascontiguousarray(sampled, dtype=np.float32)
+
+
 def init_codebook_with_kmeans(
     *,
     model: Codebook,
@@ -33,9 +45,12 @@ def init_codebook_with_kmeans(
     read_batch_size: int = 256,
     fit_batch_size: int = 8_192,
     seed: int = 42,
+    kmeans_max_vectors_per_sequence: int = 32,
 ) -> Dict[str, int]:
     if sample_size <= 0:
         raise ValueError("sample_size must be > 0")
+    if kmeans_max_vectors_per_sequence <= 0:
+        raise ValueError("kmeans_max_vectors_per_sequence must be > 0")
 
     try:
         from sklearn.cluster import MiniBatchKMeans
@@ -57,6 +72,7 @@ def init_codebook_with_kmeans(
     pending_count = 0
     seen_vectors = 0
     fitted_once = False
+    rng = np.random.default_rng(seed)
 
     def flush_pending(force: bool = False) -> None:
         nonlocal pending_count, fitted_once
@@ -75,10 +91,14 @@ def init_codebook_with_kmeans(
     for row in iter_valid_latent_rows(input_dir, dim=dim, read_batch_size=read_batch_size):
         if seen_vectors >= sample_size:
             break
-        vecs = row.latent_vectors
+        vecs = _subsample_sequence_vectors(
+            row.latent_vectors, kmeans_max_vectors_per_sequence, rng
+        )
         remaining = sample_size - seen_vectors
         if vecs.shape[0] > remaining:
             vecs = vecs[:remaining]
+        if vecs.shape[0] == 0:
+            continue
         # Align k-means geometry with cosine assignment by clustering on unit-norm latents.
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         vecs = vecs / np.maximum(norms, 1e-12)
