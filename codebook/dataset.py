@@ -27,6 +27,7 @@ class SequenceBatch:
     vector_count: int
     max_k_in_batch: int
     avg_k_in_batch: float
+    sequence_lengths: List[int]
 
 
 def list_parquet_shards(input_dir: str) -> List[Path]:
@@ -70,8 +71,12 @@ def iter_hf_rows(
     input_ref: str,
     *,
     read_batch_size: int = 256,
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 42,
 ) -> Iterator[Dict]:
     del read_batch_size  # Streaming rows are handled by datasets' internal iterators.
+    if shuffle_buffer_size <= 0:
+        raise ValueError("shuffle_buffer_size must be > 0")
 
     try:
         from datasets import load_dataset
@@ -87,6 +92,7 @@ def iter_hf_rows(
 
     try:
         ds = load_dataset(dataset_id, split=split, streaming=True)
+        ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
     except Exception as exc:  # pragma: no cover - network/runtime dependent
         raise FileNotFoundError(
             f"Input path does not exist locally and could not be loaded from Hugging Face: "
@@ -175,6 +181,8 @@ def iter_valid_latent_rows(
     *,
     dim: int,
     read_batch_size: int = 256,
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 42,
 ) -> Iterator[LatentRow]:
     if _is_local_parquet_dir(input_dir):
         for shard in list_parquet_shards(input_dir):
@@ -185,7 +193,12 @@ def iter_valid_latent_rows(
                 yield parsed
         return
 
-    for row in iter_hf_rows(input_dir, read_batch_size=read_batch_size):
+    for row in iter_hf_rows(
+        input_dir,
+        read_batch_size=read_batch_size,
+        shuffle_buffer_size=shuffle_buffer_size,
+        seed=seed,
+    ):
         parsed, _ = parse_latent_row(row, dim=dim)
         if parsed is None:
             continue
@@ -199,6 +212,8 @@ def iter_sequence_batches(
     dim: int,
     read_batch_size: int = 256,
     max_sequences_per_batch: int | None = None,
+    shuffle_buffer_size: int = 10_000,
+    seed: int = 42,
 ) -> Iterator[SequenceBatch]:
     if max_vectors_per_batch <= 0:
         raise ValueError("max_vectors_per_batch must be > 0")
@@ -208,7 +223,13 @@ def iter_sequence_batches(
     seq_latents: List[np.ndarray] = []
     seq_lengths: List[int] = []
     vector_count = 0
-    for row in iter_valid_latent_rows(input_dir, dim=dim, read_batch_size=read_batch_size):
+    for row in iter_valid_latent_rows(
+        input_dir,
+        dim=dim,
+        read_batch_size=read_batch_size,
+        shuffle_buffer_size=shuffle_buffer_size,
+        seed=seed,
+    ):
         row_latents = row.latent_vectors
         row_vectors = int(row_latents.shape[0])
 
@@ -240,6 +261,7 @@ def _pack_batch(seq_latents: List[np.ndarray], seq_lengths: List[int], *, dim: i
             vector_count=0,
             max_k_in_batch=0,
             avg_k_in_batch=0.0,
+            sequence_lengths=[],
         )
 
     flat = np.concatenate(seq_latents, axis=0)
@@ -257,4 +279,5 @@ def _pack_batch(seq_latents: List[np.ndarray], seq_lengths: List[int], *, dim: i
         vector_count=vector_count,
         max_k_in_batch=max_k_in_batch,
         avg_k_in_batch=avg_k_in_batch,
+        sequence_lengths=list(seq_lengths),
     )
