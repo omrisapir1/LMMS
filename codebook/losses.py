@@ -104,7 +104,7 @@ def compute_losses(
         )
     adjacent_overlap_loss = float(lambda_adjacent_overlap) * adjacent_overlap
 
-    total_loss = vq_loss + commit_loss + kl_loss + adjacent_overlap_loss
+    total_loss = vq_loss * 0.01 + commit_loss* 0.01 + kl_loss + adjacent_overlap_loss
     return LossOutput(
         total_loss=total_loss,
         vq_loss=vq_loss,
