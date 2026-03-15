@@ -16,10 +16,10 @@ class CodebookConfig:
     beta: float = 0.25
     lambda_kl: float = 0.000
     adjacent_overlap_tau: float = 0.1
-    lambda_adjacent_overlap: float = 0.3
+    lambda_adjacent_overlap: float = 10
     kmeans_sample_size: int = 500_000
     kmeans_max_vectors_per_sequence: int = 128
-    no_kmeans: bool = False
+    no_kmeans: bool = True
     seed: int = 42
 
     # Streaming / runtime knobs
