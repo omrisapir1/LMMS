@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,8 @@ class LossOutput:
     vq_loss: torch.Tensor
     commit_loss: torch.Tensor
     kl_loss: torch.Tensor
+    adjacent_overlap: torch.Tensor
+    adjacent_overlap_loss: torch.Tensor
     perplexity: torch.Tensor
     dead_fraction: torch.Tensor
 
@@ -73,6 +76,10 @@ def compute_losses(
     usage_kl: UsageKLLoss,
     beta: float = 0.25,
     lambda_kl: float = 0.01,
+    similarity: torch.Tensor | None = None,
+    sequence_lengths: Sequence[int] | None = None,
+    tau: float = 0.1,
+    lambda_adjacent_overlap: float = 0.0,
 ) -> LossOutput:
     if latents.shape != quantized_vectors.shape:
         raise ValueError("latents and quantized_vectors must have the same shape")
@@ -88,12 +95,62 @@ def compute_losses(
     kl_raw, perplexity, dead_fraction = usage_kl.update(z_ids)
     kl_loss = float(lambda_kl) * kl_raw
 
-    total_loss = vq_loss + commit_loss + kl_loss
+    adjacent_overlap = latents.new_zeros(())
+    if similarity is not None and sequence_lengths is not None:
+        adjacent_overlap = compute_soft_adjacent_overlap(
+            similarity=similarity,
+            sequence_lengths=sequence_lengths,
+            tau=tau,
+        )
+    adjacent_overlap_loss = float(lambda_adjacent_overlap) * adjacent_overlap
+
+    total_loss = vq_loss + commit_loss + kl_loss + adjacent_overlap_loss
     return LossOutput(
         total_loss=total_loss,
         vq_loss=vq_loss,
         commit_loss=commit_loss,
         kl_loss=kl_loss,
+        adjacent_overlap=adjacent_overlap,
+        adjacent_overlap_loss=adjacent_overlap_loss,
         perplexity=perplexity,
         dead_fraction=dead_fraction,
     )
+
+
+def compute_soft_adjacent_overlap(
+    *,
+    similarity: torch.Tensor,
+    sequence_lengths: Sequence[int],
+    tau: float,
+) -> torch.Tensor:
+    if similarity.ndim != 2:
+        raise ValueError("similarity must have shape [N, V]")
+    if tau <= 0.0:
+        raise ValueError("tau must be > 0")
+
+    n = int(similarity.shape[0])
+    expected = sum(int(k) for k in sequence_lengths)
+    if expected != n:
+        raise ValueError(f"sum(sequence_lengths)={expected} must equal similarity.shape[0]={n}")
+
+    if n == 0:
+        return similarity.new_zeros(())
+
+    probs = torch.softmax(similarity / float(tau), dim=-1)  # [N, V]
+    overlap_sum = similarity.new_zeros(())
+    pair_count = 0
+    start = 0
+    for k_raw in sequence_lengths:
+        k = int(k_raw)
+        if k < 0:
+            raise ValueError("sequence lengths must be non-negative")
+        if k >= 2:
+            seq_probs = probs[start : start + k]
+            overlaps = torch.sum(seq_probs[1:] * seq_probs[:-1], dim=-1)  # [k-1]
+            overlap_sum = overlap_sum + overlaps.sum()
+            pair_count += k - 1
+        start += k
+
+    if pair_count == 0:
+        return similarity.new_zeros(())
+    return overlap_sum / float(pair_count)

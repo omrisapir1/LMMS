@@ -15,6 +15,8 @@ class CodebookConfig:
     ema_decay: float = 0.99
     beta: float = 0.25
     lambda_kl: float = 0.001
+    adjacent_overlap_tau: float = 0.1
+    lambda_adjacent_overlap: float = 0.0
     kmeans_sample_size: int = 500_000
     kmeans_max_vectors_per_sequence: int = 32
     no_kmeans: bool = False
