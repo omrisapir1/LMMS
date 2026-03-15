@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema_decay", default=0.995, type=float)
     p.add_argument("--beta", default=0.25, type=float)
     p.add_argument("--lambda_kl", default=0.01, type=float)
+    p.add_argument("--adjacent_overlap_tau", default=0.1, type=float)
+    p.add_argument("--lambda_adjacent_overlap", default=0.0, type=float)
     p.add_argument("--kmeans_sample_size", default=500000, type=int)
     p.add_argument("--kmeans_max_vectors_per_sequence", default=32, type=int)
     p.add_argument("--no_kmeans", action="store_true")
@@ -47,6 +49,8 @@ def main() -> None:
         ema_decay=args.ema_decay,
         beta=args.beta,
         lambda_kl=args.lambda_kl,
+        adjacent_overlap_tau=args.adjacent_overlap_tau,
+        lambda_adjacent_overlap=args.lambda_adjacent_overlap,
         kmeans_sample_size=args.kmeans_sample_size,
         kmeans_max_vectors_per_sequence=args.kmeans_max_vectors_per_sequence,
         no_kmeans=bool(args.no_kmeans),

@@ -51,6 +51,8 @@ class CodebookTrainer:
     def train(self) -> None:
         cfg = self.config
         os.makedirs(cfg.output_dir, exist_ok=True)
+        if cfg.adjacent_overlap_tau <= 0.0:
+            raise ValueError("adjacent_overlap_tau must be > 0")
 
         print(
             f"[init] device={self.device.type} dim={cfg.dim} vocab={cfg.vocab_size} "
@@ -120,7 +122,7 @@ class CodebookTrainer:
                 }
 
                 with torch.no_grad():
-                    z_ids, quantized = self.model(latents)
+                    z_ids, quantized, similarity = self.model(latents, return_similarity=True)
                     metrics = compute_losses(
                         latents=latents,
                         quantized_vectors=quantized,
@@ -128,6 +130,10 @@ class CodebookTrainer:
                         usage_kl=self.usage_kl,
                         beta=cfg.beta,
                         lambda_kl=cfg.lambda_kl,
+                        similarity=similarity,
+                        sequence_lengths=batch.sequence_lengths,
+                        tau=cfg.adjacent_overlap_tau,
+                        lambda_adjacent_overlap=cfg.lambda_adjacent_overlap,
                     )
                     if should_log:
                         x_norm = F.normalize(latents, p=2, dim=-1, eps=1e-12)
@@ -235,6 +241,8 @@ class CodebookTrainer:
                         f"vq_loss={float(metrics.vq_loss.item()):.6f} "
                         f"commit_loss={float(metrics.commit_loss.item()):.6f} "
                         f"kl_loss={float(metrics.kl_loss.item()):.6f} "
+                        f"adj_overlap={float(metrics.adjacent_overlap.item()):.6f} "
+                        f"adj_overlap_loss={float(metrics.adjacent_overlap_loss.item()):.6f} "
                         f"perplexity={perplexity:.2f} "
                         f"dead_fraction={float(metrics.dead_fraction.item()):.4f} "
                         f"effective_vocab={int(round(perplexity))} "

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -47,7 +47,9 @@ class Codebook(nn.Module):
         self.ema_embedding_sum.copy_(embeddings)
         self.ema_cluster_size.fill_(1.0)
 
-    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, latents: torch.Tensor, *, return_similarity: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         if latents.ndim != 2 or latents.shape[1] != self.dim:
             raise ValueError(f"latents must have shape [N, {self.dim}]")
 
@@ -58,6 +60,8 @@ class Codebook(nn.Module):
         similarity = latents_norm @ emb_norm.transpose(0, 1)  # [N, V]
         z_ids = torch.argmax(similarity, dim=-1)  # [N]
         quantized = self.embeddings.index_select(0, z_ids)  # [N, D]
+        if return_similarity:
+            return z_ids, quantized, similarity
         return z_ids, quantized
 
     @torch.no_grad()
