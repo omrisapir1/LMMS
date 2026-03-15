@@ -19,7 +19,7 @@ class CodebookConfig:
     lambda_adjacent_overlap: float = 0.3
     kmeans_sample_size: int = 500_000
     kmeans_max_vectors_per_sequence: int = 128
-    no_kmeans: bool = True
+    no_kmeans: bool = False
     seed: int = 42
 
     # Streaming / runtime knobs
