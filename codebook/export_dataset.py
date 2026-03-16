@@ -14,9 +14,11 @@ import torch.nn.functional as F
 try:
     from .dataset import iter_parquet_rows, list_parquet_shards, parse_latent_row
     from .model import Codebook
+    from .quantize_repr import normalize_quantize_mode, transform_sequence_np
 except ImportError:
     from dataset import iter_parquet_rows, list_parquet_shards, parse_latent_row  # type: ignore
     from model import Codebook  # type: ignore
+    from quantize_repr import normalize_quantize_mode, transform_sequence_np  # type: ignore
 
 
 OUTPUT_SCHEMA = pa.schema(
@@ -32,7 +34,7 @@ OUTPUT_SCHEMA = pa.schema(
 )
 
 
-def _load_codebook(codebook_path: str, *, device: torch.device) -> Codebook:
+def _load_codebook(codebook_path: str, *, device: torch.device) -> tuple[Codebook, Dict]:
     ckpt = torch.load(codebook_path, map_location="cpu")
     embeddings = ckpt["embeddings"].to(torch.float32)
     vocab_size, dim = embeddings.shape
@@ -50,7 +52,7 @@ def _load_codebook(codebook_path: str, *, device: torch.device) -> Codebook:
         model.embeddings.copy_(updated)
 
     model.eval()
-    return model
+    return model, ckpt
 
 
 @torch.no_grad()
@@ -89,11 +91,18 @@ def export_dataset(
     dim: int = 1536,
     read_batch_size: int = 256,
     quantize_chunk_size: int = 16_384,
+    quantize_mode: str | None = None,
     skip_invalid_rows: bool = False,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _load_codebook(codebook_path, device=device)
+    model, ckpt = _load_codebook(codebook_path, device=device)
+    ckpt_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    inferred_mode = "delta"
+    if isinstance(ckpt_cfg, dict):
+        inferred_mode = str(ckpt_cfg.get("quantize_mode", inferred_mode))
+    mode = normalize_quantize_mode(quantize_mode if quantize_mode is not None else inferred_mode)
+    print(f"[export] quantize_mode={mode}")
 
     total_rows = 0
     total_shards = 0
@@ -126,7 +135,7 @@ def export_dataset(
                 start = 0 if not batch_offsets else batch_offsets[-1][1]
                 end = start + parsed.k_star
                 batch_offsets.append((start, end))
-                batch_latents.append(parsed.latent_vectors)
+                batch_latents.append(transform_sequence_np(parsed.latent_vectors, mode=mode))
                 batch_rows.append(
                     {
                         "qid": parsed.qid,
@@ -197,6 +206,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dim", default=1536, type=int)
     p.add_argument("--read_batch_size", default=256, type=int)
     p.add_argument("--quantize_chunk_size", default=16384, type=int)
+    p.add_argument("--quantize_mode", default=None, choices=["raw", "delta"], type=str)
     p.add_argument("--skip_invalid_rows", action="store_true")
     return p.parse_args()
 
@@ -210,6 +220,7 @@ def main() -> None:
         dim=args.dim,
         read_batch_size=args.read_batch_size,
         quantize_chunk_size=args.quantize_chunk_size,
+        quantize_mode=args.quantize_mode,
         skip_invalid_rows=bool(args.skip_invalid_rows),
     )
 
