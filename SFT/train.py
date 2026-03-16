@@ -240,6 +240,13 @@ def _build_loader(
     train: bool,
 ) -> DataLoader:
     ds = SFTDataset(records=records, tokenizer=tokenizer, vocab_size=cfg.vocab_size)
+    if len(ds) == 0:
+        raise ValueError(
+            "SFT dataset has 0 usable samples after preprocessing "
+            f"(kept={ds.stats.get('kept', 0)}, dropped={ds.stats.get('dropped', 0)}). "
+            "Check required fields: question, z_ids, and either valid answer_digits (5 digits) "
+            "or answer_int in [0, 99999]."
+        )
     collator = SFTCollator(tokenizer=tokenizer, max_length=cfg.max_length)
     num_workers = int(cfg.dataloader_num_workers if train else cfg.eval_dataloader_num_workers)
     loader_kwargs = {
