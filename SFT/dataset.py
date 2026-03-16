@@ -24,6 +24,18 @@ class SFTSample:
     answer_digits: List[int]
 
 
+def _digits_from_answer_int(answer_int: object) -> Optional[List[int]]:
+    if answer_int is None:
+        return None
+    try:
+        value = int(answer_int)
+    except Exception:
+        return None
+    if value < 0 or value > 99999:
+        return None
+    return [int(ch) for ch in f"{value:05d}"]
+
+
 def _validate_digits(digits: List[int]) -> List[int]:
     if len(digits) != 5:
         raise ValueError(f"answer_digits must have length 5, got {len(digits)}")
@@ -80,6 +92,8 @@ class SFTDataset(Dataset):
             q = row.get("question")
             z = row.get("z_ids")
             d = row.get("answer_digits")
+            if d is None:
+                d = _digits_from_answer_int(row.get("answer_int"))
             if q is None or z is None or d is None:
                 dropped += 1
                 continue
