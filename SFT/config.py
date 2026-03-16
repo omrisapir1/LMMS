@@ -6,14 +6,14 @@ from dataclasses import dataclass
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
-    base_model_or_checkpoint: str = "omrisap/phase1_improved"
-    train_dataset_name: str = "omrisap/SFT_512_40K"
+    base_model_or_checkpoint: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    train_dataset_name: str = "omrisap/nvidia_math_64_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
     eval_dataset_split: str = "eval"
 
     # Discrete Z vocab
-    vocab_size: int = 512
+    vocab_size: int = 64
 
     # Training
     seed: int = 42
