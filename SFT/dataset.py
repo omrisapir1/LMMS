@@ -92,18 +92,22 @@ class SFTDataset(Dataset):
             q = row.get("question")
             z = row.get("z_ids")
             d = row.get("answer_digits")
-            if d is None:
-                d = _digits_from_answer_int(row.get("answer_int"))
-            if q is None or z is None or d is None:
+            digits: Optional[List[int]] = None
+            if d is not None:
+                try:
+                    digits = _validate_digits([int(x) for x in d])
+                except Exception:
+                    digits = None
+            if digits is None:
+                from_int = _digits_from_answer_int(row.get("answer_int"))
+                if from_int is not None:
+                    digits = _validate_digits(from_int)
+
+            if q is None or z is None or digits is None:
                 dropped += 1
                 continue
             z_ids = [int(x) for x in z]
             if any(x < 0 or x >= self.vocab_size for x in z_ids):
-                dropped += 1
-                continue
-            try:
-                digits = _validate_digits([int(x) for x in d])
-            except Exception:
                 dropped += 1
                 continue
             self.samples.append(SFTSample(question=str(q), z_ids=z_ids, answer_digits=digits))
