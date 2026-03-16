@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_adjacent_overlap", default=0.0, type=float)
     p.add_argument("--kmeans_sample_size", default=500000, type=int)
     p.add_argument("--kmeans_max_vectors_per_sequence", default=32, type=int)
+    p.add_argument("--quantize_mode", default="delta", choices=["raw", "delta"], type=str)
     p.add_argument("--no_kmeans", action="store_true")
     p.add_argument("--seed", default=42, type=int)
     return p.parse_args()
@@ -53,6 +54,7 @@ def main() -> None:
         lambda_adjacent_overlap=args.lambda_adjacent_overlap,
         kmeans_sample_size=args.kmeans_sample_size,
         kmeans_max_vectors_per_sequence=args.kmeans_max_vectors_per_sequence,
+        quantize_mode=args.quantize_mode,
         no_kmeans=bool(args.no_kmeans),
         seed=args.seed,
     )

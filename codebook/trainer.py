@@ -15,12 +15,14 @@ try:
     from .kmeans_init import init_codebook_with_kmeans, random_init_codebook
     from .losses import UsageKLLoss, compute_losses
     from .model import Codebook
+    from .quantize_repr import normalize_quantize_mode, transform_flat_torch
 except ImportError:
     from config import CodebookConfig  # type: ignore
     from dataset import iter_sequence_batches  # type: ignore
     from kmeans_init import init_codebook_with_kmeans, random_init_codebook  # type: ignore
     from losses import UsageKLLoss, compute_losses  # type: ignore
     from model import Codebook  # type: ignore
+    from quantize_repr import normalize_quantize_mode, transform_flat_torch  # type: ignore
 
 
 def _set_seed(seed: int) -> None:
@@ -53,10 +55,12 @@ class CodebookTrainer:
         os.makedirs(cfg.output_dir, exist_ok=True)
         if cfg.adjacent_overlap_tau <= 0.0:
             raise ValueError("adjacent_overlap_tau must be > 0")
+        quantize_mode = normalize_quantize_mode(cfg.quantize_mode)
 
         print(
             f"[init] device={self.device.type} dim={cfg.dim} vocab={cfg.vocab_size} "
-            f"max_vectors_per_batch={cfg.max_vectors_per_batch} max_sequences_per_batch={cfg.batch_size} epochs={cfg.epochs}"
+            f"max_vectors_per_batch={cfg.max_vectors_per_batch} max_sequences_per_batch={cfg.batch_size} epochs={cfg.epochs} "
+            f"quantize_mode={quantize_mode}"
         )
         print("[target] healthy run usually shows perplexity > 100 and dead_fraction trending < 0.2")
 
@@ -73,6 +77,7 @@ class CodebookTrainer:
                 fit_batch_size=cfg.kmeans_fit_batch_size,
                 seed=cfg.seed,
                 kmeans_max_vectors_per_sequence=cfg.kmeans_max_vectors_per_sequence,
+                quantize_mode=quantize_mode,
             )
             print(
                 f"[init] kmeans complete sampled_vectors={init_stats['sampled_vectors']} "
@@ -100,6 +105,11 @@ class CodebookTrainer:
                 total_vectors += batch.vector_count
 
                 latents = batch.latents.to(self.device, dtype=torch.float32, non_blocking=True)
+                quantize_inputs = transform_flat_torch(
+                    latents,
+                    sequence_lengths=batch.sequence_lengths,
+                    mode=quantize_mode,
+                )
                 should_log = global_step % cfg.log_interval == 0 or global_step == 1
                 diagnostics: dict[str, float] = {
                     "cos_sim_mean": float("nan"),
@@ -122,9 +132,9 @@ class CodebookTrainer:
                 }
 
                 with torch.no_grad():
-                    z_ids, quantized, similarity = self.model(latents, return_similarity=True)
+                    z_ids, quantized, similarity = self.model(quantize_inputs, return_similarity=True)
                     metrics = compute_losses(
-                        latents=latents,
+                        latents=quantize_inputs,
                         quantized_vectors=quantized,
                         z_ids=z_ids,
                         usage_kl=self.usage_kl,
@@ -136,7 +146,7 @@ class CodebookTrainer:
                         lambda_adjacent_overlap=cfg.lambda_adjacent_overlap,
                     )
                     if should_log:
-                        x_norm = F.normalize(latents, p=2, dim=-1, eps=1e-12)
+                        x_norm = F.normalize(quantize_inputs, p=2, dim=-1, eps=1e-12)
                         q_norm = F.normalize(quantized, p=2, dim=-1, eps=1e-12)
                         if x_norm.shape[0] > 0:
                             cos_sim = (x_norm * q_norm).sum(dim=-1)
@@ -161,7 +171,7 @@ class CodebookTrainer:
                                 torch.tensor([0.5, 0.9], device=margin.device, dtype=margin.dtype),
                             )
 
-                            latent_norm = latents.norm(dim=-1)
+                            latent_norm = quantize_inputs.norm(dim=-1)
                             diagnostics.update({
                                 "cos_sim_mean": float(cos_sim.mean().item()),
                                 "cos_sim_std": float(cos_sim.std(unbiased=False).item()),
@@ -221,7 +231,7 @@ class CodebookTrainer:
                                     "unique_z_ratio_per_sequence_p90": float(ur_q[1].item()),
                                     "repeat_frac_mean": float(rf.mean().item()),
                                 })
-                    self.model.ema_update(latents, z_ids, eps=cfg.eps)
+                    self.model.ema_update(quantize_inputs, z_ids, eps=cfg.eps)
 
                 if should_log:
                     perplexity = float(metrics.perplexity.item())

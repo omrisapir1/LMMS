@@ -9,9 +9,11 @@ import torch.nn.functional as F
 try:
     from .dataset import iter_valid_latent_rows
     from .model import Codebook
+    from .quantize_repr import normalize_quantize_mode, transform_sequence_np
 except ImportError:
     from dataset import iter_valid_latent_rows  # type: ignore
     from model import Codebook  # type: ignore
+    from quantize_repr import normalize_quantize_mode, transform_sequence_np  # type: ignore
 
 
 def random_init_codebook(model: Codebook, *, seed: int = 42) -> Dict[str, int]:
@@ -46,11 +48,13 @@ def init_codebook_with_kmeans(
     fit_batch_size: int = 8_192,
     seed: int = 42,
     kmeans_max_vectors_per_sequence: int = 32,
+    quantize_mode: str = "delta",
 ) -> Dict[str, int]:
     if sample_size <= 0:
         raise ValueError("sample_size must be > 0")
     if kmeans_max_vectors_per_sequence <= 0:
         raise ValueError("kmeans_max_vectors_per_sequence must be > 0")
+    mode = normalize_quantize_mode(quantize_mode)
 
     try:
         from sklearn.cluster import MiniBatchKMeans
@@ -91,8 +95,9 @@ def init_codebook_with_kmeans(
     for row in iter_valid_latent_rows(input_dir, dim=dim, read_batch_size=read_batch_size):
         if seen_vectors >= sample_size:
             break
+        row_vecs = transform_sequence_np(row.latent_vectors, mode=mode)
         vecs = _subsample_sequence_vectors(
-            row.latent_vectors, kmeans_max_vectors_per_sequence, rng
+            row_vecs, kmeans_max_vectors_per_sequence, rng
         )
         remaining = sample_size - seen_vectors
         if vecs.shape[0] > remaining:
