@@ -12,11 +12,16 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from .dataset import iter_parquet_rows, list_parquet_shards, parse_latent_row
+    from .dataset import (
+        iter_hf_rows,
+        iter_parquet_rows,
+        list_parquet_shards,
+        parse_latent_row,
+    )
     from .model import Codebook
     from .quantize_repr import normalize_quantize_mode, transform_sequence_np
 except ImportError:
-    from dataset import iter_parquet_rows, list_parquet_shards, parse_latent_row  # type: ignore
+    from dataset import iter_hf_rows, iter_parquet_rows, list_parquet_shards, parse_latent_row  # type: ignore
     from model import Codebook  # type: ignore
     from quantize_repr import normalize_quantize_mode, transform_sequence_np  # type: ignore
 
@@ -107,8 +112,15 @@ def export_dataset(
     total_rows = 0
     total_shards = 0
 
-    for shard in list_parquet_shards(input_dir):
-        out_path = Path(output_dir) / shard.name
+    input_path = Path(input_dir)
+    if input_path.exists() and input_path.is_dir():
+        sources = [(shard.name, iter_parquet_rows(shard, read_batch_size=read_batch_size)) for shard in list_parquet_shards(input_dir)]
+    else:
+        # HF input is streamed and exported as a single parquet shard.
+        sources = [("hf_stream.parquet", iter_hf_rows(input_dir, read_batch_size=read_batch_size))]
+
+    for source_name, row_iter in sources:
+        out_path = Path(output_dir) / source_name
         writer = pq.ParquetWriter(str(out_path), OUTPUT_SCHEMA, compression="zstd")
         shard_rows = 0
         shard_invalid_rows = 0
@@ -118,18 +130,18 @@ def export_dataset(
             batch_latents: List[np.ndarray] = []
             batch_offsets: List[tuple[int, int]] = []
 
-            for row in iter_parquet_rows(shard, read_batch_size=read_batch_size):
+            for row in row_iter:
                 parsed, err = parse_latent_row(row, dim=dim)
                 if parsed is None:
                     if skip_invalid_rows:
                         shard_invalid_rows += 1
                         print(
-                            f"[warn] skipping invalid row shard={shard.name} "
+                            f"[warn] skipping invalid row shard={source_name} "
                             f"qid={row.get('qid', '')!r}: {err}"
                         )
                         continue
                     raise RuntimeError(
-                        f"Invalid row in shard={shard.name} qid={row.get('qid', '')!r}: {err}"
+                        f"Invalid row in shard={source_name} qid={row.get('qid', '')!r}: {err}"
                     )
 
                 start = 0 if not batch_offsets else batch_offsets[-1][1]
@@ -192,7 +204,7 @@ def export_dataset(
         total_rows += shard_rows
         total_shards += 1
         print(
-            f"[export] shard={shard.name} rows={shard_rows} invalid_rows={shard_invalid_rows} -> {out_path}"
+            f"[export] shard={source_name} rows={shard_rows} invalid_rows={shard_invalid_rows} -> {out_path}"
         )
 
     print(f"[done] exported shards={total_shards} rows={total_rows} to {output_dir}")
