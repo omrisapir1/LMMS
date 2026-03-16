@@ -88,7 +88,7 @@ def export_dataset(
     input_dir: str,
     output_dir: str,
     codebook_path: str,
-    dim: int = 1536,
+    dim: int = 1024,
     read_batch_size: int = 256,
     quantize_chunk_size: int = 16_384,
     quantize_mode: str | None = None,
@@ -203,7 +203,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input_dir", required=True, type=str)
     p.add_argument("--output_dir", required=True, type=str)
     p.add_argument("--codebook_path", required=True, type=str)
-    p.add_argument("--dim", default=1536, type=int)
+    p.add_argument("--dim", default=1024, type=int)
     p.add_argument("--read_batch_size", default=256, type=int)
     p.add_argument("--quantize_chunk_size", default=16384, type=int)
     p.add_argument("--quantize_mode", default=None, choices=["raw", "delta"], type=str)
