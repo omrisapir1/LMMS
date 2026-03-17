@@ -45,7 +45,7 @@ class SFTConfig:
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
     # Evaluation / generation
-    eval_interval_steps: int = 1
+    eval_interval_steps: int = 500
     pass_at_n: int = 16
     k_max: int = 128
     temperature: float = 1.0
