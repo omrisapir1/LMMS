@@ -19,26 +19,26 @@ class SFTConfig:
     seed: int = 42
     batch_size: int = 16
     eval_batch_size: int = 1024
-    learning_rate: float = 5e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
-    warmup_steps: int = 500
+    warmup_steps: int = 2500
     max_length: int = 2048
     torch_device: str = "cuda:0"
 
     # Objective weights
     z_label_smoothing: float = 0.05
     w_z: float = 1
-    w_answer: float = 0.02
-    w_digits: float = 0.02
+    w_answer: float = 0.5
+    w_digits: float = 1
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True
     cf_every_n_steps: int = 4
     cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
-    cf_lambda: float = 0.2
+    cf_lambda: float = 1.0
     cf_kl_margin: float = 0.5
     cf_eps: float = 1e-8
     cf_min_z_len: int = 2
