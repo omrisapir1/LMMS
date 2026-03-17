@@ -23,7 +23,7 @@ class SFTConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
-    warmup_steps: int = 2500
+    warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
 
