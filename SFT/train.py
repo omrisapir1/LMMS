@@ -294,6 +294,33 @@ def _parse_range_tuple(text: str) -> Tuple[float, float]:
     return lo, hi
 
 
+def _get_scheduled_loss_weights(cfg: SFTConfig, step: int) -> tuple[float, float]:
+    start = int(cfg.start_weights_steps)
+    ramp = int(cfg.goes_up_weights_steps)
+
+    if step < start:
+        return float(cfg.w_start_answer), float(cfg.w_start_digits)
+
+    if ramp <= 0:
+        return float(cfg.w_end_answer), float(cfg.w_end_digits)
+
+    ramp_end = start + ramp
+
+    if step >= ramp_end:
+        return float(cfg.w_end_answer), float(cfg.w_end_digits)
+
+    progress = float(step - start) / float(ramp)
+
+    w_answer = float(cfg.w_start_answer) + progress * (
+        float(cfg.w_end_answer) - float(cfg.w_start_answer)
+    )
+    w_digits = float(cfg.w_start_digits) + progress * (
+        float(cfg.w_end_digits) - float(cfg.w_start_digits)
+    )
+
+    return w_answer, w_digits
+
+
 def _validate_cf_config(cfg: SFTConfig) -> None:
     if int(cfg.cf_every_n_steps) <= 0:
         raise ValueError("cf_every_n_steps must be > 0")
@@ -501,6 +528,7 @@ def train(cfg: SFTConfig) -> str:
             cf_visible_z_mean = 0.0
             cf_eligible_count = 0.0
             cf_loss_value = torch.zeros((), dtype=torch.float32, device=device)
+            cur_w_answer, cur_w_digits = _get_scheduled_loss_weights(cfg, step)
 
             with scaler_ctx:
                 out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
@@ -511,8 +539,8 @@ def train(cfg: SFTConfig) -> str:
                     z_allowed_ids=z_and_answer_allowed,
                     digit_allowed_ids=digit_token_ids,
                     w_z=cfg.w_z,
-                    w_answer=cfg.w_answer,
-                    w_digits=cfg.w_digits,
+                    w_answer=cur_w_answer,
+                    w_digits=cur_w_digits,
                     z_label_smoothing=cfg.z_label_smoothing,
                     keep_prob=cfg.keep_prob,
                 )
@@ -626,10 +654,12 @@ def train(cfg: SFTConfig) -> str:
                     "cf_mean_entropy": float(cf_mean_entropy),
                     "cf_eligible_count": float(cf_eligible_count),
                     "cf_visible_z_mean": float(cf_visible_z_mean),
+                    "w_answer": float(cur_w_answer),
+                    "w_digits": float(cur_w_digits),
                 }
                 _append_metrics_csv(metrics_csv, row)
                 _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
+                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
                         row["L_z"],
@@ -638,6 +668,8 @@ def train(cfg: SFTConfig) -> str:
                         row["z_acc"],
                         row["digit_exact_match"],
                         row["avg_z_len"],
+                        row["w_answer"],
+                        row["w_digits"],
                         int(bool(cfg.cf_enabled)),
                         int(bool(cf_applied)),
                         cf_variant_name,
@@ -769,8 +801,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
-    p.add_argument("--w_answer", type=float, default=0.5)
-    p.add_argument("--w_digits", type=float, default=1.0)
+    p.add_argument("--w_start_answer", type=float, default=0.05)
+    p.add_argument("--w_start_digits", type=float, default=0.1)
+    p.add_argument("--w_end_answer", type=float, default=0.5)
+    p.add_argument("--w_end_digits", type=float, default=1.0)
+    p.add_argument("--start_weights_steps", type=int, default=500)
+    p.add_argument("--goes_up_weights_steps", type=int, default=1500)
     p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cf_every_n_steps", type=int, default=4)
     p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
@@ -820,8 +856,12 @@ def main() -> None:
         torch_device=args.torch_device,
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
-        w_answer=args.w_answer,
-        w_digits=args.w_digits,
+        w_start_answer=args.w_start_answer,
+        w_start_digits=args.w_start_digits,
+        w_end_answer=args.w_end_answer,
+        w_end_digits=args.w_end_digits,
+        start_weights_steps=args.start_weights_steps,
+        goes_up_weights_steps=args.goes_up_weights_steps,
         cf_enabled=bool(args.cf_enabled),
         cf_every_n_steps=args.cf_every_n_steps,
         cf_prob_tuple=cf_prob_tuple,
