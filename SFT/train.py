@@ -672,7 +672,7 @@ def train(cfg: SFTConfig) -> str:
             warmup_steps = int(cfg.warmup_steps)
             eval_ready = (warmup_steps <= 0) or (step >= warmup_steps)
             eval_on_interval = step % int(cfg.eval_interval_steps) == 0
-            if eval_ready and eval_on_interval:
+            if eval_on_interval:
                 eval_model_path = _save_last(
                     run_dir=run_dir,
                     model=model,
