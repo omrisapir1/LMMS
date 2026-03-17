@@ -7,19 +7,19 @@ from dataclasses import dataclass
 class SFTConfig:
     # Model / tokenizer inputs
     base_model_or_checkpoint: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
-    train_dataset_name: str = "omrisap/nvidia_math_512_47K"
+    train_dataset_name: str = "omrisap/nvidia_math_64_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
     eval_dataset_split: str = "eval"
 
     # Discrete Z vocab
-    vocab_size: int = 512
+    vocab_size: int = 64
 
     # Training
     seed: int = 42
     batch_size: int = 16
     eval_batch_size: int = 1024
-    learning_rate: float = 5e-5
+    learning_rate: float = 2e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
@@ -30,11 +30,11 @@ class SFTConfig:
     # Objective weights
     z_label_smoothing: float = 0.05
     w_z: float = 1
-    w_start_answer: float = 0.05
-    w_start_digits: float = 0.1
-    w_end_answer: float = 0.5
-    w_end_digits: float = 1.0
-    start_weights_steps: int = 500
+    w_start_answer: float = 0.025
+    w_start_digits: float = 0.05
+    w_end_answer: float = 0.25
+    w_end_digits: float = 0.5
+    start_weights_steps: int = 100
     goes_up_weights_steps: int = 1500
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
