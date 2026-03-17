@@ -19,7 +19,7 @@ class SFTConfig:
     seed: int = 42
     batch_size: int = 16
     eval_batch_size: int = 1024
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
@@ -30,8 +30,8 @@ class SFTConfig:
     # Objective weights
     z_label_smoothing: float = 0.05
     w_z: float = 1
-    w_answer: float = 0.1
-    w_digits: float = 0.1
+    w_answer: float = 0.02
+    w_digits: float = 0.02
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
