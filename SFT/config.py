@@ -6,7 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
-    base_model_or_checkpoint: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    base_model_or_checkpoint: str = "unsloth/gpt-oss-20b"
     train_dataset_name: str = "omrisap/nvidia_math_64_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
@@ -17,15 +17,40 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 1
     eval_batch_size: int = 1024
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-4
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 64
     max_steps: int = 60_000
-    warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
+
+    # GPT-OSS loading
+    attn_implementation: str = "eager"
+    dequantize_mxfp4: bool = True
+    force_bfloat16: bool = True
+
+    # PEFT / LoRA
+    lora_r: int = 8 #16
+    lora_alpha: int = 16# 32
+    lora_dropout: float = 0.0
+    lora_bias: str = "none"
+    lora_task_type: str = "CAUSAL_LM"
+    lora_target_modules: str = "all-linear"
+    lora_enable_moe_target_parameters: bool = True
+    lora_moe_param_substrings: tuple[str, ...] = (
+        "gate_up_proj",
+        "down_proj",
+        # "up_proj",
+        # "gate_proj",
+        # "w1",
+        # "w2",
+        # "w3",
+    )
+
+    # Checkpoint export
+    save_merged_for_eval: bool = True
 
     # Objective weights
     z_label_smoothing: float = 0.05
