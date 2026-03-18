@@ -9,7 +9,7 @@ BACH_SIZE = 64
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/SFT_Z_model"
+    init_ckpt: str = "omrisap/SFT_64"
     answer_token: str = "<ANSWER>"
     trust_remote_code: bool = True
 
