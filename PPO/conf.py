@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
-MAX_TOKENS = 256
+MAX_TOKENS = 512
 BACH_SIZE = 64
 
 @dataclass
@@ -49,7 +49,7 @@ class RolloutConfig:
 class RewardConfig:
     partial_scale: float = 0.5
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.01
+    length_penalty: float = 0.001
     reward_if_max_len: float = -1
 
 
@@ -59,7 +59,7 @@ class PPOConfig:
     c_v: float = 0.5
     c_ent: float = 0.000
     kl_coef: float = 0.00
-    apply_ce: bool = True
+    apply_ce: bool = False
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "random"  # "successful_traces" | "random"
