@@ -30,8 +30,8 @@ class RolloutConfig:
     max_new_tokens: int = MAX_TOKENS
     temperature: float = 1.3
     top_p: float = 0.98
-    digit_greedy: bool = False
-    action_scope: str = "ppo_full"  # "ppo_only_z_tokens" | "ppo_full"
+    digit_greedy: bool = True
+    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
@@ -49,8 +49,8 @@ class RolloutConfig:
 class RewardConfig:
     partial_scale: float = 0.5
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.001
-    reward_if_max_len: float = -1
+    length_penalty: float = 0.0001
+    reward_if_max_len: float = -0.1
 
 
 @dataclass
