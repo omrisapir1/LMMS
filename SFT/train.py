@@ -20,7 +20,13 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
-from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
+from .dataset import (
+    HarmonyTemplateBuilder,
+    SFTCollator,
+    SFTDataset,
+    TARGET_ANALYSIS,
+    resolve_digit_token_ids,
+)
 from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
@@ -29,21 +35,6 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _dtype_from_str(name: str) -> torch.dtype:
-    table = {
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float32": torch.float32,
-        "fp32": torch.float32,
-    }
-    key = str(name).lower()
-    if key not in table:
-        raise ValueError(f"Unsupported torch dtype string: {name}")
-    return table[key]
 
 
 def _log(msg: str, log_path: str) -> None:
@@ -60,8 +51,6 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]
 
     existing_vocab = tokenizer.get_vocab()
     to_add = [t for t in z_tokens if t not in existing_vocab]
-    if ANSWER_TOKEN not in existing_vocab:
-        to_add.append(ANSWER_TOKEN)
 
     added = 0
     if to_add:
@@ -77,66 +66,275 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]
     if added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
-    answer_token_id = int(tokenizer.convert_tokens_to_ids(ANSWER_TOKEN))
-    if answer_token_id < 0:
-        raise RuntimeError("Failed to resolve <ANSWER> token id")
-
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
     if any(i < 0 for i in z_token_ids):
         raise RuntimeError("Failed to resolve one or more Z token ids")
 
-    digit_token_ids = []
-    for d in "0123456789":
-        ids = tokenizer.encode(d, add_special_tokens=False)
-        if len(ids) != 1:
-            raise RuntimeError(f"Digit tokenization check failed for '{d}' -> {ids}")
-        digit_token_ids.append(int(ids[0]))
+    digit_token_ids = resolve_digit_token_ids(tokenizer)
+    harmony = HarmonyTemplateBuilder(tokenizer=tokenizer)
 
     return {
         "z_token_ids": z_token_ids,
         "digit_token_ids": digit_token_ids,
-        "answer_token_id": [answer_token_id],
+        "analysis_end_token_id": [int(harmony.analysis_end_token_id)],
     }
 
 
-def _apply_warmup_freeze(
-    *,
-    model,
-    z_token_ids: Sequence[int],
-    warmup_active: bool,
-) -> List[torch.utils.hooks.RemovableHandle]:
-    for p in model.parameters():
-        p.requires_grad = True
-
-    if not warmup_active:
+def _discover_moe_target_parameters(model, cfg: SFTConfig) -> List[str]:
+    if not bool(cfg.lora_enable_moe_target_parameters):
         return []
+    substrs = tuple(str(x) for x in cfg.lora_moe_param_substrings)
+    out: List[str] = []
+    for name, param in model.named_parameters():
+        if ".experts." not in name:
+            continue
+        if param.ndim < 2:
+            continue
+        if substrs and not any(s in name for s in substrs):
+            continue
+        out.append(str(name))
+    return sorted(set(out))
 
+
+def _attach_lora(model, cfg: SFTConfig) -> tuple[torch.nn.Module, List[str]]:
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except Exception as exc:
+        raise RuntimeError("PEFT is required for LoRA training but is not available.") from exc
+
+    task_type_map = {
+        "CAUSAL_LM": TaskType.CAUSAL_LM,
+        "SEQ_2_SEQ_LM": TaskType.SEQ_2_SEQ_LM,
+    }
+    task_type_key = str(cfg.lora_task_type).upper().strip()
+    if task_type_key not in task_type_map:
+        raise ValueError(f"Unsupported lora_task_type={cfg.lora_task_type}")
+
+    target_parameters = _discover_moe_target_parameters(model, cfg)
+    lora_cfg = LoraConfig(
+        r=int(cfg.lora_r),
+        lora_alpha=int(cfg.lora_alpha),
+        lora_dropout=float(cfg.lora_dropout),
+        bias=str(cfg.lora_bias),
+        task_type=task_type_map[task_type_key],
+        target_modules=str(cfg.lora_target_modules),
+        target_parameters=target_parameters if target_parameters else None,
+    )
+    model = get_peft_model(model, lora_cfg)
+    return model, target_parameters
+
+
+class RowDeltaAdapter(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        z_token_ids: Sequence[int],
+        vocab_size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        if len(z_token_ids) <= 0:
+            raise ValueError("z_token_ids must be non-empty")
+        z_ids = torch.as_tensor([int(x) for x in z_token_ids], dtype=torch.long, device=device)
+        self.register_buffer("z_token_ids", z_ids, persistent=True)
+
+        token_to_compact = torch.full((int(vocab_size),), -1, dtype=torch.long, device=device)
+        token_to_compact[z_ids] = torch.arange(int(z_ids.numel()), dtype=torch.long, device=device)
+        self.register_buffer("token_to_compact", token_to_compact, persistent=True)
+
+        self.embedding_row_deltas = torch.nn.Parameter(
+            torch.zeros((int(z_ids.numel()), int(hidden_size)), dtype=dtype, device=device)
+        )
+        self.lm_head_row_deltas = torch.nn.Parameter(
+            torch.zeros((int(z_ids.numel()), int(hidden_size)), dtype=dtype, device=device)
+        )
+
+
+def _setup_trainable_parameters(
+    model: torch.nn.Module,
+    *,
+    z_token_ids: Sequence[int],
+    device: torch.device,
+) -> RowDeltaAdapter:
     for p in model.parameters():
-        p.requires_grad = False
+        p.requires_grad_(False)
+    for name, p in model.named_parameters():
+        if "lora_" in name:
+            p.requires_grad_(True)
 
-    embed = model.get_input_embeddings().weight
-    embed.requires_grad = True
+    emb_w = model.get_input_embeddings().weight
+    lm_w = model.get_output_embeddings().weight
+    emb_w.requires_grad_(False)
+    lm_w.requires_grad_(False)
+    adapter = RowDeltaAdapter(
+        z_token_ids=z_token_ids,
+        vocab_size=int(emb_w.shape[0]),
+        hidden_size=int(emb_w.shape[1]),
+        dtype=emb_w.dtype,
+        device=device,
+    )
+    return adapter
 
-    lm_head = model.get_output_embeddings().weight
-    same_param = lm_head.data_ptr() == embed.data_ptr()
-    if not same_param:
-        lm_head.requires_grad = True
 
-    allowed = torch.zeros(embed.shape[0], dtype=torch.bool, device=embed.device)
-    allowed[torch.as_tensor(list(z_token_ids), dtype=torch.long, device=embed.device)] = True
+def _gather_trainable_parameters(model: torch.nn.Module, row_adapter: RowDeltaAdapter) -> List[torch.nn.Parameter]:
+    out: List[torch.nn.Parameter] = [p for p in model.parameters() if p.requires_grad]
+    out.extend([p for p in row_adapter.parameters() if p.requires_grad])
+    return out
 
-    handles: List[torch.utils.hooks.RemovableHandle] = []
 
-    def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
-        out = grad.clone()
-        out[~allowed] = 0
-        return out
+def _log_trainable_summary(
+    *,
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+    log_path: str,
+) -> None:
+    total_params = int(sum(p.numel() for p in model.parameters())) + int(
+        sum(p.numel() for p in row_adapter.parameters())
+    )
+    trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad)) + int(
+        sum(p.numel() for p in row_adapter.parameters() if p.requires_grad)
+    )
+    trainable_pct = (100.0 * float(trainable_params) / float(max(1, total_params)))
 
-    handles.append(embed.register_hook(_mask_grad))
-    if not same_param:
-        handles.append(lm_head.register_hook(_mask_grad))
+    lora_params = 0
+    trainable_names: List[str] = []
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            trainable_names.append(name)
+            if "lora_" in name:
+                lora_params += int(p.numel())
 
-    return handles
+    emb_rows = int(row_adapter.embedding_row_deltas.numel())
+    head_rows = int(row_adapter.lm_head_row_deltas.numel())
+
+    _log(
+        f"params total={total_params} trainable={trainable_params} trainable_pct={trainable_pct:.4f}%",
+        log_path,
+    )
+    _log(
+        "trainable_breakdown "
+        f"lora={int(lora_params)} "
+        f"embedding_rows={emb_rows} "
+        f"lm_head_rows={head_rows} "
+        f"row_local_trainables={emb_rows + head_rows}",
+        log_path,
+    )
+
+    trainable_names.extend(
+        [
+            "row_adapter.embedding_row_deltas",
+            "row_adapter.lm_head_row_deltas",
+        ]
+    )
+    preview = trainable_names[:40]
+    _log(f"trainable_param_names_preview(count={len(trainable_names)}): {preview}", log_path)
+
+
+def _collect_row_effective_state(
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+) -> Dict[str, torch.Tensor]:
+    emb_w = model.get_input_embeddings().weight.detach()
+    head_w = model.get_output_embeddings().weight.detach()
+    z_ids = row_adapter.z_token_ids.to(emb_w.device)
+    emb_base_rows = emb_w.index_select(0, z_ids)
+    head_base_rows = head_w.index_select(0, z_ids.to(head_w.device))
+    emb_eff = emb_base_rows + row_adapter.embedding_row_deltas.detach().to(emb_base_rows.dtype)
+    head_eff = head_base_rows + row_adapter.lm_head_row_deltas.detach().to(head_base_rows.dtype)
+    return {
+        "z_token_ids": row_adapter.z_token_ids.detach().cpu(),
+        "embedding_rows_effective": emb_eff.detach().cpu(),
+        "lm_head_rows_effective": head_eff.detach().cpu(),
+    }
+
+
+def _save_adapter_and_rows(
+    *,
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+    tokenizer,
+    out_dir: str,
+    base_model_name: str,
+) -> str:
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    tokenizer.save_pretrained(out_dir)
+
+    adapter_dir = os.path.join(out_dir, "adapter")
+    os.makedirs(adapter_dir, exist_ok=True)
+    model.save_pretrained(adapter_dir)
+
+    row_state = _collect_row_effective_state(model, row_adapter)
+    torch.save(row_state, os.path.join(out_dir, "row_state.pt"))
+    with open(os.path.join(out_dir, "adapter_meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"base_model_or_checkpoint": str(base_model_name)}, f, indent=2)
+    return out_dir
+
+
+def _export_merged_model(
+    *,
+    out_dir: str,
+    base_model_name: str,
+    cfg: SFTConfig,
+) -> str:
+    merged_dir = os.path.join(out_dir, "merged")
+    if os.path.isdir(merged_dir):
+        shutil.rmtree(merged_dir)
+    os.makedirs(merged_dir, exist_ok=True)
+
+    adapter_dir = os.path.join(out_dir, "adapter")
+    row_state_path = os.path.join(out_dir, "row_state.pt")
+    if not os.path.isdir(adapter_dir):
+        raise RuntimeError(f"missing adapter dir for merged export: {adapter_dir}")
+    if not os.path.isfile(row_state_path):
+        raise RuntimeError(f"missing row state for merged export: {row_state_path}")
+
+    try:
+        from peft import PeftModel
+        from transformers import Mxfp4Config
+    except Exception as exc:
+        raise RuntimeError("PEFT and Mxfp4Config are required for merged export.") from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(out_dir, use_fast=True)
+    quant_cfg = Mxfp4Config(dequantize=bool(cfg.dequantize_mxfp4))
+    load_kwargs = {
+        "quantization_config": quant_cfg,
+        "attn_implementation": str(cfg.attn_implementation),
+    }
+    if bool(cfg.force_bfloat16):
+        load_kwargs["torch_dtype"] = torch.bfloat16
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
+    if int(base_model.get_input_embeddings().weight.shape[0]) != len(tokenizer):
+        base_model.resize_token_embeddings(len(tokenizer))
+    peft_model = PeftModel.from_pretrained(base_model, adapter_dir)
+    merged_model = peft_model.merge_and_unload()
+
+    row_state = torch.load(row_state_path, map_location="cpu")
+    z_ids_t = torch.as_tensor(row_state["z_token_ids"], dtype=torch.long)
+    emb_rows = torch.as_tensor(
+        row_state["embedding_rows_effective"],
+        dtype=merged_model.get_input_embeddings().weight.dtype,
+    )
+    head_rows = torch.as_tensor(
+        row_state["lm_head_rows_effective"],
+        dtype=merged_model.get_output_embeddings().weight.dtype,
+    )
+    emb_dev = merged_model.get_input_embeddings().weight.device
+    head_dev = merged_model.get_output_embeddings().weight.device
+    merged_model.get_input_embeddings().weight.data.index_copy_(
+        0, z_ids_t.to(emb_dev), emb_rows.to(emb_dev)
+    )
+    merged_model.get_output_embeddings().weight.data.index_copy_(
+        0, z_ids_t.to(head_dev), head_rows.to(head_dev)
+    )
+
+    merged_model.save_pretrained(merged_dir)
+    tokenizer.save_pretrained(merged_dir)
+    torch.save(row_state, os.path.join(merged_dir, "row_state.pt"))
+    return merged_dir
 
 
 def _make_run_dir(cfg: SFTConfig) -> str:
@@ -149,14 +347,6 @@ def _make_run_dir(cfg: SFTConfig) -> str:
     os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
     return run_dir
-
-
-def _save_model_dir(model, tokenizer, out_dir: str) -> None:
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    model.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
 
 
 def _retain_periodic(ckpt_root: str, keep_last_k: int) -> None:
@@ -181,13 +371,28 @@ def _save_last(
     *,
     run_dir: str,
     model,
+    row_adapter: RowDeltaAdapter,
     tokenizer,
+    base_model_name: str,
     cfg: SFTConfig,
+    export_merged: bool,
     step: int,
     best_pass_at_n: float,
 ) -> str:
     out_dir = os.path.join(run_dir, "last")
-    _save_model_dir(model, tokenizer, out_dir)
+    _save_adapter_and_rows(
+        model=model,
+        row_adapter=row_adapter,
+        tokenizer=tokenizer,
+        out_dir=out_dir,
+        base_model_name=base_model_name,
+    )
+    if bool(export_merged):
+        _export_merged_model(
+            out_dir=out_dir,
+            base_model_name=base_model_name,
+            cfg=cfg,
+        )
     payload = {
         "step": int(step),
         "best_pass_at_n": float(best_pass_at_n),
@@ -202,27 +407,71 @@ def _save_periodic(
     *,
     run_dir: str,
     model,
+    row_adapter: RowDeltaAdapter,
     tokenizer,
+    base_model_name: str,
     step: int,
     keep_last_k: int,
 ) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", f"step_{step:05d}")
-    _save_model_dir(model, tokenizer, out_dir)
+    _save_adapter_and_rows(
+        model=model,
+        row_adapter=row_adapter,
+        tokenizer=tokenizer,
+        out_dir=out_dir,
+        base_model_name=base_model_name,
+    )
     _retain_periodic(os.path.join(run_dir, "checkpoints"), keep_last_k=keep_last_k)
     return out_dir
 
 
-def _save_best(*, run_dir: str, model, tokenizer, step: int, metric: float) -> str:
+def _save_best(
+    *,
+    run_dir: str,
+    model,
+    row_adapter: RowDeltaAdapter,
+    tokenizer,
+    base_model_name: str,
+    cfg: SFTConfig,
+    step: int,
+    metric: float,
+    export_merged: bool,
+) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", "best")
-    _save_model_dir(model, tokenizer, out_dir)
+    _save_adapter_and_rows(
+        model=model,
+        row_adapter=row_adapter,
+        tokenizer=tokenizer,
+        out_dir=out_dir,
+        base_model_name=base_model_name,
+    )
+    if bool(export_merged):
+        _export_merged_model(
+            out_dir=out_dir,
+            base_model_name=base_model_name,
+            cfg=cfg,
+        )
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump({"step": int(step), "pass_at_n": float(metric)}, f, indent=2)
     return out_dir
 
 
-def _save_ppo_init(*, run_dir: str, model, tokenizer) -> str:
+def _save_ppo_init(
+    *,
+    run_dir: str,
+    model,
+    row_adapter: RowDeltaAdapter,
+    tokenizer,
+    base_model_name: str,
+) -> str:
     out_dir = os.path.join(run_dir, "ppo_init")
-    _save_model_dir(model, tokenizer, out_dir)
+    _save_adapter_and_rows(
+        model=model,
+        row_adapter=row_adapter,
+        tokenizer=tokenizer,
+        out_dir=out_dir,
+        base_model_name=base_model_name,
+    )
     return out_dir
 
 
@@ -354,7 +603,7 @@ def _build_counterfactual_batch(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    answer_token_id: int,
+    target_class: torch.Tensor,
     z_token_ids: Sequence[int],
     pad_token_id: int,
     cf_min_z_len: int,
@@ -365,26 +614,19 @@ def _build_counterfactual_batch(
     input_ids_cf = input_ids.clone()
     attention_mask_cf = attention_mask.clone()
 
-    z_set = set(int(x) for x in z_token_ids)
     bsz, _ = input_ids.shape
     eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
     visible_z_counts = torch.zeros((bsz,), dtype=torch.long, device=input_ids.device)
 
     lo, hi = float(trunc_range[0]), float(trunc_range[1])
+    analysis_token_mask = torch.zeros_like(target_class, dtype=torch.bool)
+    analysis_token_mask[:, 1:] = target_class[:, :-1] == int(TARGET_ANALYSIS)
 
     for b in range(bsz):
         valid_len = int(attention_mask[b].sum().item())
         if valid_len <= 0:
             continue
-        row = input_ids[b, :valid_len]
-        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
-        if int(ans_idx.numel()) == 0:
-            continue
-        ans_pos = int(ans_idx[0].item())
-        z_pos: List[int] = []
-        for j in range(ans_pos):
-            if int(row[j].item()) in z_set:
-                z_pos.append(j)
+        z_pos = analysis_token_mask[b, :valid_len].nonzero(as_tuple=False).view(-1).tolist()
         lz = len(z_pos)
         if lz < int(cf_min_z_len):
             continue
@@ -416,23 +658,129 @@ def _build_counterfactual_batch(
     return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts
 
 
-def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
-    if "input_ids" not in batch or "attention_mask" not in batch:
+def _print_startup_examples(
+    *,
+    tokenizer,
+    batch: Dict[str, torch.Tensor],
+    z_token_ids: Sequence[int],
+    pad_token_id: int,
+    cf_min_z_len: int,
+    cf_trunc_range: Tuple[float, float],
+    seed: int,
+) -> None:
+    if int(batch["input_ids"].shape[0]) <= 0:
+        print("===== STARTUP DEBUG: EMPTY BATCH =====")
         return
-    if int(batch["input_ids"].shape[0]) == 0:
-        return
-    ids = batch["input_ids"][0].detach().cpu()
-    mask = batch["attention_mask"][0].detach().cpu()
-    seq_len = int(mask.sum().item())
-    if seq_len <= 0:
-        return
-    text = tokenizer.decode(ids[:seq_len].tolist(), skip_special_tokens=False)
-    _log(f"[example@warmup_end step={step}] {text}", log_path)
+
+    row_idx = 0
+    input_ids_row = batch["input_ids"][row_idx].detach().cpu().tolist()
+    attention_row = batch["attention_mask"][row_idx].detach().cpu().tolist()
+    labels_row = batch["labels"][row_idx].detach().cpu().tolist()
+    target_class_row = batch["target_class"][row_idx].detach().cpu().tolist()
+    valid_len = int(sum(int(x) for x in attention_row))
+    valid_ids = input_ids_row[:valid_len]
+    valid_labels = labels_row[:valid_len]
+    valid_target_class = target_class_row[:valid_len]
+
+    print("===== STARTUP REGULAR EXAMPLE =====")
+    print("decoded_text:")
+    print(tokenizer.decode(valid_ids, skip_special_tokens=False))
+    print("tokens:")
+    print(tokenizer.convert_ids_to_tokens(valid_ids))
+    print("input_ids:")
+    print(input_ids_row)
+    print("target_class:")
+    print(valid_target_class)
+    print("labels:")
+    print(valid_labels)
+
+    debug_rng = random.Random(int(seed))
+    input_ids_cf, attention_cf, _eligible_mask, _visible_z_counts = _build_counterfactual_batch(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        target_class=batch["target_class"],
+        z_token_ids=z_token_ids,
+        pad_token_id=int(pad_token_id),
+        cf_min_z_len=int(cf_min_z_len),
+        variant_name="truncate",
+        trunc_range=cf_trunc_range,
+        rng=debug_rng,
+    )
+
+    input_ids_cf_row = input_ids_cf[row_idx].detach().cpu().tolist()
+    attention_cf_row = attention_cf[row_idx].detach().cpu().tolist()
+    valid_cf_len = int(sum(int(x) for x in attention_cf_row))
+    valid_cf_ids = input_ids_cf_row[:valid_cf_len]
+    valid_cf_target_class = target_class_row[:valid_cf_len]
+
+    print("===== STARTUP COUNTERFACTUAL EXAMPLE =====")
+    print("counterfactual_variant:")
+    print("truncate")
+    print("decoded_text:")
+    print(tokenizer.decode(valid_cf_ids, skip_special_tokens=False))
+    print("tokens:")
+    print(tokenizer.convert_ids_to_tokens(valid_cf_ids))
+    print("input_ids:")
+    print(input_ids_cf_row)
+    print("attention_mask:")
+    print(attention_cf_row)
+    print("target_class:")
+    print(valid_cf_target_class)
+
+
+def _forward_with_row_deltas(
+    *,
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+):
+    with torch.no_grad():
+        inputs_embeds = model.get_input_embeddings()(input_ids)
+
+    compact = row_adapter.token_to_compact.index_select(0, input_ids.view(-1)).view_as(input_ids)
+    mask = compact >= 0
+    if bool(mask.any()):
+        inputs_embeds = inputs_embeds.clone()
+        delta = row_adapter.embedding_row_deltas.index_select(0, compact[mask])
+        inputs_embeds[mask] = inputs_embeds[mask] + delta
+
+    output_head = model.get_output_embeddings()
+    captured_hidden: Dict[str, torch.Tensor] = {}
+
+    def _capture_lm_head_input(_module, args):
+        if len(args) == 0:
+            raise RuntimeError("LM head pre-hook received empty args")
+        captured_hidden["x"] = args[0]
+
+    hook = output_head.register_forward_pre_hook(_capture_lm_head_input)
+    try:
+        out = model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+    finally:
+        hook.remove()
+
+    if "x" not in captured_hidden:
+        raise RuntimeError("Failed to capture LM head input activations for row-delta correction")
+    hidden = captured_hidden["x"]
+    corr = torch.matmul(hidden, row_adapter.lm_head_row_deltas.transpose(0, 1))  # [B,L,Z]
+    logits = out.logits
+    z_ids = row_adapter.z_token_ids.to(logits.device)
+    z_logits = logits.index_select(-1, z_ids)
+    z_logits = z_logits + corr
+    logits.index_copy_(-1, z_ids, z_logits)
+    out.logits = logits
+    return out
 
 
 def train(cfg: SFTConfig) -> str:
     if not cfg.base_model_or_checkpoint.strip():
-        raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
+        raise ValueError("config.base_model_or_checkpoint is empty; fill with GPT-OSS model path")
     if not cfg.train_dataset_name.strip():
         raise ValueError("config.train_dataset_name is empty; fill with HF dataset path")
     if not cfg.eval_dataset_name.strip():
@@ -456,10 +804,21 @@ def train(cfg: SFTConfig) -> str:
     else:
         device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model_or_checkpoint,#
-        torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
-    )
+    try:
+        from transformers import Mxfp4Config
+    except Exception as exc:
+        raise RuntimeError(
+            "transformers.Mxfp4Config is required for GPT-OSS loading but is unavailable."
+        ) from exc
+
+    quant_cfg = Mxfp4Config(dequantize=bool(cfg.dequantize_mxfp4))
+    load_kwargs = {
+        "quantization_config": quant_cfg,
+        "attn_implementation": str(cfg.attn_implementation),
+    }
+    if bool(cfg.force_bfloat16):
+        load_kwargs["torch_dtype"] = torch.bfloat16
+    model = AutoModelForCausalLM.from_pretrained(cfg.base_model_or_checkpoint, **load_kwargs)
     model.to(device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -469,8 +828,13 @@ def train(cfg: SFTConfig) -> str:
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
     digit_token_ids = token_info["digit_token_ids"]
-    answer_token_id = token_info["answer_token_id"][0]
-    z_and_answer_allowed = list(z_token_ids) + [int(answer_token_id)]
+    analysis_end_token_id = token_info["analysis_end_token_id"][0]
+    z_and_analysis_end_allowed = list(z_token_ids) + [int(analysis_end_token_id)]
+
+    model, moe_target_parameters = _attach_lora(model, cfg)
+    row_adapter = _setup_trainable_parameters(model, z_token_ids=z_token_ids, device=device)
+    _log(f"moe_target_parameters_count={len(moe_target_parameters)}", log_path)
+    _log_trainable_summary(model=model, row_adapter=row_adapter, log_path=log_path)
 
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
 
@@ -479,7 +843,21 @@ def train(cfg: SFTConfig) -> str:
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
 
-    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    startup_batch = next(iter(train_loader))
+    _print_startup_examples(
+        tokenizer=tokenizer,
+        batch=startup_batch,
+        z_token_ids=z_token_ids,
+        pad_token_id=int(tokenizer.pad_token_id),
+        cf_min_z_len=int(cfg.cf_min_z_len),
+        cf_trunc_range=cfg.cf_trunc_range,
+        seed=int(cfg.seed),
+    )
+
+    trainable_params = _gather_trainable_parameters(model, row_adapter)
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable parameters found after LoRA/row-selective setup.")
+    optimizer = AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     train_rng = random.Random(int(cfg.seed))
 
     step = 0
@@ -506,8 +884,6 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
 
-    warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
-
     while step < int(cfg.max_steps):
         for batch in train_loader:
             if step >= int(cfg.max_steps):
@@ -531,12 +907,17 @@ def train(cfg: SFTConfig) -> str:
             cur_w_answer, cur_w_digits = _get_scheduled_loss_weights(cfg, step)
 
             with scaler_ctx:
-                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                out = _forward_with_row_deltas(
+                    model=model,
+                    row_adapter=row_adapter,
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
                 loss_out = compute_weighted_loss(
                     logits=out.logits,
                     labels=batch["labels"],
                     target_class=batch["target_class"],
-                    z_allowed_ids=z_and_answer_allowed,
+                    analysis_allowed_ids=z_and_analysis_end_allowed,
                     digit_allowed_ids=digit_token_ids,
                     w_z=cfg.w_z,
                     w_answer=cur_w_answer,
@@ -551,7 +932,7 @@ def train(cfg: SFTConfig) -> str:
                     input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
-                        answer_token_id=answer_token_id,
+                        target_class=batch["target_class"],
                         z_token_ids=z_token_ids,
                         pad_token_id=int(tokenizer.pad_token_id),
                         cf_min_z_len=int(cfg.cf_min_z_len),
@@ -562,7 +943,12 @@ def train(cfg: SFTConfig) -> str:
                     cf_eligible_count = float(eligible_mask.float().sum().item())
                     if cf_eligible_count > 0:
                         cf_applied = True
-                        out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
+                        out_cf = _forward_with_row_deltas(
+                            model=model,
+                            row_adapter=row_adapter,
+                            input_ids=input_ids_cf,
+                            attention_mask=attention_mask_cf,
+                        )
                         clean_digit_logits, digit_valid_mask = extract_digit_logits(
                             logits=out.logits,
                             target_class=batch["target_class"],
@@ -619,17 +1005,6 @@ def train(cfg: SFTConfig) -> str:
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
-            if step == int(cfg.warmup_steps):
-                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
-                for h in warmup_hooks:
-                    h.remove()
-                warmup_hooks = _apply_warmup_freeze(
-                    model=model,
-                    z_token_ids=z_token_ids,
-                    warmup_active=False,
-                )
-                _log(f"warmup ended at step={step}; full model unfrozen", log_path)
-
 
 
             if step % int(cfg.log_interval_steps) == 0:
@@ -637,13 +1012,13 @@ def train(cfg: SFTConfig) -> str:
                 row = {
                     "step": float(step),
                     "L_total": float(total_loss.detach().item()),
-                    "L_z": float(loss_out.l_z.detach().item()),
-                    "L_answer": float(loss_out.l_answer.detach().item()),
+                    "L_analysis": float(loss_out.l_analysis.detach().item()),
+                    "L_analysis_end": float(loss_out.l_analysis_end.detach().item()),
                     "L_digits": float(loss_out.l_digits.detach().item()),
-                    "z_acc": float(loss_out.z_acc),
+                    "analysis_acc": float(loss_out.analysis_acc),
                     "digit_exact_match": float(loss_out.digit_exact_match),
                     "avg_z_len": float(mean_z_len),
-                    "no_answer_before_kmax": 0.0,
+                    "no_analysis_end_before_kmax": 0.0,
                     "cf_enabled": float(bool(cfg.cf_enabled)),
                     "cf_applied": float(bool(cf_applied)),
                     "cf_loss": float(cf_loss_scalar),
@@ -656,20 +1031,26 @@ def train(cfg: SFTConfig) -> str:
                     "cf_visible_z_mean": float(cf_visible_z_mean),
                     "w_answer": float(cur_w_answer),
                     "w_digits": float(cur_w_digits),
+                    "batch_seen": float(int(batch.get("batch_seen", batch["input_ids"].shape[0]))),
+                    "batch_kept": float(int(batch.get("batch_kept", batch["input_ids"].shape[0]))),
+                    "batch_dropped_invalid_after_clip": float(int(batch.get("batch_dropped_invalid_after_clip", 0))),
+                    "total_dropped_invalid_after_clip": float(int(batch.get("total_dropped_invalid_after_clip", 0))),
                 }
                 _append_metrics_csv(metrics_csv, row)
                 _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
+                    "step={} L={:.4f} Lan={:.4f} Lae={:.4f} Ld={:.4f} an_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} clip_drop_batch={} clip_drop_total={} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
-                        row["L_z"],
-                        row["L_answer"],
+                        row["L_analysis"],
+                        row["L_analysis_end"],
                         row["L_digits"],
-                        row["z_acc"],
+                        row["analysis_acc"],
                         row["digit_exact_match"],
                         row["avg_z_len"],
                         row["w_answer"],
                         row["w_digits"],
+                        int(row["batch_dropped_invalid_after_clip"]),
+                        int(row["total_dropped_invalid_after_clip"]),
                         int(bool(cfg.cf_enabled)),
                         int(bool(cf_applied)),
                         cf_variant_name,
@@ -684,8 +1065,11 @@ def train(cfg: SFTConfig) -> str:
                 _save_last(
                     run_dir=run_dir,
                     model=model,
+                    row_adapter=row_adapter,
                     tokenizer=tokenizer,
+                    base_model_name=cfg.base_model_or_checkpoint,
                     cfg=cfg,
+                    export_merged=False,
                     step=step,
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
                 )
@@ -695,24 +1079,29 @@ def train(cfg: SFTConfig) -> str:
                 p = _save_periodic(
                     run_dir=run_dir,
                     model=model,
+                    row_adapter=row_adapter,
                     tokenizer=tokenizer,
+                    base_model_name=cfg.base_model_or_checkpoint,
                     step=step,
                     keep_last_k=int(cfg.keep_last_k),
                 )
                 _log(f"saved periodic checkpoint {p}", log_path)
 
-            warmup_steps = int(cfg.warmup_steps)
-            eval_ready = (warmup_steps <= 0) or (step >= warmup_steps)
             eval_on_interval = step % int(cfg.eval_interval_steps) == 0
             if eval_on_interval:
                 eval_model_path = _save_last(
                     run_dir=run_dir,
                     model=model,
+                    row_adapter=row_adapter,
                     tokenizer=tokenizer,
+                    base_model_name=cfg.base_model_or_checkpoint,
                     cfg=cfg,
+                    export_merged=bool(cfg.save_merged_for_eval),
                     step=step,
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
                 )
+                if bool(cfg.save_merged_for_eval):
+                    eval_model_path = os.path.join(eval_model_path, "merged")
                 model.train(False)
                 torch.cuda.empty_cache()
                 metrics = evaluate_with_vllm(
@@ -749,7 +1138,7 @@ def train(cfg: SFTConfig) -> str:
                         "pass_at_n": float(metrics.pass_at_n),
                         "greedy_exact_match": float(metrics.greedy_exact_match),
                         "eval_mean_z_len": float(metrics.mean_z_len),
-                        "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
+                        "eval_no_analysis_end_before_kmax": float(metrics.no_answer_before_kmax_rate),
                     },
                 )
 
@@ -758,22 +1147,35 @@ def train(cfg: SFTConfig) -> str:
                     best_path = _save_best(
                         run_dir=run_dir,
                         model=model,
+                        row_adapter=row_adapter,
                         tokenizer=tokenizer,
+                        base_model_name=cfg.base_model_or_checkpoint,
+                        cfg=cfg,
                         step=step,
                         metric=best_pass,
+                        export_merged=bool(cfg.save_merged_for_eval),
                     )
                     _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
 
     _save_last(
         run_dir=run_dir,
         model=model,
+        row_adapter=row_adapter,
         tokenizer=tokenizer,
+        base_model_name=cfg.base_model_or_checkpoint,
         cfg=cfg,
+        export_merged=False,
         step=step,
         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
     )
     if cfg.save_ppo_init:
-        p = _save_ppo_init(run_dir=run_dir, model=model, tokenizer=tokenizer)
+        p = _save_ppo_init(
+            run_dir=run_dir,
+            model=model,
+            row_adapter=row_adapter,
+            tokenizer=tokenizer,
+            base_model_name=cfg.base_model_or_checkpoint,
+        )
         _log(f"saved ppo_init snapshot at {p}", log_path)
 
     _log("training complete", log_path)
@@ -782,7 +1184,7 @@ def train(cfg: SFTConfig) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase3 SFT over discrete latent Z-programs")
-    p.add_argument("--base_model_or_checkpoint", type=str, default="")
+    p.add_argument("--base_model_or_checkpoint", type=str, default="openai/gpt-oss-20b")
     p.add_argument("--train_dataset_name", type=str, default="")
     p.add_argument("--train_dataset_split", type=str, default="train")
     p.add_argument("--eval_dataset_name", type=str, default="")
@@ -795,9 +1197,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=10000)
-    p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--torch_device", type=str, default="cuda:0")
+    p.add_argument("--attn_implementation", type=str, default="eager")
+    p.add_argument("--dequantize_mxfp4", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--force_bfloat16", action=argparse.BooleanOptionalAction, default=True)
+
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument("--lora_bias", type=str, default="none")
+    p.add_argument("--lora_task_type", type=str, default="CAUSAL_LM")
+    p.add_argument("--lora_target_modules", type=str, default="all-linear")
+    p.add_argument("--lora_enable_moe_target_parameters", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--lora_moe_param_substrings",
+        type=str,
+        default="gate_up_proj,down_proj,up_proj,gate_proj,w1,w2,w3",
+    )
+    p.add_argument("--save_merged_for_eval", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
@@ -838,6 +1256,9 @@ def main() -> None:
     args = parse_args()
     cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
     cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
+    lora_moe_substrings = tuple(
+        s.strip() for s in str(args.lora_moe_param_substrings).split(",") if s.strip()
+    )
     cfg = SFTConfig(
         base_model_or_checkpoint=args.base_model_or_checkpoint,
         train_dataset_name=args.train_dataset_name,
@@ -851,9 +1272,20 @@ def main() -> None:
         weight_decay=args.weight_decay,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
-        warmup_steps=args.warmup_steps,
         max_length=args.max_length,
         torch_device=args.torch_device,
+        attn_implementation=args.attn_implementation,
+        dequantize_mxfp4=bool(args.dequantize_mxfp4),
+        force_bfloat16=bool(args.force_bfloat16),
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_bias=args.lora_bias,
+        lora_task_type=args.lora_task_type,
+        lora_target_modules=args.lora_target_modules,
+        lora_enable_moe_target_parameters=bool(args.lora_enable_moe_target_parameters),
+        lora_moe_param_substrings=lora_moe_substrings,
+        save_merged_for_eval=bool(args.save_merged_for_eval),
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
         w_start_answer=args.w_start_answer,

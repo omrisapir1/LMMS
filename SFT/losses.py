@@ -6,16 +6,16 @@ from typing import Dict, Sequence
 import torch
 import torch.nn.functional as F
 
-from .dataset import TARGET_ANSWER, TARGET_DIGIT, TARGET_Z
+from .dataset import TARGET_ANALYSIS, TARGET_ANALYSIS_END, TARGET_DIGIT
 
 
 @dataclass
 class LossOutput:
     total: torch.Tensor
-    l_z: torch.Tensor
-    l_answer: torch.Tensor
+    l_analysis: torch.Tensor
+    l_analysis_end: torch.Tensor
     l_digits: torch.Tensor
-    z_acc: float
+    analysis_acc: float
     digit_exact_match: float
 
 
@@ -29,15 +29,15 @@ class CounterfactualLossOutput:
 def _debug_check_label_membership(
     labels: torch.Tensor,
     target_class: torch.Tensor,
-    z_allowed_ids: Sequence[int],
+    analysis_allowed_ids: Sequence[int],
     digit_allowed_ids: Sequence[int],
 ) -> None:
-    z_allowed = set(int(x) for x in z_allowed_ids)
+    analysis_allowed = set(int(x) for x in analysis_allowed_ids)
     d_allowed = set(int(x) for x in digit_allowed_ids)
 
     with torch.no_grad():
-        z_mask = (target_class == TARGET_Z) & (labels >= 0)
-        a_mask = (target_class == TARGET_ANSWER) & (labels >= 0)
+        analysis_mask = (target_class == TARGET_ANALYSIS) & (labels >= 0)
+        analysis_end_mask = (target_class == TARGET_ANALYSIS_END) & (labels >= 0)
         d_mask = (target_class == TARGET_DIGIT) & (labels >= 0)
 
         def first_bad(mask: torch.Tensor, allowed_set: set[int], name: str) -> bool:
@@ -52,8 +52,8 @@ def _debug_check_label_membership(
                     return True
             return False
 
-        if first_bad(z_mask | a_mask, z_allowed, "Z/ANSWER"):
-            raise RuntimeError("Label not in z_allowed_ids")
+        if first_bad(analysis_mask | analysis_end_mask, analysis_allowed, "ANALYSIS/END"):
+            raise RuntimeError("Label not in analysis_allowed_ids")
         if first_bad(d_mask, d_allowed, "DIGIT"):
             raise RuntimeError("Label not in digit_allowed_ids")
 
@@ -103,7 +103,7 @@ def compute_weighted_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     target_class: torch.Tensor,
-    z_allowed_ids: Sequence[int],
+    analysis_allowed_ids: Sequence[int],
     digit_allowed_ids: Sequence[int],
     w_z: float,
     w_answer: float,
@@ -114,37 +114,39 @@ def compute_weighted_loss(
     _debug_check_label_membership(
         labels=labels,
         target_class=target_class,
-        z_allowed_ids=z_allowed_ids,
+        analysis_allowed_ids=analysis_allowed_ids,
         digit_allowed_ids=digit_allowed_ids,
     )
 
-    z_mask = (target_class == TARGET_Z) & (labels >= 0)
-    answer_mask = (target_class == TARGET_ANSWER) & (labels >= 0)
+    analysis_mask = (target_class == TARGET_ANALYSIS) & (labels >= 0)
+    analysis_end_mask = (target_class == TARGET_ANALYSIS_END) & (labels >= 0)
     digit_mask = (target_class == TARGET_DIGIT) & (labels >= 0)
     vocab_size = int(logits.shape[-1])
-    z_allowed_t, z_inv = _build_inv_map(vocab_size=vocab_size, allowed_ids=z_allowed_ids, device=logits.device)
+    analysis_allowed_t, analysis_inv = _build_inv_map(
+        vocab_size=vocab_size, allowed_ids=analysis_allowed_ids, device=logits.device
+    )
     digit_allowed_t, digit_inv = _build_inv_map(
         vocab_size=vocab_size, allowed_ids=digit_allowed_ids, device=logits.device
     )
 
-    z_idx = z_mask.nonzero(as_tuple=False)
-    answer_idx = answer_mask.nonzero(as_tuple=False)
+    analysis_idx = analysis_mask.nonzero(as_tuple=False)
+    analysis_end_idx = analysis_end_mask.nonzero(as_tuple=False)
     digit_idx = digit_mask.nonzero(as_tuple=False)
 
-    l_z, z_preds_small, z_y_small = _restricted_ce_for_positions(
+    l_analysis, analysis_preds_small, analysis_y_small = _restricted_ce_for_positions(
         logits=logits,
         labels=labels,
-        idx=z_idx,
-        allowed_t=z_allowed_t,
-        inv=z_inv,
+        idx=analysis_idx,
+        allowed_t=analysis_allowed_t,
+        inv=analysis_inv,
         label_smoothing=float(z_label_smoothing),
     )
-    l_answer, _, _ = _restricted_ce_for_positions(
+    l_analysis_end, _, _ = _restricted_ce_for_positions(
         logits=logits,
         labels=labels,
-        idx=answer_idx,
-        allowed_t=z_allowed_t,
-        inv=z_inv,
+        idx=analysis_end_idx,
+        allowed_t=analysis_allowed_t,
+        inv=analysis_inv,
         label_smoothing=0.0,
     )
     if len(keep_prob) != 5:
@@ -213,12 +215,12 @@ def compute_weighted_loss(
         else:
             l_digits = (ce_per_pos * kept).sum() / kept_count
 
-    total = float(w_z) * l_z + float(w_answer) * l_answer + float(w_digits) * l_digits
+    total = float(w_z) * l_analysis + float(w_answer) * l_analysis_end + float(w_digits) * l_digits
 
     with torch.no_grad():
-        z_acc = 0.0
-        if int(z_idx.shape[0]) > 0:
-            z_acc = float((z_preds_small == z_y_small).float().mean().item())
+        analysis_acc = 0.0
+        if int(analysis_idx.shape[0]) > 0:
+            analysis_acc = float((analysis_preds_small == analysis_y_small).float().mean().item())
 
         digit_exact_match = 0.0
         if digit_mask.any():
@@ -247,10 +249,10 @@ def compute_weighted_loss(
 
     return LossOutput(
         total=total,
-        l_z=l_z,
-        l_answer=l_answer,
+        l_analysis=l_analysis,
+        l_analysis_end=l_analysis_end,
         l_digits=l_digits,
-        z_acc=z_acc,
+        analysis_acc=analysis_acc,
         digit_exact_match=digit_exact_match,
     )
 
