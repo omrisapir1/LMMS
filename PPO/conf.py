@@ -49,8 +49,8 @@ class RolloutConfig:
 class RewardConfig:
     partial_scale: float = 0.5
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.0001
-    reward_if_max_len: float = -0.1
+    length_penalty: float = 0.0005
+    reward_if_max_len: float = -1
 
 
 @dataclass
@@ -72,7 +72,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-6
+    lr: float = 3e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
