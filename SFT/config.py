@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 64
+
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
@@ -17,11 +20,11 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 1
+    batch_size: int = BATCH_SIZE
     eval_batch_size: int = 1024
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS
     max_steps: int = 60_000
     max_length: int = 2048
     torch_device: str = "cuda:0"
@@ -56,7 +59,7 @@ class SFTConfig:
     w_start_digits: float = 0.05
     w_end_answer: float = 0.25
     w_end_digits: float = 0.5
-    start_weights_steps: int = 1000
+    start_weights_steps: int = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * 1000
     goes_up_weights_steps: int = 1000
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
