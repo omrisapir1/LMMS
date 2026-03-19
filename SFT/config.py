@@ -21,7 +21,7 @@ class SFTConfig:
     eval_batch_size: int = 1024
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 32
     max_steps: int = 60_000
     max_length: int = 2048
     torch_device: str = "cuda:0"
