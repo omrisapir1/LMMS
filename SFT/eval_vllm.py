@@ -24,6 +24,23 @@ class EvalMetrics:
     no_answer_before_kmax_rate: float
 
 
+def _resolve_eval_paths(model_path: str) -> tuple[str, str]:
+    base = Path(model_path)
+    if (base / "full_model").is_dir():
+        resolved_model = base / "full_model"
+        resolved_tokenizer = (base / "tokenizer")
+        return str(resolved_model), str(resolved_tokenizer)
+
+    if base.name == "full_model":
+        parent = base.parent
+        sibling_tokenizer = parent / "tokenizer"
+        if sibling_tokenizer.is_dir():
+            return str(base), str(sibling_tokenizer)
+        return str(base), str(base)
+
+    return str(base), str(base)
+
+
 def find_first_token_pos(token_ids: List[int], token_id: int) -> int:
     for i, tid in enumerate(token_ids):
         if int(tid) == int(token_id):
@@ -38,6 +55,28 @@ def truncate_phase_a_to_analysis_end(token_ids: List[int], analysis_end_token_id
     return list(token_ids[: pos + 1]), True
 
 
+def _extract_phase_a_ids_and_has_end(candidate, analysis_end_token_id: int) -> tuple[List[int], bool]:
+    raw_ids = [int(x) for x in getattr(candidate, "token_ids", [])]
+    trunc_ids, has_end = truncate_phase_a_to_analysis_end(raw_ids, analysis_end_token_id)
+    if has_end:
+        return trunc_ids, True
+
+    stop_reason = getattr(candidate, "stop_reason", None)
+    finish_reason = getattr(candidate, "finish_reason", None)
+    stop_matches_end = False
+    if stop_reason is not None:
+        try:
+            stop_matches_end = int(stop_reason) == int(analysis_end_token_id)
+        except Exception:
+            stop_matches_end = str(stop_reason).strip() == str(int(analysis_end_token_id))
+
+    # vLLM can stop on stop_token_ids without returning that token in token_ids.
+    if stop_matches_end or str(finish_reason).strip().lower() == "stop":
+        return list(raw_ids) + [int(analysis_end_token_id)], True
+
+    return trunc_ids, False
+
+
 def _parse_target_digits(row: Dict) -> List[int] | None:
     digits = row.get("answer_digits")
     if digits is not None:
@@ -45,6 +84,15 @@ def _parse_target_digits(row: Dict) -> List[int] | None:
             d = [int(x) for x in digits]
             if len(d) == 5 and not any(x < 0 or x > 9 for x in d):
                 return d
+        except Exception:
+            pass
+
+    answer_int = row.get("answer_int")
+    if answer_int is not None:
+        try:
+            value = int(answer_int)
+            if 0 <= value <= 99999:
+                return [int(ch) for ch in f"{value:05d}"]
         except Exception:
             pass
 
@@ -99,7 +147,9 @@ def evaluate_with_vllm(
     except Exception as exc:
         raise RuntimeError("vLLM is required for SFT evaluation and is not available.") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    resolved_model_path, resolved_tokenizer_path = _resolve_eval_paths(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer_path, use_fast=True)
+    debug_print_examples = 2  # Set to 0 to disable.
 
     z_tokens = [f"<z_{i}>" for i in range(int(vocab_size))]
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
@@ -117,7 +167,12 @@ def evaluate_with_vllm(
     if vllm_cuda_visible_devices is not None and str(vllm_cuda_visible_devices).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_cuda_visible_devices)
     try:
-        llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.95)
+        llm = LLM(
+            model=resolved_model_path,
+            tokenizer=resolved_tokenizer_path,
+            trust_remote_code=True,
+            gpu_memory_utilization=0.95,
+        )
     finally:
         if old_cuda_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -144,7 +199,9 @@ def evaluate_with_vllm(
             {
                 "problem": str(q),
                 "answer_digits": target_digits,
+                "analysis_prompt_ids": list(analysis_prompt_ids),
                 "analysis_prompt_text": tokenizer.decode(analysis_prompt_ids, skip_special_tokens=False),
+                "final_header_ids": list(final_header_ids),
                 "final_header_text": tokenizer.decode(final_header_ids, skip_special_tokens=False),
             }
         )
@@ -210,8 +267,7 @@ def evaluate_with_vllm(
         row_z_lens: List[int] = []
 
         for cand_idx, candidate in enumerate(sampled_out.outputs):
-            raw_ids = [int(x) for x in candidate.token_ids]
-            trunc_ids, has_end = truncate_phase_a_to_analysis_end(raw_ids, analysis_end_token_id)
+            trunc_ids, has_end = _extract_phase_a_ids_and_has_end(candidate, analysis_end_token_id)
             row_ids.append(trunc_ids)
             row_has_end.append(bool(has_end))
             if has_end:
@@ -252,9 +308,24 @@ def evaluate_with_vllm(
     corrupted_phase_b_owner: List[tuple[int, str]] = []
 
     for item_idx, greedy_out in enumerate(greedy_phase_a_outputs):
-        raw_ids = [int(x) for x in greedy_out.outputs[0].token_ids] if greedy_out.outputs else []
-        trunc_ids, has_end = truncate_phase_a_to_analysis_end(raw_ids, analysis_end_token_id)
+        if greedy_out.outputs:
+            raw_ids = [int(x) for x in greedy_out.outputs[0].token_ids]
+            trunc_ids, has_end = _extract_phase_a_ids_and_has_end(greedy_out.outputs[0], analysis_end_token_id)
+        else:
+            raw_ids, trunc_ids, has_end = [], [], False
         greedy_phase_a_has_end.append(bool(has_end))
+
+        if item_idx < int(debug_print_examples):
+            print(f"===== EVAL DEBUG EXAMPLE {item_idx + 1} =====")
+            print("PHASE A PROMPT")
+            print(items[item_idx]["analysis_prompt_text"])
+            print("phase_a_prompt_tokens:", tokenizer.convert_ids_to_tokens(items[item_idx]["analysis_prompt_ids"]))
+            print("phase_a_prompt_ids:", items[item_idx]["analysis_prompt_ids"])
+            print("PHASE A GENERATED")
+            print("phase_a_generated_raw_ids:", raw_ids)
+            print("phase_a_generated_truncated_ids:", trunc_ids)
+            print("phase_a_generated_text:", tokenizer.decode(trunc_ids, skip_special_tokens=False))
+            print("phase_a_has_analysis_end:", bool(has_end))
 
         if has_end:
             end_pos = find_first_token_pos(trunc_ids, analysis_end_token_id)
@@ -263,11 +334,22 @@ def evaluate_with_vllm(
             greedy_phase_a_z_lens.append(int(len(z_ids)))
 
             greedy_phase_b_owner.append(item_idx)
-            greedy_phase_b_prompts.append(
+            phase_b_prompt = (
                 analysis_prompts[item_idx]
                 + tokenizer.decode(trunc_ids, skip_special_tokens=False)
                 + final_headers[item_idx]
             )
+            greedy_phase_b_prompts.append(phase_b_prompt)
+
+            if item_idx < int(debug_print_examples):
+                phase_b_prompt_ids = tokenizer.encode(phase_b_prompt, add_special_tokens=False)
+                print("PHASE B PROMPT")
+                print(phase_b_prompt)
+                print("phase_b_prompt_tokens:", tokenizer.convert_ids_to_tokens(phase_b_prompt_ids))
+                print("phase_b_prompt_ids:", phase_b_prompt_ids)
+                print("final_header_text:", items[item_idx]["final_header_text"])
+                print("final_header_tokens:", tokenizer.convert_ids_to_tokens(items[item_idx]["final_header_ids"]))
+                print("final_header_ids:", items[item_idx]["final_header_ids"])
 
             z_first = z_ids[:1]
             z_last = z_ids[-1:]
@@ -290,6 +372,9 @@ def evaluate_with_vllm(
         else:
             greedy_phase_a_z_ids.append([])
             greedy_phase_a_z_lens.append(0)
+            if item_idx < int(debug_print_examples):
+                print("PHASE B PROMPT")
+                print("skipped: analysis end not detected in phase A")
 
     greedy_phase_b_digits_by_owner: Dict[int, List[int]] = {}
     if greedy_phase_b_prompts:
@@ -299,6 +384,10 @@ def evaluate_with_vllm(
         for owner, out in zip(greedy_phase_b_owner, greedy_phase_b_outputs):
             ids = [int(x) for x in out.outputs[0].token_ids] if out.outputs else []
             greedy_phase_b_digits_by_owner[owner] = _digits_from_generated_ids(ids, digit_id_to_val)
+            if owner < int(debug_print_examples):
+                print("phase_b_pred_token_ids:", ids)
+                print("phase_b_pred_text:", tokenizer.decode(ids, skip_special_tokens=False))
+                print("phase_b_pred_digits:", greedy_phase_b_digits_by_owner[owner])
 
     corrupted_phase_b_digits_by_owner: Dict[tuple[int, str], List[int]] = {}
     if corrupted_phase_b_prompts:
