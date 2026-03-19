@@ -1025,6 +1025,22 @@ def train(cfg: SFTConfig) -> str:
     micro = 0
     best_pass = -math.inf
     scaler_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+    accum_log = {
+        "weight_sum": 0.0,
+        "L_total_sum": 0.0,
+        "L_analysis_sum": 0.0,
+        "L_analysis_end_sum": 0.0,
+        "L_digits_sum": 0.0,
+        "analysis_acc_sum": 0.0,
+        "digit_exact_match_sum": 0.0,
+        "avg_z_len_sum": 0.0,
+        "w_answer_sum": 0.0,
+        "w_digits_sum": 0.0,
+        "batch_seen_sum": 0.0,
+        "batch_kept_sum": 0.0,
+        "batch_dropped_invalid_after_clip_sum": 0.0,
+        "total_dropped_invalid_after_clip_last": 0.0,
+    }
 
     _log(f"run_dir={run_dir}", log_path)
     _log(f"train_size={len(train_records)} eval_size={len(eval_records)}", log_path)
@@ -1157,6 +1173,27 @@ def train(cfg: SFTConfig) -> str:
                 loss = total_loss / accum_steps
 
             loss.backward()
+
+            micro_weight = float(batch["input_ids"].shape[0])
+            accum_log["weight_sum"] += micro_weight
+            accum_log["L_total_sum"] += float(total_loss.detach().item()) * micro_weight
+            accum_log["L_analysis_sum"] += float(loss_out.l_analysis.detach().item()) * micro_weight
+            accum_log["L_analysis_end_sum"] += float(loss_out.l_analysis_end.detach().item()) * micro_weight
+            accum_log["L_digits_sum"] += float(loss_out.l_digits.detach().item()) * micro_weight
+            accum_log["analysis_acc_sum"] += float(loss_out.analysis_acc) * micro_weight
+            accum_log["digit_exact_match_sum"] += float(loss_out.digit_exact_match) * micro_weight
+            accum_log["avg_z_len_sum"] += float(batch["z_lens"].float().mean().item()) * micro_weight
+            accum_log["w_answer_sum"] += float(cur_w_answer) * micro_weight
+            accum_log["w_digits_sum"] += float(cur_w_digits) * micro_weight
+            accum_log["batch_seen_sum"] += float(int(batch.get("batch_seen", batch["input_ids"].shape[0])))
+            accum_log["batch_kept_sum"] += float(int(batch.get("batch_kept", batch["input_ids"].shape[0])))
+            accum_log["batch_dropped_invalid_after_clip_sum"] += float(
+                int(batch.get("batch_dropped_invalid_after_clip", 0))
+            )
+            accum_log["total_dropped_invalid_after_clip_last"] = float(
+                int(batch.get("total_dropped_invalid_after_clip", 0))
+            )
+
             micro += 1
 
             if micro % accum_steps != 0:
@@ -1169,16 +1206,16 @@ def train(cfg: SFTConfig) -> str:
 
 
             if step % int(cfg.log_interval_steps) == 0:
-                mean_z_len = float(batch["z_lens"].float().mean().item())
+                denom = max(1e-9, float(accum_log["weight_sum"]))
                 row = {
                     "step": float(step),
-                    "L_total": float(total_loss.detach().item()),
-                    "L_analysis": float(loss_out.l_analysis.detach().item()),
-                    "L_analysis_end": float(loss_out.l_analysis_end.detach().item()),
-                    "L_digits": float(loss_out.l_digits.detach().item()),
-                    "analysis_acc": float(loss_out.analysis_acc),
-                    "digit_exact_match": float(loss_out.digit_exact_match),
-                    "avg_z_len": float(mean_z_len),
+                    "L_total": float(accum_log["L_total_sum"] / denom),
+                    "L_analysis": float(accum_log["L_analysis_sum"] / denom),
+                    "L_analysis_end": float(accum_log["L_analysis_end_sum"] / denom),
+                    "L_digits": float(accum_log["L_digits_sum"] / denom),
+                    "analysis_acc": float(accum_log["analysis_acc_sum"] / denom),
+                    "digit_exact_match": float(accum_log["digit_exact_match_sum"] / denom),
+                    "avg_z_len": float(accum_log["avg_z_len_sum"] / denom),
                     "no_analysis_end_before_kmax": 0.0,
                     "cf_enabled": float(bool(cfg.cf_enabled)),
                     "cf_applied": float(bool(cf_applied)),
@@ -1190,12 +1227,12 @@ def train(cfg: SFTConfig) -> str:
                     "cf_mean_entropy": float(cf_mean_entropy),
                     "cf_eligible_count": float(cf_eligible_count),
                     "cf_visible_z_mean": float(cf_visible_z_mean),
-                    "w_answer": float(cur_w_answer),
-                    "w_digits": float(cur_w_digits),
-                    "batch_seen": float(int(batch.get("batch_seen", batch["input_ids"].shape[0]))),
-                    "batch_kept": float(int(batch.get("batch_kept", batch["input_ids"].shape[0]))),
-                    "batch_dropped_invalid_after_clip": float(int(batch.get("batch_dropped_invalid_after_clip", 0))),
-                    "total_dropped_invalid_after_clip": float(int(batch.get("total_dropped_invalid_after_clip", 0))),
+                    "w_answer": float(accum_log["w_answer_sum"] / denom),
+                    "w_digits": float(accum_log["w_digits_sum"] / denom),
+                    "batch_seen": float(accum_log["batch_seen_sum"]),
+                    "batch_kept": float(accum_log["batch_kept_sum"]),
+                    "batch_dropped_invalid_after_clip": float(accum_log["batch_dropped_invalid_after_clip_sum"]),
+                    "total_dropped_invalid_after_clip": float(accum_log["total_dropped_invalid_after_clip_last"]),
                 }
                 _append_metrics_csv(metrics_csv, row)
                 _log(
@@ -1221,6 +1258,22 @@ def train(cfg: SFTConfig) -> str:
                     ),
                     log_path,
                 )
+            accum_log = {
+                "weight_sum": 0.0,
+                "L_total_sum": 0.0,
+                "L_analysis_sum": 0.0,
+                "L_analysis_end_sum": 0.0,
+                "L_digits_sum": 0.0,
+                "analysis_acc_sum": 0.0,
+                "digit_exact_match_sum": 0.0,
+                "avg_z_len_sum": 0.0,
+                "w_answer_sum": 0.0,
+                "w_digits_sum": 0.0,
+                "batch_seen_sum": 0.0,
+                "batch_kept_sum": 0.0,
+                "batch_dropped_invalid_after_clip_sum": 0.0,
+                "total_dropped_invalid_after_clip_last": 0.0,
+            }
 
             if step % int(cfg.save_interval_steps) == 0:
                 _save_last(
