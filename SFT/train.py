@@ -25,6 +25,8 @@ from .dataset import (
     SFTCollator,
     SFTDataset,
     TARGET_ANALYSIS,
+    TARGET_ANALYSIS_END,
+    TARGET_IGNORE,
     resolve_digit_token_ids,
 )
 from .eval_vllm import evaluate_with_vllm
@@ -250,69 +252,44 @@ def _collect_row_effective_state(
     }
 
 
-def _save_adapter_and_rows(
-    *,
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-    tokenizer,
-    out_dir: str,
-    base_model_name: str,
-) -> str:
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    tokenizer.save_pretrained(out_dir)
-
-    adapter_dir = os.path.join(out_dir, "adapter")
-    os.makedirs(adapter_dir, exist_ok=True)
-    model.save_pretrained(adapter_dir)
-
-    row_state = _collect_row_effective_state(model, row_adapter)
-    torch.save(row_state, os.path.join(out_dir, "row_state.pt"))
-    with open(os.path.join(out_dir, "adapter_meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"base_model_or_checkpoint": str(base_model_name)}, f, indent=2)
-    return out_dir
-
-
-def _export_merged_model(
-    *,
-    out_dir: str,
-    base_model_name: str,
-    cfg: SFTConfig,
-) -> str:
-    merged_dir = os.path.join(out_dir, "merged")
-    if os.path.isdir(merged_dir):
-        shutil.rmtree(merged_dir)
-    os.makedirs(merged_dir, exist_ok=True)
-
-    adapter_dir = os.path.join(out_dir, "adapter")
-    row_state_path = os.path.join(out_dir, "row_state.pt")
-    if not os.path.isdir(adapter_dir):
-        raise RuntimeError(f"missing adapter dir for merged export: {adapter_dir}")
-    if not os.path.isfile(row_state_path):
-        raise RuntimeError(f"missing row state for merged export: {row_state_path}")
-
+def _build_base_load_kwargs(cfg: SFTConfig) -> Dict[str, object]:
     try:
-        from peft import PeftModel
         from transformers import Mxfp4Config
     except Exception as exc:
-        raise RuntimeError("PEFT and Mxfp4Config are required for merged export.") from exc
-
-    tokenizer = AutoTokenizer.from_pretrained(out_dir, use_fast=True)
+        raise RuntimeError("transformers.Mxfp4Config is required for GPT-OSS loading.") from exc
     quant_cfg = Mxfp4Config(dequantize=bool(cfg.dequantize_mxfp4))
-    load_kwargs = {
+    kwargs: Dict[str, object] = {
         "quantization_config": quant_cfg,
         "attn_implementation": str(cfg.attn_implementation),
     }
     if bool(cfg.force_bfloat16):
-        load_kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["torch_dtype"] = torch.bfloat16
+    return kwargs
+
+
+def _build_full_model_for_save(
+    *,
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+    tokenizer,
+    base_model_name: str,
+    cfg: SFTConfig,
+    adapter_dir: str,
+) -> torch.nn.Module:
+    try:
+        from peft import PeftModel
+    except Exception as exc:
+        raise RuntimeError("PEFT is required to reconstruct merged full model.") from exc
+
+    load_kwargs = _build_base_load_kwargs(cfg)
     base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
     if int(base_model.get_input_embeddings().weight.shape[0]) != len(tokenizer):
         base_model.resize_token_embeddings(len(tokenizer))
     peft_model = PeftModel.from_pretrained(base_model, adapter_dir)
     merged_model = peft_model.merge_and_unload()
+    merged_model.eval()
 
-    row_state = torch.load(row_state_path, map_location="cpu")
+    row_state = _collect_row_effective_state(model, row_adapter)
     z_ids_t = torch.as_tensor(row_state["z_token_ids"], dtype=torch.long)
     emb_rows = torch.as_tensor(
         row_state["embedding_rows_effective"],
@@ -322,6 +299,28 @@ def _export_merged_model(
         row_state["lm_head_rows_effective"],
         dtype=merged_model.get_output_embeddings().weight.dtype,
     )
+    if int(emb_rows.shape[0]) != int(z_ids_t.numel()):
+        raise RuntimeError(
+            f"embedding rows mismatch: emb_rows.shape[0]={int(emb_rows.shape[0])} "
+            f"vs z_ids={int(z_ids_t.numel())}"
+        )
+    if int(head_rows.shape[0]) != int(z_ids_t.numel()):
+        raise RuntimeError(
+            f"lm_head rows mismatch: head_rows.shape[0]={int(head_rows.shape[0])} "
+            f"vs z_ids={int(z_ids_t.numel())}"
+        )
+    emb_hidden = int(merged_model.get_input_embeddings().weight.shape[1])
+    head_hidden = int(merged_model.get_output_embeddings().weight.shape[1])
+    if int(emb_rows.shape[1]) != emb_hidden:
+        raise RuntimeError(
+            f"embedding hidden dim mismatch: emb_rows.shape[1]={int(emb_rows.shape[1])} "
+            f"vs destination={emb_hidden}"
+        )
+    if int(head_rows.shape[1]) != head_hidden:
+        raise RuntimeError(
+            f"lm_head hidden dim mismatch: head_rows.shape[1]={int(head_rows.shape[1])} "
+            f"vs destination={head_hidden}"
+        )
     emb_dev = merged_model.get_input_embeddings().weight.device
     head_dev = merged_model.get_output_embeddings().weight.device
     merged_model.get_input_embeddings().weight.data.index_copy_(
@@ -330,11 +329,73 @@ def _export_merged_model(
     merged_model.get_output_embeddings().weight.data.index_copy_(
         0, z_ids_t.to(head_dev), head_rows.to(head_dev)
     )
+    return merged_model
 
-    merged_model.save_pretrained(merged_dir)
-    tokenizer.save_pretrained(merged_dir)
-    torch.save(row_state, os.path.join(merged_dir, "row_state.pt"))
-    return merged_dir
+
+def _save_checkpoint_bundle(
+    *,
+    model: torch.nn.Module,
+    row_adapter: RowDeltaAdapter,
+    tokenizer,
+    out_dir: str,
+    base_model_name: str,
+    cfg: SFTConfig,
+    step: int,
+    kind: str,
+    best_pass_at_n: Optional[float] = None,
+    metric: Optional[float] = None,
+) -> str:
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    adapter_dir = os.path.join(out_dir, "adapter")
+    full_model_dir = os.path.join(out_dir, "full_model")
+    tokenizer_dir = os.path.join(out_dir, "tokenizer")
+    os.makedirs(adapter_dir, exist_ok=True)
+    os.makedirs(full_model_dir, exist_ok=True)
+    os.makedirs(tokenizer_dir, exist_ok=True)
+
+    # Standard PEFT adapter artifact.
+    if not hasattr(model, "peft_config"):
+        raise RuntimeError("Expected PEFT model for adapter save, but peft_config is missing.")
+    model.save_pretrained(adapter_dir)
+
+    # Explicit tokenizer artifact.
+    tokenizer.save_pretrained(tokenizer_dir)
+
+    # Build standard full model artifact (no PEFT wrapper required for loading).
+    full_model = _build_full_model_for_save(
+        model=model,
+        row_adapter=row_adapter,
+        tokenizer=tokenizer,
+        base_model_name=base_model_name,
+        cfg=cfg,
+        adapter_dir=adapter_dir,
+    )
+    if int(full_model.get_input_embeddings().weight.shape[0]) != len(tokenizer):
+        raise RuntimeError("full_model vocab size does not match tokenizer length")
+    full_model.save_pretrained(full_model_dir)
+    tokenizer.save_pretrained(full_model_dir)
+    del full_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    meta_payload: Dict[str, object] = {
+        "step": int(step),
+        "kind": str(kind),
+        "base_model_or_checkpoint": str(base_model_name),
+        "save_format": "full_model_plus_lora_adapter",
+        "config": asdict(cfg),
+    }
+    if best_pass_at_n is not None:
+        meta_payload["best_pass_at_n"] = float(best_pass_at_n)
+    if metric is not None:
+        meta_payload["metric"] = float(metric)
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, indent=2)
+    return out_dir
 
 
 def _make_run_dir(cfg: SFTConfig) -> str:
@@ -375,31 +436,21 @@ def _save_last(
     tokenizer,
     base_model_name: str,
     cfg: SFTConfig,
-    export_merged: bool,
     step: int,
     best_pass_at_n: float,
 ) -> str:
     out_dir = os.path.join(run_dir, "last")
-    _save_adapter_and_rows(
+    _save_checkpoint_bundle(
         model=model,
         row_adapter=row_adapter,
         tokenizer=tokenizer,
         out_dir=out_dir,
         base_model_name=base_model_name,
+        cfg=cfg,
+        step=int(step),
+        kind="last",
+        best_pass_at_n=float(best_pass_at_n),
     )
-    if bool(export_merged):
-        _export_merged_model(
-            out_dir=out_dir,
-            base_model_name=base_model_name,
-            cfg=cfg,
-        )
-    payload = {
-        "step": int(step),
-        "best_pass_at_n": float(best_pass_at_n),
-        "config": asdict(cfg),
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
     return out_dir
 
 
@@ -410,16 +461,20 @@ def _save_periodic(
     row_adapter: RowDeltaAdapter,
     tokenizer,
     base_model_name: str,
+    cfg: SFTConfig,
     step: int,
     keep_last_k: int,
 ) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", f"step_{step:05d}")
-    _save_adapter_and_rows(
+    _save_checkpoint_bundle(
         model=model,
         row_adapter=row_adapter,
         tokenizer=tokenizer,
         out_dir=out_dir,
         base_model_name=base_model_name,
+        cfg=cfg,
+        step=int(step),
+        kind="periodic",
     )
     _retain_periodic(os.path.join(run_dir, "checkpoints"), keep_last_k=keep_last_k)
     return out_dir
@@ -435,24 +490,19 @@ def _save_best(
     cfg: SFTConfig,
     step: int,
     metric: float,
-    export_merged: bool,
 ) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", "best")
-    _save_adapter_and_rows(
+    _save_checkpoint_bundle(
         model=model,
         row_adapter=row_adapter,
         tokenizer=tokenizer,
         out_dir=out_dir,
         base_model_name=base_model_name,
+        cfg=cfg,
+        step=int(step),
+        kind="best",
+        metric=float(metric),
     )
-    if bool(export_merged):
-        _export_merged_model(
-            out_dir=out_dir,
-            base_model_name=base_model_name,
-            cfg=cfg,
-        )
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"step": int(step), "pass_at_n": float(metric)}, f, indent=2)
     return out_dir
 
 
@@ -463,14 +513,18 @@ def _save_ppo_init(
     row_adapter: RowDeltaAdapter,
     tokenizer,
     base_model_name: str,
+    cfg: SFTConfig,
 ) -> str:
     out_dir = os.path.join(run_dir, "ppo_init")
-    _save_adapter_and_rows(
+    _save_checkpoint_bundle(
         model=model,
         row_adapter=row_adapter,
         tokenizer=tokenizer,
         out_dir=out_dir,
         base_model_name=base_model_name,
+        cfg=cfg,
+        step=0,
+        kind="ppo_init",
     )
     return out_dir
 
@@ -610,9 +664,10 @@ def _build_counterfactual_batch(
     variant_name: str,
     trunc_range: Tuple[float, float],
     rng: random.Random,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     input_ids_cf = input_ids.clone()
     attention_mask_cf = attention_mask.clone()
+    target_class_cf = target_class.clone()
 
     bsz, _ = input_ids.shape
     eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
@@ -621,6 +676,53 @@ def _build_counterfactual_batch(
     lo, hi = float(trunc_range[0]), float(trunc_range[1])
     analysis_token_mask = torch.zeros_like(target_class, dtype=torch.bool)
     analysis_token_mask[:, 1:] = target_class[:, :-1] == int(TARGET_ANALYSIS)
+    analysis_end_token_mask = torch.zeros_like(target_class, dtype=torch.bool)
+    analysis_end_token_mask[:, 1:] = target_class[:, :-1] == int(TARGET_ANALYSIS_END)
+
+    def _token_class_from_target_row(tc_row: torch.Tensor, valid_len: int) -> List[int]:
+        out = [int(TARGET_IGNORE)] * int(valid_len)
+        for j in range(1, int(valid_len)):
+            out[j] = int(tc_row[j - 1].item())
+        return out
+
+    def _target_from_token_class(token_class: List[int], row_len: int) -> torch.Tensor:
+        t = torch.full((int(row_len),), int(TARGET_IGNORE), dtype=torch.long, device=input_ids.device)
+        n = len(token_class)
+        for j in range(max(0, n - 1)):
+            t[j] = int(token_class[j + 1])
+        return t
+
+    def _validate_truncate_row(
+        *,
+        row_ids: torch.Tensor,
+        row_attn: torch.Tensor,
+        row_target: torch.Tensor,
+        row_pad_id: int,
+    ) -> None:
+        valid_len_local = int(row_attn.sum().item())
+        if valid_len_local <= 0:
+            raise RuntimeError("truncate validation failed: empty valid sequence")
+        valid_ids = row_ids[:valid_len_local]
+        valid_target = row_target[:valid_len_local]
+        local_analysis_end = (valid_target == int(TARGET_ANALYSIS_END)).sum().item()
+        if int(local_analysis_end) != 1:
+            raise RuntimeError(
+                f"truncate validation failed: expected 1 analysis-end target, got {int(local_analysis_end)}"
+            )
+        local_digits = int((valid_target == 3).sum().item())
+        if local_digits != 5:
+            raise RuntimeError(
+                f"truncate validation failed: expected 5 digit targets, got {local_digits}"
+            )
+        if bool((valid_ids == int(row_pad_id)).any()):
+            raise RuntimeError("truncate validation failed: pad token found inside valid region")
+        if valid_len_local < int(row_ids.numel()):
+            tail = row_ids[valid_len_local:]
+            if not bool((tail == int(row_pad_id)).all()):
+                raise RuntimeError("truncate validation failed: non-pad token found after valid region")
+            attn_tail = row_attn[valid_len_local:]
+            if bool((attn_tail != 0).any()):
+                raise RuntimeError("truncate validation failed: non-zero attention after valid region")
 
     for b in range(bsz):
         valid_len = int(attention_mask[b].sum().item())
@@ -646,16 +748,69 @@ def _build_counterfactual_batch(
             r = float(rng.uniform(lo, hi))
             remove_count = int(math.ceil(r * lz))
             keep_k = max(0, lz - remove_count)
-            remove_pos = z_pos[keep_k:]
-            if remove_pos:
-                remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long, device=input_ids.device)
-                input_ids_cf[b, remove_tensor] = int(pad_token_id)
-                attention_mask_cf[b, remove_tensor] = 0
+            row_len = int(input_ids.shape[1])
+            row_ids = input_ids[b]
+            row_attn = attention_mask[b]
+            row_target = target_class[b]
+            valid_row_ids = row_ids[:valid_len]
+            token_class = _token_class_from_target_row(tc_row=row_target, valid_len=valid_len)
+
+            analysis_pos = z_pos
+            analysis_start = int(analysis_pos[0])
+            analysis_end_pos_vec = analysis_end_token_mask[b, :valid_len].nonzero(as_tuple=False).view(-1)
+            if int(analysis_end_pos_vec.numel()) != 1:
+                raise RuntimeError(
+                    f"truncate expects exactly one analysis-end token position; got {int(analysis_end_pos_vec.numel())}"
+                )
+            analysis_end_pos = int(analysis_end_pos_vec[0].item())
+            if analysis_end_pos <= analysis_pos[-1]:
+                raise RuntimeError("analysis-end token must come after analysis z span")
+
+            prefix_ids = valid_row_ids[:analysis_start].tolist()
+            kept_z_ids = valid_row_ids[analysis_start : analysis_start + keep_k].tolist()
+            analysis_end_token_id = int(valid_row_ids[analysis_end_pos].item())
+            final_segment_ids = valid_row_ids[analysis_end_pos + 1 :].tolist()
+
+            prefix_tc = token_class[:analysis_start]
+            final_tc = token_class[analysis_end_pos + 1 : valid_len]
+            if len(final_tc) != len(final_segment_ids):
+                raise RuntimeError("truncate internal mismatch: final token_class length mismatch")
+
+            new_valid_ids = prefix_ids + kept_z_ids + [analysis_end_token_id] + final_segment_ids
+            new_token_class = prefix_tc + [int(TARGET_ANALYSIS)] * int(keep_k) + [int(TARGET_ANALYSIS_END)] + final_tc
+            if len(new_valid_ids) != len(new_token_class):
+                raise RuntimeError("truncate internal mismatch: new ids/token_class length mismatch")
+            if len(final_segment_ids) > 0:
+                if new_valid_ids[-len(final_segment_ids) :] != final_segment_ids:
+                    raise RuntimeError("truncate failed to preserve final segment verbatim")
+
+            new_valid_len = len(new_valid_ids)
+            if new_valid_len <= 0 or new_valid_len > row_len:
+                raise RuntimeError(
+                    f"truncate produced invalid new length: {new_valid_len} (row_len={row_len})"
+                )
+
+            rebuilt_ids = torch.full((row_len,), int(pad_token_id), dtype=input_ids.dtype, device=input_ids.device)
+            rebuilt_attn = torch.zeros((row_len,), dtype=attention_mask.dtype, device=input_ids.device)
+            rebuilt_ids[:new_valid_len] = torch.as_tensor(new_valid_ids, dtype=input_ids.dtype, device=input_ids.device)
+            rebuilt_attn[:new_valid_len] = 1
+            rebuilt_target = _target_from_token_class(new_token_class, row_len=row_len)
+
+            input_ids_cf[b] = rebuilt_ids
+            attention_mask_cf[b] = rebuilt_attn
+            target_class_cf[b] = rebuilt_target
+
+            _validate_truncate_row(
+                row_ids=input_ids_cf[b],
+                row_attn=attention_mask_cf[b],
+                row_target=target_class_cf[b],
+                row_pad_id=int(pad_token_id),
+            )
             visible_z_counts[b] = int(keep_k)
         else:
             raise ValueError(f"unknown counterfactual variant: {variant_name}")
 
-    return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts
+    return input_ids_cf, attention_mask_cf, target_class_cf, eligible_mask, visible_z_counts
 
 
 def _print_startup_examples(
@@ -694,38 +849,44 @@ def _print_startup_examples(
     print("labels:")
     print(valid_labels)
 
-    debug_rng = random.Random(int(seed))
-    input_ids_cf, attention_cf, _eligible_mask, _visible_z_counts = _build_counterfactual_batch(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        target_class=batch["target_class"],
-        z_token_ids=z_token_ids,
-        pad_token_id=int(pad_token_id),
-        cf_min_z_len=int(cf_min_z_len),
-        variant_name="truncate",
-        trunc_range=cf_trunc_range,
-        rng=debug_rng,
-    )
+    def _print_cf_variant(variant_name: str, rng_seed: int) -> None:
+        debug_rng = random.Random(int(rng_seed))
+        input_ids_cf, attention_cf, target_class_cf, _eligible_mask, _visible_z_counts = _build_counterfactual_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            target_class=batch["target_class"],
+            z_token_ids=z_token_ids,
+            pad_token_id=int(pad_token_id),
+            cf_min_z_len=int(cf_min_z_len),
+            variant_name=str(variant_name),
+            trunc_range=cf_trunc_range,
+            rng=debug_rng,
+        )
 
-    input_ids_cf_row = input_ids_cf[row_idx].detach().cpu().tolist()
-    attention_cf_row = attention_cf[row_idx].detach().cpu().tolist()
-    valid_cf_len = int(sum(int(x) for x in attention_cf_row))
-    valid_cf_ids = input_ids_cf_row[:valid_cf_len]
-    valid_cf_target_class = target_class_row[:valid_cf_len]
+        input_ids_cf_row = input_ids_cf[row_idx].detach().cpu().tolist()
+        attention_cf_row = attention_cf[row_idx].detach().cpu().tolist()
+        target_class_cf_row = target_class_cf[row_idx].detach().cpu().tolist()
+        valid_cf_len = int(sum(int(x) for x in attention_cf_row))
+        valid_cf_ids = input_ids_cf_row[:valid_cf_len]
+        valid_cf_target_class = target_class_cf_row[:valid_cf_len]
 
-    print("===== STARTUP COUNTERFACTUAL EXAMPLE =====")
-    print("counterfactual_variant:")
-    print("truncate")
-    print("decoded_text:")
-    print(tokenizer.decode(valid_cf_ids, skip_special_tokens=False))
-    print("tokens:")
-    print(tokenizer.convert_ids_to_tokens(valid_cf_ids))
-    print("input_ids:")
-    print(input_ids_cf_row)
-    print("attention_mask:")
-    print(attention_cf_row)
-    print("target_class:")
-    print(valid_cf_target_class)
+        print("===== STARTUP COUNTERFACTUAL EXAMPLE =====")
+        print("counterfactual_variant:")
+        print(str(variant_name))
+        print("decoded_text:")
+        print(tokenizer.decode(valid_cf_ids, skip_special_tokens=False))
+        print("tokens:")
+        print(tokenizer.convert_ids_to_tokens(valid_cf_ids))
+        print("input_ids:")
+        print(input_ids_cf_row)
+        print("attention_mask:")
+        print(attention_cf_row)
+        print("target_class:")
+        print(valid_cf_target_class)
+
+    _print_cf_variant("truncate", int(seed) + 101)
+    _print_cf_variant("reverse", int(seed) + 202)
+    _print_cf_variant("random", int(seed) + 303)
 
 
 def _forward_with_row_deltas(
@@ -929,7 +1090,7 @@ def train(cfg: SFTConfig) -> str:
 
                 if cf_trigger:
                     cf_variant_name = _sample_cf_variant(cfg, train_rng)
-                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                    input_ids_cf, attention_mask_cf, target_class_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         target_class=batch["target_class"],
@@ -956,7 +1117,7 @@ def train(cfg: SFTConfig) -> str:
                         )
                         cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
                             logits=out_cf.logits,
-                            target_class=batch["target_class"],
+                            target_class=target_class_cf,
                             digit_allowed_ids=digit_token_ids,
                         )
                         del out_cf
@@ -1069,7 +1230,6 @@ def train(cfg: SFTConfig) -> str:
                     tokenizer=tokenizer,
                     base_model_name=cfg.base_model_or_checkpoint,
                     cfg=cfg,
-                    export_merged=False,
                     step=step,
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
                 )
@@ -1082,6 +1242,7 @@ def train(cfg: SFTConfig) -> str:
                     row_adapter=row_adapter,
                     tokenizer=tokenizer,
                     base_model_name=cfg.base_model_or_checkpoint,
+                    cfg=cfg,
                     step=step,
                     keep_last_k=int(cfg.keep_last_k),
                 )
@@ -1096,12 +1257,10 @@ def train(cfg: SFTConfig) -> str:
                     tokenizer=tokenizer,
                     base_model_name=cfg.base_model_or_checkpoint,
                     cfg=cfg,
-                    export_merged=bool(cfg.save_merged_for_eval),
                     step=step,
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
                 )
-                if bool(cfg.save_merged_for_eval):
-                    eval_model_path = os.path.join(eval_model_path, "merged")
+                eval_model_path = os.path.join(eval_model_path, "full_model")
                 model.train(False)
                 torch.cuda.empty_cache()
                 metrics = evaluate_with_vllm(
@@ -1153,7 +1312,6 @@ def train(cfg: SFTConfig) -> str:
                         cfg=cfg,
                         step=step,
                         metric=best_pass,
-                        export_merged=bool(cfg.save_merged_for_eval),
                     )
                     _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
 
@@ -1164,7 +1322,6 @@ def train(cfg: SFTConfig) -> str:
         tokenizer=tokenizer,
         base_model_name=cfg.base_model_or_checkpoint,
         cfg=cfg,
-        export_merged=False,
         step=step,
         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
     )
@@ -1175,6 +1332,7 @@ def train(cfg: SFTConfig) -> str:
             row_adapter=row_adapter,
             tokenizer=tokenizer,
             base_model_name=cfg.base_model_or_checkpoint,
+            cfg=cfg,
         )
         _log(f"saved ppo_init snapshot at {p}", log_path)
 
@@ -1215,7 +1373,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="gate_up_proj,down_proj,up_proj,gate_proj,w1,w2,w3",
     )
-    p.add_argument("--save_merged_for_eval", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
@@ -1285,7 +1442,6 @@ def main() -> None:
         lora_target_modules=args.lora_target_modules,
         lora_enable_moe_target_parameters=bool(args.lora_enable_moe_target_parameters),
         lora_moe_param_substrings=lora_moe_substrings,
-        save_merged_for_eval=bool(args.save_merged_for_eval),
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
         w_start_answer=args.w_start_answer,
