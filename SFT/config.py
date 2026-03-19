@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 64
+GRADIENT_ACCUMULATION_STEPS = 32
+DATASET_SIZE = 40_000
+START_WEIGHTS_STEPS_FRACTION = 0.15
+GOES_UP_WEIGHTS_STEPS_FRACTION = 0.5
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+UPDATES_PER_EPOCH = math.ceil(DATASET_SIZE / EFFECTIVE_BATCH_SIZE)
+START_WEIGHTS_STEPS = max(1, int(UPDATES_PER_EPOCH * START_WEIGHTS_STEPS_FRACTION))
+GOES_UP_WEIGHTS_STEPS = max(1, int(UPDATES_PER_EPOCH * GOES_UP_WEIGHTS_STEPS_FRACTION))
 
 @dataclass
 class SFTConfig:
@@ -26,7 +34,7 @@ class SFTConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = GRADIENT_ACCUMULATION_STEPS
     max_steps: int = 60_000
-    max_length: int = 2048
+    max_length: int = 512
     torch_device: str = "cuda:0"
 
     # GPT-OSS loading
@@ -59,8 +67,8 @@ class SFTConfig:
     w_start_digits: float = 0.05
     w_end_answer: float = 0.25
     w_end_digits: float = 0.5
-    start_weights_steps: int = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * 1000
-    goes_up_weights_steps: int = 1000
+    start_weights_steps: int = START_WEIGHTS_STEPS
+    goes_up_weights_steps: int = GOES_UP_WEIGHTS_STEPS
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
