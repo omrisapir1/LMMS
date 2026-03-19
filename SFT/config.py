@@ -49,9 +49,6 @@ class SFTConfig:
         # "w3",
     )
 
-    # Checkpoint export
-    save_merged_for_eval: bool = True
-
     # Objective weights
     z_label_smoothing: float = 0.05
     w_z: float = 1
