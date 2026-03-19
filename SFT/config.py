@@ -80,7 +80,7 @@ class SFTConfig:
 
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
-    log_interval_steps: int = 20
+    log_interval_steps: int = 1
     save_interval_steps: int = 2000
     save_every_steps: int = 2000
     keep_last_k: int = 3
