@@ -29,7 +29,7 @@ from .dataset import (
     TARGET_IGNORE,
     resolve_digit_token_ids,
 )
-from .eval_vllm import evaluate_with_vllm
+# from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
 
