@@ -82,7 +82,7 @@ class SFTConfig:
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
     # Evaluation / generation
-    eval_interval_steps: int = 500
+    eval_interval_steps: int = 500000
     pass_at_n: int = 16
     k_max: int = 128
     temperature: float = 1.0
@@ -93,7 +93,7 @@ class SFTConfig:
     run_root: str = "runs/sft_z"
     log_interval_steps: int = 1
     save_interval_steps: int = 2000
-    save_every_steps: int = 2000
+    save_every_steps: int = 100
     keep_last_k: int = 3
     save_best: bool = True
     save_ppo_init: bool = False
