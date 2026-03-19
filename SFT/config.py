@@ -43,8 +43,8 @@ class SFTConfig:
     force_bfloat16: bool = True
 
     # PEFT / LoRA
-    lora_r: int = 8 #16
-    lora_alpha: int = 16# 32
+    lora_r: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.0
     lora_bias: str = "none"
     lora_task_type: str = "CAUSAL_LM"
@@ -53,11 +53,11 @@ class SFTConfig:
     lora_moe_param_substrings: tuple[str, ...] = (
         "gate_up_proj",
         "down_proj",
-        # "up_proj",
-        # "gate_proj",
-        # "w1",
-        # "w2",
-        # "w3",
+        "up_proj",
+        "gate_proj",
+        "w1",
+        "w2",
+        "w3",
     )
 
     # Objective weights
