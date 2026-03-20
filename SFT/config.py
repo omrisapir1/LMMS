@@ -18,13 +18,13 @@ GOES_UP_WEIGHTS_STEPS = max(1, int(UPDATES_PER_EPOCH * GOES_UP_WEIGHTS_STEPS_FRA
 class SFTConfig:
     # Model / tokenizer inputs
     base_model_or_checkpoint: str = "unsloth/gpt-oss-20b"
-    train_dataset_name: str = "omrisap/nvidia_math_64_47K"
+    train_dataset_name: str = "omrisap/nvidia_math_512_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
     eval_dataset_split: str = "eval"
 
     # Discrete Z vocab
-    vocab_size: int = 64
+    vocab_size: int = 512
 
     # Training
     seed: int = 42
