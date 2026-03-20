@@ -171,7 +171,7 @@ def evaluate_with_vllm(
             model=resolved_model_path,
             tokenizer=resolved_tokenizer_path,
             trust_remote_code=True,
-            gpu_memory_utilization=0.95,
+            gpu_memory_utilization=0.85,
         )
     finally:
         if old_cuda_visible_devices is None:
