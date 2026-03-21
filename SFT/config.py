@@ -26,7 +26,7 @@ class SFTConfig:
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
     warmup_steps: int = 0
-    max_length: int = 2048
+    max_length: int = 16000
     torch_device: str = "cuda:0"
     debug_prefix_repeat: int = 5000
     debug_prefix_text: str = " DEBUG_PREFIX"
