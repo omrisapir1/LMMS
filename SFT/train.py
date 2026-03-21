@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
 from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
-from .eval_vllm import evaluate_with_vllm
+# from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
 
@@ -716,54 +716,54 @@ def train(cfg: SFTConfig) -> str:
             warmup_steps = int(cfg.warmup_steps)
             eval_ready = (warmup_steps <= 0) or (step >= warmup_steps)
             eval_on_interval = step % int(cfg.eval_interval_steps) == 0
-            if eval_on_interval:
-                eval_model_path = _save_last(
-                    run_dir=run_dir,
-                    model=model,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    step=step,
-                    best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
-                )
-                model.train(False)
-                torch.cuda.empty_cache()
-                metrics = evaluate_with_vllm(
-                    model_path=eval_model_path,
-                    records=eval_records,
-                    pass_at_n=cfg.pass_at_n,
-                    k_max=cfg.k_max,
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    vocab_size=cfg.vocab_size,
-                    vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
-                    output_jsonl_path=eval_jsonl,
-                )
-
-                gc.collect()
-                torch.cuda.empty_cache()
-                _log(
-                    "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
-                        step,
-                        cfg.pass_at_n,
-                        metrics.pass_at_n,
-                        metrics.greedy_exact_match,
-                        metrics.mean_z_len,
-                        metrics.no_answer_before_kmax_rate,
-                    ),
-                    log_path,
-                )
-                _log(f"eval generations appended to {eval_jsonl}", log_path)
-
-                _append_metrics_csv(
-                    metrics_csv,
-                    {
-                        "step": float(step),
-                        "pass_at_n": float(metrics.pass_at_n),
-                        "greedy_exact_match": float(metrics.greedy_exact_match),
-                        "eval_mean_z_len": float(metrics.mean_z_len),
-                        "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
-                    },
-                )
+            # if eval_on_interval:
+            #     eval_model_path = _save_last(
+            #         run_dir=run_dir,
+            #         model=model,
+            #         tokenizer=tokenizer,
+            #         cfg=cfg,
+            #         step=step,
+            #         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
+            #     )
+            #     model.train(False)
+            #     torch.cuda.empty_cache()
+            #     metrics = evaluate_with_vllm(
+            #         model_path=eval_model_path,
+            #         records=eval_records,
+            #         pass_at_n=cfg.pass_at_n,
+            #         k_max=cfg.k_max,
+            #         temperature=cfg.temperature,
+            #         top_p=cfg.top_p,
+            #         vocab_size=cfg.vocab_size,
+            #         vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
+            #         output_jsonl_path=eval_jsonl,
+            #     )
+            #
+            #     gc.collect()
+            #     torch.cuda.empty_cache()
+            #     _log(
+            #         "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
+            #             step,
+            #             cfg.pass_at_n,
+            #             metrics.pass_at_n,
+            #             metrics.greedy_exact_match,
+            #             metrics.mean_z_len,
+            #             metrics.no_answer_before_kmax_rate,
+            #         ),
+            #         log_path,
+            #     )
+            #     _log(f"eval generations appended to {eval_jsonl}", log_path)
+            #
+            #     _append_metrics_csv(
+            #         metrics_csv,
+            #         {
+            #             "step": float(step),
+            #             "pass_at_n": float(metrics.pass_at_n),
+            #             "greedy_exact_match": float(metrics.greedy_exact_match),
+            #             "eval_mean_z_len": float(metrics.mean_z_len),
+            #             "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
+            #         },
+            #     )
 
                 if cfg.save_best and metrics.pass_at_n > best_pass:
                     best_pass = metrics.pass_at_n
