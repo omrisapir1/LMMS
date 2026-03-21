@@ -764,17 +764,17 @@ def train(cfg: SFTConfig) -> str:
             #             "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
             #         },
             #     )
-
-                if cfg.save_best and metrics.pass_at_n > best_pass:
-                    best_pass = metrics.pass_at_n
-                    best_path = _save_best(
-                        run_dir=run_dir,
-                        model=model,
-                        tokenizer=tokenizer,
-                        step=step,
-                        metric=best_pass,
-                    )
-                    _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
+            #
+            #     if cfg.save_best and metrics.pass_at_n > best_pass:
+            #         best_pass = metrics.pass_at_n
+            #         best_path = _save_best(
+            #             run_dir=run_dir,
+            #             model=model,
+            #             tokenizer=tokenizer,
+            #             step=step,
+            #             metric=best_pass,
+            #         )
+            #         _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
 
     _save_last(
         run_dir=run_dir,
