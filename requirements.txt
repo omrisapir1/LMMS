@@ -2,7 +2,7 @@
 # Core HF / ML stack
 # -----------------------------
 # Qwen 3.5 + current vLLM-compatible stable range
-ransformers >= 5.2.0
+transformers >= 5.2.0
 accelerate>=0.33.0
 safetensors>=0.4.3
 bitsandbytes>=0.43.0
