@@ -103,14 +103,20 @@ def _apply_warmup_freeze(
     model,
     z_token_ids: Sequence[int],
     warmup_active: bool,
+    base_trainable_mask: Optional[List[bool]] = None,
 ) -> List[torch.utils.hooks.RemovableHandle]:
-    for p in model.parameters():
-        p.requires_grad = True
+    params = list(model.parameters())
+    if base_trainable_mask is None:
+        base_trainable_mask = [True] * len(params)
+    if len(base_trainable_mask) != len(params):
+        raise ValueError("base_trainable_mask length must match number of model parameters")
 
     if not warmup_active:
+        for p, trainable in zip(params, base_trainable_mask):
+            p.requires_grad = bool(trainable)
         return []
 
-    for p in model.parameters():
+    for p in params:
         p.requires_grad = False
 
     embed = model.get_input_embeddings().weight
@@ -238,7 +244,13 @@ def _build_loader(
     shuffle: bool,
     train: bool,
 ) -> DataLoader:
-    ds = SFTDataset(records=records, tokenizer=tokenizer, vocab_size=cfg.vocab_size)
+    ds = SFTDataset(
+        records=records,
+        tokenizer=tokenizer,
+        vocab_size=cfg.vocab_size,
+        debug_prefix_repeat=cfg.debug_prefix_repeat,
+        debug_prefix_text=cfg.debug_prefix_text,
+    )
     if len(ds) == 0:
         raise ValueError(
             "SFT dataset has 0 usable samples after preprocessing "
@@ -272,6 +284,90 @@ def _build_optimizer(trainable_params, cfg: SFTConfig):
             raise RuntimeError("bitsandbytes is required for optimizer_name='adamw_8bit'") from e
         return AdamW8bit(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     raise ValueError(f"Unsupported optimizer_name: {cfg.optimizer_name}. Supported values: 'adamw', 'adamw_8bit'")
+
+
+def _get_transformer_blocks(model):
+    candidates = [
+        ("model.layers", lambda m: m.model.layers),
+        ("transformer.h", lambda m: m.transformer.h),
+        ("gpt_neox.layers", lambda m: m.gpt_neox.layers),
+        ("model.decoder.layers", lambda m: m.model.decoder.layers),
+    ]
+    for name, getter in candidates:
+        try:
+            blocks = getter(model)
+            n = len(blocks)
+        except Exception:
+            continue
+        if n > 0:
+            return name, blocks
+    raise RuntimeError("Could not locate transformer block list on model for trainable_layer_spec")
+
+
+def _parse_trainable_layer_spec(spec: str, num_layers: int) -> List[int]:
+    s = str(spec).strip().lower()
+    if s == "all":
+        return list(range(num_layers))
+    if s.startswith("last:"):
+        n = int(s.split(":", 1)[1])
+        if n < 0:
+            raise ValueError("trainable_layer_spec last:N requires N >= 0")
+        return list(range(max(0, num_layers - n), num_layers))
+    if s.startswith("first:"):
+        n = int(s.split(":", 1)[1])
+        if n < 0:
+            raise ValueError("trainable_layer_spec first:N requires N >= 0")
+        return list(range(0, min(num_layers, n)))
+    if s.startswith("range:"):
+        parts = s.split(":")
+        if len(parts) != 3:
+            raise ValueError("trainable_layer_spec range must be 'range:START:END' (END exclusive)")
+        start = int(parts[1])
+        end = int(parts[2])
+        if start < 0 or end < start or end > num_layers:
+            raise ValueError(f"Invalid range for {num_layers} layers: start={start} end={end}")
+        return list(range(start, end))
+    if s.startswith("idx:"):
+        body = s.split(":", 1)[1].strip()
+        if not body:
+            return []
+        out: List[int] = []
+        for x in body.split(","):
+            v = int(x.strip())
+            if v < 0 or v >= num_layers:
+                raise ValueError(f"Layer index out of bounds [0, {num_layers - 1}]: {v}")
+            out.append(v)
+        return sorted(set(out))
+    raise ValueError(
+        "Unsupported trainable_layer_spec. Use one of: "
+        "'all', 'last:N', 'first:N', 'range:START:END', 'idx:i,j,k'"
+    )
+
+
+def _configure_trainable_params(model, cfg: SFTConfig):
+    spec = str(cfg.trainable_layer_spec).strip().lower()
+    if spec == "all":
+        for p in model.parameters():
+            p.requires_grad = True
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        return trainable, "all", len(trainable), len(trainable)
+
+    container_name, blocks = _get_transformer_blocks(model)
+    total_layers = len(blocks)
+    selected = _parse_trainable_layer_spec(spec, total_layers)
+
+    for p in model.parameters():
+        p.requires_grad = False
+    for idx in selected:
+        for p in blocks[idx].parameters():
+            p.requires_grad = True
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable) == 0:
+        raise RuntimeError(
+            "trainable_layer_spec selected zero parameters; adjust spec to include at least one layer"
+        )
+    return trainable, f"{container_name} total={total_layers} selected={selected}", len(selected), total_layers
 
 
 def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:

@@ -17,16 +17,19 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 32
+    batch_size: int = 64
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
     optimizer_name: str = "adamw_8bit"
+    trainable_layer_spec: str = "all"
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
     warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
+    debug_prefix_repeat: int = 0
+    debug_prefix_text: str = " DEBUG_PREFIX"
 
     # Objective weights
     z_label_smoothing: float = 0.05

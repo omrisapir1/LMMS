@@ -56,10 +56,14 @@ class SFTDataset(Dataset):
         tokenizer,
         vocab_size: int,
         answer_token: str = ANSWER_TOKEN,
+        debug_prefix_repeat: int = 0,
+        debug_prefix_text: str = " DEBUG_PREFIX",
     ) -> None:
         self.tokenizer = tokenizer
         self.vocab_size = int(vocab_size)
         self.answer_token = str(answer_token)
+        self.debug_prefix_repeat = int(debug_prefix_repeat)
+        self.debug_prefix_text = str(debug_prefix_text)
 
         self.answer_token_id = int(self.tokenizer.convert_tokens_to_ids(self.answer_token))
         if self.answer_token_id < 0:
@@ -86,6 +90,19 @@ class SFTDataset(Dataset):
                     f"expected [{self.z_token_ids[i]}]"
                 )
         self.samples: List[SFTSample] = []
+        self.extra_prefix_ids: List[int] = []
+        if self.debug_prefix_repeat < 0:
+            raise ValueError("debug_prefix_repeat must be >= 0")
+        if self.debug_prefix_repeat > 0:
+            unit_ids = self.tokenizer(
+                self.debug_prefix_text,
+                add_special_tokens=False,
+                padding=False,
+                return_attention_mask=False,
+            )["input_ids"]
+            if len(unit_ids) == 0:
+                raise ValueError("debug_prefix_text tokenized to empty sequence; provide non-empty text")
+            self.extra_prefix_ids = list(unit_ids) * self.debug_prefix_repeat
 
         dropped = 0
         for row in records:
@@ -152,10 +169,11 @@ class SFTDataset(Dataset):
         z_token_ids = [self.z_token_ids[z] for z in sample.z_ids]
         digit_ids = [self.digit_token_ids[d] for d in sample.answer_digits]
         expected_suffix = z_token_ids + [self.answer_token_id] + digit_ids
-        input_ids = list(prompt_ids) + list(expected_suffix)
+        input_ids = list(prompt_ids) + list(self.extra_prefix_ids) + list(expected_suffix)
         attention_mask = [1] * len(input_ids)
 
         token_class = [TARGET_IGNORE] * len(prompt_ids)
+        token_class += [TARGET_IGNORE] * len(self.extra_prefix_ids)
         token_class += [TARGET_Z] * len(z_token_ids)
         token_class += [TARGET_ANSWER]
         token_class += [TARGET_DIGIT] * 5
