@@ -657,6 +657,7 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
     _log(f"optimizer_name={cfg.optimizer_name}", log_path)
+    _log(f"torch_grad_enabled={torch.is_grad_enabled()} inference_mode={torch.is_inference_mode_enabled()}", log_path)
     _log(f"debug_prefix_repeat={cfg.debug_prefix_repeat} debug_prefix_text_len={len(cfg.debug_prefix_text)}", log_path)
     _log(
         f"debug_prefix_tokens_per_repeat={debug_prefix_unit_tokens} "
@@ -696,91 +697,92 @@ def train(cfg: SFTConfig) -> str:
             cf_loss_value = torch.zeros((), dtype=torch.float32, device=device)
             cur_w_answer, cur_w_digits = _get_scheduled_loss_weights(cfg, step)
 
-            with scaler_ctx:
-                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-                loss_out = compute_weighted_loss(
-                    logits=out.logits,
-                    labels=batch["labels"],
-                    target_class=batch["target_class"],
-                    z_allowed_ids=z_and_answer_allowed,
-                    digit_allowed_ids=digit_token_ids,
-                    w_z=cfg.w_z,
-                    w_answer=cur_w_answer,
-                    w_digits=cur_w_digits,
-                    z_label_smoothing=cfg.z_label_smoothing,
-                    keep_prob=cfg.keep_prob,
-                )
-                total_loss = loss_out.total
-
-                if cf_trigger:
-                    cf_variant_name = _sample_cf_variant(cfg, train_rng)
-                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        answer_token_id=answer_token_id,
-                        z_token_ids=z_token_ids,
-                        pad_token_id=int(tokenizer.pad_token_id),
-                        cf_min_z_len=int(cfg.cf_min_z_len),
-                        variant_name=cf_variant_name,
-                        trunc_range=cfg.cf_trunc_range,
-                        rng=train_rng,
+            with torch.set_grad_enabled(True):
+                with scaler_ctx:
+                    out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                    loss_out = compute_weighted_loss(
+                        logits=out.logits,
+                        labels=batch["labels"],
+                        target_class=batch["target_class"],
+                        z_allowed_ids=z_and_answer_allowed,
+                        digit_allowed_ids=digit_token_ids,
+                        w_z=cfg.w_z,
+                        w_answer=cur_w_answer,
+                        w_digits=cur_w_digits,
+                        z_label_smoothing=cfg.z_label_smoothing,
+                        keep_prob=cfg.keep_prob,
                     )
-                    cf_eligible_count = float(eligible_mask.float().sum().item())
-                    if cf_eligible_count > 0:
-                        cf_applied = True
-                        out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
-                        clean_digit_logits, digit_valid_mask = extract_digit_logits(
-                            logits=out.logits,
-                            target_class=batch["target_class"],
-                            digit_allowed_ids=digit_token_ids,
-                        )
-                        cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
-                            logits=out_cf.logits,
-                            target_class=batch["target_class"],
-                            digit_allowed_ids=digit_token_ids,
-                        )
-                        del out_cf
-                        if clean_digit_logits.shape != cf_digit_logits.shape:
-                            raise RuntimeError(
-                                "counterfactual digit logits shape mismatch: "
-                                f"{tuple(clean_digit_logits.shape)} vs {tuple(cf_digit_logits.shape)}"
-                            )
-                        if digit_valid_mask.shape != cf_digit_valid_mask.shape or not bool(
-                            torch.equal(digit_valid_mask, cf_digit_valid_mask)
-                        ):
-                            raise RuntimeError("counterfactual digit mask mismatch")
-                        cf_out = compute_counterfactual_regularizer(
-                            clean_digit_logits=clean_digit_logits,
-                            cf_digit_logits=cf_digit_logits,
-                            digit_valid_mask=digit_valid_mask,
-                            eligible_mask=eligible_mask,
+                    total_loss = loss_out.total
+
+                    if cf_trigger:
+                        cf_variant_name = _sample_cf_variant(cfg, train_rng)
+                        input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            answer_token_id=answer_token_id,
+                            z_token_ids=z_token_ids,
+                            pad_token_id=int(tokenizer.pad_token_id),
+                            cf_min_z_len=int(cfg.cf_min_z_len),
                             variant_name=cf_variant_name,
-                            kl_margin=float(cfg.cf_kl_margin),
-                            eps=float(cfg.cf_eps),
+                            trunc_range=cfg.cf_trunc_range,
+                            rng=train_rng,
                         )
-                        cf_loss_value = cf_out.loss
-                        total_loss = total_loss + float(cfg.cf_lambda) * cf_loss_value
-                        cf_loss_scalar = float(cf_out.loss.detach().item())
-                        cf_mean_sym_kl = float(cf_out.mean_sym_kl)
-                        cf_mean_entropy = float(cf_out.mean_entropy)
-                        del cf_digit_logits
-                        del clean_digit_logits
-                        del cf_digit_valid_mask
-                        del digit_valid_mask
-                        del input_ids_cf
-                        del attention_mask_cf
-                        if cf_variant_name == "truncate":
-                            v = visible_z_counts[eligible_mask]
-                            cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
+                        cf_eligible_count = float(eligible_mask.float().sum().item())
+                        if cf_eligible_count > 0:
+                            cf_applied = True
+                            out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
+                            clean_digit_logits, digit_valid_mask = extract_digit_logits(
+                                logits=out.logits,
+                                target_class=batch["target_class"],
+                                digit_allowed_ids=digit_token_ids,
+                            )
+                            cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
+                                logits=out_cf.logits,
+                                target_class=batch["target_class"],
+                                digit_allowed_ids=digit_token_ids,
+                            )
+                            del out_cf
+                            if clean_digit_logits.shape != cf_digit_logits.shape:
+                                raise RuntimeError(
+                                    "counterfactual digit logits shape mismatch: "
+                                    f"{tuple(clean_digit_logits.shape)} vs {tuple(cf_digit_logits.shape)}"
+                                )
+                            if digit_valid_mask.shape != cf_digit_valid_mask.shape or not bool(
+                                torch.equal(digit_valid_mask, cf_digit_valid_mask)
+                            ):
+                                raise RuntimeError("counterfactual digit mask mismatch")
+                            cf_out = compute_counterfactual_regularizer(
+                                clean_digit_logits=clean_digit_logits,
+                                cf_digit_logits=cf_digit_logits,
+                                digit_valid_mask=digit_valid_mask,
+                                eligible_mask=eligible_mask,
+                                variant_name=cf_variant_name,
+                                kl_margin=float(cfg.cf_kl_margin),
+                                eps=float(cfg.cf_eps),
+                            )
+                            cf_loss_value = cf_out.loss
+                            total_loss = total_loss + float(cfg.cf_lambda) * cf_loss_value
+                            cf_loss_scalar = float(cf_out.loss.detach().item())
+                            cf_mean_sym_kl = float(cf_out.mean_sym_kl)
+                            cf_mean_entropy = float(cf_out.mean_entropy)
+                            del cf_digit_logits
+                            del clean_digit_logits
+                            del cf_digit_valid_mask
+                            del digit_valid_mask
+                            del input_ids_cf
+                            del attention_mask_cf
+                            if cf_variant_name == "truncate":
+                                v = visible_z_counts[eligible_mask]
+                                cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
 
-                loss = total_loss / accum_steps
-                if not bool(loss.requires_grad):
-                    raise RuntimeError(
-                        "Loss tensor does not require grad. "
-                        f"trainable_layer_spec={cfg.trainable_layer_spec} "
-                        "likely produced no gradient path (common with gradient checkpointing when inputs "
-                        "do not require grad)."
-                    )
+                    loss = total_loss / accum_steps
+                    if not bool(loss.requires_grad):
+                        raise RuntimeError(
+                            "Loss tensor does not require grad. "
+                            f"trainable_layer_spec={cfg.trainable_layer_spec} "
+                            "likely produced no gradient path (common with gradient checkpointing when inputs "
+                            "do not require grad)."
+                        )
 
             loss.backward()
             micro += 1
