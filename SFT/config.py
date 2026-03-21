@@ -6,7 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
-    base_model_or_checkpoint: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    base_model_or_checkpoint: str = "Qwen/Qwen3.5-9B-Base"
     train_dataset_name: str = "omrisap/nvidia_math_64_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
@@ -17,10 +17,11 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 1
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
+    optimizer_name: str = "adamw_8bit"
     gradient_accumulation_steps: int = 8
     max_steps: int = 60_000
     warmup_steps: int = 0

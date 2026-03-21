@@ -15,7 +15,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -263,6 +262,18 @@ def _build_loader(
     return DataLoader(ds, **loader_kwargs)
 
 
+def _build_optimizer(trainable_params, cfg: SFTConfig):
+    if cfg.optimizer_name == "adamw":
+        return torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    if cfg.optimizer_name == "adamw_8bit":
+        try:
+            from bitsandbytes.optim import AdamW8bit
+        except ImportError as e:
+            raise RuntimeError("bitsandbytes is required for optimizer_name='adamw_8bit'") from e
+        return AdamW8bit(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    raise ValueError(f"Unsupported optimizer_name: {cfg.optimizer_name}. Supported values: 'adamw', 'adamw_8bit'")
+
+
 def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
     exists = os.path.isfile(path)
     fields = list(row.keys())
@@ -479,7 +490,7 @@ def train(cfg: SFTConfig) -> str:
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
 
-    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    optimizer = _build_optimizer(model.parameters(), cfg)
     train_rng = random.Random(int(cfg.seed))
 
     step = 0
@@ -505,6 +516,7 @@ def train(cfg: SFTConfig) -> str:
         ),
         log_path,
     )
+    _log(f"optimizer_name={cfg.optimizer_name}", log_path)
 
     warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
 
@@ -793,6 +805,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_batch_size", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--optimizer_name", type=str, default="adamw_8bit")
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=1000)
@@ -849,6 +862,7 @@ def main() -> None:
         eval_batch_size=args.eval_batch_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        optimizer_name=args.optimizer_name,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
