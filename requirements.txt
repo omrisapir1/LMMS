@@ -6,7 +6,7 @@ transformers >= 5.2.0
 accelerate>=0.33.0
 safetensors>=0.4.3
 bitsandbytes>=0.43.0
-huggingface-hub>=0.23.2,<1.0
+huggingface-hub>=1.3.0,<2.0
 
 # IMPORTANT:
 # Do NOT pin tokenizers manually.
