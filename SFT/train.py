@@ -45,6 +45,23 @@ def _dtype_from_str(name: str) -> torch.dtype:
     return table[key]
 
 
+def _ensure_input_require_grads(model) -> Optional[torch.utils.hooks.RemovableHandle]:
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+        return None
+
+    emb = model.get_input_embeddings()
+    if emb is None:
+        return None
+
+    def _make_output_require_grad(module, inputs, output):
+        if isinstance(output, torch.Tensor):
+            output.requires_grad_(True)
+        return output
+
+    return emb.register_forward_hook(_make_output_require_grad)
+
+
 def _log(msg: str, log_path: str) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
     line = f"{ts} | {msg}"
@@ -592,8 +609,7 @@ def train(cfg: SFTConfig) -> str:
     model.to(device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    input_grad_hook = _ensure_input_require_grads(model)
 
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
@@ -645,6 +661,7 @@ def train(cfg: SFTConfig) -> str:
     )
     _log(f"trainable_layer_spec={cfg.trainable_layer_spec} ({layer_info})", log_path)
     _log(f"trainable_layers={selected_layers}/{total_layers}", log_path)
+    _log(f"input_grad_hook_installed={bool(input_grad_hook is not None)}", log_path)
 
     warmup_hooks = _apply_warmup_freeze(
         model=model,
@@ -753,6 +770,13 @@ def train(cfg: SFTConfig) -> str:
                             cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
 
                 loss = total_loss / accum_steps
+                if not bool(loss.requires_grad):
+                    raise RuntimeError(
+                        "Loss tensor does not require grad. "
+                        f"trainable_layer_spec={cfg.trainable_layer_spec} "
+                        "likely produced no gradient path (common with gradient checkpointing when inputs "
+                        "do not require grad)."
+                    )
 
             loss.backward()
             micro += 1
