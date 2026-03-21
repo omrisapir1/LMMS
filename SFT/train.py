@@ -274,6 +274,22 @@ def _build_loader(
     return DataLoader(ds, **loader_kwargs)
 
 
+def _debug_prefix_token_counts(tokenizer, cfg: SFTConfig) -> Tuple[int, int]:
+    repeat = int(cfg.debug_prefix_repeat)
+    if repeat <= 0:
+        return 0, 0
+    unit_ids = tokenizer(
+        str(cfg.debug_prefix_text),
+        add_special_tokens=False,
+        padding=False,
+        return_attention_mask=False,
+    )["input_ids"]
+    unit_len = int(len(unit_ids))
+    if unit_len == 0:
+        raise ValueError("debug_prefix_text tokenized to empty sequence; provide non-empty text")
+    return unit_len, int(unit_len * repeat)
+
+
 def _build_optimizer(trainable_params, cfg: SFTConfig):
     if cfg.optimizer_name == "adamw":
         return torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -350,7 +366,13 @@ def _configure_trainable_params(model, cfg: SFTConfig):
         for p in model.parameters():
             p.requires_grad = True
         trainable = [p for p in model.parameters() if p.requires_grad]
-        return trainable, "all", len(trainable), len(trainable)
+        try:
+            container_name, blocks = _get_transformer_blocks(model)
+            total_layers = len(blocks)
+            layer_info = f"{container_name} total={total_layers} selected=all"
+            return trainable, layer_info, total_layers, total_layers
+        except Exception:
+            return trainable, "all", -1, -1
 
     container_name, blocks = _get_transformer_blocks(model)
     total_layers = len(blocks)
@@ -580,13 +602,15 @@ def train(cfg: SFTConfig) -> str:
     z_and_answer_allowed = list(z_token_ids) + [int(answer_token_id)]
 
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
+    debug_prefix_unit_tokens, debug_prefix_total_tokens = _debug_prefix_token_counts(tokenizer, cfg)
 
     train_records = _load_hf_records(cfg.train_dataset_name, cfg.train_dataset_split)
     eval_records = _load_hf_records(cfg.eval_dataset_name, cfg.eval_dataset_split)
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
-
-    optimizer = _build_optimizer(model.parameters(), cfg)
+    trainable_params, layer_info, selected_layers, total_layers = _configure_trainable_params(model, cfg)
+    base_trainable_mask = [bool(p.requires_grad) for p in model.parameters()]
+    optimizer = _build_optimizer(trainable_params, cfg)
     train_rng = random.Random(int(cfg.seed))
 
     step = 0
@@ -613,8 +637,21 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
     _log(f"optimizer_name={cfg.optimizer_name}", log_path)
+    _log(f"debug_prefix_repeat={cfg.debug_prefix_repeat} debug_prefix_text_len={len(cfg.debug_prefix_text)}", log_path)
+    _log(
+        f"debug_prefix_tokens_per_repeat={debug_prefix_unit_tokens} "
+        f"debug_prefix_tokens_total={debug_prefix_total_tokens}",
+        log_path,
+    )
+    _log(f"trainable_layer_spec={cfg.trainable_layer_spec} ({layer_info})", log_path)
+    _log(f"trainable_layers={selected_layers}/{total_layers}", log_path)
 
-    warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
+    warmup_hooks = _apply_warmup_freeze(
+        model=model,
+        z_token_ids=z_token_ids,
+        warmup_active=cfg.warmup_steps > 0,
+        base_trainable_mask=base_trainable_mask,
+    )
 
     while step < int(cfg.max_steps):
         for batch in train_loader:
@@ -735,8 +772,9 @@ def train(cfg: SFTConfig) -> str:
                     model=model,
                     z_token_ids=z_token_ids,
                     warmup_active=False,
+                    base_trainable_mask=base_trainable_mask,
                 )
-                _log(f"warmup ended at step={step}; full model unfrozen", log_path)
+                _log(f"warmup ended at step={step}; restored trainable_layer_spec={cfg.trainable_layer_spec}", log_path)
 
 
 
@@ -902,11 +940,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--optimizer_name", type=str, default="adamw_8bit")
+    p.add_argument("--trainable_layer_spec", type=str, default="all")
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--torch_device", type=str, default="cuda:0")
+    p.add_argument("--debug_prefix_repeat", type=int, default=0)
+    p.add_argument("--debug_prefix_text", type=str, default=" DEBUG_PREFIX")
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
@@ -959,11 +1000,14 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         optimizer_name=args.optimizer_name,
+        trainable_layer_spec=args.trainable_layer_spec,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         max_length=args.max_length,
         torch_device=args.torch_device,
+        debug_prefix_repeat=args.debug_prefix_repeat,
+        debug_prefix_text=args.debug_prefix_text,
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
         w_start_answer=args.w_start_answer,

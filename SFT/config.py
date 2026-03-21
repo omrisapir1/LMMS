@@ -17,7 +17,7 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 64
+    batch_size: int = 32
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
@@ -28,7 +28,7 @@ class SFTConfig:
     warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
-    debug_prefix_repeat: int = 0
+    debug_prefix_repeat: int = 5000
     debug_prefix_text: str = " DEBUG_PREFIX"
 
     # Objective weights
