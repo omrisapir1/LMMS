@@ -17,7 +17,7 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 1
+    batch_size: int = 4
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
@@ -59,7 +59,7 @@ class SFTConfig:
 
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
-    log_interval_steps: int = 20
+    log_interval_steps: int = 1
     save_interval_steps: int = 2000
     save_every_steps: int = 2000
     keep_last_k: int = 3
