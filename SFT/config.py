@@ -43,7 +43,7 @@ class SFTConfig:
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
-    cf_enabled: bool = True
+    cf_enabled: bool = False
     cf_every_n_steps: int = 2
     cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
     cf_lambda: float = 1.0
