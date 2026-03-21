@@ -577,6 +577,10 @@ def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log
 
 
 def train(cfg: SFTConfig) -> str:
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError("train() was called under torch.inference_mode(); disable it for training.")
+    torch.set_grad_enabled(True)
+
     if not cfg.base_model_or_checkpoint.strip():
         raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
     if not cfg.train_dataset_name.strip():
