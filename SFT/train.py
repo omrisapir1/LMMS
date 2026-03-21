@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
 from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
+from .dataset import TARGET_ANSWER, TARGET_DIGIT, TARGET_Z
 # from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
@@ -683,6 +684,24 @@ def train(cfg: SFTConfig) -> str:
             model.train()
             for k in ("input_ids", "attention_mask", "labels", "target_class"):
                 batch[k] = batch[k].to(device)
+
+            supervised_mask = (
+                (batch["target_class"] == TARGET_Z)
+                | (batch["target_class"] == TARGET_ANSWER)
+                | (batch["target_class"] == TARGET_DIGIT)
+            )
+            supervised_count = int(supervised_mask.sum().item())
+            if supervised_count <= 0:
+                seq_lens = batch["attention_mask"].sum(dim=1)
+                raise RuntimeError(
+                    "Batch has zero supervised targets after collation/clipping; "
+                    "no gradient can flow. This is usually caused by prefix/prompt length pushing "
+                    "Z/<ANSWER>/digit targets past max_length. "
+                    f"max_length={cfg.max_length}, debug_prefix_repeat={cfg.debug_prefix_repeat}, "
+                    f"debug_prefix_text_len={len(cfg.debug_prefix_text)}, "
+                    f"min_seq_len={int(seq_lens.min().item())}, max_seq_len={int(seq_lens.max().item())}. "
+                    "Reduce debug_prefix_repeat or increase max_length."
+                )
 
             accum_steps = max(1, int(cfg.gradient_accumulation_steps))
             will_step = ((micro + 1) % accum_steps) == 0
