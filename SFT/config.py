@@ -17,7 +17,7 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 8
+    batch_size: int = 32
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
