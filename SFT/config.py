@@ -23,7 +23,7 @@ class SFTConfig:
     weight_decay: float = 0.0
     optimizer_name: str = "adamw_8bit"
     trainable_layer_spec: str = "all"
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     max_steps: int = 60_000
     warmup_steps: int = 0
     max_length: int = 16000
