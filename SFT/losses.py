@@ -17,6 +17,7 @@ class LossOutput:
     l_digits: torch.Tensor
     z_acc: float
     digit_exact_match: float
+    clip_drop_count: float
 
 
 @dataclass
@@ -105,9 +106,9 @@ def compute_weighted_loss(
     target_class: torch.Tensor,
     z_allowed_ids: Sequence[int],
     digit_allowed_ids: Sequence[int],
-    w_z: float,
-    w_answer: float,
-    w_digits: float,
+    alpha_z: float,
+    alpha_answer: float,
+    alpha_digits: float,
     z_label_smoothing: float,
     keep_prob: Sequence[float],
 ) -> LossOutput:
@@ -153,6 +154,7 @@ def compute_weighted_loss(
         raise ValueError("digit_allowed_ids must contain exactly 10 ids (digits 0-9)")
     zero_token_id = int(digit_allowed_ids[0])
 
+    clip_drop_count = 0.0
     if int(digit_idx.shape[0]) == 0:
         l_digits = logits.new_zeros((), dtype=logits.dtype)
     else:
@@ -207,13 +209,14 @@ def compute_weighted_loss(
                 )
 
         kept = keep_mask.to(dtype=ce_per_pos.dtype)
+        clip_drop_count = float((~keep_mask).float().sum().item())
         kept_count = kept.sum()
         if float(kept_count.item()) <= 0.0:
             l_digits = logits.new_zeros((), dtype=logits.dtype)
         else:
             l_digits = (ce_per_pos * kept).sum() / kept_count
 
-    total = float(w_z) * l_z + float(w_answer) * l_answer + float(w_digits) * l_digits
+    total = float(alpha_z) * l_z + float(alpha_answer) * l_answer + float(alpha_digits) * l_digits
 
     with torch.no_grad():
         z_acc = 0.0
@@ -252,6 +255,7 @@ def compute_weighted_loss(
         l_digits=l_digits,
         z_acc=z_acc,
         digit_exact_match=digit_exact_match,
+        clip_drop_count=clip_drop_count,
     )
 
 

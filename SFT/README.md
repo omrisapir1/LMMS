@@ -1,92 +1,260 @@
-# Phase 3 — Discrete Latent SFT (Z-Program Supervision)
+# Phase 3 — Curriculum SFT for Mixed Text-to-Z Reasoning
 
-This stage trains a pretrained decoder-only LLM to execute **discrete latent programs** learned from Phase2 (codebook) and to emit a correct 5-digit answer.
+This stage trains a pretrained decoder-only LLM to move **gradually** from full-text reasoning traces to fully discrete latent reasoning programs.
+
+Instead of training only on:
+
+```text
+question + Z tokens + <ANSWER> + 5 digit tokens
+```
+
+we now train with a **curriculum** that starts with mostly text thoughts and gradually replaces the reasoning trace with Z tokens **from right to left**.
 
 This phase serves as the bridge:
 
-Phase1 (Coconut continuous latent)  
-→ Phase2 (VQ Codebook → discrete Z)  
-→ Phase3 (SFT over Z programs)  
-→ Phase4 (PPO over Z actions)
+Phase1 (continuous / text-style reasoning signals)  
+→ Phase2 (VQ codebook → discrete Z tokens)  
+→ Phase3 (curriculum SFT over mixed text + Z reasoning)  
+→ Phase4 (fully discrete PPO / RL)
 
-The model learns to generate:
+The final target format remains:
 
-prompt + Z_17 Z_153 Z_8 <ANSWER> 01589
+```text
+Question + reasoning_trace + <ANSWER> + 5 digit tokens
+```
 
-with:
+where `reasoning_trace` changes by curriculum phase:
 
-- CE supervision on Z tokens
-- CE supervision on `<ANSWER>`
-- CE supervision on 5 digit tokens
-- No loss on the prompt
+- early phases: mostly text thoughts + short Z suffix
+- late phases: mostly Z tokens
+- final phase: only Z tokens
 
-This is **not RL**. This is supervised behavior cloning over discrete latent programs.
+Supervision remains **restricted** to:
+
+- Z tokens
+- `<ANSWER>` token
+- 5 digit answer tokens
+
+There is **no CE loss** on question tokens or text-thought tokens.
+
+This stage is still **supervised learning**, not RL.
 
 ---
 
 # 1) High-Level Objective
 
-Given a training example:
+For each training example we have:
 
 - `question`
-- `z_ids: List[int]`
-- `answer_digits: List[int]` (exactly 5 digits)
+- `splitted_solution: List[str]` — one text thought per step
+- `z_ids: List[int]` — one Z token id per step
+- `answer_digits: List[int]` — exactly 5 digits
 
-We train the model autoregressively to predict:
+Important invariant:
 
-prompt → Z tokens → <ANSWER> → 5 digits
+```text
+len(splitted_solution) == len(z_ids)
+```
 
-with structured masking and weighted losses.
+for every row in the dataset.
+
+We train the model autoregressively on a curriculum of mixed reasoning traces:
+
+```text
+question → text thoughts prefix → Z suffix → <ANSWER> → 5 digits
+```
+
+where the Z suffix grows over phases until the model reaches:
+
+```text
+question → full Z program → <ANSWER> → 5 digits
+```
 
 This produces a policy that:
 
-- Knows how to generate latent programs
-- Knows how to stop with `<ANSWER>`
-- Knows how to produce 5-digit numeric answers
-- Is structurally constrained for PPO
+- first learns with easier text-heavy reasoning prefixes
+- gradually adapts to compressed latent reasoning
+- learns to emit `<ANSWER>` after the latent program
+- learns to emit the final 5-digit numeric answer
+- is structurally aligned with the downstream fully-discrete setup
 
 ---
 
 # 2) Dataset Contract
 
-## 2.1 Training Dataset (HF path provided)
+## 2.1 Required Columns
 
-Each row must contain:
+Each dataset row must contain:
 
 - `question: str`
-- `z_ids: List[int]`  (length = K)
+- `splitted_solution: List[str]`
+- `z_ids: List[int]`
 - `answer_digits: List[int]` (length = 5)
+- `tokens_count: int`
 
-The dataset is the output of Phase2 export.
+## 2.2 Semantics
 
-## 2.2 Evaluation Dataset
+### `splitted_solution`
 
-Separate HF path.
+A list of textual reasoning steps.
 
-Used for pass@N evaluation via vLLM.
+Example:
+
+```python
+[
+  "First compute the number of groups.",
+  "Now simplify the fraction.",
+  "Therefore the final intermediate value is 18."
+]
+```
+
+### `z_ids`
+
+A list of discrete codebook ids aligned 1:1 with `splitted_solution`.
+
+If a row has `k = len(z_ids)`, then the row also has exactly `k` text thoughts.
+
+### `tokens_count`
+
+`tokens_count` is a **single precomputed column per row** representing the token count of the **original full-solution text**.
+
+It is used for per-phase filtering by sequence budget.
+
+It does **not** represent a phase-specific mixed-sequence token count.
+
+## 2.3 Answer Digits
+
+`answer_digits` are always interpreted as exactly 5 digit tokens.
+
+Example:
+
+```python
+[0, 1, 5, 8, 9]
+```
 
 ---
 
-# 3) Tokenization Contract
+# 3) Curriculum Definition
 
-## 3.1 Required Tokens
+Training proceeds through ordered curriculum phases. Each phase specifies what fraction of the reasoning trace is replaced by Z tokens.
+
+Replacement always happens **from right to left**.
+
+## 3.1 Phase Ratios
+
+The intended default phases are:
+
+1. `0.00`
+2. `0.25`
+3. `0.50`
+4. `0.75`
+5. `1.00`
+
+## 3.2 Number of Z Tokens Per Sample
+
+Let:
+
+- `k = len(z_ids)`
+- `r = z_ratio`
+
+Then the number of Z tokens used for a sample is:
+
+- for phases below `100%`:
+
+```python
+num_z = max(1, floor(k * r))
+```
+
+- for the `100%` phase:
+
+```python
+num_z = k
+```
+
+This means the `0%` phase is implemented as:
+
+```python
+num_z = 1
+```
+
+So “0% Z” should be interpreted as:
+
+> zero percent, rounded up to a minimum of one trailing Z token.
+
+## 3.3 Mixed Sequence Construction
+
+For a row with `k` thoughts and `num_z` trailing Z tokens:
+
+- keep the first `k - num_z` thoughts as text
+- replace the last `num_z` thoughts with their aligned Z tokens
+
+Text thoughts are merged using:
+
+```python
+"\n\n".join(thoughts)
+```
+
+### Example: 0% phase (minimum 1 Z)
+
+```text
+Question + first (k-1) text thoughts + last Z token + <ANSWER> + 5 digits
+```
+
+### Example: 25% phase
+
+For `k = 100`:
+
+```text
+Question + first 75 text thoughts + last 25 Z tokens + <ANSWER> + 5 digits
+```
+
+### Example: 100% phase
+
+```text
+Question + all Z tokens + <ANSWER> + 5 digits
+```
+
+No text thoughts remain in the reasoning trace.
+
+---
+
+# 4) Per-Phase Data Filtering and Reshuffling
+
+Each curriculum phase has its own training constraints and therefore its own effective dataset.
+
+For each phase:
+
+1. filter rows using the phase-specific `max_tokens`
+2. rebuild the mixed reasoning trace for that phase
+3. reshuffle the dataset
+4. train for the configured number of epochs
+
+Because each phase has a different token budget, the set of usable examples may differ between phases.
+
+---
+
+# 5) Tokenization Contract
+
+## 5.1 Required Special Tokens
 
 We must add:
 
+```text
 <z_0> ... <z_{V-1}>
+```
 
-Where:
+where:
 
-- `V` = vocab_size from CodebookConfig
-- V is configurable (since multiple codebooks exist)
+- `V = vocab_size`
+- `vocab_size` comes from the Phase2 codebook export / config
 
-`<ANSWER>` already exists from Phase1.
+`<ANSWER>` is also required.
 
-## 3.2 Tokenizer Requirements
+## 5.2 Tokenizer Requirements
 
-- Each `<z_i>` must tokenize to **exactly one token**
-- `<ANSWER>` must tokenize to one token
-- Digits `"0".."9"` must be single tokens
+- each `<z_i>` must tokenize to exactly one token
+- `<ANSWER>` must tokenize to exactly one token
+- digits `"0" ... "9"` must each be single tokens
 
 After adding Z tokens:
 
@@ -97,281 +265,400 @@ model.resize_token_embeddings(len(tokenizer))
 
 ---
 
-# 4) Model Modifications
+# 6) Model Modifications
 
-## 4.1 Embedding Matrix
+## 6.1 Embedding Matrix
 
-New rows added for:
+New rows are added for:
 
 - `<z_0> ... <z_{V-1}>`
 
-## 4.2 LM Head
+## 6.2 LM Head
 
-LM head is **NOT tied** to embeddings.
+If `lm_head` is untied from the embeddings, corresponding rows must also exist in:
 
-Therefore:
-
-- New rows must also be added to `lm_head.weight`
+- `lm_head.weight`
 
 ---
 
-# 5) Warmup Phase
+# 7) Sequence Format
 
-Before full SFT, perform a warmup phase.
+For each example, the serialized target conceptually looks like:
 
-## 5.1 Goal
-
-Train only the newly added token rows:
-
-- embedding rows for Z tokens
-- lm_head rows for Z tokens
-
-All other parameters remain frozen.
-
-## 5.2 Config Parameter
-
-```
-warmup_steps: int
+```text
+question + mixed_reasoning_trace + <ANSWER> + 5 digit tokens
 ```
 
-During warmup:
+Examples:
 
-- Freeze all parameters
-- Unfreeze only:
-  - `embedding.weight[z_token_ids]`
-  - `lm_head.weight[z_token_ids]`
+### Early curriculum phase
 
-After `warmup_steps`, unfreeze full model.
-
----
-
-# 6) Sequence Construction
-
-For each example:
-
-```
-input = prompt + Z tokens + <ANSWER> + 5 digits
+```text
+<question>
+<text thought 1>
+<text thought 2>
+...
+<z_17> <z_153> <z_8>
+<ANSWER>
+0 1 5 8 9
 ```
 
-Example:
+### Final curriculum phase
 
-```
-<system+user prompt>
-<z_17> <z_153> <z_8> <ANSWER> 0 1 5 8 9
+```text
+<question>
+<z_4> <z_17> <z_153> <z_8>
+<ANSWER>
+0 1 5 8 9
 ```
 
 ---
 
-# 7) Two-Phase Restricted Logits Masking
+# 8) Restricted Logits and Supervision Regions
 
-Restricted masking is applied:
+The training sequence now contains three different logical regions:
 
-- During training forward pass
-- During evaluation generation
+1. text-thought region
+2. Z / `<ANSWER>` region
+3. digit region
 
-## 7.1 Z Phase
+These regions are handled differently.
 
-While generating Z tokens and `<ANSWER>`:
+## 8.1 Text-Thought Region
 
-Allowed tokens:
+The text-thought prefix is included in the autoregressive sequence, but:
 
-```
+- it receives **no CE loss**
+- it does **not** participate in the restricted CE objective
+
+In other words, text reasoning tokens are present in the sequence but are not supervised targets for the SFT loss.
+
+## 8.2 Z Region
+
+When the target position corresponds to Z-program prediction and stop prediction:
+
+Allowed tokens are:
+
+```text
 {Z tokens} ∪ {<ANSWER>}
 ```
 
-All other tokens must be masked to `-inf`.
+CE loss is applied only on:
 
-Digits are NOT allowed before `<ANSWER>`.
+- Z token positions
+- the `<ANSWER>` position
 
-## 7.2 Digit Phase
+## 8.3 Digit Region
 
-After `<ANSWER>` is emitted:
+After `<ANSWER>`:
 
-Allowed tokens:
+Allowed tokens are:
 
+```text
+{"0" ... "9"}
 ```
-{"0".."9"}
-```
 
-No Z tokens allowed.
+Exactly 5 digit tokens are produced.
 
-Exactly 5 digits are generated.
+CE loss is applied on those 5 positions.
 
 ---
 
-# 8) Loss Definition
+# 9) Loss Definition
 
-Loss is computed only on:
+The supervised CE objective is computed only on:
 
 - Z tokens
 - `<ANSWER>` token
 - 5 digit tokens
 
-Prompt tokens are fully masked.
+No CE is applied on:
 
-## 8.1 Loss Weights
+- question / prompt tokens
+- text-thought tokens
 
-```
-w_z = 0.1
-w_answer = 0.5
-w_digits = 1.0
-```
-
-These are configurable.
-
-## 8.2 Z Label Smoothing
-
-Apply label smoothing only to Z tokens:
-
-```
-z_label_smoothing = 0.05
-```
-
-Digit tokens use standard CE (no smoothing).
-
-## 8.3 Total Loss
+## 9.1 Weighted CE Objective
 
 Let:
 
-- `L_z` = CE over Z tokens
+- `L_z` = CE over Z token positions
 - `L_answer` = CE over `<ANSWER>`
-- `L_digits` = CE over 5 digits
+- `L_digits` = CE over the 5 answer digits
 
 Then:
 
+```text
+L_ce = alpha_z * L_z
+     + alpha_answer * L_answer
+     + alpha_digits * L_digits
 ```
-L_total = w_z * L_z
-        + w_answer * L_answer
-        + w_digits * L_digits
+
+where the three weights are phase/run-configurable.
+
+Example config names:
+
+```python
+alpha_z
+alpha_answer
+alpha_digits
 ```
+
+## 9.2 Text Tokens Are Masked Out
+
+Even in mixed phases, text thoughts are not part of the supervised objective.
+
+They are present only as part of the autoregressive training sequence and context.
 
 ---
 
-# 9) Training Forward Masking (Important)
+# 10) Counterfactual Loss (CF Loss)
 
-Restricted logits masking is applied during forward pass.
+Some phases may optionally enable an additional **Counterfactual Loss** regularizer.
 
-This ensures:
+Its purpose is to encourage the model to make the answer digits depend meaningfully on the Z-token reasoning suffix.
 
-- Model cannot allocate probability to illegal tokens
-- Model respects grammar
-- PPO transition is smooth
+## 10.1 Motivation
 
-This is mandatory.
+Without this regularizer, the model may under-use the Z tokens, especially in early curriculum phases where a long text prefix already carries strong answer information.
+
+The counterfactual objective is intended to ensure that changing or corrupting the Z reasoning trace changes the digit distribution in a measurable way.
+
+## 10.2 High-Level Behavior
+
+The implementation compares:
+
+- clean digit logits
+- counterfactual digit logits derived from a perturbed Z suffix
+
+and computes a regularizer over the answer-digit region.
+
+Supported counterfactual variants include:
+
+- `truncate`
+- `reverse`
+- `random`
+
+The current implementation behaves as follows:
+
+- `truncate` / `reverse`: penalize cases where symmetric KL divergence is too small
+- `random`: maximize uncertainty / entropy under corrupted Z context
+
+Formally, the helper computes a loss from:
+
+- `clean_digit_logits`
+- `cf_digit_logits`
+- `digit_valid_mask`
+- `eligible_mask`
+- `variant_name`
+- `kl_margin`
+- `eps`
+
+and returns:
+
+- scalar CF loss
+- mean symmetric KL
+- mean entropy
+
+## 10.3 Phase Control
+
+CF loss is enabled or disabled **per curriculum phase**.
+
+If disabled for a phase, training uses CE only.
+
+If enabled, the total objective is:
+
+```text
+L_total = L_ce + lambda_cf * L_cf
+```
+
+where `lambda_cf` is configurable.
 
 ---
 
-# 10) Evaluation Protocol
+# 11) Checkpointing
 
-Evaluation uses vLLM.
+The model is saved:
 
-## 10.1 Generation
+- after every completed epoch within a phase
+- and again at phase end
 
-For each prompt:
+This makes it possible to:
 
-1. Generate tokens with restricted mask:
-   - Only Z tokens + `<ANSWER>`
-2. Stop when `<ANSWER>` is emitted OR when `Kmax` reached.
-3. After `<ANSWER>`, allow only digit tokens.
-4. Generate exactly 5 digits.
-
-## 10.2 pass@N Metric
-
-For each question:
-
-- Sample `N` solutions (e.g. 8, 16)
-- Compute whether at least one solution matches ground-truth digits
-
-Metric:
-
-```
-pass@N = fraction of questions with ≥1 correct solution
-```
-
-We do NOT use greedy-only accuracy as primary metric.
+- inspect intermediate curriculum checkpoints
+- resume from phase boundaries
+- compare training quality across phases
 
 ---
 
-# 11) Config Parameters
+# 12) Training Schedule Format
 
-Example SFT config:
+The recommended config structure is an ordered list of phase definitions.
+
+Example:
+
+```yaml
+phases:
+  - z_ratio: 0.00
+    min_z_tokens: 1
+    batch_size:  ...
+    gradient_accumulation_steps: ...
+    max_tokens: ...
+    epochs: 0.5
+    cf_loss: false
+
+  - z_ratio: 0.25
+    min_z_tokens: 1
+    batch_size: ...
+    gradient_accumulation_steps: ...
+    max_tokens: ...
+    epochs: 1.0
+    cf_loss: true
+
+  - z_ratio: 0.50
+    min_z_tokens: 1
+    batch_size: ...
+    gradient_accumulation_steps: ...
+    max_tokens: ...
+    epochs: 1.0
+    cf_loss: true
+
+  - z_ratio: 0.75
+    min_z_tokens: 1
+    batch_size: ...
+    gradient_accumulation_steps: ...
+    max_tokens: ...
+    epochs: 1.0
+    cf_loss: true
+
+  - z_ratio: 1.00
+    min_z_tokens: 1
+    batch_size: ...
+    gradient_accumulation_steps: ...
+    max_tokens: ...
+    epochs: 1.0
+    cf_loss: true
+```
+
+Notes:
+
+- `epochs` may be fractional, e.g. `0.5`
+- `max_tokens` is phase-specific
+- `batch_size` is phase-specific
+- `gradient_accumulation_steps` is phase-specific
+- `cf_loss` is phase-specific
+- `min_z_tokens` is effectively `1` for all sub-100% phases
+
+---
+
+# 13) Suggested Config Fields
+
+A practical config will usually include:
 
 ```python
 vocab_size: int
-warmup_steps: int
-z_label_smoothing: float = 0.05
+alpha_z: float
+alpha_answer: float
+alpha_digits: float
+lambda_cf: float
+cf_variant: str
+cf_kl_margin: float
+cf_eps: float
+save_every_epoch: bool = True
+save_phase_end: bool = True
+phases: list[PhaseConfig]
+```
 
-w_z: float = 0.1
-w_answer: float = 0.5
-w_digits: float = 1.0
+Where each `PhaseConfig` contains at least:
 
-eval_interval_steps: int
-pass_at_n: int
-k_max: int
+```python
+z_ratio: float
+min_z_tokens: int = 1
+batch_size: int
+gradient_accumulation_steps: int
+max_tokens: int
+epochs: float
+cf_loss: bool
 ```
 
 ---
 
-# 12) Metrics to Log
+# 14) Logging
 
-During training:
+During training it is useful to log:
 
-- `L_total`
+- total loss
+- CE total loss
 - `L_z`
 - `L_answer`
 - `L_digits`
-- Z token accuracy
-- Digit exact match accuracy
-- Average Z length
-- Rate of “no `<ANSWER>` before Kmax”
-
-During eval:
-
-- pass@N
-- Greedy exact match (secondary)
-- Distribution of generated Z lengths
+- CF loss (when enabled)
+- mean symmetric KL (when CF enabled)
+- mean entropy (when CF enabled)
+- number of rows kept after phase filtering
+- current phase id / ratio
+- average number of Z tokens per sample in the phase
+- average number of text thoughts per sample in the phase
 
 ---
 
-# 13) Why This Is the Correct Bridge to PPO
+# 15) What Changed Relative to the Old Phase-3 Design
 
-After SFT:
+The previous design trained directly on:
 
-- Z tokens represent discrete actions
-- `<ANSWER>` represents stop action
-- Model already trained to respect grammar
-- Digit head trained to map latent program to final answer
+```text
+question + full Z sequence + <ANSWER> + 5 digits
+```
 
-PPO will:
+The new design instead trains with a curriculum:
 
-- Replace CE objective
-- Use digit correctness reward
-- Adjust Z policy for better reward
-- Potentially shorten programs
+```text
+question + text-prefix / Z-suffix mixture + <ANSWER> + 5 digits
+```
 
-Because masking and grammar are already enforced in SFT,
-PPO only needs to optimize action selection, not structure.
+Key changes:
 
----
-
-# 14) Failure Modes to Watch
-
-1. Z collapse (low entropy)
-2. Model emits digits before `<ANSWER>` (masking bug)
-3. Model fails to emit `<ANSWER>`
-4. Z loss dominates digit loss (wrong weights)
-5. Overfitting to teacher Z sequences (too high `w_z`)
+- full-Z-only training is replaced by multi-phase curriculum training
+- text thoughts are introduced as unsupervised intermediate context
+- Z tokens grow from a minimum trailing suffix to the full reasoning trace
+- each phase has its own token budget and optimization settings
+- optional counterfactual regularization can be enabled per phase
+- warmup is removed entirely
+- evaluation during training is removed
 
 ---
 
-# 15) Final Summary
+# 16) Final Summary
 
-Phase 3 (SFT over discrete Z programs):
+Phase 3 now trains the model to transition from natural-language reasoning traces to fully discrete latent reasoning programs.
 
-- Converts discrete codebook latents into executable programs
-- Teaches stop behavior
-- Supervises final answer digits
-- Enforces strict structural grammar
-- Prepares policy for PPO optimization
+It does so by:
 
-This phase is purely supervised and forms the stable initialization for RL fine-tuning.
+- replacing thoughts with Z tokens from right to left
+- keeping a minimum of one Z token even in the `0%` phase
+- supervising only Z / `<ANSWER>` / digit targets
+- optionally enforcing Z usefulness through counterfactual regularization
+- progressively ending at the fully discrete format required for downstream RL
+
+The final curriculum phase is still the same target structure needed later:
+
+```text
+Question + Z tokens + <ANSWER> + 5 digit tokens
+```
+
+but the path to get there is now smoother, more data-efficient, and better aligned with gradual compression of reasoning.
+
+---
+
+# 17) Resume Semantics (Implementation Note)
+
+Current training resume is **coarse-grained**:
+
+- resume state tracks phase index + epoch index (plus global step)
+- it does **not** track exact consumed dataloader batch offsets
+
+Therefore:
+
+- if training stops mid-epoch, resume restarts that epoch from its beginning
+- if training stops mid fractional-epoch segment, resume restarts that partial segment from its beginning
+
+This is expected behavior unless finer-grained batch-level resume state is added in a future change.

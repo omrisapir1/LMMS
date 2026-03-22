@@ -18,12 +18,9 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .config import SFTConfig
-from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
-from .dataset import TARGET_ANSWER, TARGET_DIGIT, TARGET_Z
-# from .eval_vllm import evaluate_with_vllm
+from .config import PhaseConfig, SFTConfig
+from .dataset import ANSWER_TOKEN, CurriculumSFTDataset, SFTCollator
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
-import gc
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -46,23 +43,6 @@ def _dtype_from_str(name: str) -> torch.dtype:
     return table[key]
 
 
-def _ensure_input_require_grads(model) -> Optional[torch.utils.hooks.RemovableHandle]:
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-        return None
-
-    emb = model.get_input_embeddings()
-    if emb is None:
-        return None
-
-    def _make_output_require_grad(module, inputs, output):
-        if isinstance(output, torch.Tensor):
-            output.requires_grad_(True)
-        return output
-
-    return emb.register_forward_hook(_make_output_require_grad)
-
-
 def _log(msg: str, log_path: str) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
     line = f"{ts} | {msg}"
@@ -72,7 +52,7 @@ def _log(msg: str, log_path: str) -> None:
         f.write(line + "\n")
 
 
-def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]]:
+def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, object]:
     z_tokens = [f"<z_{i}>" for i in range(int(vocab_size))]
 
     existing_vocab = tokenizer.get_vocab()
@@ -112,59 +92,13 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]
     return {
         "z_token_ids": z_token_ids,
         "digit_token_ids": digit_token_ids,
-        "answer_token_id": [answer_token_id],
+        "answer_token_id": answer_token_id,
     }
-
-
-def _apply_warmup_freeze(
-    *,
-    model,
-    z_token_ids: Sequence[int],
-    warmup_active: bool,
-    base_trainable_mask: Optional[List[bool]] = None,
-) -> List[torch.utils.hooks.RemovableHandle]:
-    params = list(model.parameters())
-    if base_trainable_mask is None:
-        base_trainable_mask = [True] * len(params)
-    if len(base_trainable_mask) != len(params):
-        raise ValueError("base_trainable_mask length must match number of model parameters")
-
-    if not warmup_active:
-        for p, trainable in zip(params, base_trainable_mask):
-            p.requires_grad = bool(trainable)
-        return []
-
-    for p in params:
-        p.requires_grad = False
-
-    embed = model.get_input_embeddings().weight
-    embed.requires_grad = True
-
-    lm_head = model.get_output_embeddings().weight
-    same_param = lm_head.data_ptr() == embed.data_ptr()
-    if not same_param:
-        lm_head.requires_grad = True
-
-    allowed = torch.zeros(embed.shape[0], dtype=torch.bool, device=embed.device)
-    allowed[torch.as_tensor(list(z_token_ids), dtype=torch.long, device=embed.device)] = True
-
-    handles: List[torch.utils.hooks.RemovableHandle] = []
-
-    def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
-        out = grad.clone()
-        out[~allowed] = 0
-        return out
-
-    handles.append(embed.register_hook(_mask_grad))
-    if not same_param:
-        handles.append(lm_head.register_hook(_mask_grad))
-
-    return handles
 
 
 def _make_run_dir(cfg: SFTConfig) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{ts}__V{cfg.vocab_size}__bs{cfg.batch_size}__lr{cfg.learning_rate}"
+    run_name = cfg.run_name or f"{ts}__V{cfg.vocab_size}__lr{cfg.learning_rate}"
     run_dir = os.path.join(cfg.run_root, run_name)
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
@@ -172,6 +106,18 @@ def _make_run_dir(cfg: SFTConfig) -> str:
     os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
     return run_dir
+
+
+def _resolve_resume_checkpoint(path: str) -> str:
+    p = os.path.abspath(path)
+    if os.path.isdir(os.path.join(p, "last")):
+        p = os.path.join(p, "last")
+    state_path = os.path.join(p, "trainer_state.json")
+    if not os.path.isfile(state_path):
+        raise ValueError(
+            f"resume_from does not point to a checkpoint with trainer_state.json: {path}"
+        )
+    return p
 
 
 def _save_model_dir(model, tokenizer, out_dir: str) -> None:
@@ -182,71 +128,19 @@ def _save_model_dir(model, tokenizer, out_dir: str) -> None:
     tokenizer.save_pretrained(out_dir)
 
 
-def _retain_periodic(ckpt_root: str, keep_last_k: int) -> None:
-    all_steps = []
-    for name in os.listdir(ckpt_root):
-        if not name.startswith("step_"):
-            continue
-        path = os.path.join(ckpt_root, name)
-        if not os.path.isdir(path):
-            continue
-        try:
-            step = int(name.split("_")[1])
-        except Exception:
-            continue
-        all_steps.append((step, path))
-    all_steps.sort(key=lambda x: x[0], reverse=True)
-    for _, path in all_steps[int(keep_last_k) :]:
-        shutil.rmtree(path)
-
-
-def _save_last(
+def _save_checkpoint(
     *,
-    run_dir: str,
+    out_dir: str,
     model,
     tokenizer,
-    cfg: SFTConfig,
-    step: int,
-    best_pass_at_n: float,
-) -> str:
-    out_dir = os.path.join(run_dir, "last")
+    optimizer,
+    state: Dict[str, object],
+) -> None:
+    # Resume is coarse: phase/epoch boundary only, not exact batch-level replay.
     _save_model_dir(model, tokenizer, out_dir)
-    payload = {
-        "step": int(step),
-        "best_pass_at_n": float(best_pass_at_n),
-        "config": asdict(cfg),
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    return out_dir
-
-
-def _save_periodic(
-    *,
-    run_dir: str,
-    model,
-    tokenizer,
-    step: int,
-    keep_last_k: int,
-) -> str:
-    out_dir = os.path.join(run_dir, "checkpoints", f"step_{step:05d}")
-    _save_model_dir(model, tokenizer, out_dir)
-    _retain_periodic(os.path.join(run_dir, "checkpoints"), keep_last_k=keep_last_k)
-    return out_dir
-
-
-def _save_best(*, run_dir: str, model, tokenizer, step: int, metric: float) -> str:
-    out_dir = os.path.join(run_dir, "checkpoints", "best")
-    _save_model_dir(model, tokenizer, out_dir)
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"step": int(step), "pass_at_n": float(metric)}, f, indent=2)
-    return out_dir
-
-
-def _save_ppo_init(*, run_dir: str, model, tokenizer) -> str:
-    out_dir = os.path.join(run_dir, "ppo_init")
-    _save_model_dir(model, tokenizer, out_dir)
-    return out_dir
+    torch.save(optimizer.state_dict(), os.path.join(out_dir, "optimizer.pt"))
+    with open(os.path.join(out_dir, "trainer_state.json"), "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
 def _load_hf_records(dataset_name: str, split: str) -> List[Dict]:
@@ -254,58 +148,51 @@ def _load_hf_records(dataset_name: str, split: str) -> List[Dict]:
     return [dict(x) for x in ds]
 
 
+def _filter_records_for_phase(*, records: Sequence[Dict], max_tokens: int) -> List[Dict]:
+    out: List[Dict] = []
+    for i, row in enumerate(records):
+        if "tokens_count" not in row:
+            raise ValueError(f"Row {i} is missing required column 'tokens_count'")
+        try:
+            count = int(row["tokens_count"])
+        except Exception as e:
+            raise ValueError(f"Row {i} has non-integer tokens_count={row['tokens_count']}") from e
+        if count <= int(max_tokens):
+            out.append(row)
+    return out
+
+
 def _build_loader(
     *,
     records: Iterable[Dict],
     tokenizer,
     cfg: SFTConfig,
+    phase: PhaseConfig,
     shuffle: bool,
-    train: bool,
-) -> DataLoader:
-    ds = SFTDataset(
+) -> tuple[DataLoader, CurriculumSFTDataset]:
+    ds = CurriculumSFTDataset(
         records=records,
         tokenizer=tokenizer,
         vocab_size=cfg.vocab_size,
-        debug_prefix_repeat=cfg.debug_prefix_repeat,
-        debug_prefix_text=cfg.debug_prefix_text,
+        z_ratio=phase.z_ratio,
+        min_z_tokens=phase.min_z_tokens,
     )
     if len(ds) == 0:
-        raise ValueError(
-            "SFT dataset has 0 usable samples after preprocessing "
-            f"(kept={ds.stats.get('kept', 0)}, dropped={ds.stats.get('dropped', 0)}). "
-            "Check required fields: question, z_ids, and either valid answer_digits (5 digits) "
-            "or answer_int in [0, 99999]."
-        )
+        raise ValueError("Curriculum dataset has 0 usable samples after preprocessing.")
+
     collator = SFTCollator(tokenizer=tokenizer, max_length=cfg.max_length)
-    num_workers = int(cfg.dataloader_num_workers if train else cfg.eval_dataloader_num_workers)
     loader_kwargs = {
-        "batch_size": int(cfg.batch_size if train else cfg.eval_batch_size),
+        "batch_size": int(phase.batch_size),
         "shuffle": bool(shuffle),
         "collate_fn": collator,
         "drop_last": False,
-        "num_workers": max(0, num_workers),
+        "num_workers": max(0, int(cfg.dataloader_num_workers)),
         "pin_memory": bool(cfg.dataloader_pin_memory),
     }
     if loader_kwargs["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(max(1, cfg.dataloader_prefetch_factor))
-    return DataLoader(ds, **loader_kwargs)
-
-
-def _debug_prefix_token_counts(tokenizer, cfg: SFTConfig) -> Tuple[int, int]:
-    repeat = int(cfg.debug_prefix_repeat)
-    if repeat <= 0:
-        return 0, 0
-    unit_ids = tokenizer(
-        str(cfg.debug_prefix_text),
-        add_special_tokens=False,
-        padding=False,
-        return_attention_mask=False,
-    )["input_ids"]
-    unit_len = int(len(unit_ids))
-    if unit_len == 0:
-        raise ValueError("debug_prefix_text tokenized to empty sequence; provide non-empty text")
-    return unit_len, int(unit_len * repeat)
+    return DataLoader(ds, **loader_kwargs), ds
 
 
 def _build_optimizer(trainable_params, cfg: SFTConfig):
@@ -320,96 +207,6 @@ def _build_optimizer(trainable_params, cfg: SFTConfig):
     raise ValueError(f"Unsupported optimizer_name: {cfg.optimizer_name}. Supported values: 'adamw', 'adamw_8bit'")
 
 
-def _get_transformer_blocks(model):
-    candidates = [
-        ("model.layers", lambda m: m.model.layers),
-        ("transformer.h", lambda m: m.transformer.h),
-        ("gpt_neox.layers", lambda m: m.gpt_neox.layers),
-        ("model.decoder.layers", lambda m: m.model.decoder.layers),
-    ]
-    for name, getter in candidates:
-        try:
-            blocks = getter(model)
-            n = len(blocks)
-        except Exception:
-            continue
-        if n > 0:
-            return name, blocks
-    raise RuntimeError("Could not locate transformer block list on model for trainable_layer_spec")
-
-
-def _parse_trainable_layer_spec(spec: str, num_layers: int) -> List[int]:
-    s = str(spec).strip().lower()
-    if s == "all":
-        return list(range(num_layers))
-    if s.startswith("last:"):
-        n = int(s.split(":", 1)[1])
-        if n < 0:
-            raise ValueError("trainable_layer_spec last:N requires N >= 0")
-        return list(range(max(0, num_layers - n), num_layers))
-    if s.startswith("first:"):
-        n = int(s.split(":", 1)[1])
-        if n < 0:
-            raise ValueError("trainable_layer_spec first:N requires N >= 0")
-        return list(range(0, min(num_layers, n)))
-    if s.startswith("range:"):
-        parts = s.split(":")
-        if len(parts) != 3:
-            raise ValueError("trainable_layer_spec range must be 'range:START:END' (END exclusive)")
-        start = int(parts[1])
-        end = int(parts[2])
-        if start < 0 or end < start or end > num_layers:
-            raise ValueError(f"Invalid range for {num_layers} layers: start={start} end={end}")
-        return list(range(start, end))
-    if s.startswith("idx:"):
-        body = s.split(":", 1)[1].strip()
-        if not body:
-            return []
-        out: List[int] = []
-        for x in body.split(","):
-            v = int(x.strip())
-            if v < 0 or v >= num_layers:
-                raise ValueError(f"Layer index out of bounds [0, {num_layers - 1}]: {v}")
-            out.append(v)
-        return sorted(set(out))
-    raise ValueError(
-        "Unsupported trainable_layer_spec. Use one of: "
-        "'all', 'last:N', 'first:N', 'range:START:END', 'idx:i,j,k'"
-    )
-
-
-def _configure_trainable_params(model, cfg: SFTConfig):
-    spec = str(cfg.trainable_layer_spec).strip().lower()
-    if spec == "all":
-        for p in model.parameters():
-            p.requires_grad = True
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        try:
-            container_name, blocks = _get_transformer_blocks(model)
-            total_layers = len(blocks)
-            layer_info = f"{container_name} total={total_layers} selected=all"
-            return trainable, layer_info, total_layers, total_layers
-        except Exception:
-            return trainable, "all", -1, -1
-
-    container_name, blocks = _get_transformer_blocks(model)
-    total_layers = len(blocks)
-    selected = _parse_trainable_layer_spec(spec, total_layers)
-
-    for p in model.parameters():
-        p.requires_grad = False
-    for idx in selected:
-        for p in blocks[idx].parameters():
-            p.requires_grad = True
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable) == 0:
-        raise RuntimeError(
-            "trainable_layer_spec selected zero parameters; adjust spec to include at least one layer"
-        )
-    return trainable, f"{container_name} total={total_layers} selected={selected}", len(selected), total_layers
-
-
 def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
     exists = os.path.isfile(path)
     fields = list(row.keys())
@@ -418,54 +215,6 @@ def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
-
-
-def _parse_prob_tuple(text: str) -> Tuple[float, float, float]:
-    parts = [p.strip() for p in str(text).split(",")]
-    if len(parts) != 3:
-        raise ValueError(f"expected 3 comma-separated probabilities, got: {text}")
-    vals = tuple(float(x) for x in parts)
-    s = vals[0] + vals[1] + vals[2]
-    if min(vals) < 0.0 or abs(s - 1.0) > 1e-6:
-        raise ValueError(f"cf_prob_tuple must be non-negative and sum to 1, got: {vals}")
-    return vals
-
-
-def _parse_range_tuple(text: str) -> Tuple[float, float]:
-    parts = [p.strip() for p in str(text).split(",")]
-    if len(parts) != 2:
-        raise ValueError(f"expected 2 comma-separated floats, got: {text}")
-    lo, hi = float(parts[0]), float(parts[1])
-    if not (0.0 <= lo <= hi):
-        raise ValueError(f"invalid range (expected 0 <= lo <= hi), got: {(lo, hi)}")
-    return lo, hi
-
-
-def _get_scheduled_loss_weights(cfg: SFTConfig, step: int) -> tuple[float, float]:
-    start = int(cfg.start_weights_steps)
-    ramp = int(cfg.goes_up_weights_steps)
-
-    if step < start:
-        return float(cfg.w_start_answer), float(cfg.w_start_digits)
-
-    if ramp <= 0:
-        return float(cfg.w_end_answer), float(cfg.w_end_digits)
-
-    ramp_end = start + ramp
-
-    if step >= ramp_end:
-        return float(cfg.w_end_answer), float(cfg.w_end_digits)
-
-    progress = float(step - start) / float(ramp)
-
-    w_answer = float(cfg.w_start_answer) + progress * (
-        float(cfg.w_end_answer) - float(cfg.w_start_answer)
-    )
-    w_digits = float(cfg.w_start_digits) + progress * (
-        float(cfg.w_end_digits) - float(cfg.w_start_digits)
-    )
-
-    return w_answer, w_digits
 
 
 def _validate_cf_config(cfg: SFTConfig) -> None:
@@ -485,6 +234,32 @@ def _validate_cf_config(cfg: SFTConfig) -> None:
     lo, hi = cfg.cf_trunc_range
     if not (0.0 <= float(lo) <= float(hi)):
         raise ValueError("cf_trunc_range must satisfy 0 <= lo <= hi")
+
+
+def _validate_phases(phases: Sequence[PhaseConfig]) -> None:
+    if not phases:
+        raise ValueError("config.phases must be non-empty")
+    ratios = [float(p.z_ratio) for p in phases]
+    for i, r in enumerate(ratios):
+        if not (0.0 <= r <= 1.0):
+            raise ValueError(f"phase[{i}].z_ratio must be in [0,1], got {r}")
+    for i in range(1, len(ratios)):
+        if not (ratios[i] > ratios[i - 1]):
+            raise ValueError(
+                "z_ratio schedule must be strictly increasing. "
+                f"Found phase[{i - 1}]={ratios[i - 1]} and phase[{i}]={ratios[i]}"
+            )
+    for i, phase in enumerate(phases):
+        if int(phase.batch_size) <= 0:
+            raise ValueError(f"phase[{i}].batch_size must be > 0")
+        if int(phase.gradient_accumulation_steps) <= 0:
+            raise ValueError(f"phase[{i}].gradient_accumulation_steps must be > 0")
+        if int(phase.max_tokens) <= 0:
+            raise ValueError(f"phase[{i}].max_tokens must be > 0")
+        if float(phase.epochs) <= 0:
+            raise ValueError(f"phase[{i}].epochs must be > 0")
+        if int(phase.min_z_tokens) < 1:
+            raise ValueError(f"phase[{i}].min_z_tokens must be >= 1")
 
 
 def _sample_cf_variant(cfg: SFTConfig, rng: random.Random) -> str:
@@ -516,7 +291,6 @@ def _build_counterfactual_batch(
     bsz, _ = input_ids.shape
     eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
     visible_z_counts = torch.zeros((bsz,), dtype=torch.long, device=input_ids.device)
-
     lo, hi = float(trunc_range[0]), float(trunc_range[1])
 
     for b in range(bsz):
@@ -563,90 +337,559 @@ def _build_counterfactual_batch(
     return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts
 
 
-def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
-    if "input_ids" not in batch or "attention_mask" not in batch:
+def _decode_sequence(tokenizer, input_ids: Sequence[int], attention_mask: Optional[Sequence[int]] = None) -> str:
+    if attention_mask is None:
+        valid = list(input_ids)
+    else:
+        n = int(sum(int(x) for x in attention_mask))
+        valid = list(input_ids)[:n]
+    return tokenizer.decode(valid, skip_special_tokens=False)
+
+
+def _count_z_before_answer(
+    *,
+    input_ids: Sequence[int],
+    attention_mask: Sequence[int],
+    answer_token_id: int,
+    z_token_ids: Sequence[int],
+) -> int:
+    valid_len = int(sum(int(x) for x in attention_mask))
+    row = list(input_ids)[:valid_len]
+    z_set = set(int(x) for x in z_token_ids)
+    try:
+        ans_pos = row.index(int(answer_token_id))
+    except ValueError:
+        return 0
+    return sum(1 for tok in row[:ans_pos] if int(tok) in z_set)
+
+
+def _log_phase_debug_examples(
+    *,
+    cfg: SFTConfig,
+    phase: PhaseConfig,
+    phase_idx: int,
+    dataset: CurriculumSFTDataset,
+    tokenizer,
+    answer_token_id: int,
+    z_token_ids: Sequence[int],
+    log_path: str,
+) -> None:
+    _log(f"[phase_debug] phase={phase_idx} dataset_len={len(dataset)}", log_path)
+    if len(dataset) == 0:
+        _log(f"[phase_debug] phase={phase_idx} has empty dataset after filtering.", log_path)
         return
-    if int(batch["input_ids"].shape[0]) == 0:
+
+    first = dataset[0]
+    decoded_full = _decode_sequence(
+        tokenizer=tokenizer,
+        input_ids=first["input_ids"],
+        attention_mask=first["attention_mask"],
+    )
+    _log(f"[phase_debug] phase={phase_idx} full_example_decoded:\n{decoded_full}", log_path)
+
+    if not bool(phase.cf_loss):
         return
-    ids = batch["input_ids"][0].detach().cpu()
-    mask = batch["attention_mask"][0].detach().cpu()
-    seq_len = int(mask.sum().item())
-    if seq_len <= 0:
+
+    eligible = None
+    for i in range(len(dataset)):
+        ex = dataset[i]
+        z_count = _count_z_before_answer(
+            input_ids=ex["input_ids"],
+            attention_mask=ex["attention_mask"],
+            answer_token_id=answer_token_id,
+            z_token_ids=z_token_ids,
+        )
+        if z_count >= int(cfg.cf_min_z_len):
+            eligible = ex
+            break
+
+    if eligible is None:
+        _log(
+            f"[phase_debug] phase={phase_idx} cf_examples_skipped: no sample with >= {cfg.cf_min_z_len} Z tokens before <ANSWER>.",
+            log_path,
+        )
         return
-    text = tokenizer.decode(ids[:seq_len].tolist(), skip_special_tokens=False)
-    _log(f"[example@warmup_end step={step}] {text}", log_path)
+
+    orig_decoded = _decode_sequence(
+        tokenizer=tokenizer,
+        input_ids=eligible["input_ids"],
+        attention_mask=eligible["attention_mask"],
+    )
+    base_ids = torch.tensor([eligible["input_ids"]], dtype=torch.long)
+    base_mask = torch.tensor([eligible["attention_mask"]], dtype=torch.long)
+    cf_rng = random.Random(int(cfg.seed) + int(phase_idx))
+
+    for variant in ("truncate", "random", "reverse"):
+        cf_ids, cf_mask, _, _ = _build_counterfactual_batch(
+            input_ids=base_ids,
+            attention_mask=base_mask,
+            answer_token_id=int(answer_token_id),
+            z_token_ids=z_token_ids,
+            pad_token_id=int(tokenizer.pad_token_id),
+            cf_min_z_len=int(cfg.cf_min_z_len),
+            variant_name=variant,
+            trunc_range=cfg.cf_trunc_range,
+            rng=cf_rng,
+        )
+        cf_decoded = _decode_sequence(
+            tokenizer=tokenizer,
+            input_ids=cf_ids[0].tolist(),
+            attention_mask=cf_mask[0].tolist(),
+        )
+        _log(
+            f"[phase_debug][cf_variant={variant}] original_decoded:\n{orig_decoded}\n"
+            f"[phase_debug][cf_variant={variant}] counterfactual_decoded:\n{cf_decoded}",
+            log_path,
+        )
+
+
+def _run_phase_batches(
+    *,
+    cfg: SFTConfig,
+    phase: PhaseConfig,
+    loader: DataLoader,
+    model,
+    optimizer,
+    device: torch.device,
+    scaler_ctx,
+    step: int,
+    train_rng: random.Random,
+    tokenizer,
+    z_token_ids: Sequence[int],
+    digit_token_ids: Sequence[int],
+    answer_token_id: int,
+    z_and_answer_allowed: Sequence[int],
+    log_path: str,
+    metrics_csv: str,
+    phase_idx: int,
+    epoch_tag: float,
+    max_batches: Optional[int] = None,
+) -> tuple[int, bool]:
+    accum_steps = int(phase.gradient_accumulation_steps)
+    if accum_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be > 0")
+
+    batches_seen = 0
+    micro = 0
+    stop_due_to_cap = False
+    clip_drop_total = 0.0
+    agg = {
+        "micro_count": 0.0,
+        "L": 0.0,
+        "Lan": 0.0,
+        "Lae": 0.0,
+        "Ld": 0.0,
+        "an_acc": 0.0,
+        "d_em": 0.0,
+        "z_len": 0.0,
+        "cf_loss": 0.0,
+        "cf_kl": 0.0,
+        "cf_H": 0.0,
+        "cf_applied": 0.0,
+        "clip_drop_batch": 0.0,
+    }
+
+    for batch in loader:
+        if cfg.max_steps is not None and step >= int(cfg.max_steps):
+            stop_due_to_cap = True
+            break
+        if max_batches is not None and batches_seen >= int(max_batches):
+            break
+        batches_seen += 1
+
+        model.train()
+        for k in ("input_ids", "attention_mask", "labels", "target_class"):
+            batch[k] = batch[k].to(device)
+        batch["z_lens"] = batch["z_lens"].to(device)
+        batch["text_thought_counts"] = batch["text_thought_counts"].to(device)
+
+        will_step = ((micro + 1) % accum_steps) == 0
+        phase_cf_enabled = bool(cfg.cf_enabled) and bool(phase.cf_loss)
+        cf_trigger = phase_cf_enabled and will_step and (((step + 1) % int(cfg.cf_every_n_steps)) == 0)
+        cf_applied = False
+        cf_variant_name = "none"
+        cf_loss_scalar = 0.0
+        cf_mean_sym_kl = 0.0
+        cf_mean_entropy = 0.0
+        cf_visible_z_mean = 0.0
+        cf_eligible_count = 0.0
+        cf_loss_value = torch.zeros((), dtype=torch.float32, device=device)
+
+        with scaler_ctx:
+            out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+            loss_out = compute_weighted_loss(
+                logits=out.logits,
+                labels=batch["labels"],
+                target_class=batch["target_class"],
+                z_allowed_ids=z_and_answer_allowed,
+                digit_allowed_ids=digit_token_ids,
+                alpha_z=cfg.alpha_z,
+                alpha_answer=cfg.alpha_answer,
+                alpha_digits=cfg.alpha_digits,
+                z_label_smoothing=cfg.z_label_smoothing,
+                keep_prob=cfg.keep_prob,
+            )
+            total_loss = loss_out.total
+
+            if cf_trigger:
+                cf_variant_name = _sample_cf_variant(cfg, train_rng)
+                input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    answer_token_id=answer_token_id,
+                    z_token_ids=z_token_ids,
+                    pad_token_id=int(tokenizer.pad_token_id),
+                    cf_min_z_len=int(cfg.cf_min_z_len),
+                    variant_name=cf_variant_name,
+                    trunc_range=cfg.cf_trunc_range,
+                    rng=train_rng,
+                )
+                cf_eligible_count = float(eligible_mask.float().sum().item())
+                if cf_eligible_count > 0:
+                    cf_applied = True
+                    out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
+                    clean_digit_logits, digit_valid_mask = extract_digit_logits(
+                        logits=out.logits,
+                        target_class=batch["target_class"],
+                        digit_allowed_ids=digit_token_ids,
+                    )
+                    cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
+                        logits=out_cf.logits,
+                        target_class=batch["target_class"],
+                        digit_allowed_ids=digit_token_ids,
+                    )
+                    if clean_digit_logits.shape != cf_digit_logits.shape:
+                        raise RuntimeError(
+                            "counterfactual digit logits shape mismatch: "
+                            f"{tuple(clean_digit_logits.shape)} vs {tuple(cf_digit_logits.shape)}"
+                        )
+                    if digit_valid_mask.shape != cf_digit_valid_mask.shape or not bool(
+                        torch.equal(digit_valid_mask, cf_digit_valid_mask)
+                    ):
+                        raise RuntimeError("counterfactual digit mask mismatch")
+
+                    cf_out = compute_counterfactual_regularizer(
+                        clean_digit_logits=clean_digit_logits,
+                        cf_digit_logits=cf_digit_logits,
+                        digit_valid_mask=digit_valid_mask,
+                        eligible_mask=eligible_mask,
+                        variant_name=cf_variant_name,
+                        kl_margin=float(cfg.cf_kl_margin),
+                        eps=float(cfg.cf_eps),
+                    )
+                    cf_loss_value = cf_out.loss
+                    total_loss = total_loss + float(cfg.cf_lambda) * cf_loss_value
+                    cf_loss_scalar = float(cf_out.loss.detach().item())
+                    cf_mean_sym_kl = float(cf_out.mean_sym_kl)
+                    cf_mean_entropy = float(cf_out.mean_entropy)
+                    if cf_variant_name == "truncate":
+                        v = visible_z_counts[eligible_mask]
+                        cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
+
+            loss = total_loss / accum_steps
+
+        micro_z_len = float(batch["z_lens"].float().mean().item())
+        agg["micro_count"] += 1.0
+        agg["L"] += float(total_loss.detach().item())
+        agg["Lan"] += float(loss_out.l_z.detach().item())
+        agg["Lae"] += float(loss_out.l_answer.detach().item())
+        agg["Ld"] += float(loss_out.l_digits.detach().item())
+        agg["an_acc"] += float(loss_out.z_acc)
+        agg["d_em"] += float(loss_out.digit_exact_match)
+        agg["z_len"] += float(micro_z_len)
+        agg["cf_loss"] += float(cf_loss_scalar)
+        agg["cf_kl"] += float(cf_mean_sym_kl)
+        agg["cf_H"] += float(cf_mean_entropy)
+        agg["cf_applied"] += 1.0 if cf_applied else 0.0
+        agg["clip_drop_batch"] += float(loss_out.clip_drop_count)
+        clip_drop_total += float(loss_out.clip_drop_count)
+
+        loss.backward()
+        micro += 1
+
+        if micro % accum_steps != 0:
+            continue
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        step += 1
+        denom = max(1.0, float(agg["micro_count"]))
+        eff = {
+            "L": agg["L"] / denom,
+            "Lan": agg["Lan"] / denom,
+            "Lae": agg["Lae"] / denom,
+            "Ld": agg["Ld"] / denom,
+            "an_acc": agg["an_acc"] / denom,
+            "d_em": agg["d_em"] / denom,
+            "z_len": agg["z_len"] / denom,
+            "cf_loss": agg["cf_loss"] / denom,
+            "cf_kl": agg["cf_kl"] / denom,
+            "cf_H": agg["cf_H"] / denom,
+            "cf_applied": agg["cf_applied"] / denom,
+            "clip_drop_batch": agg["clip_drop_batch"],
+        }
+
+        if step % int(cfg.log_interval_steps) == 0:
+            mean_text_thoughts = float(batch["text_thought_counts"].float().mean().item())
+            row = {
+                "step": float(step),
+                "phase_idx": float(phase_idx),
+                "phase_z_ratio": float(phase.z_ratio),
+                "phase_epoch_tag": float(epoch_tag),
+                "L": float(eff["L"]),
+                "Lan": float(eff["Lan"]),
+                "Lae": float(eff["Lae"]),
+                "Ld": float(eff["Ld"]),
+                "an_acc": float(eff["an_acc"]),
+                "d_em": float(eff["d_em"]),
+                "z_len": float(eff["z_len"]),
+                "cf_loss": float(eff["cf_loss"]),
+                "cf_kl": float(eff["cf_kl"]),
+                "cf_H": float(eff["cf_H"]),
+                "cf_applied": float(eff["cf_applied"]),
+                "clip_drop_batch": float(eff["clip_drop_batch"]),
+                "clip_drop_total": float(clip_drop_total),
+                "avg_text_thoughts": float(mean_text_thoughts),
+                "cf_phase_enabled": float(phase_cf_enabled),
+                "cf_variant_truncate": float(cf_variant_name == "truncate"),
+                "cf_variant_reverse": float(cf_variant_name == "reverse"),
+                "cf_variant_random": float(cf_variant_name == "random"),
+                "cf_eligible_count": float(cf_eligible_count),
+                "cf_visible_z_mean": float(cf_visible_z_mean),
+            }
+            _append_metrics_csv(metrics_csv, row)
+            _log(
+                "step={} phase={} z_ratio={} epoch_tag={:.2f} L={:.4f} Lan={:.4f} Lae={:.4f} Ld={:.4f} an_acc={:.3f} d_em={:.3f} z_len={:.2f} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f} cf_applied={:.3f} clip_drop_batch={:.1f} clip_drop_total={:.1f} txt={:.2f} cf_on={} cf_variant={}".format(
+                    step,
+                    phase_idx,
+                    phase.z_ratio,
+                    epoch_tag,
+                    row["L"],
+                    row["Lan"],
+                    row["Lae"],
+                    row["Ld"],
+                    row["an_acc"],
+                    row["d_em"],
+                    row["z_len"],
+                    row["cf_loss"],
+                    row["cf_kl"],
+                    row["cf_H"],
+                    row["cf_applied"],
+                    row["clip_drop_batch"],
+                    row["clip_drop_total"],
+                    row["avg_text_thoughts"],
+                    int(phase_cf_enabled),
+                    cf_variant_name,
+                ),
+                log_path,
+            )
+        agg = {
+            "micro_count": 0.0,
+            "L": 0.0,
+            "Lan": 0.0,
+            "Lae": 0.0,
+            "Ld": 0.0,
+            "an_acc": 0.0,
+            "d_em": 0.0,
+            "z_len": 0.0,
+            "cf_loss": 0.0,
+            "cf_kl": 0.0,
+            "cf_H": 0.0,
+            "cf_applied": 0.0,
+            "clip_drop_batch": 0.0,
+        }
+
+    return step, stop_due_to_cap
+
+
+def _build_config_from_yaml_dict(data: Dict) -> SFTConfig:
+    if not isinstance(data, dict):
+        raise ValueError("Config root must be a mapping/object.")
+    for key in ("base_model_or_checkpoint", "train_dataset_name", "vocab_size"):
+        if key not in data:
+            raise ValueError(f"Config is missing required field '{key}'")
+
+    if "phases" not in data:
+        raise ValueError("Config must include a top-level 'phases' list.")
+
+    phase_list = data["phases"]
+    if not isinstance(phase_list, list):
+        raise ValueError("Config field 'phases' must be a list.")
+
+    phases: List[PhaseConfig] = []
+    for i, p in enumerate(phase_list):
+        if not isinstance(p, dict):
+            raise ValueError(f"phases[{i}] must be a mapping/object.")
+        required = ("z_ratio", "batch_size", "gradient_accumulation_steps", "max_tokens", "epochs", "cf_loss")
+        missing = [k for k in required if k not in p]
+        if missing:
+            raise ValueError(f"phases[{i}] missing required fields: {missing}")
+        phases.append(
+            PhaseConfig(
+                z_ratio=float(p["z_ratio"]),
+                batch_size=int(p["batch_size"]),
+                gradient_accumulation_steps=int(p["gradient_accumulation_steps"]),
+                max_tokens=int(p["max_tokens"]),
+                epochs=float(p["epochs"]),
+                cf_loss=bool(p["cf_loss"]),
+                min_z_tokens=int(p.get("min_z_tokens", 1)),
+            )
+        )
+
+    keep_prob_raw = data.get("keep_prob", [0.2, 0.3, 0.45, 0.75, 1.0])
+    keep_prob = tuple(float(x) for x in keep_prob_raw)
+
+    cf_prob_raw = data.get("cf_prob_tuple", [0.5, 0.25, 0.25])
+    cf_prob_tuple = tuple(float(x) for x in cf_prob_raw)
+
+    cf_trunc_raw = data.get("cf_trunc_range", [0.5, 1.0])
+    cf_trunc_range = tuple(float(x) for x in cf_trunc_raw)
+    if len(cf_trunc_range) != 2:
+        raise ValueError("cf_trunc_range must have exactly 2 values")
+
+    max_steps_raw = data.get("max_steps", None)
+    max_steps = None if max_steps_raw is None else int(max_steps_raw)
+
+    return SFTConfig(
+        base_model_or_checkpoint=str(data["base_model_or_checkpoint"]),
+        train_dataset_name=str(data["train_dataset_name"]),
+        train_dataset_split=str(data.get("train_dataset_split", "train")),
+        vocab_size=int(data["vocab_size"]),
+        seed=int(data.get("seed", 42)),
+        learning_rate=float(data.get("learning_rate", 2e-5)),
+        weight_decay=float(data.get("weight_decay", 0.0)),
+        optimizer_name=str(data.get("optimizer_name", "adamw_8bit")),
+        max_length=int(data.get("max_length", 16000)),
+        torch_device=str(data.get("torch_device", "cuda:0")),
+        max_steps=max_steps,
+        z_label_smoothing=float(data.get("z_label_smoothing", 0.05)),
+        alpha_z=float(data.get("alpha_z", 0.1)),
+        alpha_answer=float(data.get("alpha_answer", 0.5)),
+        alpha_digits=float(data.get("alpha_digits", 1.0)),
+        keep_prob=keep_prob,
+        cf_enabled=bool(data.get("cf_enabled", True)),
+        cf_every_n_steps=int(data.get("cf_every_n_steps", 2)),
+        cf_prob_tuple=cf_prob_tuple,  # type: ignore[arg-type]
+        cf_lambda=float(data.get("cf_lambda", 1.0)),
+        cf_kl_margin=float(data.get("cf_kl_margin", 0.5)),
+        cf_eps=float(data.get("cf_eps", 1e-8)),
+        cf_min_z_len=int(data.get("cf_min_z_len", 2)),
+        cf_trunc_range=cf_trunc_range,  # type: ignore[arg-type]
+        phases=tuple(phases),
+        run_root=str(data.get("run_root", "runs/sft_curriculum")),
+        run_name=(None if data.get("run_name") in (None, "") else str(data.get("run_name"))),
+        log_interval_steps=int(data.get("log_interval_steps", 20)),
+        save_every_epoch=bool(data.get("save_every_epoch", True)),
+        save_phase_end=bool(data.get("save_phase_end", True)),
+        resume_from=(None if data.get("resume_from") in (None, "") else str(data.get("resume_from"))),
+        dataloader_num_workers=int(data.get("dataloader_num_workers", 2)),
+        dataloader_pin_memory=bool(data.get("dataloader_pin_memory", True)),
+        dataloader_prefetch_factor=int(data.get("dataloader_prefetch_factor", 2)),
+    )
+
+
+def _load_config_yaml(path: str) -> SFTConfig:
+    try:
+        import yaml
+    except ImportError as e:
+        raise RuntimeError("PyYAML is required. Install with `pip install pyyaml`.") from e
+    with open(path, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f)
+    return _build_config_from_yaml_dict(payload)
 
 
 def train(cfg: SFTConfig) -> str:
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError("train() was called under torch.inference_mode(); disable it for training.")
-    torch.set_grad_enabled(True)
-
     if not cfg.base_model_or_checkpoint.strip():
-        raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
+        raise ValueError("config.base_model_or_checkpoint is empty.")
     if not cfg.train_dataset_name.strip():
-        raise ValueError("config.train_dataset_name is empty; fill with HF dataset path")
-    if not cfg.eval_dataset_name.strip():
-        raise ValueError("config.eval_dataset_name is empty; fill with HF dataset path")
+        raise ValueError("config.train_dataset_name is empty.")
     if int(cfg.vocab_size) <= 0:
         raise ValueError("config.vocab_size must be > 0")
+    if len(cfg.keep_prob) != 5:
+        raise ValueError(f"keep_prob must have length 5, got {len(cfg.keep_prob)}")
     _validate_cf_config(cfg)
+    _validate_phases(cfg.phases)
 
     _set_seed(cfg.seed)
-
-    run_dir = _make_run_dir(cfg)
-    log_path = os.path.join(run_dir, "logs", "train.log")
-    metrics_csv = os.path.join(run_dir, "logs", "metrics.csv")
-    eval_jsonl = os.path.join(run_dir, "logs", "eval.jsonl")
-
-    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
+    train_rng = random.Random(int(cfg.seed))
 
     if torch.cuda.is_available():
         device = torch.device(str(cfg.torch_device))
     else:
         device = torch.device("cpu")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model_or_checkpoint,#
-        torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
-    )
+
+    resume_ckpt = None
+    start_phase_idx = 0
+    start_epoch_idx = 0
+    step = 0
+
+    if cfg.resume_from:
+        resume_ckpt = _resolve_resume_checkpoint(cfg.resume_from)
+        state_path = os.path.join(resume_ckpt, "trainer_state.json")
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        run_dir = str(state.get("run_dir", os.path.abspath(os.path.join(resume_ckpt, "..", ".."))))
+        start_phase_idx = int(state.get("next_phase_idx", 0))
+        start_epoch_idx = int(state.get("next_epoch_idx_in_phase", 0))
+        step = int(state.get("global_step", 0))
+        tokenizer = AutoTokenizer.from_pretrained(resume_ckpt, use_fast=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            resume_ckpt,
+            torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
+        )
+    else:
+        run_dir = _make_run_dir(cfg)
+        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.base_model_or_checkpoint,
+            torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
+        )
+
+    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "last"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
+    log_path = os.path.join(run_dir, "logs", "train.log")
+    metrics_csv = os.path.join(run_dir, "logs", "metrics.csv")
+
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
     model.to(device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
-    input_grad_hook = _ensure_input_require_grads(model)
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
     digit_token_ids = token_info["digit_token_ids"]
-    answer_token_id = token_info["answer_token_id"][0]
+    answer_token_id = int(token_info["answer_token_id"])
     z_and_answer_allowed = list(z_token_ids) + [int(answer_token_id)]
-
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
-    debug_prefix_unit_tokens, debug_prefix_total_tokens = _debug_prefix_token_counts(tokenizer, cfg)
 
     train_records = _load_hf_records(cfg.train_dataset_name, cfg.train_dataset_split)
-    eval_records = _load_hf_records(cfg.eval_dataset_name, cfg.eval_dataset_split)
+    optimizer = _build_optimizer(model.parameters(), cfg)
+    if resume_ckpt:
+        opt_path = os.path.join(resume_ckpt, "optimizer.pt")
+        if os.path.isfile(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+        _log(
+            f"resumed from {resume_ckpt} at phase={start_phase_idx} epoch={start_epoch_idx} step={step}",
+            log_path,
+        )
+        _log(
+            "resume_granularity=coarse (phase/epoch boundary). "
+            "If interrupted mid-epoch or mid-partial-epoch, that segment restarts from its beginning.",
+            log_path,
+        )
 
-    train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
-    trainable_params, layer_info, selected_layers, total_layers = _configure_trainable_params(model, cfg)
-    base_trainable_mask = [bool(p.requires_grad) for p in model.parameters()]
-    optimizer = _build_optimizer(trainable_params, cfg)
-    train_rng = random.Random(int(cfg.seed))
-
-    step = 0
-    micro = 0
-    best_pass = -math.inf
     scaler_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
 
     _log(f"run_dir={run_dir}", log_path)
-    _log(f"train_size={len(train_records)} eval_size={len(eval_records)}", log_path)
+    _log(f"train_size={len(train_records)}", log_path)
     _log(
-        f"torch_device={device} vllm_cuda_visible_devices={cfg.vllm_cuda_visible_devices}",
-        log_path,
-    )
-    _log(
-        "counterfactual enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
+        "counterfactual global_enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
             int(cfg.cf_every_n_steps),
             tuple(float(x) for x in cfg.cf_prob_tuple),
@@ -657,436 +900,183 @@ def train(cfg: SFTConfig) -> str:
         ),
         log_path,
     )
-    _log(f"optimizer_name={cfg.optimizer_name}", log_path)
-    _log(f"torch_grad_enabled={torch.is_grad_enabled()} inference_mode={torch.is_inference_mode_enabled()}", log_path)
-    _log(f"debug_prefix_repeat={cfg.debug_prefix_repeat} debug_prefix_text_len={len(cfg.debug_prefix_text)}", log_path)
-    _log(
-        f"debug_prefix_tokens_per_repeat={debug_prefix_unit_tokens} "
-        f"debug_prefix_tokens_total={debug_prefix_total_tokens}",
-        log_path,
-    )
-    _log(f"trainable_layer_spec={cfg.trainable_layer_spec} ({layer_info})", log_path)
-    _log(f"trainable_layers={selected_layers}/{total_layers}", log_path)
-    _log(f"input_grad_hook_installed={bool(input_grad_hook is not None)}", log_path)
 
-    warmup_hooks = _apply_warmup_freeze(
-        model=model,
-        z_token_ids=z_token_ids,
-        warmup_active=cfg.warmup_steps > 0,
-        base_trainable_mask=base_trainable_mask,
-    )
+    reached_cap = False
+    stop_next_phase_idx = int(len(cfg.phases))
+    stop_next_epoch_idx = 0
+    for phase_idx in range(start_phase_idx, len(cfg.phases)):
+        phase = cfg.phases[phase_idx]
+        phase_records = _filter_records_for_phase(records=train_records, max_tokens=phase.max_tokens)
+        loader, phase_ds = _build_loader(
+            records=phase_records,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            phase=phase,
+            shuffle=True,
+        )
+        avg_z = float(sum(len(x.z_ids) for x in phase_ds.samples) / len(phase_ds.samples))
+        avg_text = float(sum(len(x.text_thoughts) for x in phase_ds.samples) / len(phase_ds.samples))
 
-    while step < int(cfg.max_steps):
-        for batch in train_loader:
-            if step >= int(cfg.max_steps):
+        _log(
+            "phase={} z_ratio={} max_tokens={} rows_kept={} avg_z={:.2f} avg_text={:.2f} batch={} grad_accum={} epochs={} cf_phase={}".format(
+                phase_idx,
+                phase.z_ratio,
+                phase.max_tokens,
+                len(phase_records),
+                avg_z,
+                avg_text,
+                phase.batch_size,
+                phase.gradient_accumulation_steps,
+                phase.epochs,
+                int(bool(phase.cf_loss)),
+            ),
+            log_path,
+        )
+        _log_phase_debug_examples(
+            cfg=cfg,
+            phase=phase,
+            phase_idx=phase_idx,
+            dataset=phase_ds,
+            tokenizer=tokenizer,
+            answer_token_id=answer_token_id,
+            z_token_ids=z_token_ids,
+            log_path=log_path,
+        )
+
+        full_epochs = int(math.floor(float(phase.epochs)))
+        partial_frac = float(phase.epochs) - float(full_epochs)
+        epoch_start = start_epoch_idx if phase_idx == start_phase_idx else 0
+        if partial_frac > 0.0:
+            _log(
+                f"phase={phase_idx} uses fractional epoch={partial_frac:.4f}; "
+                "resume for this segment is coarse and restarts the partial segment from batch 0.",
+                log_path,
+            )
+
+        for epoch_idx in range(epoch_start, full_epochs):
+            step, hit_cap = _run_phase_batches(
+                cfg=cfg,
+                phase=phase,
+                loader=loader,
+                model=model,
+                optimizer=optimizer,
+                device=device,
+                scaler_ctx=scaler_ctx,
+                step=step,
+                train_rng=train_rng,
+                tokenizer=tokenizer,
+                z_token_ids=z_token_ids,
+                digit_token_ids=digit_token_ids,
+                answer_token_id=answer_token_id,
+                z_and_answer_allowed=z_and_answer_allowed,
+                log_path=log_path,
+                metrics_csv=metrics_csv,
+                phase_idx=phase_idx,
+                epoch_tag=float(epoch_idx + 1),
+            )
+            if cfg.save_every_epoch:
+                state = {
+                    "run_dir": run_dir,
+                    "global_step": int(step),
+                    "next_phase_idx": int(phase_idx),
+                    "next_epoch_idx_in_phase": int(epoch_idx + 1),
+                }
+                epoch_dir = os.path.join(run_dir, "checkpoints", f"phase_{phase_idx:02d}_epoch_{epoch_idx + 1:03d}")
+                _save_checkpoint(out_dir=epoch_dir, model=model, tokenizer=tokenizer, optimizer=optimizer, state=state)
+                _save_checkpoint(
+                    out_dir=os.path.join(run_dir, "last"),
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    state=state,
+                )
+                _log(f"saved epoch checkpoint {epoch_dir}", log_path)
+            if hit_cap:
+                reached_cap = True
+                stop_next_phase_idx = int(phase_idx)
+                stop_next_epoch_idx = int(epoch_idx)
+                break
+        if reached_cap:
+            break
+
+        if partial_frac > 0.0:
+            partial_batches = int(math.ceil(partial_frac * len(loader)))
+            step, hit_cap = _run_phase_batches(
+                cfg=cfg,
+                phase=phase,
+                loader=loader,
+                model=model,
+                optimizer=optimizer,
+                device=device,
+                scaler_ctx=scaler_ctx,
+                step=step,
+                train_rng=train_rng,
+                tokenizer=tokenizer,
+                z_token_ids=z_token_ids,
+                digit_token_ids=digit_token_ids,
+                answer_token_id=answer_token_id,
+                z_and_answer_allowed=z_and_answer_allowed,
+                log_path=log_path,
+                metrics_csv=metrics_csv,
+                phase_idx=phase_idx,
+                epoch_tag=float(full_epochs) + partial_frac,
+                max_batches=partial_batches,
+            )
+            if hit_cap:
+                reached_cap = True
+                stop_next_phase_idx = int(phase_idx)
+                stop_next_epoch_idx = int(full_epochs)
                 break
 
-            model.train()
-            for k in ("input_ids", "attention_mask", "labels", "target_class"):
-                batch[k] = batch[k].to(device)
-
-            supervised_mask = (
-                (batch["target_class"] == TARGET_Z)
-                | (batch["target_class"] == TARGET_ANSWER)
-                | (batch["target_class"] == TARGET_DIGIT)
+        if cfg.save_phase_end:
+            state = {
+                "run_dir": run_dir,
+                "global_step": int(step),
+                "next_phase_idx": int(phase_idx + 1),
+                "next_epoch_idx_in_phase": 0,
+            }
+            phase_dir = os.path.join(run_dir, "checkpoints", f"phase_{phase_idx:02d}_end")
+            _save_checkpoint(out_dir=phase_dir, model=model, tokenizer=tokenizer, optimizer=optimizer, state=state)
+            _save_checkpoint(
+                out_dir=os.path.join(run_dir, "last"),
+                model=model,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                state=state,
             )
-            supervised_count = int(supervised_mask.sum().item())
-            if supervised_count <= 0:
-                seq_lens = batch["attention_mask"].sum(dim=1)
-                raise RuntimeError(
-                    "Batch has zero supervised targets after collation/clipping; "
-                    "no gradient can flow. This is usually caused by prefix/prompt length pushing "
-                    "Z/<ANSWER>/digit targets past max_length. "
-                    f"max_length={cfg.max_length}, debug_prefix_repeat={cfg.debug_prefix_repeat}, "
-                    f"debug_prefix_text_len={len(cfg.debug_prefix_text)}, "
-                    f"min_seq_len={int(seq_lens.min().item())}, max_seq_len={int(seq_lens.max().item())}. "
-                    "Reduce debug_prefix_repeat or increase max_length."
-                )
+            _log(f"saved phase-end checkpoint {phase_dir}", log_path)
 
-            accum_steps = max(1, int(cfg.gradient_accumulation_steps))
-            will_step = ((micro + 1) % accum_steps) == 0
-            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % int(cfg.cf_every_n_steps)) == 0)
-            cf_applied = False
-            cf_variant_name = "none"
-            cf_loss_scalar = 0.0
-            cf_mean_sym_kl = 0.0
-            cf_mean_entropy = 0.0
-            cf_visible_z_mean = 0.0
-            cf_eligible_count = 0.0
-            cf_loss_value = torch.zeros((), dtype=torch.float32, device=device)
-            cur_w_answer, cur_w_digits = _get_scheduled_loss_weights(cfg, step)
+    if reached_cap:
+        # Save a recoverable checkpoint at the current boundary state.
+        state = {
+            "run_dir": run_dir,
+            "global_step": int(step),
+            "next_phase_idx": int(stop_next_phase_idx),
+            "next_epoch_idx_in_phase": int(stop_next_epoch_idx),
+        }
+        _save_checkpoint(
+            out_dir=os.path.join(run_dir, "last"),
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            state=state,
+        )
+        _log(f"stopped by max_steps safety cap at step={step}", log_path)
+    else:
+        _log("training complete", log_path)
 
-            with torch.set_grad_enabled(True):
-                with scaler_ctx:
-                    out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-                    loss_out = compute_weighted_loss(
-                        logits=out.logits,
-                        labels=batch["labels"],
-                        target_class=batch["target_class"],
-                        z_allowed_ids=z_and_answer_allowed,
-                        digit_allowed_ids=digit_token_ids,
-                        w_z=cfg.w_z,
-                        w_answer=cur_w_answer,
-                        w_digits=cur_w_digits,
-                        z_label_smoothing=cfg.z_label_smoothing,
-                        keep_prob=cfg.keep_prob,
-                    )
-                    total_loss = loss_out.total
-
-                    if cf_trigger:
-                        cf_variant_name = _sample_cf_variant(cfg, train_rng)
-                        input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            answer_token_id=answer_token_id,
-                            z_token_ids=z_token_ids,
-                            pad_token_id=int(tokenizer.pad_token_id),
-                            cf_min_z_len=int(cfg.cf_min_z_len),
-                            variant_name=cf_variant_name,
-                            trunc_range=cfg.cf_trunc_range,
-                            rng=train_rng,
-                        )
-                        cf_eligible_count = float(eligible_mask.float().sum().item())
-                        if cf_eligible_count > 0:
-                            cf_applied = True
-                            out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
-                            clean_digit_logits, digit_valid_mask = extract_digit_logits(
-                                logits=out.logits,
-                                target_class=batch["target_class"],
-                                digit_allowed_ids=digit_token_ids,
-                            )
-                            cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
-                                logits=out_cf.logits,
-                                target_class=batch["target_class"],
-                                digit_allowed_ids=digit_token_ids,
-                            )
-                            del out_cf
-                            if clean_digit_logits.shape != cf_digit_logits.shape:
-                                raise RuntimeError(
-                                    "counterfactual digit logits shape mismatch: "
-                                    f"{tuple(clean_digit_logits.shape)} vs {tuple(cf_digit_logits.shape)}"
-                                )
-                            if digit_valid_mask.shape != cf_digit_valid_mask.shape or not bool(
-                                torch.equal(digit_valid_mask, cf_digit_valid_mask)
-                            ):
-                                raise RuntimeError("counterfactual digit mask mismatch")
-                            cf_out = compute_counterfactual_regularizer(
-                                clean_digit_logits=clean_digit_logits,
-                                cf_digit_logits=cf_digit_logits,
-                                digit_valid_mask=digit_valid_mask,
-                                eligible_mask=eligible_mask,
-                                variant_name=cf_variant_name,
-                                kl_margin=float(cfg.cf_kl_margin),
-                                eps=float(cfg.cf_eps),
-                            )
-                            cf_loss_value = cf_out.loss
-                            total_loss = total_loss + float(cfg.cf_lambda) * cf_loss_value
-                            cf_loss_scalar = float(cf_out.loss.detach().item())
-                            cf_mean_sym_kl = float(cf_out.mean_sym_kl)
-                            cf_mean_entropy = float(cf_out.mean_entropy)
-                            del cf_digit_logits
-                            del clean_digit_logits
-                            del cf_digit_valid_mask
-                            del digit_valid_mask
-                            del input_ids_cf
-                            del attention_mask_cf
-                            if cf_variant_name == "truncate":
-                                v = visible_z_counts[eligible_mask]
-                                cf_visible_z_mean = float(v.float().mean().item()) if int(v.numel()) > 0 else 0.0
-
-                    loss = total_loss / accum_steps
-                    if not bool(loss.requires_grad):
-                        raise RuntimeError(
-                            "Loss tensor does not require grad. "
-                            f"trainable_layer_spec={cfg.trainable_layer_spec} "
-                            "likely produced no gradient path (common with gradient checkpointing when inputs "
-                            "do not require grad)."
-                        )
-
-            loss.backward()
-            micro += 1
-
-            if micro % accum_steps != 0:
-                continue
-
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            step += 1
-
-            if step == int(cfg.warmup_steps):
-                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
-                for h in warmup_hooks:
-                    h.remove()
-                warmup_hooks = _apply_warmup_freeze(
-                    model=model,
-                    z_token_ids=z_token_ids,
-                    warmup_active=False,
-                    base_trainable_mask=base_trainable_mask,
-                )
-                _log(f"warmup ended at step={step}; restored trainable_layer_spec={cfg.trainable_layer_spec}", log_path)
-
-
-
-            if step % int(cfg.log_interval_steps) == 0:
-                mean_z_len = float(batch["z_lens"].float().mean().item())
-                row = {
-                    "step": float(step),
-                    "L_total": float(total_loss.detach().item()),
-                    "L_z": float(loss_out.l_z.detach().item()),
-                    "L_answer": float(loss_out.l_answer.detach().item()),
-                    "L_digits": float(loss_out.l_digits.detach().item()),
-                    "z_acc": float(loss_out.z_acc),
-                    "digit_exact_match": float(loss_out.digit_exact_match),
-                    "avg_z_len": float(mean_z_len),
-                    "no_answer_before_kmax": 0.0,
-                    "cf_enabled": float(bool(cfg.cf_enabled)),
-                    "cf_applied": float(bool(cf_applied)),
-                    "cf_loss": float(cf_loss_scalar),
-                    "cf_variant_truncate": float(cf_variant_name == "truncate"),
-                    "cf_variant_reverse": float(cf_variant_name == "reverse"),
-                    "cf_variant_random": float(cf_variant_name == "random"),
-                    "cf_mean_sym_kl": float(cf_mean_sym_kl),
-                    "cf_mean_entropy": float(cf_mean_entropy),
-                    "cf_eligible_count": float(cf_eligible_count),
-                    "cf_visible_z_mean": float(cf_visible_z_mean),
-                    "w_answer": float(cur_w_answer),
-                    "w_digits": float(cur_w_digits),
-                }
-                _append_metrics_csv(metrics_csv, row)
-                _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
-                        step,
-                        row["L_total"],
-                        row["L_z"],
-                        row["L_answer"],
-                        row["L_digits"],
-                        row["z_acc"],
-                        row["digit_exact_match"],
-                        row["avg_z_len"],
-                        row["w_answer"],
-                        row["w_digits"],
-                        int(bool(cfg.cf_enabled)),
-                        int(bool(cf_applied)),
-                        cf_variant_name,
-                        row["cf_loss"],
-                        row["cf_mean_sym_kl"],
-                        row["cf_mean_entropy"],
-                    ),
-                    log_path,
-                )
-
-            if step % int(cfg.save_interval_steps) == 0:
-                _save_last(
-                    run_dir=run_dir,
-                    model=model,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    step=step,
-                    best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
-                )
-                _log(f"saved last checkpoint at step={step}", log_path)
-
-            if step % int(cfg.save_every_steps) == 0:
-                p = _save_periodic(
-                    run_dir=run_dir,
-                    model=model,
-                    tokenizer=tokenizer,
-                    step=step,
-                    keep_last_k=int(cfg.keep_last_k),
-                )
-                _log(f"saved periodic checkpoint {p}", log_path)
-
-            warmup_steps = int(cfg.warmup_steps)
-            eval_ready = (warmup_steps <= 0) or (step >= warmup_steps)
-            eval_on_interval = step % int(cfg.eval_interval_steps) == 0
-            # if eval_on_interval:
-            #     eval_model_path = _save_last(
-            #         run_dir=run_dir,
-            #         model=model,
-            #         tokenizer=tokenizer,
-            #         cfg=cfg,
-            #         step=step,
-            #         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
-            #     )
-            #     model.train(False)
-            #     torch.cuda.empty_cache()
-            #     metrics = evaluate_with_vllm(
-            #         model_path=eval_model_path,
-            #         records=eval_records,
-            #         pass_at_n=cfg.pass_at_n,
-            #         k_max=cfg.k_max,
-            #         temperature=cfg.temperature,
-            #         top_p=cfg.top_p,
-            #         vocab_size=cfg.vocab_size,
-            #         vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
-            #         output_jsonl_path=eval_jsonl,
-            #     )
-            #
-            #     gc.collect()
-            #     torch.cuda.empty_cache()
-            #     _log(
-            #         "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
-            #             step,
-            #             cfg.pass_at_n,
-            #             metrics.pass_at_n,
-            #             metrics.greedy_exact_match,
-            #             metrics.mean_z_len,
-            #             metrics.no_answer_before_kmax_rate,
-            #         ),
-            #         log_path,
-            #     )
-            #     _log(f"eval generations appended to {eval_jsonl}", log_path)
-            #
-            #     _append_metrics_csv(
-            #         metrics_csv,
-            #         {
-            #             "step": float(step),
-            #             "pass_at_n": float(metrics.pass_at_n),
-            #             "greedy_exact_match": float(metrics.greedy_exact_match),
-            #             "eval_mean_z_len": float(metrics.mean_z_len),
-            #             "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
-            #         },
-            #     )
-            #
-            #     if cfg.save_best and metrics.pass_at_n > best_pass:
-            #         best_pass = metrics.pass_at_n
-            #         best_path = _save_best(
-            #             run_dir=run_dir,
-            #             model=model,
-            #             tokenizer=tokenizer,
-            #             step=step,
-            #             metric=best_pass,
-            #         )
-            #         _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
-
-    _save_last(
-        run_dir=run_dir,
-        model=model,
-        tokenizer=tokenizer,
-        cfg=cfg,
-        step=step,
-        best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
-    )
-    if cfg.save_ppo_init:
-        p = _save_ppo_init(run_dir=run_dir, model=model, tokenizer=tokenizer)
-        _log(f"saved ppo_init snapshot at {p}", log_path)
-
-    _log("training complete", log_path)
     return run_dir
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Phase3 SFT over discrete latent Z-programs")
-    p.add_argument("--base_model_or_checkpoint", type=str, default="")
-    p.add_argument("--train_dataset_name", type=str, default="")
-    p.add_argument("--train_dataset_split", type=str, default="train")
-    p.add_argument("--eval_dataset_name", type=str, default="")
-    p.add_argument("--eval_dataset_split", type=str, default="eval")
-    p.add_argument("--vocab_size", type=int, required=True)
-
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--eval_batch_size", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=2e-5)
-    p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--optimizer_name", type=str, default="adamw_8bit")
-    p.add_argument("--trainable_layer_spec", type=str, default="all")
-    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    p.add_argument("--max_steps", type=int, default=10000)
-    p.add_argument("--warmup_steps", type=int, default=1000)
-    p.add_argument("--max_length", type=int, default=2048)
-    p.add_argument("--torch_device", type=str, default="cuda:0")
-    p.add_argument("--debug_prefix_repeat", type=int, default=0)
-    p.add_argument("--debug_prefix_text", type=str, default=" DEBUG_PREFIX")
-
-    p.add_argument("--z_label_smoothing", type=float, default=0.05)
-    p.add_argument("--w_z", type=float, default=0.1)
-    p.add_argument("--w_start_answer", type=float, default=0.05)
-    p.add_argument("--w_start_digits", type=float, default=0.1)
-    p.add_argument("--w_end_answer", type=float, default=0.5)
-    p.add_argument("--w_end_digits", type=float, default=1.0)
-    p.add_argument("--start_weights_steps", type=int, default=500)
-    p.add_argument("--goes_up_weights_steps", type=int, default=1500)
-    p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--cf_every_n_steps", type=int, default=4)
-    p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
-    p.add_argument("--cf_lambda", type=float, default=0.1)
-    p.add_argument("--cf_kl_margin", type=float, default=0.5)
-    p.add_argument("--cf_eps", type=float, default=1e-8)
-    p.add_argument("--cf_min_z_len", type=int, default=2)
-    p.add_argument("--cf_trunc_range", type=str, default="0.5,1.0")
-
-    p.add_argument("--eval_interval_steps", type=int, default=500)
-    p.add_argument("--pass_at_n", type=int, default=16)
-    p.add_argument("--k_max", type=int, default=128)
-    p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--top_p", type=float, default=0.95)
-    p.add_argument("--vllm_cuda_visible_devices", type=str, default="1")
-
-    p.add_argument("--run_root", type=str, default="runs/sft_z")
-    p.add_argument("--log_interval_steps", type=int, default=20)
-    p.add_argument("--save_interval_steps", type=int, default=200)
-    p.add_argument("--save_every_steps", type=int, default=2000)
-    p.add_argument("--keep_last_k", type=int, default=3)
-    p.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--save_ppo_init", action="store_true")
-
+    p = argparse.ArgumentParser(description="Phase3 Curriculum SFT")
+    p.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
-    cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
-    cfg = SFTConfig(
-        base_model_or_checkpoint=args.base_model_or_checkpoint,
-        train_dataset_name=args.train_dataset_name,
-        train_dataset_split=args.train_dataset_split,
-        eval_dataset_name=args.eval_dataset_name,
-        eval_dataset_split=args.eval_dataset_split,
-        vocab_size=args.vocab_size,
-        batch_size=args.batch_size,
-        eval_batch_size=args.eval_batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        optimizer_name=args.optimizer_name,
-        trainable_layer_spec=args.trainable_layer_spec,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_steps=args.max_steps,
-        warmup_steps=args.warmup_steps,
-        max_length=args.max_length,
-        torch_device=args.torch_device,
-        debug_prefix_repeat=args.debug_prefix_repeat,
-        debug_prefix_text=args.debug_prefix_text,
-        z_label_smoothing=args.z_label_smoothing,
-        w_z=args.w_z,
-        w_start_answer=args.w_start_answer,
-        w_start_digits=args.w_start_digits,
-        w_end_answer=args.w_end_answer,
-        w_end_digits=args.w_end_digits,
-        start_weights_steps=args.start_weights_steps,
-        goes_up_weights_steps=args.goes_up_weights_steps,
-        cf_enabled=bool(args.cf_enabled),
-        cf_every_n_steps=args.cf_every_n_steps,
-        cf_prob_tuple=cf_prob_tuple,
-        cf_lambda=args.cf_lambda,
-        cf_kl_margin=args.cf_kl_margin,
-        cf_eps=args.cf_eps,
-        cf_min_z_len=args.cf_min_z_len,
-        cf_trunc_range=cf_trunc_range,
-        eval_interval_steps=args.eval_interval_steps,
-        pass_at_n=args.pass_at_n,
-        k_max=args.k_max,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        vllm_cuda_visible_devices=args.vllm_cuda_visible_devices,
-        run_root=args.run_root,
-        log_interval_steps=args.log_interval_steps,
-        save_interval_steps=args.save_interval_steps,
-        save_every_steps=args.save_every_steps,
-        keep_last_k=args.keep_last_k,
-        save_best=bool(args.save_best),
-        save_ppo_init=bool(args.save_ppo_init),
-    )
+    cfg = _load_config_yaml(args.config)
     train(cfg)
 
 

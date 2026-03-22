@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
@@ -10,7 +11,7 @@ from phase1.dataset import SYSTEM_PROMPT
 
 ANSWER_TOKEN = "<ANSWER>"
 
-# 0=ignore(prompt), 1=z, 2=answer, 3=digit
+# 0=ignore(prompt+text), 1=z, 2=answer, 3=digit
 TARGET_IGNORE = 0
 TARGET_Z = 1
 TARGET_ANSWER = 2
@@ -20,8 +21,10 @@ TARGET_DIGIT = 3
 @dataclass
 class SFTSample:
     question: str
+    text_thoughts: List[str]
     z_ids: List[int]
     answer_digits: List[int]
+    num_z: int
 
 
 def _digits_from_answer_int(answer_int: object) -> Optional[List[int]]:
@@ -48,22 +51,24 @@ def _validate_digits(digits: List[int]) -> List[int]:
     return out
 
 
-class SFTDataset(Dataset):
+class CurriculumSFTDataset(Dataset):
     def __init__(
         self,
         *,
         records: Iterable[Dict],
         tokenizer,
         vocab_size: int,
+        z_ratio: float,
+        min_z_tokens: int = 1,
         answer_token: str = ANSWER_TOKEN,
-        debug_prefix_repeat: int = 0,
-        debug_prefix_text: str = " DEBUG_PREFIX",
     ) -> None:
         self.tokenizer = tokenizer
         self.vocab_size = int(vocab_size)
         self.answer_token = str(answer_token)
-        self.debug_prefix_repeat = int(debug_prefix_repeat)
-        self.debug_prefix_text = str(debug_prefix_text)
+        self.z_ratio = float(z_ratio)
+        self.min_z_tokens = int(min_z_tokens)
+        if self.min_z_tokens < 1:
+            raise ValueError("min_z_tokens must be >= 1")
 
         self.answer_token_id = int(self.tokenizer.convert_tokens_to_ids(self.answer_token))
         if self.answer_token_id < 0:
@@ -75,6 +80,10 @@ class SFTDataset(Dataset):
             raise RuntimeError("Some Z tokens were not added to tokenizer.")
 
         self.digit_token_ids = self._resolve_digit_token_ids()
+        self.sep_token_ids = self.tokenizer.encode("\n\n", add_special_tokens=False)
+        if len(self.sep_token_ids) == 0:
+            raise RuntimeError("Failed to tokenize required text/Z separator '\\n\\n'.")
+
         answer_enc = self.tokenizer.encode(self.answer_token, add_special_tokens=False)
         if answer_enc != [self.answer_token_id]:
             raise RuntimeError(
@@ -89,26 +98,37 @@ class SFTDataset(Dataset):
                     f"Tokenization contract violated for {z_tok}: got {z_enc}, "
                     f"expected [{self.z_token_ids[i]}]"
                 )
-        self.samples: List[SFTSample] = []
-        self.extra_prefix_ids: List[int] = []
-        if self.debug_prefix_repeat < 0:
-            raise ValueError("debug_prefix_repeat must be >= 0")
-        if self.debug_prefix_repeat > 0:
-            unit_ids = self.tokenizer(
-                self.debug_prefix_text,
-                add_special_tokens=False,
-                padding=False,
-                return_attention_mask=False,
-            )["input_ids"]
-            if len(unit_ids) == 0:
-                raise ValueError("debug_prefix_text tokenized to empty sequence; provide non-empty text")
-            self.extra_prefix_ids = list(unit_ids) * self.debug_prefix_repeat
 
+        self.samples: List[SFTSample] = []
         dropped = 0
-        for row in records:
+        for row_idx, row in enumerate(records):
             q = row.get("question")
             z = row.get("z_ids")
+            thoughts = row.get("splitted_solution")
             d = row.get("answer_digits")
+
+            if q is None or z is None or thoughts is None:
+                raise ValueError(
+                    f"Dataset row {row_idx} is missing required columns. "
+                    "Required: question, splitted_solution, z_ids, answer_digits/answer_int."
+                )
+
+            z_ids = [int(x) for x in z]
+            text_thoughts = [str(x) for x in thoughts]
+            if len(text_thoughts) != len(z_ids):
+                raise ValueError(
+                    f"Dataset row {row_idx} violates alignment invariant: "
+                    f"len(splitted_solution)={len(text_thoughts)} != len(z_ids)={len(z_ids)}"
+                )
+            if len(z_ids) == 0:
+                raise ValueError(f"Dataset row {row_idx} has empty z_ids; expected at least one aligned step.")
+            bad = [x for x in z_ids if x < 0 or x >= self.vocab_size]
+            if bad:
+                raise ValueError(
+                    f"Dataset row {row_idx} has z_ids outside [0, {self.vocab_size - 1}]. "
+                    f"First bad id={bad[0]}"
+                )
+
             digits: Optional[List[int]] = None
             if d is not None:
                 try:
@@ -119,17 +139,32 @@ class SFTDataset(Dataset):
                 from_int = _digits_from_answer_int(row.get("answer_int"))
                 if from_int is not None:
                     digits = _validate_digits(from_int)
+            if digits is None:
+                raise ValueError(
+                    f"Dataset row {row_idx} has no valid answer target: expected answer_digits or fallback answer_int."
+                )
 
-            if q is None or z is None or digits is None:
-                dropped += 1
-                continue
-            z_ids = [int(x) for x in z]
-            if any(x < 0 or x >= self.vocab_size for x in z_ids):
-                dropped += 1
-                continue
-            self.samples.append(SFTSample(question=str(q), z_ids=z_ids, answer_digits=digits))
+            num_z = self._compute_num_z(k=len(z_ids))
+            keep_text_n = len(z_ids) - num_z
+            self.samples.append(
+                SFTSample(
+                    question=str(q),
+                    text_thoughts=text_thoughts[:keep_text_n],
+                    z_ids=z_ids[-num_z:],
+                    answer_digits=digits,
+                    num_z=num_z,
+                )
+            )
 
         self.stats = {"dropped": dropped, "kept": len(self.samples)}
+
+    def _compute_num_z(self, k: int) -> int:
+        if k <= 0:
+            raise ValueError("k must be positive")
+        if math.isclose(self.z_ratio, 1.0):
+            return k
+        num_z = max(self.min_z_tokens, int(math.floor(k * self.z_ratio)))
+        return min(k, num_z)
 
     def _resolve_digit_token_ids(self) -> List[int]:
         ids: List[int] = []
@@ -166,17 +201,38 @@ class SFTDataset(Dataset):
             return_attention_mask=False,
         )["input_ids"]
 
+        text_ids: List[int] = []
+        if sample.text_thoughts:
+            mixed_text = "\n\n".join(sample.text_thoughts)
+            text_ids = self.tokenizer(
+                mixed_text,
+                add_special_tokens=False,
+                padding=False,
+                return_attention_mask=False,
+            )["input_ids"]
+
         z_token_ids = [self.z_token_ids[z] for z in sample.z_ids]
         digit_ids = [self.digit_token_ids[d] for d in sample.answer_digits]
-        expected_suffix = z_token_ids + [self.answer_token_id] + digit_ids
-        input_ids = list(prompt_ids) + list(self.extra_prefix_ids) + list(expected_suffix)
+
+        reasoning_ids: List[int] = []
+        reasoning_cls: List[int] = []
+        if text_ids:
+            reasoning_ids.extend(text_ids)
+            reasoning_cls.extend([TARGET_IGNORE] * len(text_ids))
+        if text_ids and z_token_ids:
+            reasoning_ids.extend(self.sep_token_ids)
+            reasoning_cls.extend([TARGET_IGNORE] * len(self.sep_token_ids))
+        if z_token_ids:
+            reasoning_ids.extend(z_token_ids)
+            reasoning_cls.extend([TARGET_Z] * len(z_token_ids))
+
+        suffix_ids = [self.answer_token_id] + digit_ids
+        suffix_cls = [TARGET_ANSWER] + [TARGET_DIGIT] * 5
+
+        input_ids = list(prompt_ids) + reasoning_ids + suffix_ids
         attention_mask = [1] * len(input_ids)
 
-        token_class = [TARGET_IGNORE] * len(prompt_ids)
-        token_class += [TARGET_IGNORE] * len(self.extra_prefix_ids)
-        token_class += [TARGET_Z] * len(z_token_ids)
-        token_class += [TARGET_ANSWER]
-        token_class += [TARGET_DIGIT] * 5
+        token_class = [TARGET_IGNORE] * len(prompt_ids) + reasoning_cls + suffix_cls
 
         target_class = [TARGET_IGNORE] * len(input_ids)
         for pos in range(len(input_ids) - 1):
@@ -188,17 +244,13 @@ class SFTDataset(Dataset):
             if tcls in (TARGET_Z, TARGET_ANSWER, TARGET_DIGIT):
                 labels[pos] = int(input_ids[pos + 1])
 
-        z_target_positions = [i for i, t in enumerate(target_class) if t == TARGET_Z]
-        digit_target_positions = [i for i, t in enumerate(target_class) if t == TARGET_DIGIT]
-
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "target_class": target_class,
             "z_len": len(z_token_ids),
-            "z_target_positions": z_target_positions,
-            "digit_target_positions": digit_target_positions,
+            "text_thought_count": len(sample.text_thoughts),
         }
 
 
@@ -222,8 +274,7 @@ class SFTCollator:
                 "labels": ex["labels"][:keep],
                 "target_class": ex["target_class"][:keep],
                 "z_len": ex["z_len"],
-                "z_target_positions": [p for p in ex["z_target_positions"] if p < keep],
-                "digit_target_positions": [p for p in ex["digit_target_positions"] if p < keep],
+                "text_thought_count": ex["text_thought_count"],
             }
             clipped.append(ex2)
 
@@ -239,6 +290,7 @@ class SFTCollator:
         labels = torch.tensor([pad(x["labels"], -100) for x in clipped], dtype=torch.long)
         target_class = torch.tensor([pad(x["target_class"], TARGET_IGNORE) for x in clipped], dtype=torch.long)
         z_lens = torch.tensor([int(x["z_len"]) for x in clipped], dtype=torch.long)
+        text_thought_counts = torch.tensor([int(x["text_thought_count"]) for x in clipped], dtype=torch.long)
 
         return {
             "input_ids": input_ids,
@@ -246,4 +298,5 @@ class SFTCollator:
             "labels": labels,
             "target_class": target_class,
             "z_lens": z_lens,
+            "text_thought_counts": text_thought_counts,
         }

@@ -1,49 +1,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional, Sequence
+
+
+@dataclass
+class PhaseConfig:
+    z_ratio: float
+    batch_size: int
+    gradient_accumulation_steps: int
+    max_tokens: int
+    epochs: float
+    cf_loss: bool
+    min_z_tokens: int = 1
 
 
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
     base_model_or_checkpoint: str = "Qwen/Qwen3.5-9B-Base"
-    train_dataset_name: str = "omrisap/nvidia_math_64_47K"
+    train_dataset_name: str = "omrisap/nvidia_math_512_47K"
     train_dataset_split: str = "train"
-    eval_dataset_name: str = "omrisap/SFT_eval"
-    eval_dataset_split: str = "eval"
 
     # Discrete Z vocab
-    vocab_size: int = 64
+    vocab_size: int = 512
 
     # Training
     seed: int = 42
-    batch_size: int = 4
-    eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
     optimizer_name: str = "adamw_8bit"
-    trainable_layer_spec: str = "all"
-    gradient_accumulation_steps: int = 1
-    max_steps: int = 60_000
-    warmup_steps: int = 0
     max_length: int = 16000
     torch_device: str = "cuda:0"
-    debug_prefix_repeat: int = 5000
-    debug_prefix_text: str = " DEBUG_PREFIX"
+    max_steps: Optional[int] = None
 
     # Objective weights
     z_label_smoothing: float = 0.05
-    w_z: float = 1
-    w_start_answer: float = 0.025
-    w_start_digits: float = 0.05
-    w_end_answer: float = 0.25
-    w_end_digits: float = 0.5
-    start_weights_steps: int = 1000
-    goes_up_weights_steps: int = 1000
+    alpha_z: float = 0.1
+    alpha_answer: float = 0.5
+    alpha_digits: float = 1.0
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
-    cf_enabled: bool = False
+    cf_enabled: bool = True
     cf_every_n_steps: int = 2
     cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
     cf_lambda: float = 1.0
@@ -52,25 +51,64 @@ class SFTConfig:
     cf_min_z_len: int = 2
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
-    # Evaluation / generation
-    eval_interval_steps: int = 500
-    pass_at_n: int = 16
-    k_max: int = 128
-    temperature: float = 1.0
-    top_p: float = 0.95
-    vllm_cuda_visible_devices: str = "1"
+    # Curriculum phases
+    phases: Sequence[PhaseConfig] = (
+    PhaseConfig(
+        z_ratio=0.0,
+        min_z_tokens=1,
+        batch_size=16,
+        gradient_accumulation_steps=4,
+        max_tokens=3000,
+        epochs=2,
+        cf_loss=False,
+    ),
+    PhaseConfig(
+        z_ratio=0.25,
+        min_z_tokens=1,
+        batch_size=16,
+        gradient_accumulation_steps=4,
+        max_tokens=4000,
+        epochs=1,
+        cf_loss=True,
+    ),
+    PhaseConfig(
+        z_ratio=0.5,
+        min_z_tokens=1,
+        batch_size=32,
+        gradient_accumulation_steps=2,
+        max_tokens=5000,
+        epochs=0.5,
+        cf_loss=True,
+    ),
+    PhaseConfig(
+        z_ratio=0.75,
+        min_z_tokens=1,
+        batch_size=32,
+        gradient_accumulation_steps=2,
+        max_tokens=7000,
+        epochs=0.5,
+        cf_loss=True,
+    ),
+    PhaseConfig(
+        z_ratio=1.0,
+        min_z_tokens=1,
+        batch_size=64,
+        gradient_accumulation_steps=1,
+        max_tokens=9999999999,
+        epochs=2.0,
+        cf_loss=True,
+    ),
+)
 
-    # Logging / checkpointing
-    run_root: str = "runs/sft_z"
-    log_interval_steps: int = 1
-    save_interval_steps: int = 2000
-    save_every_steps: int = 2000
-    keep_last_k: int = 3
-    save_best: bool = True
-    save_ppo_init: bool = False
+    # Logging / checkpointing / resume
+    run_root: str = "runs/sft_curriculum"
+    run_name: Optional[str] = None
+    log_interval_steps: int = 20
+    save_every_epoch: bool = True
+    save_phase_end: bool = True
+    resume_from: Optional[str] = None
 
     # DataLoader
     dataloader_num_workers: int = 2
-    eval_dataloader_num_workers: int = 2
     dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
