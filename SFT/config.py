@@ -95,26 +95,26 @@ class SFTConfig:
     PhaseConfig(
         z_ratio=0.75,
         min_z_tokens=1,
-        batch_size=16,
-        gradient_accumulation_steps=4,
+        batch_size=8,
+        gradient_accumulation_steps=8,
         max_tokens=7000,
-        epochs=0.5,
+        epochs=1,
         cf_loss=True,
     ),
     PhaseConfig(
         z_ratio=0.9,
         min_z_tokens=1,
-        batch_size=32,
-        gradient_accumulation_steps=2,
+        batch_size=8,
+        gradient_accumulation_steps=8,
         max_tokens=11000,
-        epochs=0.75,
+        epochs=1,
         cf_loss=True,
     ),
     PhaseConfig(
         z_ratio=1.0,
         min_z_tokens=1,
-        batch_size=64,
-        gradient_accumulation_steps=1,
+        batch_size=32,
+        gradient_accumulation_steps=2,
         max_tokens=9999999999,
         epochs=2.0,
         cf_loss=True,
@@ -127,7 +127,7 @@ class SFTConfig:
     log_interval_steps: int = 1
     save_every_epoch: bool = True
     save_phase_end: bool = True
-    resume_from: Optional[str] = None
+    resume_from: Optional[str] = "sft_curriculum/20260323_123730__V512__lr2e-05/last"
 
     # DataLoader
     dataloader_num_workers: int = 2
