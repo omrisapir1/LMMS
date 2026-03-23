@@ -55,23 +55,45 @@ def _load_model_with_attn_fallback(
         model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype)
         return model, "default", None
 
+    chain: List[str]
+    if requested == "flash_attention_4":
+        chain = ["flash_attention_4", "flash_attention_2", "sdpa"]
+    elif requested == "flash_attention_2":
+        chain = ["flash_attention_2", "sdpa"]
+    else:
+        chain = [requested]
+
+    first_error: Optional[Exception] = None
+    for impl in chain:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                attn_implementation=impl,
+            )
+            if impl == requested:
+                return model, impl, None
+            return model, impl, f"{requested} unavailable; fell back to {impl}"
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+
+    if first_error is None:
+        raise RuntimeError(f"Failed to load model with requested attn implementation '{requested}'")
+    if requested not in ("flash_attention_4", "flash_attention_2"):
+        raise first_error
+    # Defensive fallback path (should be unreachable because 'sdpa' is in chain).
+    fallback = "sdpa"
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            attn_implementation=requested,
-        )
-        return model, requested, None
-    except Exception as exc:
-        if requested != "flash_attention_2":
-            raise
-        fallback = "sdpa"
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
             attn_implementation=fallback,
         )
-        return model, fallback, str(exc)
+        return model, fallback, f"{requested} unavailable; fell back to {fallback}. reason={first_error}"
+    except Exception:
+        raise first_error
 
 
 def _log(msg: str, log_path: str) -> None:
@@ -827,7 +849,7 @@ def _build_config_from_yaml_dict(data: Dict) -> SFTConfig:
         weight_decay=float(data.get("weight_decay", 0.0)),
         optimizer_name=str(data.get("optimizer_name", "adamw_8bit")),
         model_dtype=str(data.get("model_dtype", "bf16")),
-        attn_implementation=str(data.get("attn_implementation", "flash_attention_2")),
+        attn_implementation=str(data.get("attn_implementation", "flash_attention_4")),
         max_length=int(data.get("max_length", 16000)),
         torch_device=str(data.get("torch_device", "cuda:0")),
         max_steps=max_steps,
@@ -984,7 +1006,7 @@ def train(cfg: SFTConfig) -> str:
     )
     if attn_fallback_reason is not None:
         _log(
-            f"attention_backend fallback: flash_attention_2 unavailable, switched to sdpa. reason={attn_fallback_reason}",
+            f"attention_backend fallback: {attn_fallback_reason}",
             log_path,
         )
     _log(
