@@ -68,7 +68,7 @@ class SFTConfig:
         batch_size=8,
         gradient_accumulation_steps=8,
         max_tokens=3000,
-        epochs=1,
+        epochs=0.5,
         cf_loss=False,
     ),
     PhaseConfig(
