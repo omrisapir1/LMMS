@@ -59,7 +59,7 @@ class SFTConfig:
         batch_size=8,
         gradient_accumulation_steps=8,
         max_tokens=3000,
-        epochs=0.005,
+        epochs=0.25,
         cf_loss=False,
     ),
     PhaseConfig(
@@ -68,7 +68,7 @@ class SFTConfig:
         batch_size=8,
         gradient_accumulation_steps=8,
         max_tokens=3000,
-        epochs=0.005,
+        epochs=0.5,
         cf_loss=False,
     ),
     PhaseConfig(
@@ -77,7 +77,7 @@ class SFTConfig:
         batch_size=8,
         gradient_accumulation_steps=8,
         max_tokens=4000,
-        epochs=0.001,
+        epochs=1.5,
         cf_loss=True,
     ),
     PhaseConfig(
@@ -86,7 +86,7 @@ class SFTConfig:
         batch_size=8,
         gradient_accumulation_steps=8,
         max_tokens=5000,
-        epochs=0.005,
+        epochs=0.5,
         cf_loss=True,
     ),
     PhaseConfig(
@@ -95,7 +95,7 @@ class SFTConfig:
         batch_size=16,
         gradient_accumulation_steps=4,
         max_tokens=7000,
-        epochs=0.0005,
+        epochs=0.5,
         cf_loss=True,
     ),
     PhaseConfig(
@@ -104,7 +104,7 @@ class SFTConfig:
         batch_size=32,
         gradient_accumulation_steps=2,
         max_tokens=11000,
-        epochs=0.00075,
+        epochs=0.75,
         cf_loss=True,
     ),
     PhaseConfig(
