@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import os
@@ -50,6 +51,12 @@ def _log(msg: str, log_path: str) -> None:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def _cleanup_phase_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, object]:
@@ -1052,6 +1059,12 @@ def train(cfg: SFTConfig) -> str:
                 state=state,
             )
             _log(f"saved phase-end checkpoint {phase_dir}", log_path)
+
+        del loader
+        del phase_ds
+        del phase_records
+        _cleanup_phase_memory()
+        _log(f"phase={phase_idx} memory cleanup complete (gc + cuda.empty_cache)", log_path)
 
     if reached_cap:
         # Save a recoverable checkpoint at the current boundary state.
