@@ -29,7 +29,7 @@ class SFTConfig:
     seed: int = 42
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
-    optimizer_name: str = "adamw_8bit"  # one of: adamw_8bit, adamw, adamw_fused
+    optimizer_name: str = "adamw_fused"  # one of: adamw_8bit, adamw, adamw_fused
     model_dtype: str = "bf16"
     attn_implementation: str = "flash_attention_2"
     max_length: int = 16000
