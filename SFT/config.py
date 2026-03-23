@@ -56,8 +56,8 @@ class SFTConfig:
     PhaseConfig(
         z_ratio=0.0,
         min_z_tokens=1,
-        batch_size=16,
-        gradient_accumulation_steps=4,
+        batch_size=8,
+        gradient_accumulation_steps=8,
         max_tokens=3000,
         epochs=0.5,
         cf_loss=False,
@@ -104,7 +104,7 @@ class SFTConfig:
         batch_size=32,
         gradient_accumulation_steps=2,
         max_tokens=11000,
-        epochs=0.5,
+        epochs=0.75,
         cf_loss=True,
     ),
     PhaseConfig(
