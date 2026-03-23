@@ -27,7 +27,7 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-5
     weight_decay: float = 0.0
     optimizer_name: str = "adamw_8bit"  # one of: adamw_8bit, adamw, adamw_fused
     model_dtype: str = "bf16"
@@ -37,7 +37,7 @@ class SFTConfig:
     max_steps: Optional[int] = None
 
     # Objective weights
-    z_label_smoothing: float = 0.05
+    z_label_smoothing: float = 0.005
     alpha_z: float = 1.0
     alpha_answer: float = 0.5
     alpha_digits: float = 1.0
