@@ -36,7 +36,7 @@ class SFTConfig:
 
     # Objective weights
     z_label_smoothing: float = 0.05
-    alpha_z: float = 0.1
+    alpha_z: float = 1.0
     alpha_answer: float = 0.5
     alpha_digits: float = 1.0
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
@@ -55,6 +55,15 @@ class SFTConfig:
     phases: Sequence[PhaseConfig] = (
     PhaseConfig(
         z_ratio=0.0,
+        min_z_tokens=1,
+        batch_size=16,
+        gradient_accumulation_steps=4,
+        max_tokens=3000,
+        epochs=0.5,
+        cf_loss=False,
+    ),
+    PhaseConfig(
+        z_ratio=0.1,
         min_z_tokens=1,
         batch_size=16,
         gradient_accumulation_steps=4,
@@ -90,6 +99,15 @@ class SFTConfig:
         cf_loss=True,
     ),
     PhaseConfig(
+        z_ratio=0.9,
+        min_z_tokens=1,
+        batch_size=32,
+        gradient_accumulation_steps=2,
+        max_tokens=11000,
+        epochs=0.5,
+        cf_loss=True,
+    ),
+    PhaseConfig(
         z_ratio=1.0,
         min_z_tokens=1,
         batch_size=64,
@@ -103,7 +121,7 @@ class SFTConfig:
     # Logging / checkpointing / resume
     run_root: str = "runs/sft_curriculum"
     run_name: Optional[str] = None
-    log_interval_steps: int = 20
+    log_interval_steps: int = 1
     save_every_epoch: bool = True
     save_phase_end: bool = True
     resume_from: Optional[str] = None

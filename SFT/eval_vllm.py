@@ -114,9 +114,10 @@ def evaluate_with_vllm(
     if any(i < 0 for i in z_token_ids):
         raise RuntimeError("Tokenizer missing some Z tokens for evaluation.")
 
-    answer_token_id = int(tokenizer.convert_tokens_to_ids("<ANSWER>"))
-    if answer_token_id < 0:
-        raise RuntimeError("Tokenizer missing <ANSWER> token for evaluation.")
+    closing_think_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    if len(closing_think_ids) != 1:
+        raise RuntimeError(f"Tokenizer closing think token must be single-token, got {closing_think_ids}")
+    answer_token_id = int(closing_think_ids[0])
 
     digit_token_ids: List[int] = []
     for d in "0123456789":

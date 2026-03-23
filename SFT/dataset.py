@@ -7,11 +7,9 @@ from typing import Dict, Iterable, List, Optional
 import torch
 from torch.utils.data import Dataset
 
-from phase1.dataset import SYSTEM_PROMPT
+THINK_CLOSE_TOKEN = "</think>"
 
-ANSWER_TOKEN = "<ANSWER>"
-
-# 0=ignore(prompt+text), 1=z, 2=answer, 3=digit
+# 0=ignore(prompt+text), 1=z, 2=closing-think boundary, 3=digit
 TARGET_IGNORE = 0
 TARGET_Z = 1
 TARGET_ANSWER = 2
@@ -60,19 +58,23 @@ class CurriculumSFTDataset(Dataset):
         vocab_size: int,
         z_ratio: float,
         min_z_tokens: int = 1,
-        answer_token: str = ANSWER_TOKEN,
+        think_close_token: str = THINK_CLOSE_TOKEN,
     ) -> None:
         self.tokenizer = tokenizer
         self.vocab_size = int(vocab_size)
-        self.answer_token = str(answer_token)
+        self.think_close_token = str(think_close_token)
         self.z_ratio = float(z_ratio)
         self.min_z_tokens = int(min_z_tokens)
         if self.min_z_tokens < 1:
             raise ValueError("min_z_tokens must be >= 1")
 
-        self.answer_token_id = int(self.tokenizer.convert_tokens_to_ids(self.answer_token))
-        if self.answer_token_id < 0:
-            raise RuntimeError(f"Failed to resolve token id for {self.answer_token}")
+        think_close_ids = self.tokenizer.encode(self.think_close_token, add_special_tokens=False)
+        if len(think_close_ids) != 1:
+            raise RuntimeError(
+                f"Tokenization contract violated for {self.think_close_token}: "
+                f"expected 1 token, got {think_close_ids}"
+            )
+        self.think_close_token_id = int(think_close_ids[0])
 
         self.z_token_texts = [f"<z_{i}>" for i in range(self.vocab_size)]
         self.z_token_ids = [int(self.tokenizer.convert_tokens_to_ids(t)) for t in self.z_token_texts]
@@ -84,11 +86,11 @@ class CurriculumSFTDataset(Dataset):
         if len(self.sep_token_ids) == 0:
             raise RuntimeError("Failed to tokenize required text/Z separator '\\n\\n'.")
 
-        answer_enc = self.tokenizer.encode(self.answer_token, add_special_tokens=False)
-        if answer_enc != [self.answer_token_id]:
+        think_close_from_vocab = int(self.tokenizer.convert_tokens_to_ids(self.think_close_token))
+        if think_close_from_vocab >= 0 and think_close_from_vocab != self.think_close_token_id:
             raise RuntimeError(
-                f"Tokenization contract violated for {self.answer_token}: got {answer_enc}, "
-                f"expected [{self.answer_token_id}]"
+                f"Tokenizer id mismatch for {self.think_close_token}: "
+                f"convert_tokens_to_ids={think_close_from_vocab}, encode={self.think_close_token_id}"
             )
         for i in range(self.vocab_size):
             z_tok = f"<z_{i}>"
@@ -182,7 +184,6 @@ class CurriculumSFTDataset(Dataset):
 
     def _build_prompt_text(self, question: str) -> str:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ]
         return self.tokenizer.apply_chat_template(
@@ -226,7 +227,7 @@ class CurriculumSFTDataset(Dataset):
             reasoning_ids.extend(z_token_ids)
             reasoning_cls.extend([TARGET_Z] * len(z_token_ids))
 
-        suffix_ids = [self.answer_token_id] + digit_ids
+        suffix_ids = [self.think_close_token_id] + digit_ids
         suffix_cls = [TARGET_ANSWER] + [TARGET_DIGIT] * 5
 
         input_ids = list(prompt_ids) + reasoning_ids + suffix_ids

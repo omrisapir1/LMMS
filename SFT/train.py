@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import PhaseConfig, SFTConfig
-from .dataset import ANSWER_TOKEN, CurriculumSFTDataset, SFTCollator
+from .dataset import THINK_CLOSE_TOKEN, CurriculumSFTDataset, SFTCollator
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 
 def _set_seed(seed: int) -> None:
@@ -57,8 +57,6 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, object]:
 
     existing_vocab = tokenizer.get_vocab()
     to_add = [t for t in z_tokens if t not in existing_vocab]
-    if ANSWER_TOKEN not in existing_vocab:
-        to_add.append(ANSWER_TOKEN)
 
     added = 0
     if to_add:
@@ -74,9 +72,18 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, object]:
     if added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
-    answer_token_id = int(tokenizer.convert_tokens_to_ids(ANSWER_TOKEN))
-    if answer_token_id < 0:
-        raise RuntimeError("Failed to resolve <ANSWER> token id")
+    closing_think_ids = tokenizer.encode(THINK_CLOSE_TOKEN, add_special_tokens=False)
+    if len(closing_think_ids) != 1:
+        raise RuntimeError(
+            f"Tokenization contract violated for {THINK_CLOSE_TOKEN}: expected 1 token, got {closing_think_ids}"
+        )
+    closing_think_token_id = int(closing_think_ids[0])
+    closing_think_from_vocab = int(tokenizer.convert_tokens_to_ids(THINK_CLOSE_TOKEN))
+    if closing_think_from_vocab >= 0 and closing_think_from_vocab != closing_think_token_id:
+        raise RuntimeError(
+            f"Tokenizer id mismatch for {THINK_CLOSE_TOKEN}: "
+            f"convert_tokens_to_ids={closing_think_from_vocab}, encode={closing_think_token_id}"
+        )
 
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
     if any(i < 0 for i in z_token_ids):
@@ -92,7 +99,7 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, object]:
     return {
         "z_token_ids": z_token_ids,
         "digit_token_ids": digit_token_ids,
-        "answer_token_id": answer_token_id,
+        "closing_think_token_id": closing_think_token_id,
     }
 
 
@@ -276,7 +283,7 @@ def _build_counterfactual_batch(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    answer_token_id: int,
+    closing_think_token_id: int,
     z_token_ids: Sequence[int],
     pad_token_id: int,
     cf_min_z_len: int,
@@ -298,7 +305,7 @@ def _build_counterfactual_batch(
         if valid_len <= 0:
             continue
         row = input_ids[b, :valid_len]
-        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
+        ans_idx = (row == int(closing_think_token_id)).nonzero(as_tuple=False).view(-1)
         if int(ans_idx.numel()) == 0:
             continue
         ans_pos = int(ans_idx[0].item())
@@ -346,18 +353,18 @@ def _decode_sequence(tokenizer, input_ids: Sequence[int], attention_mask: Option
     return tokenizer.decode(valid, skip_special_tokens=False)
 
 
-def _count_z_before_answer(
+def _count_z_before_closing_think(
     *,
     input_ids: Sequence[int],
     attention_mask: Sequence[int],
-    answer_token_id: int,
+    closing_think_token_id: int,
     z_token_ids: Sequence[int],
 ) -> int:
     valid_len = int(sum(int(x) for x in attention_mask))
     row = list(input_ids)[:valid_len]
     z_set = set(int(x) for x in z_token_ids)
     try:
-        ans_pos = row.index(int(answer_token_id))
+        ans_pos = row.index(int(closing_think_token_id))
     except ValueError:
         return 0
     return sum(1 for tok in row[:ans_pos] if int(tok) in z_set)
@@ -370,7 +377,7 @@ def _log_phase_debug_examples(
     phase_idx: int,
     dataset: CurriculumSFTDataset,
     tokenizer,
-    answer_token_id: int,
+    closing_think_token_id: int,
     z_token_ids: Sequence[int],
     log_path: str,
 ) -> None:
@@ -393,10 +400,10 @@ def _log_phase_debug_examples(
     eligible = None
     for i in range(len(dataset)):
         ex = dataset[i]
-        z_count = _count_z_before_answer(
+        z_count = _count_z_before_closing_think(
             input_ids=ex["input_ids"],
             attention_mask=ex["attention_mask"],
-            answer_token_id=answer_token_id,
+            closing_think_token_id=closing_think_token_id,
             z_token_ids=z_token_ids,
         )
         if z_count >= int(cfg.cf_min_z_len):
@@ -405,7 +412,7 @@ def _log_phase_debug_examples(
 
     if eligible is None:
         _log(
-            f"[phase_debug] phase={phase_idx} cf_examples_skipped: no sample with >= {cfg.cf_min_z_len} Z tokens before <ANSWER>.",
+            f"[phase_debug] phase={phase_idx} cf_examples_skipped: no sample with >= {cfg.cf_min_z_len} Z tokens before </think>.",
             log_path,
         )
         return
@@ -423,7 +430,7 @@ def _log_phase_debug_examples(
         cf_ids, cf_mask, _, _ = _build_counterfactual_batch(
             input_ids=base_ids,
             attention_mask=base_mask,
-            answer_token_id=int(answer_token_id),
+            closing_think_token_id=int(closing_think_token_id),
             z_token_ids=z_token_ids,
             pad_token_id=int(tokenizer.pad_token_id),
             cf_min_z_len=int(cfg.cf_min_z_len),
@@ -457,8 +464,8 @@ def _run_phase_batches(
     tokenizer,
     z_token_ids: Sequence[int],
     digit_token_ids: Sequence[int],
-    answer_token_id: int,
-    z_and_answer_allowed: Sequence[int],
+    closing_think_token_id: int,
+    z_and_boundary_allowed: Sequence[int],
     log_path: str,
     metrics_csv: str,
     phase_idx: int,
@@ -521,7 +528,7 @@ def _run_phase_batches(
                 logits=out.logits,
                 labels=batch["labels"],
                 target_class=batch["target_class"],
-                z_allowed_ids=z_and_answer_allowed,
+                z_allowed_ids=z_and_boundary_allowed,
                 digit_allowed_ids=digit_token_ids,
                 alpha_z=cfg.alpha_z,
                 alpha_answer=cfg.alpha_answer,
@@ -536,7 +543,7 @@ def _run_phase_batches(
                 input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
-                    answer_token_id=answer_token_id,
+                    closing_think_token_id=closing_think_token_id,
                     z_token_ids=z_token_ids,
                     pad_token_id=int(tokenizer.pad_token_id),
                     cf_min_z_len=int(cfg.cf_min_z_len),
@@ -864,8 +871,8 @@ def train(cfg: SFTConfig) -> str:
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
     digit_token_ids = token_info["digit_token_ids"]
-    answer_token_id = int(token_info["answer_token_id"])
-    z_and_answer_allowed = list(z_token_ids) + [int(answer_token_id)]
+    closing_think_token_id = int(token_info["closing_think_token_id"])
+    z_and_boundary_allowed = list(z_token_ids) + [int(closing_think_token_id)]
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
 
     train_records = _load_hf_records(cfg.train_dataset_name, cfg.train_dataset_split)
@@ -938,7 +945,7 @@ def train(cfg: SFTConfig) -> str:
             phase_idx=phase_idx,
             dataset=phase_ds,
             tokenizer=tokenizer,
-            answer_token_id=answer_token_id,
+            closing_think_token_id=closing_think_token_id,
             z_token_ids=z_token_ids,
             log_path=log_path,
         )
@@ -967,8 +974,8 @@ def train(cfg: SFTConfig) -> str:
                 tokenizer=tokenizer,
                 z_token_ids=z_token_ids,
                 digit_token_ids=digit_token_ids,
-                answer_token_id=answer_token_id,
-                z_and_answer_allowed=z_and_answer_allowed,
+                closing_think_token_id=closing_think_token_id,
+                z_and_boundary_allowed=z_and_boundary_allowed,
                 log_path=log_path,
                 metrics_csv=metrics_csv,
                 phase_idx=phase_idx,
@@ -1014,8 +1021,8 @@ def train(cfg: SFTConfig) -> str:
                 tokenizer=tokenizer,
                 z_token_ids=z_token_ids,
                 digit_token_ids=digit_token_ids,
-                answer_token_id=answer_token_id,
-                z_and_answer_allowed=z_and_answer_allowed,
+                closing_think_token_id=closing_think_token_id,
+                z_and_boundary_allowed=z_and_boundary_allowed,
                 log_path=log_path,
                 metrics_csv=metrics_csv,
                 phase_idx=phase_idx,
