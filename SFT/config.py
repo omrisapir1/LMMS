@@ -127,7 +127,7 @@ class SFTConfig:
     log_interval_steps: int = 1
     save_every_epoch: bool = True
     save_phase_end: bool = True
-    resume_from: Optional[str] = "sft_curriculum/20260323_123730__V512__lr2e-05/last"
+    resume_from: Optional[str] = "runs/sft_curriculum/20260323_123730__V512__lr2e-05/last"
 
     # DataLoader
     dataloader_num_workers: int = 2
