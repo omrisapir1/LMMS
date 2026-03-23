@@ -115,7 +115,6 @@ def _make_run_dir(cfg: SFTConfig) -> str:
     run_name = cfg.run_name or f"{ts}__V{cfg.vocab_size}__lr{cfg.learning_rate}"
     run_dir = os.path.join(cfg.run_root, run_name)
     os.makedirs(run_dir, exist_ok=True)
-    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "last"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
@@ -355,8 +354,7 @@ def _decode_sequence(tokenizer, input_ids: Sequence[int], attention_mask: Option
     if attention_mask is None:
         valid = list(input_ids)
     else:
-        n = int(sum(int(x) for x in attention_mask))
-        valid = list(input_ids)[:n]
+        valid = [int(tid) for tid, m in zip(input_ids, attention_mask) if int(m) == 1]
     return tokenizer.decode(valid, skip_special_tokens=False)
 
 
@@ -859,7 +857,6 @@ def train(cfg: SFTConfig) -> str:
             torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
         )
 
-    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "last"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
@@ -995,8 +992,6 @@ def train(cfg: SFTConfig) -> str:
                     "next_phase_idx": int(phase_idx),
                     "next_epoch_idx_in_phase": int(epoch_idx + 1),
                 }
-                epoch_dir = os.path.join(run_dir, "checkpoints", f"phase_{phase_idx:02d}_epoch_{epoch_idx + 1:03d}")
-                _save_checkpoint(out_dir=epoch_dir, model=model, tokenizer=tokenizer, optimizer=optimizer, state=state)
                 _save_checkpoint(
                     out_dir=os.path.join(run_dir, "last"),
                     model=model,
@@ -1004,7 +999,7 @@ def train(cfg: SFTConfig) -> str:
                     optimizer=optimizer,
                     state=state,
                 )
-                _log(f"saved epoch checkpoint {epoch_dir}", log_path)
+                _log("saved checkpoint at run_dir/last (epoch boundary)", log_path)
             if hit_cap:
                 reached_cap = True
                 stop_next_phase_idx = int(phase_idx)
@@ -1049,8 +1044,6 @@ def train(cfg: SFTConfig) -> str:
                 "next_phase_idx": int(phase_idx + 1),
                 "next_epoch_idx_in_phase": 0,
             }
-            phase_dir = os.path.join(run_dir, "checkpoints", f"phase_{phase_idx:02d}_end")
-            _save_checkpoint(out_dir=phase_dir, model=model, tokenizer=tokenizer, optimizer=optimizer, state=state)
             _save_checkpoint(
                 out_dir=os.path.join(run_dir, "last"),
                 model=model,
@@ -1058,7 +1051,7 @@ def train(cfg: SFTConfig) -> str:
                 optimizer=optimizer,
                 state=state,
             )
-            _log(f"saved phase-end checkpoint {phase_dir}", log_path)
+            _log("saved checkpoint at run_dir/last (phase end)", log_path)
 
         del loader
         del phase_ds
