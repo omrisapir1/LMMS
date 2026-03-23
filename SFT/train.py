@@ -21,7 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import PhaseConfig, SFTConfig
 from .dataset import THINK_CLOSE_TOKEN, CurriculumSFTDataset, SFTCollator
-from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
+from .losses import _build_inv_map, compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -42,6 +42,36 @@ def _dtype_from_str(name: str) -> torch.dtype:
     if key not in table:
         raise ValueError(f"Unsupported torch dtype string: {name}")
     return table[key]
+
+
+def _load_model_with_attn_fallback(
+    *,
+    model_path: str,
+    torch_dtype: torch.dtype,
+    attn_implementation: str,
+) -> tuple[AutoModelForCausalLM, str, Optional[str]]:
+    requested = str(attn_implementation).strip()
+    if not requested:
+        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype)
+        return model, "default", None
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            attn_implementation=requested,
+        )
+        return model, requested, None
+    except Exception as exc:
+        if requested != "flash_attention_2":
+            raise
+        fallback = "sdpa"
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            attn_implementation=fallback,
+        )
+        return model, fallback, str(exc)
 
 
 def _log(msg: str, log_path: str) -> None:
@@ -211,13 +241,29 @@ def _build_loader(
 def _build_optimizer(trainable_params, cfg: SFTConfig):
     if cfg.optimizer_name == "adamw":
         return torch.optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    if cfg.optimizer_name == "adamw_fused":
+        try:
+            return torch.optim.AdamW(
+                trainable_params,
+                lr=cfg.learning_rate,
+                weight_decay=cfg.weight_decay,
+                fused=True,
+            )
+        except TypeError as e:
+            raise RuntimeError(
+                "optimizer_name='adamw_fused' is not supported by this PyTorch build/device. "
+                "Use optimizer_name='adamw' or 'adamw_8bit'."
+            ) from e
     if cfg.optimizer_name == "adamw_8bit":
         try:
             from bitsandbytes.optim import AdamW8bit
         except ImportError as e:
             raise RuntimeError("bitsandbytes is required for optimizer_name='adamw_8bit'") from e
         return AdamW8bit(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    raise ValueError(f"Unsupported optimizer_name: {cfg.optimizer_name}. Supported values: 'adamw', 'adamw_8bit'")
+    raise ValueError(
+        f"Unsupported optimizer_name: {cfg.optimizer_name}. "
+        "Supported values: 'adamw', 'adamw_fused', 'adamw_8bit'"
+    )
 
 
 def _append_metrics_csv(path: str, row: Dict[str, float]) -> None:
@@ -471,6 +517,10 @@ def _run_phase_batches(
     digit_token_ids: Sequence[int],
     closing_think_token_id: int,
     z_and_boundary_allowed: Sequence[int],
+    z_allowed_t: torch.Tensor,
+    z_inv: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    digit_inv: torch.Tensor,
     log_path: str,
     metrics_csv: str,
     phase_idx: int,
@@ -540,6 +590,11 @@ def _run_phase_batches(
                 alpha_digits=cfg.alpha_digits,
                 z_label_smoothing=cfg.z_label_smoothing,
                 keep_prob=cfg.keep_prob,
+                debug_loss_checks=bool(cfg.debug_loss_checks),
+                z_allowed_t=z_allowed_t,
+                z_inv=z_inv,
+                digit_allowed_t=digit_allowed_t,
+                digit_inv=digit_inv,
             )
             total_loss = loss_out.total
 
@@ -771,6 +826,8 @@ def _build_config_from_yaml_dict(data: Dict) -> SFTConfig:
         learning_rate=float(data.get("learning_rate", 2e-5)),
         weight_decay=float(data.get("weight_decay", 0.0)),
         optimizer_name=str(data.get("optimizer_name", "adamw_8bit")),
+        model_dtype=str(data.get("model_dtype", "bf16")),
+        attn_implementation=str(data.get("attn_implementation", "flash_attention_2")),
         max_length=int(data.get("max_length", 16000)),
         torch_device=str(data.get("torch_device", "cuda:0")),
         max_steps=max_steps,
@@ -779,6 +836,7 @@ def _build_config_from_yaml_dict(data: Dict) -> SFTConfig:
         alpha_answer=float(data.get("alpha_answer", 0.5)),
         alpha_digits=float(data.get("alpha_digits", 1.0)),
         keep_prob=keep_prob,
+        debug_loss_checks=bool(data.get("debug_loss_checks", False)),
         cf_enabled=bool(data.get("cf_enabled", True)),
         cf_every_n_steps=int(data.get("cf_every_n_steps", 2)),
         cf_prob_tuple=cf_prob_tuple,  # type: ignore[arg-type]
@@ -834,6 +892,10 @@ def train(cfg: SFTConfig) -> str:
     start_phase_idx = 0
     start_epoch_idx = 0
     step = 0
+    requested_attn_impl = str(cfg.attn_implementation).strip()
+    torch_dtype = _dtype_from_str(cfg.model_dtype) if torch.cuda.is_available() else torch.float32
+    used_attn_impl = "default"
+    attn_fallback_reason: Optional[str] = None
 
     if cfg.resume_from:
         resume_ckpt = _resolve_resume_checkpoint(cfg.resume_from)
@@ -845,16 +907,18 @@ def train(cfg: SFTConfig) -> str:
         start_epoch_idx = int(state.get("next_epoch_idx_in_phase", 0))
         step = int(state.get("global_step", 0))
         tokenizer = AutoTokenizer.from_pretrained(resume_ckpt, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            resume_ckpt,
-            torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
+        model, used_attn_impl, attn_fallback_reason = _load_model_with_attn_fallback(
+            model_path=resume_ckpt,
+            torch_dtype=torch_dtype,
+            attn_implementation=requested_attn_impl,
         )
     else:
         run_dir = _make_run_dir(cfg)
         tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.base_model_or_checkpoint,
-            torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
+        model, used_attn_impl, attn_fallback_reason = _load_model_with_attn_fallback(
+            model_path=cfg.base_model_or_checkpoint,
+            torch_dtype=torch_dtype,
+            attn_implementation=requested_attn_impl,
         )
 
     os.makedirs(os.path.join(run_dir, "last"), exist_ok=True)
@@ -877,6 +941,16 @@ def train(cfg: SFTConfig) -> str:
     digit_token_ids = token_info["digit_token_ids"]
     closing_think_token_id = int(token_info["closing_think_token_id"])
     z_and_boundary_allowed = list(z_token_ids) + [int(closing_think_token_id)]
+    z_allowed_t, z_inv = _build_inv_map(
+        vocab_size=int(model.config.vocab_size),
+        allowed_ids=z_and_boundary_allowed,
+        device=device,
+    )
+    digit_allowed_t, digit_inv = _build_inv_map(
+        vocab_size=int(model.config.vocab_size),
+        allowed_ids=digit_token_ids,
+        device=device,
+    )
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
 
     train_records = _load_hf_records(cfg.train_dataset_name, cfg.train_dataset_split)
@@ -899,6 +973,20 @@ def train(cfg: SFTConfig) -> str:
 
     _log(f"run_dir={run_dir}", log_path)
     _log(f"train_size={len(train_records)}", log_path)
+    active_attn_impl = (
+        getattr(model.config, "_attn_implementation", None)
+        or getattr(model.config, "attn_implementation", None)
+        or used_attn_impl
+    )
+    _log(
+        f"attention_backend requested={requested_attn_impl or 'default'} active={active_attn_impl}",
+        log_path,
+    )
+    if attn_fallback_reason is not None:
+        _log(
+            f"attention_backend fallback: flash_attention_2 unavailable, switched to sdpa. reason={attn_fallback_reason}",
+            log_path,
+        )
     _log(
         "counterfactual global_enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
@@ -980,6 +1068,10 @@ def train(cfg: SFTConfig) -> str:
                 digit_token_ids=digit_token_ids,
                 closing_think_token_id=closing_think_token_id,
                 z_and_boundary_allowed=z_and_boundary_allowed,
+                z_allowed_t=z_allowed_t,
+                z_inv=z_inv,
+                digit_allowed_t=digit_allowed_t,
+                digit_inv=digit_inv,
                 log_path=log_path,
                 metrics_csv=metrics_csv,
                 phase_idx=phase_idx,
@@ -1025,6 +1117,10 @@ def train(cfg: SFTConfig) -> str:
                 digit_token_ids=digit_token_ids,
                 closing_think_token_id=closing_think_token_id,
                 z_and_boundary_allowed=z_and_boundary_allowed,
+                z_allowed_t=z_allowed_t,
+                z_inv=z_inv,
+                digit_allowed_t=digit_allowed_t,
+                digit_inv=digit_inv,
                 log_path=log_path,
                 metrics_csv=metrics_csv,
                 phase_idx=phase_idx,

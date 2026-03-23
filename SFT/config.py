@@ -29,7 +29,9 @@ class SFTConfig:
     seed: int = 42
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
-    optimizer_name: str = "adamw_8bit"
+    optimizer_name: str = "adamw_8bit"  # one of: adamw_8bit, adamw, adamw_fused
+    model_dtype: str = "bf16"
+    attn_implementation: str = "flash_attention_2"
     max_length: int = 16000
     torch_device: str = "cuda:0"
     max_steps: Optional[int] = None
@@ -40,6 +42,7 @@ class SFTConfig:
     alpha_answer: float = 0.5
     alpha_digits: float = 1.0
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
+    debug_loss_checks: bool = False
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True

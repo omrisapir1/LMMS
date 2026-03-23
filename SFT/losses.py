@@ -111,22 +111,30 @@ def compute_weighted_loss(
     alpha_digits: float,
     z_label_smoothing: float,
     keep_prob: Sequence[float],
+    debug_loss_checks: bool = False,
+    z_allowed_t: torch.Tensor | None = None,
+    z_inv: torch.Tensor | None = None,
+    digit_allowed_t: torch.Tensor | None = None,
+    digit_inv: torch.Tensor | None = None,
 ) -> LossOutput:
-    _debug_check_label_membership(
-        labels=labels,
-        target_class=target_class,
-        z_allowed_ids=z_allowed_ids,
-        digit_allowed_ids=digit_allowed_ids,
-    )
+    if bool(debug_loss_checks):
+        _debug_check_label_membership(
+            labels=labels,
+            target_class=target_class,
+            z_allowed_ids=z_allowed_ids,
+            digit_allowed_ids=digit_allowed_ids,
+        )
 
     z_mask = (target_class == TARGET_Z) & (labels >= 0)
     answer_mask = (target_class == TARGET_ANSWER) & (labels >= 0)
     digit_mask = (target_class == TARGET_DIGIT) & (labels >= 0)
     vocab_size = int(logits.shape[-1])
-    z_allowed_t, z_inv = _build_inv_map(vocab_size=vocab_size, allowed_ids=z_allowed_ids, device=logits.device)
-    digit_allowed_t, digit_inv = _build_inv_map(
-        vocab_size=vocab_size, allowed_ids=digit_allowed_ids, device=logits.device
-    )
+    if z_allowed_t is None or z_inv is None:
+        z_allowed_t, z_inv = _build_inv_map(vocab_size=vocab_size, allowed_ids=z_allowed_ids, device=logits.device)
+    if digit_allowed_t is None or digit_inv is None:
+        digit_allowed_t, digit_inv = _build_inv_map(
+            vocab_size=vocab_size, allowed_ids=digit_allowed_ids, device=logits.device
+        )
 
     z_idx = z_mask.nonzero(as_tuple=False)
     answer_idx = answer_mask.nonzero(as_tuple=False)
