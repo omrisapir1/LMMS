@@ -430,6 +430,83 @@ def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log
     _log(f"[example@warmup_end step={step}] {text}", log_path)
 
 
+def _log_start_counterfactual_examples(
+    *,
+    tokenizer,
+    batch: Dict[str, torch.Tensor],
+    log_path: str,
+    answer_token_id: int,
+    z_token_ids: Sequence[int],
+    cf_min_z_len: int,
+    cf_trunc_range: Tuple[float, float],
+    pad_token_id: int,
+    seed: int,
+) -> None:
+    if "input_ids" not in batch or "attention_mask" not in batch:
+        return
+    if int(batch["input_ids"].shape[0]) == 0:
+        return
+
+    input_ids = batch["input_ids"].detach().cpu()
+    attention_mask = batch["attention_mask"].detach().cpu()
+    z_set = set(int(x) for x in z_token_ids)
+
+    sample_idx = None
+    for b in range(int(input_ids.shape[0])):
+        valid_len = int(attention_mask[b].sum().item())
+        if valid_len <= 0:
+            continue
+        row = input_ids[b, :valid_len]
+        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
+        if int(ans_idx.numel()) == 0:
+            continue
+        ans_pos = int(ans_idx[0].item())
+        lz = 0
+        for j in range(ans_pos):
+            if int(row[j].item()) in z_set:
+                lz += 1
+        if lz >= int(cf_min_z_len):
+            sample_idx = b
+            break
+
+    if sample_idx is None:
+        _log("[example@train_start] no eligible sequence found for counterfactual preview", log_path)
+        return
+
+    sample_ids = input_ids[sample_idx : sample_idx + 1].clone()
+    sample_mask = attention_mask[sample_idx : sample_idx + 1].clone()
+    full_len = int(sample_mask[0].sum().item())
+    if full_len <= 0:
+        return
+
+    full_text = tokenizer.decode(sample_ids[0, :full_len].tolist(), skip_special_tokens=False)
+    _log(f"[example@train_start full] {full_text}", log_path)
+
+    for variant_name, display_name, seed_offset in (
+        ("random", "random", 10_001),
+        ("reverse", "reverse", 10_002),
+        ("truncate", "truncated", 10_003),
+    ):
+        preview_rng = random.Random(int(seed) + int(seed_offset))
+        ids_cf, mask_cf, eligible_mask, _ = _build_counterfactual_batch(
+            input_ids=sample_ids,
+            attention_mask=sample_mask,
+            answer_token_id=answer_token_id,
+            z_token_ids=z_token_ids,
+            pad_token_id=int(pad_token_id),
+            cf_min_z_len=int(cf_min_z_len),
+            variant_name=variant_name,
+            trunc_range=cf_trunc_range,
+            rng=preview_rng,
+        )
+        if not bool(eligible_mask[0].item()):
+            _log(f"[example@train_start {display_name}] not eligible", log_path)
+            continue
+        cf_len = int(mask_cf[0].sum().item())
+        cf_text = tokenizer.decode(ids_cf[0, :cf_len].tolist(), skip_special_tokens=False)
+        _log(f"[example@train_start {display_name}] {cf_text}", log_path)
+
+
 def train(cfg: SFTConfig) -> str:
     if not cfg.base_model_or_checkpoint.strip():
         raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
@@ -507,11 +584,26 @@ def train(cfg: SFTConfig) -> str:
     )
 
     warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
+    start_examples_logged = False
 
     while step < int(cfg.max_steps):
         for batch in train_loader:
             if step >= int(cfg.max_steps):
                 break
+
+            if not start_examples_logged:
+                _log_start_counterfactual_examples(
+                    tokenizer=tokenizer,
+                    batch=batch,
+                    log_path=log_path,
+                    answer_token_id=int(answer_token_id),
+                    z_token_ids=z_token_ids,
+                    cf_min_z_len=int(cfg.cf_min_z_len),
+                    cf_trunc_range=cfg.cf_trunc_range,
+                    pad_token_id=int(tokenizer.pad_token_id),
+                    seed=int(cfg.seed),
+                )
+                start_examples_logged = True
 
             model.train()
             for k in ("input_ids", "attention_mask", "labels", "target_class"):
