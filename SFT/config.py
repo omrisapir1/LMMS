@@ -6,24 +6,24 @@ from dataclasses import dataclass
 @dataclass
 class SFTConfig:
     # Model / tokenizer inputs
-    base_model_or_checkpoint: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
-    train_dataset_name: str = "omrisap/nvidia_math_64_47K"
+    base_model_or_checkpoint: str = "nvidia/OpenMath-Nemotron-7B"
+    train_dataset_name: str = "omrisap/nvidia_math_512_47K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
     eval_dataset_split: str = "eval"
 
     # Discrete Z vocab
-    vocab_size: int = 64
+    vocab_size: int = 512
 
     # Training
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 64
     eval_batch_size: int = 1024
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     max_steps: int = 60_000
-    warmup_steps: int = 0
+    warmup_steps: int = 50
     max_length: int = 2048
     torch_device: str = "cuda:0"
 
@@ -49,7 +49,7 @@ class SFTConfig:
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
     # Evaluation / generation
-    eval_interval_steps: int = 500
+    eval_interval_steps: int = 50000000
     pass_at_n: int = 16
     k_max: int = 128
     temperature: float = 1.0
