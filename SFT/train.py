@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
-from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset
+from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset, TARGET_IGNORE
 # from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
@@ -354,6 +354,7 @@ def _build_counterfactual_batch(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    target_class: Optional[torch.Tensor],
     answer_token_id: int,
     z_token_ids: Sequence[int],
     pad_token_id: int,
@@ -361,9 +362,10 @@ def _build_counterfactual_batch(
     variant_name: str,
     trunc_range: Tuple[float, float],
     rng: random.Random,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     input_ids_cf = input_ids.clone()
     attention_mask_cf = attention_mask.clone()
+    target_class_cf = target_class.clone() if target_class is not None else None
 
     z_set = set(int(x) for x in z_token_ids)
     bsz, _ = input_ids.shape
@@ -406,14 +408,28 @@ def _build_counterfactual_batch(
             keep_k = max(0, lz - remove_count)
             remove_pos = z_pos[keep_k:]
             if remove_pos:
+                # Truncate by compacting the visible sequence (no attention holes),
+                # then right-pad to preserve tensor shape.
+                keep_mask = torch.ones((valid_len,), dtype=torch.bool, device=input_ids.device)
                 remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long, device=input_ids.device)
-                input_ids_cf[b, remove_tensor] = int(pad_token_id)
-                attention_mask_cf[b, remove_tensor] = 0
+                keep_mask[remove_tensor] = False
+                compact_ids = row[keep_mask]
+                new_valid_len = int(compact_ids.shape[0])
+                input_ids_cf[b, :new_valid_len] = compact_ids
+                attention_mask_cf[b, :new_valid_len] = 1
+                input_ids_cf[b, new_valid_len:] = int(pad_token_id)
+                attention_mask_cf[b, new_valid_len:] = 0
+
+                if target_class_cf is not None:
+                    row_tc = target_class[b, :valid_len]
+                    compact_tc = row_tc[keep_mask]
+                    target_class_cf[b, :new_valid_len] = compact_tc
+                    target_class_cf[b, new_valid_len:] = int(TARGET_IGNORE)
             visible_z_counts[b] = int(keep_k)
         else:
             raise ValueError(f"unknown counterfactual variant: {variant_name}")
 
-    return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts
+    return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts, target_class_cf
 
 
 def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
@@ -451,6 +467,8 @@ def _log_start_counterfactual_examples(
 
     if "input_ids" not in batch or "attention_mask" not in batch:
         return
+    if "target_class" not in batch:
+        return
     if int(batch["input_ids"].shape[0]) == 0:
         return
 
@@ -482,6 +500,7 @@ def _log_start_counterfactual_examples(
 
     sample_ids = input_ids[sample_idx : sample_idx + 1].clone()
     sample_mask = attention_mask[sample_idx : sample_idx + 1].clone()
+    sample_target_class = batch["target_class"].detach().cpu()[sample_idx : sample_idx + 1].clone()
     if int(sample_mask[0].sum().item()) <= 0:
         return
 
@@ -494,9 +513,10 @@ def _log_start_counterfactual_examples(
         ("truncate", "truncated", 10_003),
     ):
         preview_rng = random.Random(int(seed) + int(seed_offset))
-        ids_cf, mask_cf, eligible_mask, _ = _build_counterfactual_batch(
+        ids_cf, mask_cf, eligible_mask, _, _ = _build_counterfactual_batch(
             input_ids=sample_ids,
             attention_mask=sample_mask,
+            target_class=sample_target_class,
             answer_token_id=answer_token_id,
             z_token_ids=z_token_ids,
             pad_token_id=int(pad_token_id),
@@ -645,9 +665,10 @@ def train(cfg: SFTConfig) -> str:
 
                 if cf_trigger:
                     cf_variant_name = _sample_cf_variant(cfg, train_rng)
-                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts, target_class_cf = _build_counterfactual_batch(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
+                        target_class=batch["target_class"],
                         answer_token_id=answer_token_id,
                         z_token_ids=z_token_ids,
                         pad_token_id=int(tokenizer.pad_token_id),
@@ -667,7 +688,7 @@ def train(cfg: SFTConfig) -> str:
                         )
                         cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
                             logits=out_cf.logits,
-                            target_class=batch["target_class"],
+                            target_class=target_class_cf if target_class_cf is not None else batch["target_class"],
                             digit_allowed_ids=digit_token_ids,
                         )
                         del out_cf
