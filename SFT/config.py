@@ -35,7 +35,7 @@ class SFTConfig:
     w_end_answer: float = 0.25
     w_end_digits: float = 0.5
     start_weights_steps: int = 300
-    goes_up_weights_steps: int = 3000
+    goes_up_weights_steps: int = 300
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
