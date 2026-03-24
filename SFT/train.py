@@ -442,6 +442,13 @@ def _log_start_counterfactual_examples(
     pad_token_id: int,
     seed: int,
 ) -> None:
+    def _decode_visible(ids_1d: torch.Tensor, mask_1d: torch.Tensor) -> str:
+        keep = mask_1d.to(dtype=torch.bool)
+        visible_ids = ids_1d[keep]
+        if int(visible_ids.numel()) == 0:
+            return ""
+        return tokenizer.decode(visible_ids.tolist(), skip_special_tokens=False)
+
     if "input_ids" not in batch or "attention_mask" not in batch:
         return
     if int(batch["input_ids"].shape[0]) == 0:
@@ -475,11 +482,10 @@ def _log_start_counterfactual_examples(
 
     sample_ids = input_ids[sample_idx : sample_idx + 1].clone()
     sample_mask = attention_mask[sample_idx : sample_idx + 1].clone()
-    full_len = int(sample_mask[0].sum().item())
-    if full_len <= 0:
+    if int(sample_mask[0].sum().item()) <= 0:
         return
 
-    full_text = tokenizer.decode(sample_ids[0, :full_len].tolist(), skip_special_tokens=False)
+    full_text = _decode_visible(sample_ids[0], sample_mask[0])
     _log(f"[example@train_start full] {full_text}", log_path)
 
     for variant_name, display_name, seed_offset in (
@@ -502,8 +508,7 @@ def _log_start_counterfactual_examples(
         if not bool(eligible_mask[0].item()):
             _log(f"[example@train_start {display_name}] not eligible", log_path)
             continue
-        cf_len = int(mask_cf[0].sum().item())
-        cf_text = tokenizer.decode(ids_cf[0, :cf_len].tolist(), skip_special_tokens=False)
+        cf_text = _decode_visible(ids_cf[0], mask_cf[0])
         _log(f"[example@train_start {display_name}] {cf_text}", log_path)
 
 
