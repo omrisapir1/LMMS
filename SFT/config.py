@@ -34,8 +34,8 @@ class SFTConfig:
     w_start_digits: float = 0.05
     w_end_answer: float = 0.25
     w_end_digits: float = 0.5
-    start_weights_steps: int = 1000
-    goes_up_weights_steps: int = 1000
+    start_weights_steps: int = 300
+    goes_up_weights_steps: int = 3000
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
@@ -59,8 +59,8 @@ class SFTConfig:
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
     log_interval_steps: int = 20
-    save_interval_steps: int = 2000
-    save_every_steps: int = 2000
+    save_interval_steps: int = 625
+    save_every_steps: int = 625
     keep_last_k: int = 3
     save_best: bool = True
     save_ppo_init: bool = False
