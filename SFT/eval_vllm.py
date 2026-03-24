@@ -9,8 +9,6 @@ from typing import Dict, Iterable, List
 
 from transformers import AutoTokenizer
 
-from phase1.dataset import SYSTEM_PROMPT
-
 
 @dataclass
 class EvalMetrics:
@@ -40,7 +38,6 @@ def truncate_phaseA_to_answer(token_ids: List[int], answer_token_id: int) -> tup
 
 def _build_prompt(tokenizer, problem: str) -> str:
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -107,7 +104,7 @@ def evaluate_with_vllm(
     except Exception as exc:
         raise RuntimeError("vLLM is required for SFT evaluation and is not available.") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained('/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b', use_fast=True)
 
     z_tokens = [f"<z_{i}>" for i in range(int(vocab_size))]
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
