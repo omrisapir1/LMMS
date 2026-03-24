@@ -587,6 +587,8 @@ def train(cfg: SFTConfig) -> str:
     step = 0
     micro = 0
     best_pass = -math.inf
+    log_window_sums: Dict[str, float] = {}
+    log_window_count = 0
     scaler_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
 
     _log(f"run_dir={run_dir}", log_path)
@@ -750,34 +752,52 @@ def train(cfg: SFTConfig) -> str:
 
 
 
+            mean_z_len = float(batch["z_lens"].float().mean().item())
+            row_step = {
+                "L_total": float(total_loss.detach().item()),
+                "L_z": float(loss_out.l_z.detach().item()),
+                "L_answer": float(loss_out.l_answer.detach().item()),
+                "L_digits": float(loss_out.l_digits.detach().item()),
+                "z_acc": float(loss_out.z_acc),
+                "digit_exact_match": float(loss_out.digit_exact_match),
+                "avg_z_len": float(mean_z_len),
+                "no_answer_before_kmax": 0.0,
+                "cf_enabled": float(bool(cfg.cf_enabled)),
+                "cf_applied": float(bool(cf_applied)),
+                "cf_loss": float(cf_loss_scalar),
+                "cf_variant_truncate": float(cf_variant_name == "truncate"),
+                "cf_variant_reverse": float(cf_variant_name == "reverse"),
+                "cf_variant_random": float(cf_variant_name == "random"),
+                "cf_mean_sym_kl": float(cf_mean_sym_kl),
+                "cf_mean_entropy": float(cf_mean_entropy),
+                "cf_eligible_count": float(cf_eligible_count),
+                "cf_visible_z_mean": float(cf_visible_z_mean),
+                "w_answer": float(cur_w_answer),
+                "w_digits": float(cur_w_digits),
+            }
+            for k, v in row_step.items():
+                log_window_sums[k] = float(log_window_sums.get(k, 0.0) + float(v))
+            log_window_count += 1
+
             if step % int(cfg.log_interval_steps) == 0:
-                mean_z_len = float(batch["z_lens"].float().mean().item())
-                row = {
-                    "step": float(step),
-                    "L_total": float(total_loss.detach().item()),
-                    "L_z": float(loss_out.l_z.detach().item()),
-                    "L_answer": float(loss_out.l_answer.detach().item()),
-                    "L_digits": float(loss_out.l_digits.detach().item()),
-                    "z_acc": float(loss_out.z_acc),
-                    "digit_exact_match": float(loss_out.digit_exact_match),
-                    "avg_z_len": float(mean_z_len),
-                    "no_answer_before_kmax": 0.0,
-                    "cf_enabled": float(bool(cfg.cf_enabled)),
-                    "cf_applied": float(bool(cf_applied)),
-                    "cf_loss": float(cf_loss_scalar),
-                    "cf_variant_truncate": float(cf_variant_name == "truncate"),
-                    "cf_variant_reverse": float(cf_variant_name == "reverse"),
-                    "cf_variant_random": float(cf_variant_name == "random"),
-                    "cf_mean_sym_kl": float(cf_mean_sym_kl),
-                    "cf_mean_entropy": float(cf_mean_entropy),
-                    "cf_eligible_count": float(cf_eligible_count),
-                    "cf_visible_z_mean": float(cf_visible_z_mean),
-                    "w_answer": float(cur_w_answer),
-                    "w_digits": float(cur_w_digits),
-                }
+                denom = float(max(1, int(log_window_count)))
+                row = {"step": float(step)}
+                for k, v in log_window_sums.items():
+                    row[k] = float(v / denom)
+
                 _append_metrics_csv(metrics_csv, row)
+
+                cf_trunc_p = float(row.get("cf_variant_truncate", 0.0))
+                cf_rev_p = float(row.get("cf_variant_reverse", 0.0))
+                cf_rand_p = float(row.get("cf_variant_random", 0.0))
+                dominant_variant = "truncate"
+                if cf_rev_p >= cf_trunc_p and cf_rev_p >= cf_rand_p:
+                    dominant_variant = "reverse"
+                elif cf_rand_p >= cf_trunc_p and cf_rand_p >= cf_rev_p:
+                    dominant_variant = "random"
+
                 _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
+                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={:.2f} cf_applied={:.2f} cf_variant={} cf_variant_p(t/r/rnd)=({:.2f}/{:.2f}/{:.2f}) cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
                         row["L_z"],
@@ -788,15 +808,20 @@ def train(cfg: SFTConfig) -> str:
                         row["avg_z_len"],
                         row["w_answer"],
                         row["w_digits"],
-                        int(bool(cfg.cf_enabled)),
-                        int(bool(cf_applied)),
-                        cf_variant_name,
+                        row["cf_enabled"],
+                        row["cf_applied"],
+                        dominant_variant,
+                        cf_trunc_p,
+                        cf_rev_p,
+                        cf_rand_p,
                         row["cf_loss"],
                         row["cf_mean_sym_kl"],
                         row["cf_mean_entropy"],
                     ),
                     log_path,
                 )
+                log_window_sums = {}
+                log_window_count = 0
 
             if step % int(cfg.save_interval_steps) == 0:
                 _save_last(
