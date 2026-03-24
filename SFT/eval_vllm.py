@@ -127,7 +127,7 @@ def evaluate_with_vllm(
     if vllm_cuda_visible_devices is not None and str(vllm_cuda_visible_devices).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_cuda_visible_devices)
     try:
-        llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.95)
+        llm = LLM(model="/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b_vllm", tokenizer='/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b', trust_remote_code=True, gpu_memory_utilization=0.95)
     finally:
         if old_cuda_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
