@@ -104,7 +104,7 @@ def evaluate_with_vllm(
     except Exception as exc:
         raise RuntimeError("vLLM is required for SFT evaluation and is not available.") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained('/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b', use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
 
     z_tokens = [f"<z_{i}>" for i in range(int(vocab_size))]
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
@@ -127,7 +127,7 @@ def evaluate_with_vllm(
     if vllm_cuda_visible_devices is not None and str(vllm_cuda_visible_devices).strip():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(vllm_cuda_visible_devices)
     try:
-        llm = LLM(model="/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b_vllm", tokenizer='/root/.cache/huggingface/hub/models--omrisap--Qwen-9B-512Z/snapshots/540bddc5affd6f3bfe4f977131a762d001cc112b', trust_remote_code=True, gpu_memory_utilization=0.95)
+        llm = LLM(model=model_path, tokenizer=model_path, trust_remote_code=True, gpu_memory_utilization=0.95)
     finally:
         if old_cuda_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
