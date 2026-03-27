@@ -602,10 +602,12 @@ def _map_pretokenize_impl(
             continue
 
         user_prompt = _render_user_prompt(user_prompt_template, problem)
-        assistant_content, separator_positions_in_assistant = _build_assistant_content_and_positions(
-            tokenizer,
-            thoughts,
-            separator_text,
+        assistant_content, separator_positions_in_assistant, separator_char_spans_in_assistant = (
+            _build_assistant_content_and_positions_with_spans(
+                tokenizer,
+                thoughts,
+                separator_text,
+            )
         )
 
         input_ids, separator_positions, alignment_debug = _build_chat_ids_and_positions(
@@ -613,15 +615,20 @@ def _map_pretokenize_impl(
             user_prompt,
             assistant_content,
             separator_positions_in_assistant,
-        )
-
-        _assert_shifted_positions(
-            input_ids=input_ids,
-            shifted_positions=separator_positions,
-            separator_token_id=separator_token_id,
+            separator_char_spans_in_assistant,
+            separator_text,
         )
 
         valid = True
+        try:
+            _assert_shifted_positions(
+                input_ids=input_ids,
+                shifted_positions=separator_positions,
+                separator_token_id=separator_token_id,
+            )
+        except AssertionError:
+            valid = False
+
         for pos in separator_positions:
             if pos < 0 or pos >= len(input_ids) or int(input_ids[pos]) != separator_token_id:
                 valid = False
@@ -720,6 +727,19 @@ def _build_assistant_content_and_positions(
     thoughts: list[str],
     separator: str,
 ) -> tuple[str, list[int]]:
+    text, positions, _ = _build_assistant_content_and_positions_with_spans(
+        tokenizer=tokenizer,
+        thoughts=thoughts,
+        separator=separator,
+    )
+    return text, positions
+
+
+def _build_assistant_content_and_positions_with_spans(
+    tokenizer: Any,
+    thoughts: list[str],
+    separator: str,
+) -> tuple[str, list[int], list[tuple[int, int]]]:
     text = ""
     separator_char_spans: list[tuple[int, int]] = []
 
@@ -738,7 +758,7 @@ def _build_assistant_content_and_positions(
         separator=separator,
         separator_char_spans=separator_char_spans,
     )
-    return text, separator_positions
+    return text, separator_positions, separator_char_spans
 
 
 def _resolve_separator_positions(
@@ -794,6 +814,8 @@ def _build_chat_ids_and_positions(
     user_prompt: str,
     assistant_content: str,
     separator_positions_in_assistant: list[int],
+    separator_char_spans_in_assistant: list[tuple[int, int]],
+    separator_text: str,
 ) -> tuple[list[int], list[int], dict[str, Any]]:
     chat_text = _build_chat_text(tokenizer, user_prompt, assistant_content)
 
@@ -805,15 +827,24 @@ def _build_chat_ids_and_positions(
     prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
     assistant_ids = tokenizer.encode(assistant_content, add_special_tokens=False)
     full_ids = tokenizer.encode(chat_text, add_special_tokens=False)
+    absolute_separator_spans = [
+        (assistant_start_char + start, assistant_start_char + end)
+        for start, end in separator_char_spans_in_assistant
+    ]
 
-    assistant_start_token_idx = len(prefix_ids)
-    separator_positions_final = [assistant_start_token_idx + p for p in separator_positions_in_assistant]
+    separator_positions_final = _resolve_separator_positions(
+        tokenizer,
+        text=chat_text,
+        separator=separator_text,
+        separator_char_spans=absolute_separator_spans,
+    )
 
     debug = {
         "prefix_len": len(prefix_ids),
         "assistant_len": len(assistant_ids),
         "assistant_positions": [int(x) for x in separator_positions_in_assistant],
         "shifted_positions": [int(x) for x in separator_positions_final],
+        "assistant_start_char": assistant_start_char,
     }
     return [int(x) for x in full_ids], separator_positions_final, debug
 
