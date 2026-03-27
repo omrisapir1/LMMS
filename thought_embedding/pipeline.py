@@ -20,17 +20,21 @@ from thought_embedding.io_utils import (
 
 logger = logging.getLogger(__name__)
 
+_MAP_TOKENIZER_CACHE: dict[str, Any] = {}
+
 
 @dataclass
-class PreparedExample:
+class PreTokenizedExample:
     key: str
     row_index: int
     input_ids: list[int]
-    thought_token_end_positions: list[int]
+    input_token_count: int
+    thought_separator_positions: list[int]
     problem: str
     thoughts: list[str]
     answer: Any = None
     expected_answer: Any = None
+    source: Any = None
     source_id: Optional[str] = None
     source_qid: Optional[str] = None
     solution: Optional[str] = None
@@ -38,7 +42,7 @@ class PreparedExample:
 
 @dataclass
 class BatchState:
-    examples: list[PreparedExample]
+    examples: list[PreTokenizedExample]
     total_tokens: int
 
 
@@ -65,7 +69,29 @@ def run_pipeline(
     if dataset is None:
         dataset = load_dataset(cfg.dataset_name, split=cfg.train_split)
 
-    _validate_dataset_columns(dataset, cfg)
+    if cfg.source_filter:
+        if not cfg.input_source_field:
+            raise PipelineError("source_filter is set but input_source_field is not configured.")
+        if cfg.input_source_field not in set(dataset.column_names):
+            raise PipelineError(
+                f"source_filter is set but '{cfg.input_source_field}' column is missing from dataset."
+            )
+        wanted_source = str(cfg.source_filter)
+        dataset = dataset.filter(
+            lambda x: str(x.get(cfg.input_source_field)) == wanted_source,
+            desc=f"Filter source={wanted_source}",
+        )
+
+    dataset = dataset.shuffle(seed=cfg.seed)
+
+    if cfg.max_samples > 0:
+        dataset = dataset.select(range(min(cfg.max_samples, len(dataset))))
+
+    processed_rows = int(manifest.get("processed_rows", 0)) + len(dataset)
+    written_rows = int(manifest.get("written_rows", 0))
+    next_shard_idx = int(manifest.get("next_shard_idx", 0))
+    failed_rows = 0
+    completed_since_manifest = 0
 
     local_tokenizer = tokenizer or AutoTokenizer.from_pretrained(
         cfg.model_name,
@@ -76,99 +102,121 @@ def run_pipeline(
 
     sep_token_id = _separator_token_id(local_tokenizer, cfg.separator_text)
 
+    pretokenized_ds = _pretokenize_dataset(
+        cfg,
+        dataset,
+        tokenizer=local_tokenizer,
+        separator_token_id=sep_token_id,
+    )
+
+    if cfg.resume and completed_keys:
+        pretokenized_ds = pretokenized_ds.filter(
+            lambda x: x["__row_key"] not in completed_keys,
+            desc="Filter completed keys",
+        )
+
+    invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
+    overlong_count = sum(1 for v in pretokenized_ds["is_overlong"] if v)
+
+    filtered_ds = pretokenized_ds.filter(
+        lambda x: x["is_valid"] and (not x["is_overlong"]),
+        desc="Filter invalid and overlong",
+    )
+
+    _print_startup_example(filtered_ds)
+
+    if cfg.sort_by_length and len(filtered_ds) > 0:
+        filtered_ds = filtered_ds.sort("input_token_count")
+
+    pad_token_id = _pad_token_id(local_tokenizer, local_model)
+
     output_rows: list[dict[str, Any]] = []
     batch = BatchState(examples=[], total_tokens=0)
 
-    processed_rows = int(manifest.get("processed_rows", 0))
-    written_rows = int(manifest.get("written_rows", 0))
-    next_shard_idx = int(manifest.get("next_shard_idx", 0))
-    skipped_rows = 0
-    failed_rows = 0
-
-    for row_idx, row in enumerate(dataset):
-        if cfg.max_samples > 0 and row_idx >= cfg.max_samples:
-            break
-
-        processed_rows += 1
+    for row in filtered_ds:
         try:
-            key = _row_key(row, row_idx, cfg)
-            if cfg.resume and key in completed_keys:
-                continue
+            ex = _row_to_pretokenized_example(row)
 
-            prepared = _prepare_example_row(cfg, local_tokenizer, row, row_idx, key, sep_token_id)
-            if prepared is None:
-                skipped_rows += 1
-                continue
+            if _would_overflow_batch(cfg, batch, ex):
+                completed_now = _flush_batch(
+                    cfg,
+                    local_model,
+                    pad_token_id,
+                    batch,
+                    output_rows,
+                    completed_keys,
+                )
+                completed_since_manifest += completed_now
 
-            # Primary limit: total tokens in a model forward. Secondary: number of examples.
-            if _would_overflow_batch(cfg, batch, prepared):
-                _flush_batch(cfg, local_model, batch, output_rows, completed_keys)
                 if len(output_rows) >= cfg.shard_size:
-                    write_parquet_shard(output_rows, output_dir, next_shard_idx)
-                    next_shard_idx += 1
-                    written_rows += len(output_rows)
-                    output_rows.clear()
+                    rows_written, next_shard_idx = _write_shard(output_rows, output_dir, next_shard_idx)
+                    written_rows += rows_written
+                    _save_manifest(output_dir, completed_keys, processed_rows, written_rows, next_shard_idx)
+                    completed_since_manifest = 0
 
-            batch.examples.append(prepared)
-            batch.total_tokens += len(prepared.input_ids)
+            batch.examples.append(ex)
+            batch.total_tokens += ex.input_token_count
 
             if _is_batch_full(cfg, batch):
-                _flush_batch(cfg, local_model, batch, output_rows, completed_keys)
+                completed_now = _flush_batch(
+                    cfg,
+                    local_model,
+                    pad_token_id,
+                    batch,
+                    output_rows,
+                    completed_keys,
+                )
+                completed_since_manifest += completed_now
 
             if len(output_rows) >= cfg.shard_size:
-                write_parquet_shard(output_rows, output_dir, next_shard_idx)
-                next_shard_idx += 1
-                written_rows += len(output_rows)
-                output_rows.clear()
+                rows_written, next_shard_idx = _write_shard(output_rows, output_dir, next_shard_idx)
+                written_rows += rows_written
+                _save_manifest(output_dir, completed_keys, processed_rows, written_rows, next_shard_idx)
+                completed_since_manifest = 0
 
-            if processed_rows % cfg.log_every_n_examples == 0:
+            if len(completed_keys) % cfg.log_every_n_examples == 0 and len(completed_keys) > 0:
                 logger.info(
-                    "Processed %s rows | completed=%s | skipped=%s | pending_batch_examples=%s",
-                    processed_rows,
+                    "Completed=%s | skipped_invalid=%s | skipped_overlong=%s | pending_batch_examples=%s",
                     len(completed_keys),
-                    skipped_rows,
+                    invalid_count,
+                    overlong_count,
                     len(batch.examples),
                 )
 
-            if (written_rows + len(output_rows)) % cfg.save_every_n_examples == 0:
-                save_manifest(
-                    output_dir,
-                    {
-                        "completed_keys": sorted(completed_keys),
-                        "processed_rows": processed_rows,
-                        "written_rows": written_rows,
-                        "next_shard_idx": next_shard_idx,
-                    },
-                )
+            if completed_since_manifest >= cfg.save_every_n_examples:
+                _save_manifest(output_dir, completed_keys, processed_rows, written_rows, next_shard_idx)
+                completed_since_manifest = 0
 
         except Exception as exc:
-            logger.exception("Row %s failed: %s", row_idx, exc)
+            logger.exception("Pre-tokenized row failed: %s", exc)
             failed_rows += 1
             continue
 
     if batch.examples:
-        _flush_batch(cfg, local_model, batch, output_rows, completed_keys)
+        completed_now = _flush_batch(
+            cfg,
+            local_model,
+            pad_token_id,
+            batch,
+            output_rows,
+            completed_keys,
+        )
+        completed_since_manifest += completed_now
 
     if output_rows:
-        write_parquet_shard(output_rows, output_dir, next_shard_idx)
-        next_shard_idx += 1
-        written_rows += len(output_rows)
-        output_rows.clear()
+        rows_written, next_shard_idx = _write_shard(output_rows, output_dir, next_shard_idx)
+        written_rows += rows_written
+        _save_manifest(output_dir, completed_keys, processed_rows, written_rows, next_shard_idx)
+        completed_since_manifest = 0
 
-    manifest = {
-        "completed_keys": sorted(completed_keys),
-        "processed_rows": processed_rows,
-        "written_rows": written_rows,
-        "next_shard_idx": next_shard_idx,
-    }
-    save_manifest(output_dir, manifest)
+    manifest = _save_manifest(output_dir, completed_keys, processed_rows, written_rows, next_shard_idx)
 
     summary = {
         "output_dir": str(output_dir),
         "num_shards": len(list_existing_shards(output_dir)),
         "processed_rows": processed_rows,
         "written_rows": written_rows,
-        "skipped_rows": skipped_rows,
+        "skipped_rows": invalid_count + overlong_count,
         "failed_rows": failed_rows,
         "manifest": manifest,
     }
@@ -191,25 +239,6 @@ def _prepare_output_dir(cfg: ThoughtEmbeddingConfig, output_dir: Path) -> None:
         manifest_path = output_dir / "manifest.json"
         if manifest_path.exists():
             manifest_path.unlink()
-
-
-def _validate_dataset_columns(dataset: Dataset, cfg: ThoughtEmbeddingConfig) -> None:
-    columns = set(dataset.column_names)
-    required = {cfg.input_problem_field, cfg.input_thoughts_field}
-    missing = [c for c in required if c not in columns]
-    if missing:
-        raise ValueError(
-            "Dataset is missing required columns for this config: "
-            f"{missing}. Available columns: {sorted(columns)}"
-        )
-
-
-def _row_key(row: dict[str, Any], row_idx: int, cfg: ThoughtEmbeddingConfig) -> str:
-    if cfg.input_id_field and row.get(cfg.input_id_field) is not None:
-        return f"id:{row[cfg.input_id_field]}"
-    if cfg.input_qid_field and row.get(cfg.input_qid_field) is not None:
-        return f"qid:{row[cfg.input_qid_field]}"
-    return f"row:{row_idx}"
 
 
 def _torch_dtype(dtype: str) -> torch.dtype:
@@ -249,100 +278,351 @@ def _separator_token_id(tokenizer: Any, separator_text: str) -> int:
     return int(ids[0])
 
 
-def _prepare_example_row(
+def _pretokenize_dataset(
     cfg: ThoughtEmbeddingConfig,
+    dataset: Dataset,
+    *,
     tokenizer: Any,
-    row: dict[str, Any],
-    row_idx: int,
-    key: str,
-    sep_token_id: int,
-) -> Optional[PreparedExample]:
-    problem = row[cfg.input_problem_field]
-    if not isinstance(problem, str) or not problem.strip():
-        logger.warning("Skipping row %s: problem is missing or empty", row_idx)
-        return None
+    separator_token_id: int,
+) -> Dataset:
+    ds = dataset.map(
+        _map_add_row_keys,
+        with_indices=True,
+        batched=True,
+        batch_size=cfg.pretokenize_batch_size,
+        fn_kwargs={
+            "input_id_field": cfg.input_id_field,
+            "input_qid_field": cfg.input_qid_field,
+        },
+        desc="Attach row keys",
+    )
 
-    raw_thoughts = row[cfg.input_thoughts_field]
-    if not isinstance(raw_thoughts, list):
-        logger.warning("Skipping row %s: %s must be a list", row_idx, cfg.input_thoughts_field)
-        return None
+    map_num_proc = cfg.pretokenize_num_proc
+    if tokenizer is not None and map_num_proc > 1:
+        # Injected tokenizers (e.g., tests) may not be serializable across worker processes.
+        map_num_proc = 1
 
-    thoughts: list[str] = []
-    if any(not isinstance(t, str) for t in raw_thoughts):
-        logger.warning("Skipping row %s: %s must contain only strings", row_idx, cfg.input_thoughts_field)
-        return None
-
-    for t in raw_thoughts:
-        cleaned = t.strip()
-        if cleaned or not cfg.drop_empty_thoughts:
-            thoughts.append(cleaned)
-
-    if cfg.drop_empty_thoughts:
-        thoughts = [t for t in thoughts if t]
-
-    if len(thoughts) < cfg.min_thoughts:
-        logger.warning(
-            "Skipping row %s: only %s thoughts after filtering (min=%s)",
-            row_idx,
-            len(thoughts),
-            cfg.min_thoughts,
+    if map_num_proc > 1:
+        ds = ds.map(
+            _map_pretokenize_parallel,
+            batched=True,
+            batch_size=cfg.pretokenize_batch_size,
+            num_proc=map_num_proc,
+            fn_kwargs={
+                "model_name": cfg.model_name,
+                "input_problem_field": cfg.input_problem_field,
+                "input_thoughts_field": cfg.input_thoughts_field,
+                "input_answer_field": cfg.input_answer_field,
+                "input_expected_answer_field": cfg.input_expected_answer_field,
+                "input_solution_field": cfg.input_solution_field,
+                "input_source_field": cfg.input_source_field,
+                "input_id_field": cfg.input_id_field,
+                "input_qid_field": cfg.input_qid_field,
+                "drop_empty_thoughts": cfg.drop_empty_thoughts,
+                "min_thoughts": cfg.min_thoughts,
+                "user_prompt_template": cfg.user_prompt_template,
+                "separator_text": cfg.separator_text,
+                "separator_token_id": separator_token_id,
+                "max_model_len": cfg.max_model_len,
+                "keep_solution": cfg.keep_solution,
+            },
+            desc="Pre-tokenize/alignment",
         )
-        return None
-
-    user_prompt = cfg.user_prompt_template.format(problem=problem)
-    assistant_content, sep_positions_in_assistant = _build_assistant_content_and_positions(
-        tokenizer,
-        thoughts,
-        cfg.separator_text,
-    )
-
-    final_ids, sep_positions_final = _build_chat_ids_and_positions(
-        tokenizer,
-        user_prompt,
-        assistant_content,
-        sep_positions_in_assistant,
-    )
-
-    for pos in sep_positions_final:
-        if pos < 0 or pos >= len(final_ids):
-            raise PipelineError(f"Invalid separator token position {pos} for sequence length {len(final_ids)}")
-        if int(final_ids[pos]) != sep_token_id:
-            raise PipelineError(
-                "Tracked separator position does not point to separator token after chat template. "
-                f"pos={pos}, token_id={final_ids[pos]}, expected={sep_token_id}."
-            )
-
-    if len(final_ids) > cfg.max_model_len:
-        logger.warning(
-            "Skipping row %s: input length %s exceeds max_model_len=%s",
-            row_idx,
-            len(final_ids),
-            cfg.max_model_len,
+    else:
+        ds = ds.map(
+            _map_pretokenize_serial,
+            batched=True,
+            batch_size=cfg.pretokenize_batch_size,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "input_problem_field": cfg.input_problem_field,
+                "input_thoughts_field": cfg.input_thoughts_field,
+                "input_answer_field": cfg.input_answer_field,
+                "input_expected_answer_field": cfg.input_expected_answer_field,
+                "input_solution_field": cfg.input_solution_field,
+                "input_source_field": cfg.input_source_field,
+                "input_id_field": cfg.input_id_field,
+                "input_qid_field": cfg.input_qid_field,
+                "drop_empty_thoughts": cfg.drop_empty_thoughts,
+                "min_thoughts": cfg.min_thoughts,
+                "user_prompt_template": cfg.user_prompt_template,
+                "separator_text": cfg.separator_text,
+                "separator_token_id": separator_token_id,
+                "max_model_len": cfg.max_model_len,
+                "keep_solution": cfg.keep_solution,
+            },
+            desc="Pre-tokenize/alignment",
         )
-        return None
 
-    answer = row.get(cfg.input_answer_field) if cfg.input_answer_field else None
-    expected_answer = row.get(cfg.input_expected_answer_field) if cfg.input_expected_answer_field else None
-    source_id = str(row[cfg.input_id_field]) if cfg.input_id_field and row.get(cfg.input_id_field) is not None else None
-    source_qid = str(row[cfg.input_qid_field]) if cfg.input_qid_field and row.get(cfg.input_qid_field) is not None else None
+    return ds
 
-    solution = None
-    if cfg.keep_solution and cfg.input_solution_field and row.get(cfg.input_solution_field) is not None:
-        solution = str(row[cfg.input_solution_field])
 
-    return PreparedExample(
-        key=key,
-        row_index=row_idx,
-        input_ids=[int(x) for x in final_ids],
-        thought_token_end_positions=sep_positions_final,
-        problem=problem,
-        thoughts=thoughts,
-        answer=answer,
-        expected_answer=expected_answer,
-        source_id=source_id,
-        source_qid=source_qid,
-        solution=solution,
+def _map_add_row_keys(
+    batch: dict[str, list[Any]],
+    indices: list[int],
+    *,
+    input_id_field: Optional[str],
+    input_qid_field: Optional[str],
+) -> dict[str, list[Any]]:
+    keys: list[str] = []
+    for i, row_idx in enumerate(indices):
+        source_id = _get_optional_value(batch, input_id_field, i)
+        source_qid = _get_optional_value(batch, input_qid_field, i)
+        if source_id is not None:
+            keys.append(f"id:{source_id}")
+        elif source_qid is not None:
+            keys.append(f"qid:{source_qid}")
+        else:
+            keys.append(f"row:{row_idx}")
+
+    return {
+        "__row_key": keys,
+        "__row_index": [int(i) for i in indices],
+    }
+
+
+def _map_pretokenize_parallel(
+    batch: dict[str, list[Any]],
+    *,
+    model_name: str,
+    input_problem_field: str,
+    input_thoughts_field: str,
+    input_answer_field: Optional[str],
+    input_expected_answer_field: Optional[str],
+    input_solution_field: Optional[str],
+    input_source_field: Optional[str],
+    input_id_field: Optional[str],
+    input_qid_field: Optional[str],
+    drop_empty_thoughts: bool,
+    min_thoughts: int,
+    user_prompt_template: str,
+    separator_text: str,
+    separator_token_id: int,
+    max_model_len: int,
+    keep_solution: bool,
+) -> dict[str, list[Any]]:
+    tokenizer = _get_map_tokenizer(model_name)
+    return _map_pretokenize_impl(
+        batch,
+        tokenizer=tokenizer,
+        input_problem_field=input_problem_field,
+        input_thoughts_field=input_thoughts_field,
+        input_answer_field=input_answer_field,
+        input_expected_answer_field=input_expected_answer_field,
+        input_solution_field=input_solution_field,
+        input_source_field=input_source_field,
+        input_id_field=input_id_field,
+        input_qid_field=input_qid_field,
+        drop_empty_thoughts=drop_empty_thoughts,
+        min_thoughts=min_thoughts,
+        user_prompt_template=user_prompt_template,
+        separator_text=separator_text,
+        separator_token_id=separator_token_id,
+        max_model_len=max_model_len,
+        keep_solution=keep_solution,
     )
+
+
+def _map_pretokenize_serial(
+    batch: dict[str, list[Any]],
+    *,
+    tokenizer: Any,
+    input_problem_field: str,
+    input_thoughts_field: str,
+    input_answer_field: Optional[str],
+    input_expected_answer_field: Optional[str],
+    input_solution_field: Optional[str],
+    input_source_field: Optional[str],
+    input_id_field: Optional[str],
+    input_qid_field: Optional[str],
+    drop_empty_thoughts: bool,
+    min_thoughts: int,
+    user_prompt_template: str,
+    separator_text: str,
+    separator_token_id: int,
+    max_model_len: int,
+    keep_solution: bool,
+) -> dict[str, list[Any]]:
+    return _map_pretokenize_impl(
+        batch,
+        tokenizer=tokenizer,
+        input_problem_field=input_problem_field,
+        input_thoughts_field=input_thoughts_field,
+        input_answer_field=input_answer_field,
+        input_expected_answer_field=input_expected_answer_field,
+        input_solution_field=input_solution_field,
+        input_source_field=input_source_field,
+        input_id_field=input_id_field,
+        input_qid_field=input_qid_field,
+        drop_empty_thoughts=drop_empty_thoughts,
+        min_thoughts=min_thoughts,
+        user_prompt_template=user_prompt_template,
+        separator_text=separator_text,
+        separator_token_id=separator_token_id,
+        max_model_len=max_model_len,
+        keep_solution=keep_solution,
+    )
+
+
+def _map_pretokenize_impl(
+    batch: dict[str, list[Any]],
+    *,
+    tokenizer: Any,
+    input_problem_field: str,
+    input_thoughts_field: str,
+    input_answer_field: Optional[str],
+    input_expected_answer_field: Optional[str],
+    input_solution_field: Optional[str],
+    input_source_field: Optional[str],
+    input_id_field: Optional[str],
+    input_qid_field: Optional[str],
+    drop_empty_thoughts: bool,
+    min_thoughts: int,
+    user_prompt_template: str,
+    separator_text: str,
+    separator_token_id: int,
+    max_model_len: int,
+    keep_solution: bool,
+) -> dict[str, list[Any]]:
+    batch_size = len(batch["__row_key"])
+
+    out: dict[str, list[Any]] = {
+        "problem": [],
+        "thoughts": [],
+        "num_thoughts": [],
+        "full_text": [],
+        "input_ids": [],
+        "input_token_count": [],
+        "thought_separator_positions": [],
+        "is_overlong": [],
+        "is_valid": [],
+        "answer": [],
+        "expected_answer": [],
+        "source": [],
+        "id": [],
+        "qid": [],
+        "solution": [],
+    }
+
+    for i in range(batch_size):
+        problem = _get_optional_value(batch, input_problem_field, i)
+        thoughts_raw = _get_optional_value(batch, input_thoughts_field, i)
+
+        answer = _get_optional_value(batch, input_answer_field, i)
+        expected_answer = _get_optional_value(batch, input_expected_answer_field, i)
+        source = _get_optional_value(batch, input_source_field, i)
+        source_id = _get_optional_value(batch, input_id_field, i)
+        source_qid = _get_optional_value(batch, input_qid_field, i)
+        solution = _get_optional_value(batch, input_solution_field, i) if keep_solution else None
+
+        out["answer"].append(answer)
+        out["expected_answer"].append(expected_answer)
+        out["source"].append(source)
+        out["id"].append(None if source_id is None else str(source_id))
+        out["qid"].append(None if source_qid is None else str(source_qid))
+        out["solution"].append(None if solution is None else str(solution))
+
+        if not isinstance(problem, str) or not problem.strip():
+            _append_invalid_row(out, problem=None)
+            continue
+        if not isinstance(thoughts_raw, list):
+            _append_invalid_row(out, problem=problem)
+            continue
+        if any(not isinstance(t, str) for t in thoughts_raw):
+            _append_invalid_row(out, problem=problem)
+            continue
+
+        thoughts = [t.strip() for t in thoughts_raw]
+        if drop_empty_thoughts:
+            thoughts = [t for t in thoughts if t]
+
+        if len(thoughts) < min_thoughts:
+            _append_invalid_row(out, problem=problem)
+            continue
+
+        user_prompt = user_prompt_template.format(problem=problem)
+        assistant_content, separator_positions_in_assistant = _build_assistant_content_and_positions(
+            tokenizer,
+            thoughts,
+            separator_text,
+        )
+
+        input_ids, separator_positions = _build_chat_ids_and_positions(
+            tokenizer,
+            user_prompt,
+            assistant_content,
+            separator_positions_in_assistant,
+        )
+
+        valid = True
+        for pos in separator_positions:
+            if pos < 0 or pos >= len(input_ids) or int(input_ids[pos]) != separator_token_id:
+                valid = False
+                break
+
+        if not valid:
+            _append_invalid_row(out, problem=problem)
+            continue
+
+        out["problem"].append(problem)
+        out["thoughts"].append(thoughts)
+        out["num_thoughts"].append(len(thoughts))
+        out["full_text"].append(_build_chat_text(tokenizer, user_prompt, assistant_content))
+        out["input_ids"].append([int(x) for x in input_ids])
+        out["input_token_count"].append(len(input_ids))
+        out["thought_separator_positions"].append([int(x) for x in separator_positions])
+        out["is_overlong"].append(len(input_ids) > max_model_len)
+        out["is_valid"].append(True)
+
+    return out
+
+
+def _append_invalid_row(out: dict[str, list[Any]], *, problem: Optional[str]) -> None:
+    out["problem"].append(problem)
+    out["thoughts"].append([])
+    out["num_thoughts"].append(0)
+    out["full_text"].append("")
+    out["input_ids"].append([])
+    out["input_token_count"].append(0)
+    out["thought_separator_positions"].append([])
+    out["is_overlong"].append(False)
+    out["is_valid"].append(False)
+
+
+def _get_map_tokenizer(model_name: str) -> Any:
+    tok = _MAP_TOKENIZER_CACHE.get(model_name)
+    if tok is None:
+        tok = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+        _MAP_TOKENIZER_CACHE[model_name] = tok
+    return tok
+
+
+def _get_optional_value(batch: dict[str, list[Any]], field: Optional[str], idx: int) -> Any:
+    if not field:
+        return None
+    values = batch.get(field)
+    if values is None:
+        return None
+    return values[idx]
+
+
+def _row_to_pretokenized_example(row: dict[str, Any]) -> PreTokenizedExample:
+    return PreTokenizedExample(
+        key=row["__row_key"],
+        row_index=int(row.get("__row_index", -1)),
+        input_ids=[int(x) for x in row["input_ids"]],
+        input_token_count=int(row["input_token_count"]),
+        thought_separator_positions=[int(x) for x in row["thought_separator_positions"]],
+        problem=row["problem"],
+        thoughts=list(row["thoughts"]),
+        answer=row.get("answer"),
+        expected_answer=row.get("expected_answer"),
+        source=row.get("source"),
+        source_id=row.get("id"),
+        source_qid=row.get("qid"),
+        solution=row.get("solution"),
+    )
+
 
 
 def _build_assistant_content_and_positions(
@@ -352,17 +632,16 @@ def _build_assistant_content_and_positions(
 ) -> tuple[str, list[int]]:
     text = ""
     token_len = 0
-    sep_positions: list[int] = []
+    separator_positions: list[int] = []
 
-    # Must start exactly with separator.
-    text, token_len = _append_segment(tokenizer, text, token_len, separator)
-
+    # Canonical format: separator is inserted before each thought, with no trailing separator.
+    # This guarantees exactly one separator token per thought.
     for thought in thoughts:
-        text, token_len = _append_segment(tokenizer, text, token_len, thought)
         text, token_len = _append_segment(tokenizer, text, token_len, separator)
-        sep_positions.append(token_len - 1)
+        separator_positions.append(token_len - 1)
+        text, token_len = _append_segment(tokenizer, text, token_len, thought)
 
-    return text, sep_positions
+    return text, separator_positions
 
 
 def _append_segment(tokenizer: Any, current_text: str, current_len: int, segment: str) -> tuple[str, int]:
@@ -377,16 +656,9 @@ def _build_chat_ids_and_positions(
     tokenizer: Any,
     user_prompt: str,
     assistant_content: str,
-    sep_positions_in_assistant: list[int],
+    separator_positions_in_assistant: list[int],
 ) -> tuple[list[int], list[int]]:
-    messages = [
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": assistant_content},
-    ]
-    try:
-        chat_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    except Exception as exc:
-        raise PipelineError("Failed to apply chat template for this tokenizer.") from exc
+    chat_text = _build_chat_text(tokenizer, user_prompt, assistant_content)
 
     assistant_start_char = chat_text.rfind(assistant_content)
     if assistant_start_char < 0:
@@ -397,18 +669,47 @@ def _build_chat_ids_and_positions(
     full_ids = tokenizer.encode(chat_text, add_special_tokens=False)
 
     assistant_start_token_idx = len(prefix_ids)
-    sep_positions_final = [assistant_start_token_idx + p for p in sep_positions_in_assistant]
+    separator_positions_final = [assistant_start_token_idx + p for p in separator_positions_in_assistant]
 
-    return [int(x) for x in full_ids], sep_positions_final
+    return [int(x) for x in full_ids], separator_positions_final
 
 
-def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreparedExample) -> bool:
+def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -> str:
+    messages = [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": assistant_content},
+    ]
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    except Exception as exc:
+        raise PipelineError("Failed to apply chat template for this tokenizer.") from exc
+
+
+def _print_startup_example(ds: Dataset) -> None:
+    if len(ds) == 0:
+        print("Startup example: no valid examples after preprocessing/filtering.")
+        return
+
+    row = ds[0]
+    input_ids = [int(x) for x in row["input_ids"]]
+    positions = [int(x) for x in row["thought_separator_positions"]]
+    extracted_token_ids = [input_ids[p] for p in positions]
+
+    print("Startup example full text sequence:")
+    print(row.get("full_text", ""))
+    print("Startup example input ids:")
+    print(input_ids)
+    print("Startup example extraction positions:")
+    print(positions)
+    print("Startup example token ids at extraction positions:")
+    print(extracted_token_ids)
+
+
+def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
     if not batch.examples:
         return False
-
     if len(batch.examples) >= cfg.max_examples_per_batch:
         return True
-
     return (batch.total_tokens + len(example.input_ids)) > cfg.max_tokens_per_batch
 
 
@@ -423,14 +724,13 @@ def _is_batch_full(cfg: ThoughtEmbeddingConfig, batch: BatchState) -> bool:
 def _flush_batch(
     cfg: ThoughtEmbeddingConfig,
     model: Any,
+    pad_token_id: int,
     batch: BatchState,
     output_rows: list[dict[str, Any]],
     completed_keys: set[str],
-) -> None:
+) -> int:
     if not batch.examples:
-        return
-
-    pad_token_id = _pad_token_id(model, batch.examples)
+        return 0
 
     max_len = max(len(x.input_ids) for x in batch.examples)
     bsz = len(batch.examples)
@@ -455,9 +755,10 @@ def _flush_batch(
 
     hidden = outputs.hidden_states[-1]
 
+    completed_now = 0
     for i, ex in enumerate(batch.examples):
         vectors: list[list[float]] = []
-        for pos in ex.thought_token_end_positions:
+        for pos in ex.thought_separator_positions:
             vec = hidden[i, pos, :].detach().to(dtype=torch.float32).cpu().tolist()
             vectors.append(_cast_vector_dtype(vec, cfg.save_float_dtype))
 
@@ -474,7 +775,7 @@ def _flush_batch(
             "state_vectors": vectors,
             "embedding_dim": dim,
             "model_name": cfg.model_name,
-            "thought_token_end_positions": ex.thought_token_end_positions,
+            "thought_separator_positions": ex.thought_separator_positions,
             "input_token_count": len(ex.input_ids),
             "was_truncated": False,
         }
@@ -482,6 +783,8 @@ def _flush_batch(
             out["answer"] = ex.answer
         if ex.expected_answer is not None:
             out["expected_answer"] = ex.expected_answer
+        if ex.source is not None:
+            out["source"] = ex.source
         if ex.source_id is not None:
             out["id"] = ex.source_id
         if ex.source_qid is not None:
@@ -491,19 +794,29 @@ def _flush_batch(
 
         output_rows.append(out)
         completed_keys.add(ex.key)
+        completed_now += 1
 
     batch.examples.clear()
     batch.total_tokens = 0
+    return completed_now
 
 
-def _pad_token_id(model: Any, examples: list[PreparedExample]) -> int:
+def _pad_token_id(tokenizer: Any, model: Any) -> int:
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+        return int(tokenizer.pad_token_id)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        return int(tokenizer.eos_token_id)
+
     model_cfg = getattr(model, "config", None)
     if model_cfg is not None and getattr(model_cfg, "pad_token_id", None) is not None:
         return int(model_cfg.pad_token_id)
     if model_cfg is not None and getattr(model_cfg, "eos_token_id", None) is not None:
         return int(model_cfg.eos_token_id)
 
-    return int(examples[0].input_ids[0])
+    raise PipelineError(
+        "Unable to determine a padding token id. Provide tokenizer.pad_token_id/eos_token_id "
+        "or model.config.pad_token_id/eos_token_id."
+    )
 
 
 def _model_device(model: Any) -> torch.device:
@@ -524,3 +837,33 @@ def _cast_vector_dtype(vector: list[float], dtype: str) -> list[float]:
         return np.asarray(vector, dtype=np.float16).astype(float).tolist()
     except Exception:
         return [float(v) for v in vector]
+
+
+def _write_shard(
+    output_rows: list[dict[str, Any]],
+    output_dir: Path,
+    next_shard_idx: int,
+) -> tuple[int, int]:
+    rows_written = len(output_rows)
+    if rows_written == 0:
+        return 0, next_shard_idx
+    write_parquet_shard(output_rows, output_dir, next_shard_idx)
+    output_rows.clear()
+    return rows_written, next_shard_idx + 1
+
+
+def _save_manifest(
+    output_dir: Path,
+    completed_keys: set[str],
+    processed_rows: int,
+    written_rows: int,
+    next_shard_idx: int,
+) -> dict[str, Any]:
+    manifest = {
+        "completed_keys": sorted(completed_keys),
+        "processed_rows": processed_rows,
+        "written_rows": written_rows,
+        "next_shard_idx": next_shard_idx,
+    }
+    save_manifest(output_dir, manifest)
+    return manifest

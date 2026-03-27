@@ -15,9 +15,11 @@ class ThoughtEmbeddingConfig:
     input_answer_field: Optional[str] = "answer"
     input_expected_answer_field: Optional[str] = "expected_answer"
     input_solution_field: Optional[str] = "generated_solution"
+    input_source_field: Optional[str] = "source"
     input_id_field: Optional[str] = "id"
     input_qid_field: Optional[str] = "qid"
     max_samples: int = 0
+    source_filter: Optional[str] = None  # None means use all sources
 
     # Model
     model_name: str = "nvidia/OpenMath-Nemotron-1.5B"
@@ -27,13 +29,18 @@ class ThoughtEmbeddingConfig:
     # Prompt / construction
     user_prompt_template: str = (
         "Solve the following math problem. Make sure to put the answer "
-        "(and only answer) inside \\boxed{}.\\n\\n{problem}"
+        "(and only answer) inside \\boxed{}.\n\n{problem}"
     )
-    separator_text: str = "\\n\\n"
+    separator_text: str = "\n\n"
 
     # Batching
-    max_tokens_per_batch: int = 16384
+    max_tokens_per_batch: int = 16_384
     max_examples_per_batch: int = 8
+    sort_by_length: bool = True
+
+    # Parallel preprocessing
+    pretokenize_num_proc: int = 8
+    pretokenize_batch_size: int = 128
 
     # Output
     output_dir: str = "runs/thought_embedding"
@@ -75,6 +82,10 @@ def validate_config(cfg: ThoughtEmbeddingConfig) -> None:
         raise ConfigError("max_tokens_per_batch must be positive.")
     if cfg.max_examples_per_batch <= 0:
         raise ConfigError("max_examples_per_batch must be positive.")
+    if cfg.pretokenize_num_proc <= 0:
+        raise ConfigError("pretokenize_num_proc must be positive.")
+    if cfg.pretokenize_batch_size <= 0:
+        raise ConfigError("pretokenize_batch_size must be positive.")
     if cfg.shard_size <= 0:
         raise ConfigError("shard_size must be positive.")
     if cfg.save_every_n_examples <= 0:
