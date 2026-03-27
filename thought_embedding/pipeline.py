@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -22,8 +21,6 @@ from thought_embedding.io_utils import (
 logger = logging.getLogger(__name__)
 
 _MAP_TOKENIZER_CACHE: dict[str, Any] = {}
-_PRINTED_SEPARATOR_DEBUG = False
-_PRINTED_NONSTANDALONE_NOTICE = False
 _CANONICAL_SEPARATOR_MARKER_TOKEN_ID = 271
 
 
@@ -63,7 +60,6 @@ def run_pipeline(
 ) -> dict[str, Any]:
     validate_config(cfg)
     _configure_logging()
-    _print_startup_config_checks(cfg)
 
     output_dir = ensure_output_dir(cfg.output_dir)
     _prepare_output_dir(cfg, output_dir)
@@ -113,7 +109,6 @@ def run_pipeline(
     local_model = model or _load_model(cfg)
 
     sep_token_id = _separator_token_id(local_tokenizer, cfg.separator_text)
-    print(f"separator_token_ids={local_tokenizer.encode(cfg.separator_text, add_special_tokens=False)}")
 
     pretokenized_ds = _pretokenize_dataset(
         cfg,
@@ -123,7 +118,6 @@ def run_pipeline(
     )
     pretokenized_rows = len(pretokenized_ds)
     resume_removed_count = 0
-    print(f"Counter(row_key_source)={Counter(pretokenized_ds['__row_key_source'])}")
 
     if cfg.resume and completed_keys:
         before_resume = len(pretokenized_ds)
@@ -136,19 +130,9 @@ def run_pipeline(
         resume_removed_count = before_resume - len(pretokenized_ds)
     after_resume_rows = len(pretokenized_ds)
 
-    print(f"raw_dataset_len={loaded_rows}")
-    print(f"len_after_source_filter={rows_after_source_filter}")
-    print(f"len_after_resume_filter={after_resume_rows}")
-    print(f"len_pretokenized_ds={pretokenized_rows}")
-
     invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
     overlong_count = sum(1 for v in pretokenized_ds["is_overlong"] if v)
     valid_count = after_resume_rows - invalid_count
-    print(f"invalid_count={invalid_count}")
-    print(f"overlong_count={overlong_count}")
-    print(f"Counter(is_valid)={Counter(pretokenized_ds['is_valid'])}")
-    print(f"Counter(is_overlong)={Counter(pretokenized_ds['is_overlong'])}")
-    _print_filter_reasons(pretokenized_ds)
 
     ready_indices = [
         i
@@ -158,7 +142,6 @@ def run_pipeline(
         if bool(is_valid) and (not bool(is_overlong))
     ]
     filtered_ds = pretokenized_ds.select(ready_indices)
-    print(f"len_filtered_ds={len(filtered_ds)}")
 
     logger.info(
         "Preprocess stats | loaded=%s | after_source_filter=%s | after_shuffle=%s | "
@@ -652,11 +635,10 @@ def _map_pretokenize_impl(
             )
         )
 
-        input_ids, separator_positions, alignment_debug = _build_chat_ids_and_positions(
+        input_ids, separator_positions = _build_chat_ids_and_positions(
             tokenizer,
             user_prompt,
             assistant_content,
-            separator_positions_in_assistant,
             separator_char_spans_in_assistant,
             separator_text,
         )
@@ -674,28 +656,8 @@ def _map_pretokenize_impl(
             valid = False
 
         if not valid:
-            _debug_separator_alignment_failure(
-                tokenizer=tokenizer,
-                separator_text=separator_text,
-                separator_token_id=separator_token_id,
-                thoughts=thoughts,
-                assistant_text=assistant_content,
-                separator_positions_in_assistant=separator_positions_in_assistant,
-                input_ids=input_ids,
-                shifted_positions=separator_positions,
-                alignment_debug=alignment_debug,
-            )
             _append_invalid_row(out, problem=problem, reason="invalid_separator_alignment")
             continue
-
-        exact_match_count = sum(1 for p in separator_positions if int(input_ids[p]) == int(separator_token_id))
-        if exact_match_count != len(separator_positions):
-            _debug_separator_nonstandalone_notice(
-                separator_text=separator_text,
-                separator_token_id=separator_token_id,
-                exact_match_count=exact_match_count,
-                expected_count=len(separator_positions),
-            )
 
         input_ids = _overwrite_canonical_marker_positions(
             input_ids=input_ids,
@@ -874,10 +836,9 @@ def _build_chat_ids_and_positions(
     tokenizer: Any,
     user_prompt: str,
     assistant_content: str,
-    separator_positions_in_assistant: list[int],
     separator_char_spans_in_assistant: list[tuple[int, int]],
     separator_text: str,
-) -> tuple[list[int], list[int], dict[str, Any]]:
+) -> tuple[list[int], list[int]]:
     chat_text = _build_chat_text(tokenizer, user_prompt, assistant_content)
 
     assistant_start_char = chat_text.rfind(assistant_content)
@@ -900,14 +861,7 @@ def _build_chat_ids_and_positions(
         separator_char_spans=absolute_separator_spans,
     )
 
-    debug = {
-        "prefix_len": len(prefix_ids),
-        "assistant_len": len(assistant_ids),
-        "assistant_positions": [int(x) for x in separator_positions_in_assistant],
-        "shifted_positions": [int(x) for x in separator_positions_final],
-        "assistant_start_char": assistant_start_char,
-    }
-    return [int(x) for x in full_ids], separator_positions_final, debug
+    return [int(x) for x in full_ids], separator_positions_final
 
 
 def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -> str:
@@ -923,77 +877,10 @@ def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -
 
 def _print_startup_example(ds: Dataset) -> None:
     if len(ds) == 0:
-        print("Startup example: no rows ready for inference after preprocessing/resume filtering.")
+        print("Startup example: none")
         return
 
-    row = ds[0]
-    input_ids = [int(x) for x in row["input_ids"]]
-    positions = [int(x) for x in row["thought_separator_positions"]]
-    extracted_token_ids = [input_ids[p] for p in positions]
-
-    print("Startup example full text sequence:")
-    print(row.get("full_text", ""))
-    print("Startup example input ids:")
-    print(input_ids)
-    print("Startup example extraction positions:")
-    print(positions)
-    print("Startup example token ids at extraction positions:")
-    print(extracted_token_ids)
-
-
-def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None:
-    if len(ds) == 0:
-        print("Filter reasons: dataset is empty before preprocessing output analysis.")
-        return
-
-    if "filter_reason" not in set(ds.column_names):
-        print(
-            "Filter reasons: unavailable (missing filter_reason column in pretokenized dataset). "
-            "This usually indicates a stale cached map artifact or an older pipeline version."
-        )
-        return
-
-    reasons: dict[str, list[str]] = {}
-    for row in ds:
-        reason = row.get("filter_reason", "")
-        if not reason:
-            continue
-        key = str(row.get("__row_key", "unknown"))
-        reasons.setdefault(reason, []).append(key)
-
-    if not reasons:
-        print("Filter reasons: none (all rows passed preprocessing filters).")
-        return
-
-    print("Filter reasons summary:")
-    for reason, keys in sorted(reasons.items(), key=lambda x: (-len(x[1]), x[0])):
-        sample = keys[:max_examples_per_reason]
-        print(f"- {reason}: {len(keys)} rows | sample_keys={sample}")
-
-    _print_one_filtered_example(ds)
-
-
-def _print_startup_config_checks(cfg: ThoughtEmbeddingConfig) -> None:
-    print(f"cfg.separator_text repr: {repr(cfg.separator_text)}")
-    boxed_ok = "\\boxed{{}}" in cfg.user_prompt_template
-    print(f"user_prompt_template_contains_escaped_boxed={{}}: {boxed_ok}")
-
-
-def _print_one_filtered_example(ds: Dataset) -> None:
-    for row in ds:
-        reason = row.get("filter_reason", "")
-        if not reason:
-            continue
-        print("One filtered example:")
-        print(f"  row_key={row.get('__row_key')}")
-        print(f"  reason={reason}")
-        print(f"  problem={repr(row.get('problem'))}")
-        print(f"  num_thoughts={row.get('num_thoughts')}")
-        print(f"  input_token_count={row.get('input_token_count')}")
-        print(f"  source={row.get('source')}")
-        print(f"  id={row.get('id')} qid={row.get('qid')}")
-        return
-    print("One filtered example: none")
+    print("Startup example")
 
 
 def _assert_shifted_positions_in_bounds(
@@ -1003,65 +890,6 @@ def _assert_shifted_positions_in_bounds(
 ) -> None:
     for pos in shifted_positions:
         assert 0 <= pos < len(input_ids), f"Shifted separator position out of range: pos={pos}, len={len(input_ids)}"
-
-
-def _debug_separator_alignment_failure(
-    *,
-    tokenizer: Any,
-    separator_text: str,
-    separator_token_id: int,
-    thoughts: list[str],
-    assistant_text: str,
-    separator_positions_in_assistant: list[int],
-    input_ids: list[int],
-    shifted_positions: list[int],
-    alignment_debug: dict[str, Any],
-) -> None:
-    global _PRINTED_SEPARATOR_DEBUG
-    if _PRINTED_SEPARATOR_DEBUG:
-        return
-    _PRINTED_SEPARATOR_DEBUG = True
-
-    separator_ids = tokenizer.encode(separator_text, add_special_tokens=False)
-    assistant_ids = tokenizer(assistant_text, add_special_tokens=False)["input_ids"]
-    assistant_sep_count = sum(1 for t in assistant_ids if int(t) == int(separator_token_id))
-    shifted_values = [int(input_ids[p]) for p in shifted_positions if 0 <= p < len(input_ids)]
-
-    print("DEBUG separator alignment failure:")
-    print(f"- repr(separator_text)={repr(separator_text)}")
-    print(f"- tokenizer.encode(separator_text)={separator_ids}")
-    print(f"- num_thoughts={len(thoughts)}")
-    print(f"- expected_num_separator_positions={len(thoughts)}")
-    print("- assistant_text_first_300:")
-    print(assistant_text[:300])
-    print(f"- repr(assistant_text[:100])={repr(assistant_text[:100])}")
-    print(f"- assistant_separator_positions={separator_positions_in_assistant}")
-    print(f"- assistant_ids_len={len(assistant_ids)}")
-    print(f"- assistant_separator_token_count={assistant_sep_count}")
-    print(f"- prefix_ids_len={alignment_debug.get('prefix_len')}")
-    print(f"- assistant_ids_len_from_shift_debug={alignment_debug.get('assistant_len')}")
-    print(f"- shifted_separator_positions={shifted_positions}")
-    print(f"- final_ids_at_shifted_positions={shifted_values}")
-
-
-def _debug_separator_nonstandalone_notice(
-    *,
-    separator_text: str,
-    separator_token_id: int,
-    exact_match_count: int,
-    expected_count: int,
-) -> None:
-    global _PRINTED_NONSTANDALONE_NOTICE
-    if exact_match_count == expected_count:
-        return
-    if _PRINTED_NONSTANDALONE_NOTICE:
-        return
-    _PRINTED_NONSTANDALONE_NOTICE = True
-    print(
-        "NOTE: separator token is not standalone in all contexts; using span-aligned boundary positions. "
-        f"repr(separator_text)={repr(separator_text)} separator_token_id={separator_token_id} "
-        f"exact_token_matches={exact_match_count}/{expected_count}"
-    )
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
