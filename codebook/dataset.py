@@ -203,6 +203,7 @@ def iter_valid_latent_rows(
     read_batch_size: int = 256,
     shuffle_buffer_size: int = 10_000,
     seed: int = 42,
+    delete_input_files: bool = False,
 ) -> Iterator[LatentRow]:
     valid_count = 0
     invalid_count = 0
@@ -223,6 +224,11 @@ def iter_valid_latent_rows(
                     continue
                 valid_count += 1
                 yield parsed
+            if delete_input_files:
+                try:
+                    shard.unlink()
+                except FileNotFoundError:
+                    pass
         if valid_count == 0:
             raise RuntimeError(
                 f"No valid latent rows found in local parquet dir={input_dir!r} for dim={dim}. "
@@ -260,6 +266,7 @@ def iter_sequence_batches(
     max_sequences_per_batch: int | None = None,
     shuffle_buffer_size: int = 10_000,
     seed: int = 42,
+    delete_input_files: bool = False,
 ) -> Iterator[SequenceBatch]:
     if max_vectors_per_batch <= 0:
         raise ValueError("max_vectors_per_batch must be > 0")
@@ -275,6 +282,7 @@ def iter_sequence_batches(
         read_batch_size=read_batch_size,
         shuffle_buffer_size=shuffle_buffer_size,
         seed=seed,
+        delete_input_files=delete_input_files,
     ):
         row_latents = row.latent_vectors
         row_vectors = int(row_latents.shape[0])
