@@ -100,7 +100,7 @@ def export_dataset(
     skip_invalid_rows: bool = False,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cpu')#("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt = _load_codebook(codebook_path, device=device)
     ckpt_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
     inferred_mode = "delta"
