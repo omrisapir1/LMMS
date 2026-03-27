@@ -73,6 +73,7 @@ def run_pipeline(
 
     if dataset is None:
         dataset = load_dataset(cfg.dataset_name, split=cfg.train_split)
+    dataset = _ensure_source_row_index(dataset, batch_size=cfg.pretokenize_batch_size)
     loaded_rows = len(dataset)
 
     rows_after_source_filter = loaded_rows
@@ -122,6 +123,7 @@ def run_pipeline(
     )
     pretokenized_rows = len(pretokenized_ds)
     resume_removed_count = 0
+    print(f"Counter(row_key_source)={Counter(pretokenized_ds['__row_key_source'])}")
 
     if cfg.resume and completed_keys:
         before_resume = len(pretokenized_ds)
@@ -350,7 +352,8 @@ def _pretokenize_dataset(
     tokenizer: Any,
     separator_token_id: int,
 ) -> Dataset:
-    ds = dataset.map(
+    ds = _ensure_source_row_index(dataset, batch_size=cfg.pretokenize_batch_size)
+    ds = ds.map(
         _map_add_row_keys,
         with_indices=True,
         batched=True,
@@ -359,6 +362,7 @@ def _pretokenize_dataset(
         fn_kwargs={
             "input_id_field": cfg.input_id_field,
             "input_qid_field": cfg.input_qid_field,
+            "source_row_index_field": "__source_row_index",
         },
         desc="Attach row keys",
     )
@@ -431,22 +435,52 @@ def _map_add_row_keys(
     *,
     input_id_field: Optional[str],
     input_qid_field: Optional[str],
+    source_row_index_field: str,
 ) -> dict[str, list[Any]]:
     keys: list[str] = []
+    key_sources: list[str] = []
     for i, row_idx in enumerate(indices):
         source_id = _get_optional_value(batch, input_id_field, i)
         source_qid = _get_optional_value(batch, input_qid_field, i)
+        source_row_index = _get_optional_value(batch, source_row_index_field, i)
         if source_id is not None:
             keys.append(f"id:{source_id}")
+            key_sources.append("id")
         elif source_qid is not None:
             keys.append(f"qid:{source_qid}")
+            key_sources.append("qid")
         else:
-            keys.append(f"row:{row_idx}")
+            if source_row_index is None:
+                source_row_index = row_idx
+            keys.append(f"row:{int(source_row_index)}")
+            key_sources.append("source_row_index")
 
     return {
         "__row_key": keys,
+        "__row_key_source": key_sources,
         "__row_index": [int(i) for i in indices],
     }
+
+
+def _ensure_source_row_index(dataset: Dataset, *, batch_size: int) -> Dataset:
+    if "__source_row_index" in set(dataset.column_names):
+        return dataset
+    return dataset.map(
+        _map_attach_source_row_index,
+        with_indices=True,
+        batched=True,
+        batch_size=batch_size,
+        load_from_cache_file=False,
+        desc="Attach source row index",
+    )
+
+
+def _map_attach_source_row_index(
+    batch: dict[str, list[Any]],
+    indices: list[int],
+) -> dict[str, list[int]]:
+    _ = batch
+    return {"__source_row_index": [int(i) for i in indices]}
 
 
 def _map_pretokenize_parallel(
