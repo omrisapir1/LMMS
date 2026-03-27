@@ -22,6 +22,7 @@ from thought_embedding.io_utils import (
 logger = logging.getLogger(__name__)
 
 _MAP_TOKENIZER_CACHE: dict[str, Any] = {}
+_PRINTED_SEPARATOR_DEBUG = False
 
 
 @dataclass
@@ -109,6 +110,7 @@ def run_pipeline(
     local_model = model or _load_model(cfg)
 
     sep_token_id = _separator_token_id(local_tokenizer, cfg.separator_text)
+    print(f"separator_token_ids={local_tokenizer.encode(cfg.separator_text, add_special_tokens=False)}")
 
     pretokenized_ds = _pretokenize_dataset(
         cfg,
@@ -606,11 +608,17 @@ def _map_pretokenize_impl(
             separator_text,
         )
 
-        input_ids, separator_positions = _build_chat_ids_and_positions(
+        input_ids, separator_positions, alignment_debug = _build_chat_ids_and_positions(
             tokenizer,
             user_prompt,
             assistant_content,
             separator_positions_in_assistant,
+        )
+
+        _assert_shifted_positions(
+            input_ids=input_ids,
+            shifted_positions=separator_positions,
+            separator_token_id=separator_token_id,
         )
 
         valid = True
@@ -620,6 +628,17 @@ def _map_pretokenize_impl(
                 break
 
         if not valid:
+            _debug_separator_alignment_failure(
+                tokenizer=tokenizer,
+                separator_text=separator_text,
+                separator_token_id=separator_token_id,
+                thoughts=thoughts,
+                assistant_text=assistant_content,
+                separator_positions_in_assistant=separator_positions_in_assistant,
+                input_ids=input_ids,
+                shifted_positions=separator_positions,
+                alignment_debug=alignment_debug,
+            )
             _append_invalid_row(out, problem=problem, reason="invalid_separator_alignment")
             continue
 
@@ -775,7 +794,7 @@ def _build_chat_ids_and_positions(
     user_prompt: str,
     assistant_content: str,
     separator_positions_in_assistant: list[int],
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], dict[str, Any]]:
     chat_text = _build_chat_text(tokenizer, user_prompt, assistant_content)
 
     assistant_start_char = chat_text.rfind(assistant_content)
@@ -784,12 +803,19 @@ def _build_chat_ids_and_positions(
 
     prefix_text = chat_text[:assistant_start_char]
     prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    assistant_ids = tokenizer.encode(assistant_content, add_special_tokens=False)
     full_ids = tokenizer.encode(chat_text, add_special_tokens=False)
 
     assistant_start_token_idx = len(prefix_ids)
     separator_positions_final = [assistant_start_token_idx + p for p in separator_positions_in_assistant]
 
-    return [int(x) for x in full_ids], separator_positions_final
+    debug = {
+        "prefix_len": len(prefix_ids),
+        "assistant_len": len(assistant_ids),
+        "assistant_positions": [int(x) for x in separator_positions_in_assistant],
+        "shifted_positions": [int(x) for x in separator_positions_final],
+    }
+    return [int(x) for x in full_ids], separator_positions_final, debug
 
 
 def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -> str:
@@ -876,6 +902,59 @@ def _print_one_filtered_example(ds: Dataset) -> None:
         print(f"  id={row.get('id')} qid={row.get('qid')}")
         return
     print("One filtered example: none")
+
+
+def _assert_shifted_positions(
+    *,
+    input_ids: list[int],
+    shifted_positions: list[int],
+    separator_token_id: int,
+) -> None:
+    for pos in shifted_positions:
+        assert 0 <= pos < len(input_ids), f"Shifted separator position out of range: pos={pos}, len={len(input_ids)}"
+        assert int(input_ids[pos]) == int(separator_token_id), (
+            f"Shifted separator mismatch at pos={pos}: "
+            f"found={input_ids[pos]}, expected={separator_token_id}"
+        )
+
+
+def _debug_separator_alignment_failure(
+    *,
+    tokenizer: Any,
+    separator_text: str,
+    separator_token_id: int,
+    thoughts: list[str],
+    assistant_text: str,
+    separator_positions_in_assistant: list[int],
+    input_ids: list[int],
+    shifted_positions: list[int],
+    alignment_debug: dict[str, Any],
+) -> None:
+    global _PRINTED_SEPARATOR_DEBUG
+    if _PRINTED_SEPARATOR_DEBUG:
+        return
+    _PRINTED_SEPARATOR_DEBUG = True
+
+    separator_ids = tokenizer.encode(separator_text, add_special_tokens=False)
+    assistant_ids = tokenizer(assistant_text, add_special_tokens=False)["input_ids"]
+    assistant_sep_count = sum(1 for t in assistant_ids if int(t) == int(separator_token_id))
+    shifted_values = [int(input_ids[p]) for p in shifted_positions if 0 <= p < len(input_ids)]
+
+    print("DEBUG separator alignment failure:")
+    print(f"- repr(separator_text)={repr(separator_text)}")
+    print(f"- tokenizer.encode(separator_text)={separator_ids}")
+    print(f"- num_thoughts={len(thoughts)}")
+    print(f"- expected_num_separator_positions={len(thoughts)}")
+    print("- assistant_text_first_300:")
+    print(assistant_text[:300])
+    print(f"- repr(assistant_text[:100])={repr(assistant_text[:100])}")
+    print(f"- assistant_separator_positions={separator_positions_in_assistant}")
+    print(f"- assistant_ids_len={len(assistant_ids)}")
+    print(f"- assistant_separator_token_count={assistant_sep_count}")
+    print(f"- prefix_ids_len={alignment_debug.get('prefix_len')}")
+    print(f"- assistant_ids_len_from_shift_debug={alignment_debug.get('assistant_len')}")
+    print(f"- shifted_separator_positions={shifted_positions}")
+    print(f"- final_ids_at_shifted_positions={shifted_values}")
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
