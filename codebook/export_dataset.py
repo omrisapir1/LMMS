@@ -30,6 +30,7 @@ OUTPUT_SCHEMA = pa.schema(
     [
         pa.field("qid", pa.string()),
         pa.field("question", pa.string()),
+        pa.field("source", pa.string()),
         pa.field("answer_int", pa.int32()),
         pa.field("answer_digits", pa.list_(pa.int32())),
         pa.field("K_star", pa.int32()),
@@ -156,6 +157,7 @@ def export_dataset(
                     {
                         "qid": parsed.qid,
                         "question": parsed.question,
+                        "source": parsed.source,
                         "answer_int": int(parsed.answer_int),
                         "answer_digits": [int(x) for x in parsed.answer_digits],
                         "K_star": int(parsed.k_star),
