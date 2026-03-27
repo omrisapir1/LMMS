@@ -40,7 +40,7 @@ class ThoughtEmbeddingConfig:
 
     # Parallel preprocessing
     pretokenize_num_proc: int = 15
-    pretokenize_batch_size: int = 128*10
+    pretokenize_batch_size: int = 128*50
 
     # Output
     output_dir: str = "runs/thought_embedding"
