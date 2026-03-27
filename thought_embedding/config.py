@@ -96,3 +96,15 @@ def validate_config(cfg: ThoughtEmbeddingConfig) -> None:
         raise ConfigError("max_model_len must be positive.")
     if cfg.min_thoughts <= 0:
         raise ConfigError("min_thoughts must be positive.")
+    if cfg.separator_text != "\n\n":
+        raise ConfigError(
+            "separator_text must be exactly two newline characters. "
+            "If you set it in Python code, use separator_text='\\n\\n' (not '\\\\n\\\\n')."
+        )
+    try:
+        _ = cfg.user_prompt_template.format(problem="x")
+    except Exception as exc:
+        raise ConfigError(
+            "user_prompt_template is invalid for str.format(...). "
+            "Escape literal braces (e.g., '\\\\boxed{{}}') and keep '{problem}' as the placeholder."
+        ) from exc
