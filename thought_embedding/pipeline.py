@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _MAP_TOKENIZER_CACHE: dict[str, Any] = {}
 _PRINTED_SEPARATOR_DEBUG = False
+_PRINTED_NONSTANDALONE_NOTICE = False
 
 
 @dataclass
@@ -123,10 +124,12 @@ def run_pipeline(
 
     if cfg.resume and completed_keys:
         before_resume = len(pretokenized_ds)
-        pretokenized_ds = pretokenized_ds.filter(
-            lambda x: x["__row_key"] not in completed_keys,
-            desc="Filter completed keys",
-        )
+        keep_indices = [
+            i
+            for i, row_key in enumerate(pretokenized_ds["__row_key"])
+            if row_key not in completed_keys
+        ]
+        pretokenized_ds = pretokenized_ds.select(keep_indices)
         resume_removed_count = before_resume - len(pretokenized_ds)
     after_resume_rows = len(pretokenized_ds)
 
@@ -144,10 +147,14 @@ def run_pipeline(
     print(f"Counter(is_overlong)={Counter(pretokenized_ds['is_overlong'])}")
     _print_filter_reasons(pretokenized_ds)
 
-    filtered_ds = pretokenized_ds.filter(
-        lambda x: x["is_valid"] and (not x["is_overlong"]),
-        desc="Filter invalid and overlong",
-    )
+    ready_indices = [
+        i
+        for i, (is_valid, is_overlong) in enumerate(
+            zip(pretokenized_ds["is_valid"], pretokenized_ds["is_overlong"])
+        )
+        if bool(is_valid) and (not bool(is_overlong))
+    ]
+    filtered_ds = pretokenized_ds.select(ready_indices)
     print(f"len_filtered_ds={len(filtered_ds)}")
 
     logger.info(
@@ -996,8 +1003,12 @@ def _debug_separator_nonstandalone_notice(
     exact_match_count: int,
     expected_count: int,
 ) -> None:
+    global _PRINTED_NONSTANDALONE_NOTICE
     if exact_match_count == expected_count:
         return
+    if _PRINTED_NONSTANDALONE_NOTICE:
+        return
+    _PRINTED_NONSTANDALONE_NOTICE = True
     print(
         "NOTE: separator token is not standalone in all contexts; using span-aligned boundary positions. "
         f"repr(separator_text)={repr(separator_text)} separator_token_id={separator_token_id} "
