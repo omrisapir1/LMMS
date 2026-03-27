@@ -7,7 +7,7 @@ from typing import Optional
 @dataclass
 class ThoughtEmbeddingConfig:
     # Data
-    dataset_name: str = "your_dataset_name"
+    dataset_name: str = "omrisap/nvidia_math_generated_solution_750K"
     train_split: str = "train"
     eval_split: Optional[str] = None
     input_problem_field: str = "problem"
