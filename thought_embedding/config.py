@@ -29,7 +29,7 @@ class ThoughtEmbeddingConfig:
     # Prompt / construction
     user_prompt_template: str = (
         "Solve the following math problem. Make sure to put the answer "
-        "(and only answer) inside \\boxed{}.\n\n{problem}"
+        "(and only answer) inside \\boxed{{}}.\n\n{problem}"
     )
     separator_text: str = "\n\n"
 
