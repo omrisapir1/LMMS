@@ -174,7 +174,7 @@ def run_pipeline(
         len(filtered_ds),
     )
 
-    _print_startup_example(filtered_ds)
+    _print_startup_example(filtered_ds, separator_token_id=sep_token_id)
 
     if cfg.sort_by_length and len(filtered_ds) > 0:
         filtered_ds = filtered_ds.sort("input_token_count")
@@ -920,12 +920,22 @@ def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -
         raise PipelineError("Failed to apply chat template for this tokenizer.") from exc
 
 
-def _print_startup_example(ds: Dataset) -> None:
+def _print_startup_example(ds: Dataset, *, separator_token_id: int) -> None:
     if len(ds) == 0:
         print("Startup example: none")
         return
 
+    row = ds[0]
+    input_ids = [int(x) for x in row.get("input_ids", [])]
+    tracked_positions = [int(x) for x in row.get("thought_separator_positions", [])]
+    separator_token_indices = [i for i, tok in enumerate(input_ids) if int(tok) == int(separator_token_id)]
+    token_ids_at_tracked_positions = [input_ids[i] for i in tracked_positions if 0 <= i < len(input_ids)]
+
     print("Startup example")
+    print(f"input_ids={input_ids}")
+    print(f"separator_token_indices={separator_token_indices}")
+    print(f"thought_separator_positions={tracked_positions}")
+    print(f"token_ids_at_thought_separator_positions={token_ids_at_tracked_positions}")
 
 
 def _assert_shifted_positions_in_bounds(
