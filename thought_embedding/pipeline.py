@@ -84,14 +84,11 @@ def run_pipeline(
 
     dataset = dataset.shuffle(seed=cfg.seed)
 
-    selected_indices = range(1000)
-    dataset = dataset.select(selected_indices)
-
-
     if cfg.max_samples > 0:
         dataset = dataset.select(range(min(cfg.max_samples, len(dataset))))
 
-    processed_rows = int(manifest.get("processed_rows", 0)) + len(dataset)
+    run_rows = len(dataset)
+    processed_rows = int(manifest.get("processed_rows", 0)) + run_rows
     written_rows = int(manifest.get("written_rows", 0))
     next_shard_idx = int(manifest.get("next_shard_idx", 0))
     failed_rows = 0
@@ -126,6 +123,15 @@ def run_pipeline(
     filtered_ds = pretokenized_ds.filter(
         lambda x: x["is_valid"] and (not x["is_overlong"]),
         desc="Filter invalid and overlong",
+    )
+
+    logger.info(
+        "Preprocess stats | run_rows=%s | pretokenized=%s | valid=%s | overlong=%s | ready=%s",
+        run_rows,
+        len(pretokenized_ds),
+        len(pretokenized_ds) - invalid_count,
+        overlong_count,
+        len(filtered_ds),
     )
 
     _print_startup_example(filtered_ds)
@@ -259,13 +265,23 @@ def _load_model(cfg: ThoughtEmbeddingConfig) -> Any:
     if not torch.cuda.is_available():
         raise PipelineError("CUDA is required for this phase. No CPU fallback is implemented.")
 
+    model_dtype = _torch_dtype(cfg.dtype)
     kwargs = {
-        "torch_dtype": _torch_dtype(cfg.dtype),
+        "dtype": model_dtype,
         "trust_remote_code": True,
     }
 
     try:
         model = AutoModel.from_pretrained(cfg.model_name, **kwargs)
+    except TypeError:
+        legacy_kwargs = {
+            "torch_dtype": model_dtype,
+            "trust_remote_code": True,
+        }
+        try:
+            model = AutoModel.from_pretrained(cfg.model_name, **legacy_kwargs)
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **legacy_kwargs)
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
 
@@ -773,6 +789,10 @@ def _print_startup_example(ds: Dataset) -> None:
 def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None:
     if len(ds) == 0:
         print("Filter reasons: dataset is empty before preprocessing output analysis.")
+        return
+
+    if "filter_reason" not in set(ds.column_names):
+        print("Filter reasons: unavailable (missing filter_reason column in pretokenized dataset).")
         return
 
     reasons: dict[str, list[str]] = {}
