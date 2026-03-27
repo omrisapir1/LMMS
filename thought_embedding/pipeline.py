@@ -641,25 +641,72 @@ def _build_assistant_content_and_positions(
     separator: str,
 ) -> tuple[str, list[int]]:
     text = ""
-    token_len = 0
-    separator_positions: list[int] = []
+    separator_char_spans: list[tuple[int, int]] = []
 
     # Canonical format: separator is inserted before each thought, with no trailing separator.
     # This guarantees exactly one separator token per thought.
     for thought in thoughts:
-        text, token_len = _append_segment(tokenizer, text, token_len, separator)
-        separator_positions.append(token_len - 1)
-        text, token_len = _append_segment(tokenizer, text, token_len, thought)
+        sep_start = len(text)
+        text = text + separator
+        sep_end = len(text)
+        separator_char_spans.append((sep_start, sep_end))
+        text = text + thought
 
+    separator_positions = _resolve_separator_positions(
+        tokenizer,
+        text=text,
+        separator=separator,
+        separator_char_spans=separator_char_spans,
+    )
     return text, separator_positions
 
 
-def _append_segment(tokenizer: Any, current_text: str, current_len: int, segment: str) -> tuple[str, int]:
-    new_text = current_text + segment
-    new_len = len(tokenizer.encode(new_text, add_special_tokens=False))
-    if new_len < current_len:
-        raise PipelineError("Token length decreased while constructing assistant content.")
-    return new_text, new_len
+def _resolve_separator_positions(
+    tokenizer: Any,
+    *,
+    text: str,
+    separator: str,
+    separator_char_spans: list[tuple[int, int]],
+) -> list[int]:
+    # Fast-tokenizer path: resolve separator positions from final token offsets.
+    try:
+        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        ids = enc["input_ids"]
+        offsets = enc["offset_mapping"]
+        positions: list[int] = []
+        for sep_start, sep_end in separator_char_spans:
+            pos = None
+            for i, (tok_start, tok_end) in enumerate(offsets):
+                if tok_start == sep_start and tok_end == sep_end:
+                    pos = i
+                    break
+            if pos is None:
+                for i, (tok_start, tok_end) in enumerate(offsets):
+                    if tok_start <= sep_start and tok_end >= sep_end:
+                        pos = i
+                        break
+            if pos is None:
+                raise PipelineError(
+                    f"Could not resolve separator token span ({sep_start}, {sep_end}) in assistant text."
+                )
+            positions.append(pos)
+        return positions
+    except Exception:
+        # Fallback for tokenizers without offset mapping support.
+        sep_ids = tokenizer.encode(separator, add_special_tokens=False)
+        if len(sep_ids) != 1:
+            raise PipelineError(
+                f"separator_text={separator!r} must tokenize to exactly one token, got {len(sep_ids)}."
+            )
+        sep_id = int(sep_ids[0])
+        ids = [int(x) for x in tokenizer.encode(text, add_special_tokens=False)]
+        all_sep_positions = [i for i, tok_id in enumerate(ids) if tok_id == sep_id]
+        if len(all_sep_positions) != len(separator_char_spans):
+            raise PipelineError(
+                "Unable to align separator positions in assistant text: "
+                f"expected {len(separator_char_spans)} separators, found {len(all_sep_positions)}."
+            )
+        return all_sep_positions
 
 
 def _build_chat_ids_and_positions(
