@@ -17,7 +17,7 @@ class LatentRow:
     answer_digits: List[int]
     k_star: int
     k_max: int
-    latent_vectors: np.ndarray  # [K_star, dim], float32
+    state_vectors: np.ndarray  # [K_star, dim], float32
 
 
 @dataclass
