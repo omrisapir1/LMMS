@@ -8,7 +8,7 @@ class CodebookConfig:
     input_dir: str = "omrisap/nvidia-math-vectorized"
     output_dir: str = "runs/codebook"
     vocab_size: int = 512
-    dim: int = 1024
+    dim: int = 1536
     batch_size: int = 128  # max sequences per step
     max_vectors_per_batch: int = 8_192
     epochs: int = 3
