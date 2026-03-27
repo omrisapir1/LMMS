@@ -29,9 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--user_prompt_template", default=(
         "Solve the following math problem. Make sure to put the answer "
-        "(and only answer) inside \\boxed{{}}.\\n\\n{problem}"
+        "(and only answer) inside \\boxed{{}}.\n\n{problem}"
     ))
-    p.add_argument("--separator_text", default="\\n\\n")
+    p.add_argument("--separator_text", default="\n\n")
 
     p.add_argument("--max_tokens_per_batch", type=int, default=16384)
     p.add_argument("--max_examples_per_batch", type=int, default=8)

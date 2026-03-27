@@ -68,7 +68,9 @@ def run_pipeline(
 
     if dataset is None:
         dataset = load_dataset(cfg.dataset_name, split=cfg.train_split)
+    loaded_rows = len(dataset)
 
+    rows_after_source_filter = loaded_rows
     if cfg.source_filter:
         if not cfg.input_source_field:
             raise PipelineError("source_filter is set but input_source_field is not configured.")
@@ -81,13 +83,16 @@ def run_pipeline(
             lambda x: str(x.get(cfg.input_source_field)) == wanted_source,
             desc=f"Filter source={wanted_source}",
         )
+        rows_after_source_filter = len(dataset)
 
     dataset = dataset.shuffle(seed=cfg.seed)
+    rows_after_shuffle = len(dataset)
 
     if cfg.max_samples > 0:
         dataset = dataset.select(range(min(cfg.max_samples, len(dataset))))
+    rows_after_sampling = len(dataset)
 
-    run_rows = len(dataset)
+    run_rows = rows_after_sampling
     processed_rows = int(manifest.get("processed_rows", 0)) + run_rows
     written_rows = int(manifest.get("written_rows", 0))
     next_shard_idx = int(manifest.get("next_shard_idx", 0))
@@ -109,15 +114,21 @@ def run_pipeline(
         tokenizer=local_tokenizer,
         separator_token_id=sep_token_id,
     )
+    pretokenized_rows = len(pretokenized_ds)
+    resume_removed_count = 0
 
     if cfg.resume and completed_keys:
+        before_resume = len(pretokenized_ds)
         pretokenized_ds = pretokenized_ds.filter(
             lambda x: x["__row_key"] not in completed_keys,
             desc="Filter completed keys",
         )
+        resume_removed_count = before_resume - len(pretokenized_ds)
+    after_resume_rows = len(pretokenized_ds)
 
     invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
     overlong_count = sum(1 for v in pretokenized_ds["is_overlong"] if v)
+    valid_count = after_resume_rows - invalid_count
     _print_filter_reasons(pretokenized_ds)
 
     filtered_ds = pretokenized_ds.filter(
@@ -126,10 +137,18 @@ def run_pipeline(
     )
 
     logger.info(
-        "Preprocess stats | run_rows=%s | pretokenized=%s | valid=%s | overlong=%s | ready=%s",
+        "Preprocess stats | loaded=%s | after_source_filter=%s | after_shuffle=%s | "
+        "after_sampling=%s | pretokenized=%s | resume_removed=%s | after_resume=%s | "
+        "valid=%s | invalid=%s | overlong=%s | ready=%s",
+        loaded_rows,
+        rows_after_source_filter,
+        rows_after_shuffle,
         run_rows,
-        len(pretokenized_ds),
-        len(pretokenized_ds) - invalid_count,
+        pretokenized_rows,
+        resume_removed_count,
+        after_resume_rows,
+        valid_count,
+        invalid_count,
         overlong_count,
         len(filtered_ds),
     )
@@ -227,7 +246,10 @@ def run_pipeline(
         "num_shards": len(list_existing_shards(output_dir)),
         "processed_rows": processed_rows,
         "written_rows": written_rows,
-        "skipped_rows": invalid_count + overlong_count,
+        "skipped_rows": invalid_count + overlong_count + resume_removed_count,
+        "invalid_rows": invalid_count,
+        "overlong_rows": overlong_count,
+        "resume_removed_rows": resume_removed_count,
         "failed_rows": failed_rows,
         "manifest": manifest,
     }
@@ -768,7 +790,7 @@ def _build_chat_text(tokenizer: Any, user_prompt: str, assistant_content: str) -
 
 def _print_startup_example(ds: Dataset) -> None:
     if len(ds) == 0:
-        print("Startup example: no valid examples after preprocessing/filtering.")
+        print("Startup example: no rows ready for inference after preprocessing/resume filtering.")
         return
 
     row = ds[0]
