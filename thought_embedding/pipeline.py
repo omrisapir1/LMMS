@@ -852,11 +852,30 @@ def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None
         sample = keys[:max_examples_per_reason]
         print(f"- {reason}: {len(keys)} rows | sample_keys={sample}")
 
+    _print_one_filtered_example(ds)
+
 
 def _print_startup_config_checks(cfg: ThoughtEmbeddingConfig) -> None:
     print(f"cfg.separator_text repr: {repr(cfg.separator_text)}")
     boxed_ok = "\\boxed{{}}" in cfg.user_prompt_template
     print(f"user_prompt_template_contains_escaped_boxed={{}}: {boxed_ok}")
+
+
+def _print_one_filtered_example(ds: Dataset) -> None:
+    for row in ds:
+        reason = row.get("filter_reason", "")
+        if not reason:
+            continue
+        print("One filtered example:")
+        print(f"  row_key={row.get('__row_key')}")
+        print(f"  reason={reason}")
+        print(f"  problem={repr(row.get('problem'))}")
+        print(f"  num_thoughts={row.get('num_thoughts')}")
+        print(f"  input_token_count={row.get('input_token_count')}")
+        print(f"  source={row.get('source')}")
+        print(f"  id={row.get('id')} qid={row.get('qid')}")
+        return
+    print("One filtered example: none")
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
