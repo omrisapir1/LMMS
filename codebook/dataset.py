@@ -17,7 +17,7 @@ class LatentRow:
     answer_digits: List[int]
     k_star: int
     k_max: int
-    state_vectors: np.ndarray  # [K_star, dim], float32
+    latent_vectors: np.ndarray  # [K_star, dim], float32
 
 
 @dataclass
@@ -113,6 +113,13 @@ def _coerce_int(value: object, *, default: int = 0) -> int:
         return default
 
 
+def _first_present(row: Dict, keys: Sequence[str]) -> object:
+    for key in keys:
+        if key in row:
+            return row[key]
+    return None
+
+
 def _coerce_digits(value: object) -> List[int]:
     if value is None:
         return []
@@ -137,7 +144,7 @@ def validate_latent_vectors(
         return None, "latent_vectors is null"
     if k_star < 0:
         return None, "K_star is negative"
-    if not isinstance(latent_vectors, Sequence):
+    if not isinstance(latent_vectors, Sequence) and not isinstance(latent_vectors, np.ndarray):
         return None, "latent_vectors is not a sequence"
     if len(latent_vectors) != k_star:
         return None, f"len(latent_vectors)={len(latent_vectors)} != K_star={k_star}"
@@ -159,18 +166,30 @@ def validate_latent_vectors(
 
 
 def parse_latent_row(row: Dict, *, dim: int) -> Tuple[Optional[LatentRow], Optional[str]]:
-    k_star = _coerce_int(row.get("K_star"), default=-1)
-    latents, err = validate_latent_vectors(row.get("latent_vectors"), k_star=k_star, dim=dim)
+    raw_latents = _first_present(row, ("latent_vectors", "state_vectors"))
+    raw_k_star = _first_present(row, ("K_star", "k_star", "num_thoughts"))
+    k_star = _coerce_int(raw_k_star, default=-1)
+    if k_star < 0 and raw_latents is not None:
+        try:
+            k_star = int(len(raw_latents))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            k_star = -1
+
+    latents, err = validate_latent_vectors(raw_latents, k_star=k_star, dim=dim)
     if err is not None or latents is None:
         return None, err or "invalid latent_vectors"
 
+    raw_qid = _first_present(row, ("qid", "id"))
+    raw_question = _first_present(row, ("question", "problem"))
+    raw_k_max = _first_present(row, ("k_max", "K_max", "num_thoughts", "K_star", "k_star"))
+
     parsed = LatentRow(
-        qid=str(row.get("qid", "")),
-        question=str(row.get("question", "")),
+        qid=str(raw_qid if raw_qid is not None else ""),
+        question=str(raw_question if raw_question is not None else ""),
         answer_int=_coerce_int(row.get("answer_int"), default=0),
         answer_digits=_coerce_digits(row.get("answer_digits")),
         k_star=k_star,
-        k_max=_coerce_int(row.get("k_max"), default=0),
+        k_max=_coerce_int(raw_k_max, default=k_star),
         latent_vectors=latents,
     )
     return parsed, None
@@ -184,13 +203,31 @@ def iter_valid_latent_rows(
     shuffle_buffer_size: int = 10_000,
     seed: int = 42,
 ) -> Iterator[LatentRow]:
+    valid_count = 0
+    invalid_count = 0
+    first_error: Optional[str] = None
+
+    def _on_invalid(err: Optional[str]) -> None:
+        nonlocal invalid_count, first_error
+        invalid_count += 1
+        if first_error is None and err:
+            first_error = err
+
     if _is_local_parquet_dir(input_dir):
         for shard in list_parquet_shards(input_dir):
             for row in iter_parquet_rows(shard, read_batch_size=read_batch_size):
-                parsed, _ = parse_latent_row(row, dim=dim)
+                parsed, err = parse_latent_row(row, dim=dim)
                 if parsed is None:
+                    _on_invalid(err)
                     continue
+                valid_count += 1
                 yield parsed
+        if valid_count == 0:
+            raise RuntimeError(
+                f"No valid latent rows found in local parquet dir={input_dir!r} for dim={dim}. "
+                f"invalid_rows={invalid_count}, first_error={first_error!r}. "
+                "Expected row keys include one of {latent_vectors,state_vectors} and one of {K_star,k_star,num_thoughts}."
+            )
         return
 
     for row in iter_hf_rows(
@@ -199,10 +236,18 @@ def iter_valid_latent_rows(
         shuffle_buffer_size=shuffle_buffer_size,
         seed=seed,
     ):
-        parsed, _ = parse_latent_row(row, dim=dim)
+        parsed, err = parse_latent_row(row, dim=dim)
         if parsed is None:
+            _on_invalid(err)
             continue
+        valid_count += 1
         yield parsed
+    if valid_count == 0:
+        raise RuntimeError(
+            f"No valid latent rows found in HF input={input_dir!r} for dim={dim}. "
+            f"invalid_rows={invalid_count}, first_error={first_error!r}. "
+            "Expected row keys include one of {latent_vectors,state_vectors} and one of {K_star,k_star,num_thoughts}."
+        )
 
 
 def iter_sequence_batches(
