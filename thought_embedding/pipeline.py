@@ -84,6 +84,10 @@ def run_pipeline(
 
     dataset = dataset.shuffle(seed=cfg.seed)
 
+    selected_indices = range(1000)
+    dataset = dataset.select(selected_indices)
+
+
     if cfg.max_samples > 0:
         dataset = dataset.select(range(min(cfg.max_samples, len(dataset))))
 
