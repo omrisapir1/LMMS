@@ -28,7 +28,7 @@ class CodebookConfig:
     export_quantize_chunk_size: int = 16_384
     log_interval: int = 5
     quantize_mode: str = "delta"
-    delete_input_files: bool = True
+    delete_input_files: bool = False
 
     # Fixed constants requested by the spec
     usage_laplace_alpha: float = 1.0
