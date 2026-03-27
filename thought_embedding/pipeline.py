@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _MAP_TOKENIZER_CACHE: dict[str, Any] = {}
 _PRINTED_SEPARATOR_DEBUG = False
 _PRINTED_NONSTANDALONE_NOTICE = False
+_CANONICAL_SEPARATOR_MARKER_TOKEN_ID = 271
 
 
 @dataclass
@@ -662,6 +663,12 @@ def _map_pretokenize_impl(
                 expected_count=len(separator_positions),
             )
 
+        input_ids = _overwrite_canonical_marker_positions(
+            input_ids=input_ids,
+            positions=separator_positions,
+            marker_token_id=_CANONICAL_SEPARATOR_MARKER_TOKEN_ID,
+        )
+
         out["problem"].append(problem)
         out["thoughts"].append(thoughts)
         out["num_thoughts"].append(len(thoughts))
@@ -784,25 +791,20 @@ def _resolve_separator_positions(
     # Fast-tokenizer path: resolve separator positions from final token offsets.
     try:
         enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        ids = enc["input_ids"]
         offsets = enc["offset_mapping"]
         positions: list[int] = []
         for sep_start, sep_end in separator_char_spans:
-            pos = None
-            for i, (tok_start, tok_end) in enumerate(offsets):
-                if tok_start == sep_start and tok_end == sep_end:
-                    pos = i
-                    break
-            if pos is None:
-                for i, (tok_start, tok_end) in enumerate(offsets):
-                    if tok_start <= sep_start and tok_end >= sep_end:
-                        pos = i
-                        break
-            if pos is None:
+            overlapping_positions = [
+                i
+                for i, (tok_start, tok_end) in enumerate(offsets)
+                if tok_end > sep_start and tok_start < sep_end
+            ]
+            if not overlapping_positions:
                 raise PipelineError(
                     f"Could not resolve separator token span ({sep_start}, {sep_end}) in assistant text."
                 )
-            positions.append(pos)
+            # Canonical extraction index: last token overlapping the separator span.
+            positions.append(int(overlapping_positions[-1]))
         return positions
     except Exception:
         # Fallback for tokenizers without offset mapping support.
@@ -820,6 +822,18 @@ def _resolve_separator_positions(
                 f"expected {len(separator_char_spans)} separators, found {len(all_sep_positions)}."
             )
         return all_sep_positions
+
+
+def _overwrite_canonical_marker_positions(
+    *,
+    input_ids: list[int],
+    positions: list[int],
+    marker_token_id: int,
+) -> list[int]:
+    out = [int(x) for x in input_ids]
+    for pos in positions:
+        out[pos] = int(marker_token_id)
+    return out
 
 
 def _build_chat_ids_and_positions(
