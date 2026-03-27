@@ -168,13 +168,28 @@ def validate_latent_vectors(
 
 def parse_latent_row(row: Dict, *, dim: int) -> Tuple[Optional[LatentRow], Optional[str]]:
     raw_latents = _first_present(row, ("latent_vectors", "state_vectors"))
-    raw_k_star = _first_present(row, ("K_star", "k_star", "num_thoughts"))
-    k_star = _coerce_int(raw_k_star, default=-1)
-    if k_star < 0 and raw_latents is not None:
+    raw_k_star_explicit = _first_present(row, ("K_star", "k_star"))
+    k_star = _coerce_int(raw_k_star_explicit, default=-1)
+
+    latents_len = -1
+    if raw_latents is not None:
         try:
-            k_star = int(len(raw_latents))  # type: ignore[arg-type]
+            latents_len = int(len(raw_latents))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            k_star = -1
+            latents_len = -1
+
+    # If K_star/k_star is not provided, infer from vectors directly.
+    # This supports both legacy rows (len == num_thoughts) and the newer
+    # thought-embedding rows (len == num_thoughts + 1).
+    if k_star < 0:
+        raw_num_thoughts = _coerce_int(_first_present(row, ("num_thoughts",)), default=-1)
+        if latents_len >= 0:
+            if raw_num_thoughts >= 0 and latents_len in (raw_num_thoughts, raw_num_thoughts + 1):
+                k_star = latents_len
+            else:
+                k_star = latents_len
+        elif raw_num_thoughts >= 0:
+            k_star = raw_num_thoughts
 
     latents, err = validate_latent_vectors(raw_latents, k_star=k_star, dim=dim)
     if err is not None or latents is None:
@@ -186,6 +201,10 @@ def parse_latent_row(row: Dict, *, dim: int) -> Tuple[Optional[LatentRow], Optio
     raw_k_max = _first_present(row, ("k_max", "K_max", "num_thoughts", "K_star", "k_star"))
     raw_answer_int = _first_present(row, ("expected_answer", "answer_int", "answer"))
 
+    parsed_k_max = _coerce_int(raw_k_max, default=k_star)
+    if parsed_k_max < k_star:
+        parsed_k_max = k_star
+
     parsed = LatentRow(
         qid=str(raw_qid if raw_qid is not None else ""),
         question=str(raw_question if raw_question is not None else ""),
@@ -193,7 +212,7 @@ def parse_latent_row(row: Dict, *, dim: int) -> Tuple[Optional[LatentRow], Optio
         answer_int=_coerce_int(raw_answer_int, default=0),
         answer_digits=_coerce_digits(row.get("answer_digits")),
         k_star=k_star,
-        k_max=_coerce_int(raw_k_max, default=k_star),
+        k_max=parsed_k_max,
         latent_vectors=latents,
     )
     return parsed, None
