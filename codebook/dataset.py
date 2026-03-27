@@ -182,11 +182,12 @@ def parse_latent_row(row: Dict, *, dim: int) -> Tuple[Optional[LatentRow], Optio
     raw_qid = _first_present(row, ("qid", "id"))
     raw_question = _first_present(row, ("question", "problem"))
     raw_k_max = _first_present(row, ("k_max", "K_max", "num_thoughts", "K_star", "k_star"))
+    raw_answer_int = _first_present(row, ("expected_answer", "answer_int", "answer"))
 
     parsed = LatentRow(
         qid=str(raw_qid if raw_qid is not None else ""),
         question=str(raw_question if raw_question is not None else ""),
-        answer_int=_coerce_int(row.get("answer_int"), default=0),
+        answer_int=_coerce_int(raw_answer_int, default=0),
         answer_digits=_coerce_digits(row.get("answer_digits")),
         k_star=k_star,
         k_max=_coerce_int(raw_k_max, default=k_star),
