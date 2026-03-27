@@ -121,6 +121,7 @@ def run_pipeline(
 
     invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
     overlong_count = sum(1 for v in pretokenized_ds["is_overlong"] if v)
+    _print_filter_reasons(pretokenized_ds)
 
     filtered_ds = pretokenized_ds.filter(
         lambda x: x["is_valid"] and (not x["is_overlong"]),
@@ -500,6 +501,7 @@ def _map_pretokenize_impl(
         "thought_separator_positions": [],
         "is_overlong": [],
         "is_valid": [],
+        "filter_reason": [],
         "answer": [],
         "expected_answer": [],
         "source": [],
@@ -527,13 +529,13 @@ def _map_pretokenize_impl(
         out["solution"].append(None if solution is None else str(solution))
 
         if not isinstance(problem, str) or not problem.strip():
-            _append_invalid_row(out, problem=None)
+            _append_invalid_row(out, problem=None, reason="invalid_problem")
             continue
         if not isinstance(thoughts_raw, list):
-            _append_invalid_row(out, problem=problem)
+            _append_invalid_row(out, problem=problem, reason="invalid_splitted_solution_not_list")
             continue
         if any(not isinstance(t, str) for t in thoughts_raw):
-            _append_invalid_row(out, problem=problem)
+            _append_invalid_row(out, problem=problem, reason="invalid_splitted_solution_non_string_item")
             continue
 
         thoughts = [t.strip() for t in thoughts_raw]
@@ -541,7 +543,7 @@ def _map_pretokenize_impl(
             thoughts = [t for t in thoughts if t]
 
         if len(thoughts) < min_thoughts:
-            _append_invalid_row(out, problem=problem)
+            _append_invalid_row(out, problem=problem, reason="invalid_min_thoughts_not_met")
             continue
 
         user_prompt = _render_user_prompt(user_prompt_template, problem)
@@ -565,7 +567,7 @@ def _map_pretokenize_impl(
                 break
 
         if not valid:
-            _append_invalid_row(out, problem=problem)
+            _append_invalid_row(out, problem=problem, reason="invalid_separator_alignment")
             continue
 
         out["problem"].append(problem)
@@ -577,11 +579,12 @@ def _map_pretokenize_impl(
         out["thought_separator_positions"].append([int(x) for x in separator_positions])
         out["is_overlong"].append(len(input_ids) > max_model_len)
         out["is_valid"].append(True)
+        out["filter_reason"].append("" if len(input_ids) <= max_model_len else "overlong_input")
 
     return out
 
 
-def _append_invalid_row(out: dict[str, list[Any]], *, problem: Optional[str]) -> None:
+def _append_invalid_row(out: dict[str, list[Any]], *, problem: Optional[str], reason: str) -> None:
     out["problem"].append(problem)
     out["thoughts"].append([])
     out["num_thoughts"].append(0)
@@ -591,6 +594,7 @@ def _append_invalid_row(out: dict[str, list[Any]], *, problem: Optional[str]) ->
     out["thought_separator_positions"].append([])
     out["is_overlong"].append(False)
     out["is_valid"].append(False)
+    out["filter_reason"].append(reason)
 
 
 def _get_map_tokenizer(model_name: str) -> Any:
@@ -764,6 +768,29 @@ def _print_startup_example(ds: Dataset) -> None:
     print(positions)
     print("Startup example token ids at extraction positions:")
     print(extracted_token_ids)
+
+
+def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None:
+    if len(ds) == 0:
+        print("Filter reasons: dataset is empty before preprocessing output analysis.")
+        return
+
+    reasons: dict[str, list[str]] = {}
+    for row in ds:
+        reason = row.get("filter_reason", "")
+        if not reason:
+            continue
+        key = str(row.get("__row_key", "unknown"))
+        reasons.setdefault(reason, []).append(key)
+
+    if not reasons:
+        print("Filter reasons: none (all rows passed preprocessing filters).")
+        return
+
+    print("Filter reasons summary:")
+    for reason, keys in sorted(reasons.items(), key=lambda x: (-len(x[1]), x[0])):
+        sample = keys[:max_examples_per_reason]
+        print(f"- {reason}: {len(keys)} rows | sample_keys={sample}")
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
