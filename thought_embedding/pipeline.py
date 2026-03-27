@@ -540,7 +540,7 @@ def _map_pretokenize_impl(
             _append_invalid_row(out, problem=problem)
             continue
 
-        user_prompt = user_prompt_template.format(problem=problem)
+        user_prompt = _render_user_prompt(user_prompt_template, problem)
         assistant_content, separator_positions_in_assistant = _build_assistant_content_and_positions(
             tokenizer,
             thoughts,
@@ -604,6 +604,16 @@ def _get_optional_value(batch: dict[str, list[Any]], field: Optional[str], idx: 
     if values is None:
         return None
     return values[idx]
+
+
+def _render_user_prompt(user_prompt_template: str, problem: str) -> str:
+    try:
+        return user_prompt_template.format(problem=problem)
+    except Exception as exc:
+        raise PipelineError(
+            "Invalid user_prompt_template for str.format(...). "
+            "If you need literal braces (e.g., '\\boxed{}'), escape them as '{{' and '}}'."
+        ) from exc
 
 
 def _row_to_pretokenized_example(row: dict[str, Any]) -> PreTokenizedExample:

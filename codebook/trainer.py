@@ -29,8 +29,8 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
 
 
 class CodebookTrainer:
@@ -38,7 +38,7 @@ class CodebookTrainer:
         self.config = config
         _set_seed(config.seed)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")#("cuda" if torch.cuda.is_available() else "cpu")
         self.model = Codebook(
             dim=config.dim,
             vocab_size=config.vocab_size,
