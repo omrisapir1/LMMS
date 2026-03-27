@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,7 @@ def run_pipeline(
 ) -> dict[str, Any]:
     validate_config(cfg)
     _configure_logging()
+    _print_startup_config_checks(cfg)
 
     output_dir = ensure_output_dir(cfg.output_dir)
     _prepare_output_dir(cfg, output_dir)
@@ -126,15 +128,25 @@ def run_pipeline(
         resume_removed_count = before_resume - len(pretokenized_ds)
     after_resume_rows = len(pretokenized_ds)
 
+    print(f"raw_dataset_len={loaded_rows}")
+    print(f"len_after_source_filter={rows_after_source_filter}")
+    print(f"len_after_resume_filter={after_resume_rows}")
+    print(f"len_pretokenized_ds={pretokenized_rows}")
+
     invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
     overlong_count = sum(1 for v in pretokenized_ds["is_overlong"] if v)
     valid_count = after_resume_rows - invalid_count
+    print(f"invalid_count={invalid_count}")
+    print(f"overlong_count={overlong_count}")
+    print(f"Counter(is_valid)={Counter(pretokenized_ds['is_valid'])}")
+    print(f"Counter(is_overlong)={Counter(pretokenized_ds['is_overlong'])}")
     _print_filter_reasons(pretokenized_ds)
 
     filtered_ds = pretokenized_ds.filter(
         lambda x: x["is_valid"] and (not x["is_overlong"]),
         desc="Filter invalid and overlong",
     )
+    print(f"len_filtered_ds={len(filtered_ds)}")
 
     logger.info(
         "Preprocess stats | loaded=%s | after_source_filter=%s | after_shuffle=%s | "
@@ -333,6 +345,7 @@ def _pretokenize_dataset(
         with_indices=True,
         batched=True,
         batch_size=cfg.pretokenize_batch_size,
+        load_from_cache_file=False,
         fn_kwargs={
             "input_id_field": cfg.input_id_field,
             "input_qid_field": cfg.input_qid_field,
@@ -351,6 +364,7 @@ def _pretokenize_dataset(
             batched=True,
             batch_size=cfg.pretokenize_batch_size,
             num_proc=map_num_proc,
+            load_from_cache_file=False,
             fn_kwargs={
                 "model_name": cfg.model_name,
                 "input_problem_field": cfg.input_problem_field,
@@ -376,6 +390,7 @@ def _pretokenize_dataset(
             _map_pretokenize_serial,
             batched=True,
             batch_size=cfg.pretokenize_batch_size,
+            load_from_cache_file=False,
             fn_kwargs={
                 "tokenizer": tokenizer,
                 "input_problem_field": cfg.input_problem_field,
@@ -814,7 +829,10 @@ def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None
         return
 
     if "filter_reason" not in set(ds.column_names):
-        print("Filter reasons: unavailable (missing filter_reason column in pretokenized dataset).")
+        print(
+            "Filter reasons: unavailable (missing filter_reason column in pretokenized dataset). "
+            "This usually indicates a stale cached map artifact or an older pipeline version."
+        )
         return
 
     reasons: dict[str, list[str]] = {}
@@ -833,6 +851,12 @@ def _print_filter_reasons(ds: Dataset, max_examples_per_reason: int = 5) -> None
     for reason, keys in sorted(reasons.items(), key=lambda x: (-len(x[1]), x[0])):
         sample = keys[:max_examples_per_reason]
         print(f"- {reason}: {len(keys)} rows | sample_keys={sample}")
+
+
+def _print_startup_config_checks(cfg: ThoughtEmbeddingConfig) -> None:
+    print(f"cfg.separator_text repr: {repr(cfg.separator_text)}")
+    boxed_ok = "\\boxed{{}}" in cfg.user_prompt_template
+    print(f"user_prompt_template_contains_escaped_boxed={{}}: {boxed_ok}")
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
