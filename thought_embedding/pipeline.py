@@ -87,6 +87,20 @@ def run_pipeline(
         )
         rows_after_source_filter = len(dataset)
 
+    dataset = _ensure_row_keys(
+        dataset,
+        batch_size=cfg.pretokenize_batch_size,
+        input_id_field=cfg.input_id_field,
+        input_qid_field=cfg.input_qid_field,
+        source_row_index_field="__source_row_index",
+    )
+    resume_removed_pre_count = 0
+    if cfg.resume and completed_keys:
+        before_resume = len(dataset)
+        keep_indices = [i for i, k in enumerate(dataset["__row_key"]) if k not in completed_keys]
+        dataset = dataset.select(keep_indices)
+        resume_removed_pre_count = before_resume - len(dataset)
+
     dataset = dataset.shuffle(seed=cfg.seed)
     rows_after_shuffle = len(dataset)
 
@@ -117,7 +131,7 @@ def run_pipeline(
         separator_token_id=sep_token_id,
     )
     pretokenized_rows = len(pretokenized_ds)
-    resume_removed_count = 0
+    resume_removed_count = resume_removed_pre_count
 
     if cfg.resume and completed_keys:
         before_resume = len(pretokenized_ds)
@@ -127,7 +141,7 @@ def run_pipeline(
             if row_key not in completed_keys
         ]
         pretokenized_ds = pretokenized_ds.select(keep_indices)
-        resume_removed_count = before_resume - len(pretokenized_ds)
+        resume_removed_count += before_resume - len(pretokenized_ds)
     after_resume_rows = len(pretokenized_ds)
 
     invalid_count = sum(1 for v in pretokenized_ds["is_valid"] if not v)
@@ -336,18 +350,12 @@ def _pretokenize_dataset(
     separator_token_id: int,
 ) -> Dataset:
     ds = _ensure_source_row_index(dataset, batch_size=cfg.pretokenize_batch_size)
-    ds = ds.map(
-        _map_add_row_keys,
-        with_indices=True,
-        batched=True,
+    ds = _ensure_row_keys(
+        ds,
         batch_size=cfg.pretokenize_batch_size,
-        load_from_cache_file=False,
-        fn_kwargs={
-            "input_id_field": cfg.input_id_field,
-            "input_qid_field": cfg.input_qid_field,
-            "source_row_index_field": "__source_row_index",
-        },
-        desc="Attach row keys",
+        input_id_field=cfg.input_id_field,
+        input_qid_field=cfg.input_qid_field,
+        source_row_index_field="__source_row_index",
     )
 
     map_num_proc = cfg.pretokenize_num_proc
@@ -410,6 +418,31 @@ def _pretokenize_dataset(
         )
 
     return ds
+
+
+def _ensure_row_keys(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    input_id_field: Optional[str],
+    input_qid_field: Optional[str],
+    source_row_index_field: str,
+) -> Dataset:
+    if "__row_key" in set(dataset.column_names):
+        return dataset
+    return dataset.map(
+        _map_add_row_keys,
+        with_indices=True,
+        batched=True,
+        batch_size=batch_size,
+        load_from_cache_file=False,
+        fn_kwargs={
+            "input_id_field": input_id_field,
+            "input_qid_field": input_qid_field,
+            "source_row_index_field": source_row_index_field,
+        },
+        desc="Attach row keys",
+    )
 
 
 def _map_add_row_keys(
