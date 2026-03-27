@@ -18,7 +18,7 @@ class ThoughtEmbeddingConfig:
     input_source_field: Optional[str] = "source"
     input_id_field: Optional[str] = "id"
     input_qid_field: Optional[str] = "qid"
-    max_samples: int = 1000
+    max_samples: int = 0
     source_filter: Optional[str] = None  # None means use all sources
 
     # Model
