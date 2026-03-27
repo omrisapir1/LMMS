@@ -93,9 +93,9 @@ def export_dataset(
     input_dir: str,
     output_dir: str,
     codebook_path: str,
-    dim: int = 1024,
-    read_batch_size: int = 256,
-    quantize_chunk_size: int = 16_384,
+    dim: int = 1536,
+    read_batch_size: int = 1024,
+    quantize_chunk_size: int = 16_384*4,
     quantize_mode: str | None = None,
     skip_invalid_rows: bool = False,
 ) -> None:
