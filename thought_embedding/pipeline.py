@@ -621,18 +621,15 @@ def _map_pretokenize_impl(
 
         valid = True
         try:
-            _assert_shifted_positions(
+            _assert_shifted_positions_in_bounds(
                 input_ids=input_ids,
                 shifted_positions=separator_positions,
-                separator_token_id=separator_token_id,
             )
         except AssertionError:
             valid = False
 
-        for pos in separator_positions:
-            if pos < 0 or pos >= len(input_ids) or int(input_ids[pos]) != separator_token_id:
-                valid = False
-                break
+        if len(separator_positions) != len(thoughts):
+            valid = False
 
         if not valid:
             _debug_separator_alignment_failure(
@@ -648,6 +645,15 @@ def _map_pretokenize_impl(
             )
             _append_invalid_row(out, problem=problem, reason="invalid_separator_alignment")
             continue
+
+        exact_match_count = sum(1 for p in separator_positions if int(input_ids[p]) == int(separator_token_id))
+        if exact_match_count != len(separator_positions):
+            _debug_separator_nonstandalone_notice(
+                separator_text=separator_text,
+                separator_token_id=separator_token_id,
+                exact_match_count=exact_match_count,
+                expected_count=len(separator_positions),
+            )
 
         out["problem"].append(problem)
         out["thoughts"].append(thoughts)
@@ -935,18 +941,13 @@ def _print_one_filtered_example(ds: Dataset) -> None:
     print("One filtered example: none")
 
 
-def _assert_shifted_positions(
+def _assert_shifted_positions_in_bounds(
     *,
     input_ids: list[int],
     shifted_positions: list[int],
-    separator_token_id: int,
 ) -> None:
     for pos in shifted_positions:
         assert 0 <= pos < len(input_ids), f"Shifted separator position out of range: pos={pos}, len={len(input_ids)}"
-        assert int(input_ids[pos]) == int(separator_token_id), (
-            f"Shifted separator mismatch at pos={pos}: "
-            f"found={input_ids[pos]}, expected={separator_token_id}"
-        )
 
 
 def _debug_separator_alignment_failure(
@@ -986,6 +987,22 @@ def _debug_separator_alignment_failure(
     print(f"- assistant_ids_len_from_shift_debug={alignment_debug.get('assistant_len')}")
     print(f"- shifted_separator_positions={shifted_positions}")
     print(f"- final_ids_at_shifted_positions={shifted_values}")
+
+
+def _debug_separator_nonstandalone_notice(
+    *,
+    separator_text: str,
+    separator_token_id: int,
+    exact_match_count: int,
+    expected_count: int,
+) -> None:
+    if exact_match_count == expected_count:
+        return
+    print(
+        "NOTE: separator token is not standalone in all contexts; using span-aligned boundary positions. "
+        f"repr(separator_text)={repr(separator_text)} separator_token_id={separator_token_id} "
+        f"exact_token_matches={exact_match_count}/{expected_count}"
+    )
 
 
 def _would_overflow_batch(cfg: ThoughtEmbeddingConfig, batch: BatchState, example: PreTokenizedExample) -> bool:
