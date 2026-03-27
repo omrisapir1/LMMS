@@ -16,6 +16,7 @@
       <change beforePath="$USER_HOME$/hiredscore/git/candidate_parsing/tests/integration_test/parsing.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/candidate_parsing/tests/integration_test/parsing.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -266,7 +267,7 @@
       <workItem from="1770552291960" duration="11307000" />
       <workItem from="1770617404265" duration="92254000" />
       <workItem from="1771354565185" duration="9366000" />
-      <workItem from="1774536820915" duration="16153000" />
+      <workItem from="1774536820915" duration="17688000" />
     </task>
     <task id="LOCAL-00001" summary="important">
       <option name="closed" value="true" />
