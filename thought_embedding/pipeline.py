@@ -697,7 +697,7 @@ def _map_pretokenize_impl(
         except AssertionError:
             valid = False
 
-        if len(separator_positions) != len(thoughts):
+        if len(separator_positions) != (len(thoughts) + 1):
             valid = False
 
         if not valid:
@@ -804,14 +804,18 @@ def _build_assistant_content_and_positions_with_spans(
     text = ""
     separator_char_spans: list[tuple[int, int]] = []
 
-    # Canonical format: separator is inserted before each thought, with no trailing separator.
-    # This guarantees exactly one separator token per thought.
+    # Canonical format: separator before each thought + one trailing separator.
+    # This guarantees K+1 separator positions for K thoughts.
     for thought in thoughts:
         sep_start = len(text)
         text = text + separator
         sep_end = len(text)
         separator_char_spans.append((sep_start, sep_end))
         text = text + thought
+    trailing_sep_start = len(text)
+    text = text + separator
+    trailing_sep_end = len(text)
+    separator_char_spans.append((trailing_sep_start, trailing_sep_end))
 
     separator_positions = _resolve_separator_positions(
         tokenizer,
@@ -1004,9 +1008,9 @@ def _flush_batch(
             vec = hidden[i, pos, :].detach().to(dtype=torch.float32).cpu().tolist()
             vectors.append(_cast_vector_dtype(vec, cfg.save_float_dtype))
 
-        if len(vectors) != len(ex.thoughts):
+        if len(vectors) != (len(ex.thoughts) + 1):
             raise PipelineError(
-                f"Row {ex.row_index} vector count mismatch: {len(vectors)} != {len(ex.thoughts)}"
+                f"Row {ex.row_index} vector count mismatch: {len(vectors)} != {len(ex.thoughts) + 1}"
             )
 
         dim = len(vectors[0])
