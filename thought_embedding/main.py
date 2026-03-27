@@ -17,9 +17,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input_answer_field", default="answer")
     p.add_argument("--input_expected_answer_field", default="expected_answer")
     p.add_argument("--input_solution_field", default="generated_solution")
+    p.add_argument("--input_source_field", default="source")
     p.add_argument("--input_id_field", default="id")
     p.add_argument("--input_qid_field", default="qid")
     p.add_argument("--max_samples", type=int, default=0)
+    p.add_argument("--source_filter", default=None)
 
     p.add_argument("--model_name", default="nvidia/OpenMath-Nemotron-1.5B")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -33,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--max_tokens_per_batch", type=int, default=16384)
     p.add_argument("--max_examples_per_batch", type=int, default=8)
+    p.add_argument("--sort_by_length", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--pretokenize_num_proc", type=int, default=8)
+    p.add_argument("--pretokenize_batch_size", type=int, default=128)
 
     p.add_argument("--output_dir", default="runs/thought_embedding")
     p.add_argument("--output_format", default="parquet")
