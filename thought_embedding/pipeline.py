@@ -274,7 +274,19 @@ def run_pipeline(
         "failed_rows": failed_rows,
         "manifest": manifest,
     }
-    logger.info("Run complete: %s", summary)
+    logger.info(
+        "Run complete | output_dir=%s | shards=%s | processed=%s | written=%s | "
+        "skipped=%s (invalid=%s, overlong=%s, resume_removed=%s) | failed=%s",
+        summary["output_dir"],
+        summary["num_shards"],
+        summary["processed_rows"],
+        summary["written_rows"],
+        summary["skipped_rows"],
+        summary["invalid_rows"],
+        summary["overlong_rows"],
+        summary["resume_removed_rows"],
+        summary["failed_rows"],
+    )
     return summary
 
 
