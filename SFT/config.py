@@ -43,7 +43,7 @@ class SFTConfig:
     cf_every_n_steps_early: int = 1
     cf_every_n_steps_late: int = 8
     cf_every_n_steps_switch_step: int = 1500
-    cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
+    cf_prob_tuple: tuple[float, float, float] = (0.0, 0.5, 0.5)  # (truncate, reverse, random)
     cf_lambda: float = 1.0
     cf_kl_margin: float = 0.5
     cf_eps: float = 1e-8
