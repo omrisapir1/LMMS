@@ -75,5 +75,5 @@ class SFTConfig:
 
     # Source curriculum (without replacement, linear across each loader pass)
     curriculum_enabled: bool = True
-    curriculum_easy_start: float = 0.80
-    curriculum_easy_end: float = 0.20
+    curriculum_easy_start: float = 0.90
+    curriculum_easy_end: float = 0.10
