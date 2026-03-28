@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class SFTConfig:
     # Model / tokenizer inputs
     base_model_or_checkpoint: str = "nvidia/OpenMath-Nemotron-7B"
-    train_dataset_name: str = "omrisap/nvidia_math_512_47K"
+    train_dataset_name: str = "omrisap/nvidia_math_512_750K"
     train_dataset_split: str = "train"
     eval_dataset_name: str = "omrisap/SFT_eval"
     eval_dataset_split: str = "eval"
