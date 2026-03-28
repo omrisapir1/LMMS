@@ -444,8 +444,6 @@ def _get_cf_every_n_steps(cfg: SFTConfig, step: int) -> int:
 
 
 def _validate_cf_config(cfg: SFTConfig) -> None:
-    if int(cfg.cf_every_n_steps) <= 0:
-        raise ValueError("cf_every_n_steps must be > 0")
     if int(cfg.cf_every_n_steps_early) <= 0:
         raise ValueError("cf_every_n_steps_early must be > 0")
     if int(cfg.cf_every_n_steps_late) <= 0:
@@ -738,9 +736,8 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
     _log(
-        "counterfactual enabled={} every_n_steps={} schedule(early/late/switch)=({}/{}/{}) prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
+        "counterfactual enabled={} schedule(early/late/switch)=({}/{}/{}) prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
-            int(cfg.cf_every_n_steps),
             int(cfg.cf_every_n_steps_early),
             int(cfg.cf_every_n_steps_late),
             int(cfg.cf_every_n_steps_switch_step),
@@ -1096,10 +1093,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start_weights_steps", type=int, default=500)
     p.add_argument("--goes_up_weights_steps", type=int, default=1500)
     p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--cf_every_n_steps", type=int, default=None)
-    p.add_argument("--cf_every_n_steps_early", type=int, default=None)
-    p.add_argument("--cf_every_n_steps_late", type=int, default=None)
-    p.add_argument("--cf_every_n_steps_switch_step", type=int, default=None)
+    p.add_argument("--cf_every_n_steps_early", type=int, default=1)
+    p.add_argument("--cf_every_n_steps_late", type=int, default=8)
+    p.add_argument("--cf_every_n_steps_switch_step", type=int, default=1500)
     p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
     p.add_argument("--cf_lambda", type=float, default=0.1)
     p.add_argument("--cf_kl_margin", type=float, default=0.5)
@@ -1132,19 +1128,6 @@ def main() -> None:
     args = parse_args()
     cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
     cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
-    cfg_defaults = SFTConfig()
-    base_cf_every = int(args.cf_every_n_steps) if args.cf_every_n_steps is not None else int(cfg_defaults.cf_every_n_steps)
-    cf_every_n_steps_early = (
-        int(args.cf_every_n_steps_early) if args.cf_every_n_steps_early is not None else int(base_cf_every)
-    )
-    cf_every_n_steps_late = (
-        int(args.cf_every_n_steps_late) if args.cf_every_n_steps_late is not None else int(base_cf_every)
-    )
-    cf_every_n_steps_switch_step = (
-        int(args.cf_every_n_steps_switch_step)
-        if args.cf_every_n_steps_switch_step is not None
-        else int(cfg_defaults.cf_every_n_steps_switch_step)
-    )
     cfg = SFTConfig(
         base_model_or_checkpoint=args.base_model_or_checkpoint,
         train_dataset_name=args.train_dataset_name,
@@ -1170,10 +1153,9 @@ def main() -> None:
         start_weights_steps=args.start_weights_steps,
         goes_up_weights_steps=args.goes_up_weights_steps,
         cf_enabled=bool(args.cf_enabled),
-        cf_every_n_steps=base_cf_every,
-        cf_every_n_steps_early=cf_every_n_steps_early,
-        cf_every_n_steps_late=cf_every_n_steps_late,
-        cf_every_n_steps_switch_step=cf_every_n_steps_switch_step,
+        cf_every_n_steps_early=int(args.cf_every_n_steps_early),
+        cf_every_n_steps_late=int(args.cf_every_n_steps_late),
+        cf_every_n_steps_switch_step=int(args.cf_every_n_steps_switch_step),
         cf_prob_tuple=cf_prob_tuple,
         cf_lambda=args.cf_lambda,
         cf_kl_margin=args.cf_kl_margin,

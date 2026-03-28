@@ -40,7 +40,6 @@ class SFTConfig:
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True
-    # cf_every_n_steps: int = 1
     cf_every_n_steps_early: int = 1
     cf_every_n_steps_late: int = 8
     cf_every_n_steps_switch_step: int = 1500
