@@ -123,7 +123,26 @@ class SFTDataset(Dataset):
             )
 
         self.stats = {"dropped": dropped, "kept": len(self.samples)}
-        self._precomputed_samples: List[Dict] = [self._precompute_item(sample) for sample in self.samples]
+        total = len(self.samples)
+        self._precomputed_samples: List[Dict] = []
+        try:
+            from tqdm import tqdm  # type: ignore
+
+            iterator = tqdm(
+                self.samples,
+                total=total,
+                desc="Precomputing SFT samples",
+                unit="sample",
+                leave=False,
+            )
+            for sample in iterator:
+                self._precomputed_samples.append(self._precompute_item(sample))
+        except Exception:
+            log_every = max(1000, total // 100) if total > 0 else 1
+            for idx, sample in enumerate(self.samples, start=1):
+                self._precomputed_samples.append(self._precompute_item(sample))
+                if idx == 1 or idx == total or (idx % log_every) == 0:
+                    print(f"Precomputing SFT samples: {idx}/{total}")
 
     def _resolve_digit_token_ids(self) -> List[int]:
         ids: List[int] = []

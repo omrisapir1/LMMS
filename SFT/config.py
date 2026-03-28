@@ -68,7 +68,7 @@ class SFTConfig:
     save_ppo_init: bool = False
 
     # DataLoader
-    dataloader_num_workers: int = 2
+    dataloader_num_workers: int = 8
     eval_dataloader_num_workers: int = 2
     dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
