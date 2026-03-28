@@ -17,11 +17,11 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 32
+    batch_size: int = 16
     eval_batch_size: int = 1024
     learning_rate: float = 5e-6
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     max_steps: int = 12080
     warmup_steps: int = 0
     max_length: int = 2048
