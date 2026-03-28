@@ -790,7 +790,7 @@ def train(cfg: SFTConfig) -> str:
 
             model.train()
             for k in ("input_ids", "attention_mask", "labels", "target_class"):
-                batch[k] = batch[k].to(device)
+                batch[k] = batch[k].to(device, non_blocking=True)
 
             accum_steps = max(1, int(cfg.gradient_accumulation_steps))
             will_step = ((micro + 1) % accum_steps) == 0

@@ -123,6 +123,7 @@ class SFTDataset(Dataset):
             )
 
         self.stats = {"dropped": dropped, "kept": len(self.samples)}
+        self._precomputed_samples: List[Dict] = [self._precompute_item(sample) for sample in self.samples]
 
     def _resolve_digit_token_ids(self) -> List[int]:
         ids: List[int] = []
@@ -138,19 +139,7 @@ class SFTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _build_prompt_text(self, question: str) -> str:
-        user_prompt = THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE.format(problem=question)
-        messages = [
-            {"role": "user", "content": user_prompt},
-        ]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    def __getitem__(self, idx: int) -> Dict:
-        sample = self.samples[idx]
+    def _precompute_item(self, sample: SFTSample) -> Dict:
         prompt_text = self._build_prompt_text(sample.question)
         prompt_ids = self.tokenizer(
             prompt_text,
@@ -184,6 +173,7 @@ class SFTDataset(Dataset):
         digit_target_positions = [i for i, t in enumerate(target_class) if t == TARGET_DIGIT]
 
         return {
+            "prompt_ids": list(prompt_ids),
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -192,6 +182,20 @@ class SFTDataset(Dataset):
             "z_target_positions": z_target_positions,
             "digit_target_positions": digit_target_positions,
         }
+
+    def _build_prompt_text(self, question: str) -> str:
+        user_prompt = THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE.format(problem=question)
+        messages = [
+            {"role": "user", "content": user_prompt},
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def __getitem__(self, idx: int) -> Dict:
+        return self._precomputed_samples[idx]
 
 
 class SFTCollator:
