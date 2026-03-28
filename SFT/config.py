@@ -60,7 +60,7 @@ class SFTConfig:
 
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
-    log_interval_steps: int = 5
+    log_interval_steps: int = 1
     save_interval_steps: int = 625*5
     save_every_steps: int = 625*5
     keep_last_k: int = 3
