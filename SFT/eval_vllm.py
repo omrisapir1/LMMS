@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List
 
 from transformers import AutoTokenizer
 
-from phase1.dataset import SYSTEM_PROMPT
+from .dataset import THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE
 
 
 @dataclass
@@ -39,9 +39,9 @@ def truncate_phaseA_to_answer(token_ids: List[int], answer_token_id: int) -> tup
 
 
 def _build_prompt(tokenizer, problem: str) -> str:
+    user_prompt = THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE.format(problem=problem)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": problem},
+        {"role": "user", "content": user_prompt},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 

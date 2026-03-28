@@ -19,7 +19,7 @@ class SFTConfig:
     seed: int = 42
     batch_size: int = 32
     eval_batch_size: int = 1024
-    learning_rate: float = 1e-5
+    learning_rate: float = 1e-6
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 2
     max_steps: int = 12080

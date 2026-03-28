@@ -6,9 +6,11 @@ from typing import Dict, Iterable, List, Optional
 import torch
 from torch.utils.data import Dataset
 
-from phase1.dataset import SYSTEM_PROMPT
-
 ANSWER_TOKEN = "<ANSWER>"
+THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE = (
+    "Solve the following math problem. Make sure to put the answer "
+    "(and only answer) inside \\boxed{{}}.\n\n{problem}"
+)
 
 # 0=ignore(prompt), 1=z, 2=answer, 3=digit
 TARGET_IGNORE = 0
@@ -137,9 +139,9 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def _build_prompt_text(self, question: str) -> str:
+        user_prompt = THOUGHT_EMBEDDING_USER_PROMPT_TEMPLATE.format(problem=question)
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
+            {"role": "user", "content": user_prompt},
         ]
         return self.tokenizer.apply_chat_template(
             messages,
