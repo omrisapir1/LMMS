@@ -17,11 +17,11 @@ class SFTConfig:
 
     # Training
     seed: int = 42
-    batch_size: int = 32
+    batch_size: int = 16
     eval_batch_size: int = 1024
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     max_steps: int = 12080
     warmup_steps: int = 0
     max_length: int = 2048
@@ -75,5 +75,5 @@ class SFTConfig:
 
     # Source curriculum (without replacement, linear across each loader pass)
     curriculum_enabled: bool = True
-    curriculum_easy_start: float = 0.90
-    curriculum_easy_end: float = 0.10
+    curriculum_easy_start: float = 0.85
+    curriculum_easy_end: float = 0.15

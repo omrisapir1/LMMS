@@ -15,7 +15,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import BatchSampler, DataLoader, RandomSampler, Sampler, SequentialSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
@@ -26,6 +26,7 @@ import gc
 
 CURRICULUM_EASY_SOURCE = "OpenMathInstruct-2"
 CURRICULUM_HARD_SOURCE = "OpenMathReasoning"
+LENGTH_BUCKET_WINDOW_MULT = 50
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -320,6 +321,47 @@ class LinearSourceCurriculumSampler(Sampler[int]):
         return iter(order)
 
 
+class WindowedLengthBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        sampler: Sampler[int],
+        lengths: Sequence[int],
+        batch_size: int,
+        drop_last: bool,
+        window_mult: int = LENGTH_BUCKET_WINDOW_MULT,
+    ) -> None:
+        self.sampler = sampler
+        self.lengths = lengths
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.window_size = max(self.batch_size, int(window_mult) * self.batch_size)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        window: List[int] = []
+        for idx in self.sampler:
+            window.append(int(idx))
+            if len(window) >= self.window_size:
+                yield from self._emit_window(window)
+                window = []
+        if window:
+            yield from self._emit_window(window)
+
+    def _emit_window(self, window: List[int]) -> Iterator[List[int]]:
+        window.sort(key=lambda i: int(self.lengths[i]))
+        for start in range(0, len(window), self.batch_size):
+            batch = window[start : start + self.batch_size]
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
+
+    def __len__(self) -> int:
+        total = len(self.sampler)
+        if self.drop_last:
+            return total // self.batch_size
+        return (total + self.batch_size - 1) // self.batch_size
+
+
 def _build_source_curriculum_sampler(*, ds: SFTDataset, cfg: SFTConfig) -> LinearSourceCurriculumSampler:
     easy_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_EASY_SOURCE]
     hard_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_HARD_SOURCE]
@@ -369,22 +411,29 @@ def _build_loader(
         )
     collator = SFTCollator(tokenizer=tokenizer, max_length=cfg.max_length)
     num_workers = int(cfg.dataloader_num_workers if train else cfg.eval_dataloader_num_workers)
-    sampler: Optional[Sampler[int]] = None
-    use_shuffle = bool(shuffle)
-    if train and bool(cfg.curriculum_enabled):
-        sampler = _build_source_curriculum_sampler(ds=ds, cfg=cfg)
-        use_shuffle = False
-
     loader_kwargs = {
-        "batch_size": int(cfg.batch_size if train else cfg.eval_batch_size),
-        "shuffle": use_shuffle,
         "collate_fn": collator,
-        "drop_last": False,
         "num_workers": max(0, num_workers),
         "pin_memory": bool(cfg.dataloader_pin_memory),
     }
-    if sampler is not None:
-        loader_kwargs["sampler"] = sampler
+    if train:
+        batch_size = int(cfg.batch_size)
+        if bool(cfg.curriculum_enabled):
+            base_sampler: Sampler[int] = _build_source_curriculum_sampler(ds=ds, cfg=cfg)
+        elif bool(shuffle):
+            base_sampler = RandomSampler(ds)
+        else:
+            base_sampler = SequentialSampler(ds)
+        loader_kwargs["batch_sampler"] = WindowedLengthBatchSampler(
+            sampler=base_sampler,
+            lengths=ds.sample_lengths,
+            batch_size=batch_size,
+            drop_last=False,
+        )
+    else:
+        loader_kwargs["batch_size"] = int(cfg.eval_batch_size)
+        loader_kwargs["shuffle"] = bool(shuffle)
+        loader_kwargs["drop_last"] = False
     if loader_kwargs["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(max(1, cfg.dataloader_prefetch_factor))
@@ -504,22 +553,27 @@ def _build_counterfactual_batch(
     trunc_range: Tuple[float, float],
     rng: random.Random,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    input_ids_cf = input_ids.clone()
-    attention_mask_cf = attention_mask.clone()
-    target_class_cf = target_class.clone() if target_class is not None else None
+    device = input_ids.device
+    input_ids_cpu = input_ids.detach().cpu()
+    attention_mask_cpu = attention_mask.detach().cpu()
+    target_class_cpu = target_class.detach().cpu() if target_class is not None else None
+
+    input_ids_cf_cpu = input_ids_cpu.clone()
+    attention_mask_cf_cpu = attention_mask_cpu.clone()
+    target_class_cf_cpu = target_class_cpu.clone() if target_class_cpu is not None else None
 
     z_set = set(int(x) for x in z_token_ids)
     bsz, _ = input_ids.shape
-    eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
-    visible_z_counts = torch.zeros((bsz,), dtype=torch.long, device=input_ids.device)
+    eligible_mask_cpu = torch.zeros((bsz,), dtype=torch.bool)
+    visible_z_counts_cpu = torch.zeros((bsz,), dtype=torch.long)
 
     lo, hi = float(trunc_range[0]), float(trunc_range[1])
 
     for b in range(bsz):
-        valid_len = int(attention_mask[b].sum().item())
+        valid_len = int(attention_mask_cpu[b].sum().item())
         if valid_len <= 0:
             continue
-        row = input_ids[b, :valid_len]
+        row = input_ids_cpu[b, :valid_len]
         ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
         if int(ans_idx.numel()) == 0:
             continue
@@ -532,17 +586,17 @@ def _build_counterfactual_batch(
         if lz < int(cf_min_z_len):
             continue
 
-        eligible_mask[b] = True
+        eligible_mask_cpu[b] = True
 
         if variant_name == "reverse":
-            src = input_ids[b, z_pos].clone()
-            input_ids_cf[b, z_pos] = src.flip(0)
-            visible_z_counts[b] = int(lz)
+            src = input_ids_cpu[b, z_pos].clone()
+            input_ids_cf_cpu[b, z_pos] = src.flip(0)
+            visible_z_counts_cpu[b] = int(lz)
         elif variant_name == "random":
             vals = [int(rng.choice(z_token_ids)) for _ in z_pos]
             if vals:
-                input_ids_cf[b, z_pos] = torch.as_tensor(vals, dtype=input_ids.dtype, device=input_ids.device)
-            visible_z_counts[b] = int(lz)
+                input_ids_cf_cpu[b, z_pos] = torch.as_tensor(vals, dtype=input_ids_cpu.dtype)
+            visible_z_counts_cpu[b] = int(lz)
         elif variant_name == "truncate":
             r = float(rng.uniform(lo, hi))
             remove_count = int(math.ceil(r * lz))
@@ -551,24 +605,34 @@ def _build_counterfactual_batch(
             if remove_pos:
                 # Truncate by compacting the visible sequence (no attention holes),
                 # then right-pad to preserve tensor shape.
-                keep_mask = torch.ones((valid_len,), dtype=torch.bool, device=input_ids.device)
-                remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long, device=input_ids.device)
+                keep_mask = torch.ones((valid_len,), dtype=torch.bool)
+                remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long)
                 keep_mask[remove_tensor] = False
                 compact_ids = row[keep_mask]
                 new_valid_len = int(compact_ids.shape[0])
-                input_ids_cf[b, :new_valid_len] = compact_ids
-                attention_mask_cf[b, :new_valid_len] = 1
-                input_ids_cf[b, new_valid_len:] = int(pad_token_id)
-                attention_mask_cf[b, new_valid_len:] = 0
+                input_ids_cf_cpu[b, :new_valid_len] = compact_ids
+                attention_mask_cf_cpu[b, :new_valid_len] = 1
+                input_ids_cf_cpu[b, new_valid_len:] = int(pad_token_id)
+                attention_mask_cf_cpu[b, new_valid_len:] = 0
 
-                if target_class_cf is not None:
-                    row_tc = target_class[b, :valid_len]
+                if target_class_cf_cpu is not None:
+                    row_tc = target_class_cpu[b, :valid_len]
                     compact_tc = row_tc[keep_mask]
-                    target_class_cf[b, :new_valid_len] = compact_tc
-                    target_class_cf[b, new_valid_len:] = int(TARGET_IGNORE)
-            visible_z_counts[b] = int(keep_k)
+                    target_class_cf_cpu[b, :new_valid_len] = compact_tc
+                    target_class_cf_cpu[b, new_valid_len:] = int(TARGET_IGNORE)
+            visible_z_counts_cpu[b] = int(keep_k)
         else:
             raise ValueError(f"unknown counterfactual variant: {variant_name}")
+
+    input_ids_cf = input_ids_cf_cpu.to(device=device, non_blocking=True)
+    attention_mask_cf = attention_mask_cf_cpu.to(device=device, non_blocking=True)
+    eligible_mask = eligible_mask_cpu.to(device=device, non_blocking=True)
+    visible_z_counts = visible_z_counts_cpu.to(device=device, non_blocking=True)
+    target_class_cf = (
+        target_class_cf_cpu.to(device=device, non_blocking=True)
+        if target_class_cf_cpu is not None
+        else None
+    )
 
     return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts, target_class_cf
 
@@ -721,13 +785,17 @@ def train(cfg: SFTConfig) -> str:
     eval_records = _load_hf_records(cfg.eval_dataset_name, cfg.eval_dataset_split)
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
-    if isinstance(train_loader.sampler, LinearSourceCurriculumSampler):
+    train_sampler = getattr(train_loader, "sampler", None)
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if isinstance(batch_sampler, WindowedLengthBatchSampler):
+        train_sampler = batch_sampler.sampler
+    if isinstance(train_sampler, LinearSourceCurriculumSampler):
         _log(
             "source curriculum enabled: easy_source={!r} hard_source={!r} easy_count={} hard_count={} easy_schedule=({:.3f}->{:.3f})".format(
                 CURRICULUM_EASY_SOURCE,
                 CURRICULUM_HARD_SOURCE,
-                len(train_loader.sampler.easy_indices),
-                len(train_loader.sampler.hard_indices),
+                len(train_sampler.easy_indices),
+                len(train_sampler.hard_indices),
                 float(cfg.curriculum_easy_start),
                 float(cfg.curriculum_easy_end),
             ),
