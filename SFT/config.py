@@ -22,6 +22,7 @@ class SFTConfig:
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 4
+    max_grad_norm: float = 1.0
     max_steps: int = 12080
     warmup_steps: int = 0
     max_length: int = 2048
