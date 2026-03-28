@@ -143,6 +143,7 @@ class SFTDataset(Dataset):
                 self._precomputed_samples.append(self._precompute_item(sample))
                 if idx == 1 or idx == total or (idx % log_every) == 0:
                     print(f"Precomputing SFT samples: {idx}/{total}")
+        self.sample_lengths: List[int] = [len(ex["input_ids"]) for ex in self._precomputed_samples]
 
     def _resolve_digit_token_ids(self) -> List[int]:
         ids: List[int] = []
