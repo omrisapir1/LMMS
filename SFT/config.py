@@ -19,7 +19,7 @@ class SFTConfig:
     seed: int = 42
     batch_size: int = 16
     eval_batch_size: int = 1024
-    learning_rate: float = 5e-6
+    learning_rate: float = 2e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 4
     max_steps: int = 12080
@@ -39,7 +39,7 @@ class SFTConfig:
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
-    cf_enabled: bool = True
+    cf_enabled: bool = False
     cf_every_n_steps_early: int = 1
     cf_every_n_steps_late: int = 8
     cf_every_n_steps_switch_step: int = 1500
