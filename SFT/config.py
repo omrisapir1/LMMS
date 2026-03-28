@@ -22,7 +22,7 @@ class SFTConfig:
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
-    max_steps: int = 60_000
+    max_steps: int = 12080
     warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
@@ -61,9 +61,9 @@ class SFTConfig:
 
     # Logging / checkpointing
     run_root: str = "runs/sft_z"
-    log_interval_steps: int = 20
-    save_interval_steps: int = 625
-    save_every_steps: int = 625
+    log_interval_steps: int = 5
+    save_interval_steps: int = 625*5
+    save_every_steps: int = 625*5
     keep_last_k: int = 3
     save_best: bool = True
     save_ppo_init: bool = False
