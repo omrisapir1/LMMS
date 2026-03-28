@@ -22,6 +22,7 @@ class SFTSample:
     question: str
     z_ids: List[int]
     answer_digits: List[int]
+    source: str
 
 
 def _digits_from_answer_int(answer_int: object) -> Optional[List[int]]:
@@ -110,7 +111,14 @@ class SFTDataset(Dataset):
             if any(x < 0 or x >= self.vocab_size for x in z_ids):
                 dropped += 1
                 continue
-            self.samples.append(SFTSample(question=str(q), z_ids=z_ids, answer_digits=digits))
+            self.samples.append(
+                SFTSample(
+                    question=str(q),
+                    z_ids=z_ids,
+                    answer_digits=digits,
+                    source=str(row.get("source", "")),
+                )
+            )
 
         self.stats = {"dropped": dropped, "kept": len(self.samples)}
 

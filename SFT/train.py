@@ -11,12 +11,12 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
@@ -24,6 +24,9 @@ from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset, TARGET_IGNORE
 # from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
+
+CURRICULUM_EASY_SOURCE = "OpenMathInstruct-2"
+CURRICULUM_HARD_SOURCE = "OpenMathReasoning"
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -231,6 +234,108 @@ def _load_hf_records(dataset_name: str, split: str) -> List[Dict]:
     return [dict(x) for x in ds]
 
 
+class LinearSourceCurriculumSampler(Sampler[int]):
+    def __init__(
+        self,
+        *,
+        easy_indices: Sequence[int],
+        hard_indices: Sequence[int],
+        easy_start: float,
+        easy_end: float,
+        seed: int,
+    ) -> None:
+        self.easy_indices = [int(i) for i in easy_indices]
+        self.hard_indices = [int(i) for i in hard_indices]
+        self.easy_start = float(easy_start)
+        self.easy_end = float(easy_end)
+        self.seed = int(seed)
+        self._epoch = 0
+        self._total = len(self.easy_indices) + len(self.hard_indices)
+
+    def __len__(self) -> int:
+        return self._total
+
+    def _p_easy(self, pos: int) -> float:
+        if self._total <= 1:
+            return self.easy_start
+        t = float(pos) / float(self._total - 1)
+        return self.easy_start + (self.easy_end - self.easy_start) * t
+
+    def __iter__(self) -> Iterator[int]:
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+
+        easy_perm = list(self.easy_indices)
+        hard_perm = list(self.hard_indices)
+        rng.shuffle(easy_perm)
+        rng.shuffle(hard_perm)
+
+        used_easy = 0
+        used_hard = 0
+        target_easy_prefix = 0.0
+        order: List[int] = []
+
+        for pos in range(self._total):
+            target_easy_prefix += self._p_easy(pos)
+            remaining = self._total - pos
+            rem_easy = len(easy_perm) - used_easy
+            rem_hard = len(hard_perm) - used_hard
+
+            if rem_easy == remaining:
+                pick_easy = True
+            elif rem_hard == remaining:
+                pick_easy = False
+            else:
+                pick_easy = used_easy < target_easy_prefix
+                if pick_easy and rem_easy <= 0:
+                    pick_easy = False
+                elif (not pick_easy) and rem_hard <= 0:
+                    pick_easy = True
+
+            if pick_easy:
+                order.append(easy_perm[used_easy])
+                used_easy += 1
+            else:
+                order.append(hard_perm[used_hard])
+                used_hard += 1
+
+        if len(order) != self._total:
+            raise RuntimeError(f"sampler produced {len(order)} indices, expected {self._total}")
+
+        return iter(order)
+
+
+def _build_source_curriculum_sampler(*, ds: SFTDataset, cfg: SFTConfig) -> LinearSourceCurriculumSampler:
+    easy_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_EASY_SOURCE]
+    hard_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_HARD_SOURCE]
+    unknown_sources = sorted({s.source for s in ds.samples if s.source not in (CURRICULUM_EASY_SOURCE, CURRICULUM_HARD_SOURCE)})
+    if unknown_sources:
+        raise ValueError(
+            "Train dataset contains sources that are not part of the curriculum mapping: "
+            f"{unknown_sources}. Expected only {CURRICULUM_EASY_SOURCE!r} and {CURRICULUM_HARD_SOURCE!r}."
+        )
+    if not easy_indices or not hard_indices:
+        raise ValueError(
+            "Curriculum requires both source groups to be present. "
+            f"Found easy={len(easy_indices)} for {CURRICULUM_EASY_SOURCE!r}, "
+            f"hard={len(hard_indices)} for {CURRICULUM_HARD_SOURCE!r}."
+        )
+    easy_start = float(cfg.curriculum_easy_start)
+    easy_end = float(cfg.curriculum_easy_end)
+    if not (0.0 <= easy_start <= 1.0 and 0.0 <= easy_end <= 1.0):
+        raise ValueError(
+            f"curriculum_easy_start/end must be in [0,1], got start={easy_start}, end={easy_end}"
+        )
+
+    return LinearSourceCurriculumSampler(
+        easy_indices=easy_indices,
+        hard_indices=hard_indices,
+        easy_start=easy_start,
+        easy_end=easy_end,
+        seed=int(cfg.seed),
+    )
+
+
 def _build_loader(
     *,
     records: Iterable[Dict],
@@ -249,14 +354,22 @@ def _build_loader(
         )
     collator = SFTCollator(tokenizer=tokenizer, max_length=cfg.max_length)
     num_workers = int(cfg.dataloader_num_workers if train else cfg.eval_dataloader_num_workers)
+    sampler: Optional[Sampler[int]] = None
+    use_shuffle = bool(shuffle)
+    if train and bool(cfg.curriculum_enabled):
+        sampler = _build_source_curriculum_sampler(ds=ds, cfg=cfg)
+        use_shuffle = False
+
     loader_kwargs = {
         "batch_size": int(cfg.batch_size if train else cfg.eval_batch_size),
-        "shuffle": bool(shuffle),
+        "shuffle": use_shuffle,
         "collate_fn": collator,
         "drop_last": False,
         "num_workers": max(0, num_workers),
         "pin_memory": bool(cfg.dataloader_pin_memory),
     }
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
     if loader_kwargs["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(max(1, cfg.dataloader_prefetch_factor))
@@ -321,9 +434,24 @@ def _get_scheduled_loss_weights(cfg: SFTConfig, step: int) -> tuple[float, float
     return w_answer, w_digits
 
 
+def _get_cf_every_n_steps(cfg: SFTConfig, step: int) -> int:
+    switch_step = int(cfg.cf_every_n_steps_switch_step)
+    if switch_step <= 0:
+        return max(1, int(cfg.cf_every_n_steps_late))
+    if int(step) < switch_step:
+        return max(1, int(cfg.cf_every_n_steps_early))
+    return max(1, int(cfg.cf_every_n_steps_late))
+
+
 def _validate_cf_config(cfg: SFTConfig) -> None:
     if int(cfg.cf_every_n_steps) <= 0:
         raise ValueError("cf_every_n_steps must be > 0")
+    if int(cfg.cf_every_n_steps_early) <= 0:
+        raise ValueError("cf_every_n_steps_early must be > 0")
+    if int(cfg.cf_every_n_steps_late) <= 0:
+        raise ValueError("cf_every_n_steps_late must be > 0")
+    if int(cfg.cf_every_n_steps_switch_step) < 0:
+        raise ValueError("cf_every_n_steps_switch_step must be >= 0")
     if float(cfg.cf_lambda) < 0.0:
         raise ValueError("cf_lambda must be >= 0")
     if float(cfg.cf_eps) <= 0.0:
@@ -580,6 +708,18 @@ def train(cfg: SFTConfig) -> str:
     eval_records = _load_hf_records(cfg.eval_dataset_name, cfg.eval_dataset_split)
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
+    if isinstance(train_loader.sampler, LinearSourceCurriculumSampler):
+        _log(
+            "source curriculum enabled: easy_source={!r} hard_source={!r} easy_count={} hard_count={} easy_schedule=({:.3f}->{:.3f})".format(
+                CURRICULUM_EASY_SOURCE,
+                CURRICULUM_HARD_SOURCE,
+                len(train_loader.sampler.easy_indices),
+                len(train_loader.sampler.hard_indices),
+                float(cfg.curriculum_easy_start),
+                float(cfg.curriculum_easy_end),
+            ),
+            log_path,
+        )
 
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     train_rng = random.Random(int(cfg.seed))
@@ -598,9 +738,12 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
     _log(
-        "counterfactual enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
+        "counterfactual enabled={} every_n_steps={} schedule(early/late/switch)=({}/{}/{}) prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
             int(cfg.cf_every_n_steps),
+            int(cfg.cf_every_n_steps_early),
+            int(cfg.cf_every_n_steps_late),
+            int(cfg.cf_every_n_steps_switch_step),
             tuple(float(x) for x in cfg.cf_prob_tuple),
             float(cfg.cf_lambda),
             float(cfg.cf_kl_margin),
@@ -638,7 +781,8 @@ def train(cfg: SFTConfig) -> str:
 
             accum_steps = max(1, int(cfg.gradient_accumulation_steps))
             will_step = ((micro + 1) % accum_steps) == 0
-            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % int(cfg.cf_every_n_steps)) == 0)
+            cur_cf_every = _get_cf_every_n_steps(cfg, step)
+            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % cur_cf_every) == 0)
             cf_applied = False
             cf_variant_name = "none"
             cf_loss_scalar = 0.0
@@ -764,6 +908,7 @@ def train(cfg: SFTConfig) -> str:
                 "no_answer_before_kmax": 0.0,
                 "cf_enabled": float(bool(cfg.cf_enabled)),
                 "cf_applied": float(bool(cf_applied)),
+                "cf_every_n_steps": float(cur_cf_every),
                 "cf_loss": float(cf_loss_scalar),
                 "cf_variant_truncate": float(cf_variant_name == "truncate"),
                 "cf_variant_reverse": float(cf_variant_name == "reverse"),
@@ -951,7 +1096,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start_weights_steps", type=int, default=500)
     p.add_argument("--goes_up_weights_steps", type=int, default=1500)
     p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--cf_every_n_steps", type=int, default=4)
+    p.add_argument("--cf_every_n_steps", type=int, default=None)
+    p.add_argument("--cf_every_n_steps_early", type=int, default=None)
+    p.add_argument("--cf_every_n_steps_late", type=int, default=None)
+    p.add_argument("--cf_every_n_steps_switch_step", type=int, default=None)
     p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
     p.add_argument("--cf_lambda", type=float, default=0.1)
     p.add_argument("--cf_kl_margin", type=float, default=0.5)
@@ -973,6 +1121,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_last_k", type=int, default=3)
     p.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save_ppo_init", action="store_true")
+    p.add_argument("--curriculum_enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--curriculum_easy_start", type=float, default=0.9)
+    p.add_argument("--curriculum_easy_end", type=float, default=0.1)
 
     return p.parse_args()
 
@@ -981,6 +1132,19 @@ def main() -> None:
     args = parse_args()
     cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
     cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
+    cfg_defaults = SFTConfig()
+    base_cf_every = int(args.cf_every_n_steps) if args.cf_every_n_steps is not None else int(cfg_defaults.cf_every_n_steps)
+    cf_every_n_steps_early = (
+        int(args.cf_every_n_steps_early) if args.cf_every_n_steps_early is not None else int(base_cf_every)
+    )
+    cf_every_n_steps_late = (
+        int(args.cf_every_n_steps_late) if args.cf_every_n_steps_late is not None else int(base_cf_every)
+    )
+    cf_every_n_steps_switch_step = (
+        int(args.cf_every_n_steps_switch_step)
+        if args.cf_every_n_steps_switch_step is not None
+        else int(cfg_defaults.cf_every_n_steps_switch_step)
+    )
     cfg = SFTConfig(
         base_model_or_checkpoint=args.base_model_or_checkpoint,
         train_dataset_name=args.train_dataset_name,
@@ -1006,7 +1170,10 @@ def main() -> None:
         start_weights_steps=args.start_weights_steps,
         goes_up_weights_steps=args.goes_up_weights_steps,
         cf_enabled=bool(args.cf_enabled),
-        cf_every_n_steps=args.cf_every_n_steps,
+        cf_every_n_steps=base_cf_every,
+        cf_every_n_steps_early=cf_every_n_steps_early,
+        cf_every_n_steps_late=cf_every_n_steps_late,
+        cf_every_n_steps_switch_step=cf_every_n_steps_switch_step,
         cf_prob_tuple=cf_prob_tuple,
         cf_lambda=args.cf_lambda,
         cf_kl_margin=args.cf_kl_margin,
@@ -1026,6 +1193,9 @@ def main() -> None:
         keep_last_k=args.keep_last_k,
         save_best=bool(args.save_best),
         save_ppo_init=bool(args.save_ppo_init),
+        curriculum_enabled=bool(args.curriculum_enabled),
+        curriculum_easy_start=float(args.curriculum_easy_start),
+        curriculum_easy_end=float(args.curriculum_easy_end),
     )
     train(cfg)
 

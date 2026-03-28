@@ -23,7 +23,7 @@ class SFTConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
     max_steps: int = 60_000
-    warmup_steps: int = 50
+    warmup_steps: int = 0
     max_length: int = 2048
     torch_device: str = "cuda:0"
 
@@ -34,13 +34,16 @@ class SFTConfig:
     w_start_digits: float = 0.05
     w_end_answer: float = 0.25
     w_end_digits: float = 0.5
-    start_weights_steps: int = 300
-    goes_up_weights_steps: int = 300
+    start_weights_steps: int = 500
+    goes_up_weights_steps: int = 500
     keep_prob: tuple[float, ...] = (0.2, 0.3, 0.45, 0.75, 1.0)
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True
-    cf_every_n_steps: int = 1
+    # cf_every_n_steps: int = 1
+    cf_every_n_steps_early: int = 1
+    cf_every_n_steps_late: int = 8
+    cf_every_n_steps_switch_step: int = 1500
     cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)
     cf_lambda: float = 1.0
     cf_kl_margin: float = 0.5
@@ -70,3 +73,8 @@ class SFTConfig:
     eval_dataloader_num_workers: int = 2
     dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
+
+    # Source curriculum (without replacement, linear across each loader pass)
+    curriculum_enabled: bool = True
+    curriculum_easy_start: float = 0.90
+    curriculum_easy_end: float = 0.10
