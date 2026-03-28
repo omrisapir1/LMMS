@@ -746,6 +746,8 @@ def train(cfg: SFTConfig) -> str:
         raise ValueError("config.eval_dataset_name is empty; fill with HF dataset path")
     if int(cfg.vocab_size) <= 0:
         raise ValueError("config.vocab_size must be > 0")
+    if float(cfg.max_grad_norm) <= 0.0:
+        raise ValueError("config.max_grad_norm must be > 0")
     _validate_cf_config(cfg)
 
     _set_seed(cfg.seed)
@@ -810,6 +812,8 @@ def train(cfg: SFTConfig) -> str:
     best_pass = -math.inf
     log_window_sums: Dict[str, float] = {}
     log_window_count = 0
+    log_window_grad_norm_sum = 0.0
+    log_window_grad_norm_count = 0
     scaler_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
 
     _log(f"run_dir={run_dir}", log_path)
@@ -988,6 +992,10 @@ def train(cfg: SFTConfig) -> str:
             if micro % accum_steps != 0:
                 continue
 
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.max_grad_norm))
+            grad_norm_scalar = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+            log_window_grad_norm_sum += grad_norm_scalar
+            log_window_grad_norm_count += 1
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
@@ -1007,6 +1015,8 @@ def train(cfg: SFTConfig) -> str:
                 row = {"step": float(step)}
                 for k, v in log_window_sums.items():
                     row[k] = float(v / denom)
+                grad_norm_denom = float(max(1, int(log_window_grad_norm_count)))
+                row["grad_norm"] = float(log_window_grad_norm_sum / grad_norm_denom)
 
                 _append_metrics_csv(metrics_csv, row)
 
@@ -1020,7 +1030,7 @@ def train(cfg: SFTConfig) -> str:
                     dominant_variant = "random"
 
                 _log(
-                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} cf_on={:.2f} cf_applied={:.2f} cf_variant={} cf_variant_p(t/r/rnd)=({:.2f}/{:.2f}/{:.2f}) cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
+                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} gnorm={:.4f} cf_on={:.2f} cf_applied={:.2f} cf_variant={} cf_variant_p(t/r/rnd)=({:.2f}/{:.2f}/{:.2f}) cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
                         row["L_z"],
@@ -1031,6 +1041,7 @@ def train(cfg: SFTConfig) -> str:
                         row["avg_z_len"],
                         row["w_answer"],
                         row["w_digits"],
+                        row["grad_norm"],
                         row["cf_enabled"],
                         row["cf_applied"],
                         dominant_variant,
@@ -1045,6 +1056,8 @@ def train(cfg: SFTConfig) -> str:
                 )
                 log_window_sums = {}
                 log_window_count = 0
+                log_window_grad_norm_sum = 0.0
+                log_window_grad_norm_count = 0
 
             if step % int(cfg.save_interval_steps) == 0:
                 _save_last(
@@ -1160,6 +1173,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_length", type=int, default=2048)
@@ -1221,6 +1235,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=float(args.max_grad_norm),
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
         max_length=args.max_length,
