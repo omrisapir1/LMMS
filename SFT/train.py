@@ -15,7 +15,6 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, Sampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -227,6 +226,22 @@ def _save_ppo_init(*, run_dir: str, model, tokenizer) -> str:
     out_dir = os.path.join(run_dir, "ppo_init")
     _save_model_dir(model, tokenizer, out_dir)
     return out_dir
+
+
+def _build_optimizer_8bit(*, model, cfg: SFTConfig):
+    try:
+        import bitsandbytes as bnb  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "8-bit optimizer requested but bitsandbytes is not available. "
+            "Install bitsandbytes to run SFT with 8-bit AdamW."
+        ) from exc
+
+    return bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=float(cfg.learning_rate),
+        weight_decay=float(cfg.weight_decay),
+    )
 
 
 def _load_hf_records(dataset_name: str, split: str) -> List[Dict]:
@@ -719,7 +734,7 @@ def train(cfg: SFTConfig) -> str:
             log_path,
         )
 
-    optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    optimizer = _build_optimizer_8bit(model=model, cfg=cfg)
     train_rng = random.Random(int(cfg.seed))
 
     step = 0
@@ -735,6 +750,7 @@ def train(cfg: SFTConfig) -> str:
         f"torch_device={device} vllm_cuda_visible_devices={cfg.vllm_cuda_visible_devices}",
         log_path,
     )
+    _log("optimizer=bitsandbytes.optim.AdamW8bit", log_path)
     _log(
         "counterfactual enabled={} schedule(early/late/switch)=({}/{}/{}) prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
