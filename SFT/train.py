@@ -957,26 +957,6 @@ def train(cfg: SFTConfig) -> str:
             loss.backward()
             micro += 1
 
-            if micro % accum_steps != 0:
-                continue
-
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            step += 1
-
-            if step == int(cfg.warmup_steps):
-                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
-                for h in warmup_hooks:
-                    h.remove()
-                warmup_hooks = _apply_warmup_freeze(
-                    model=model,
-                    z_token_ids=z_token_ids,
-                    warmup_active=False,
-                )
-                _log(f"warmup ended at step={step}; full model unfrozen", log_path)
-
-
-
             mean_z_len = float(batch["z_lens"].float().mean().item())
             row_step = {
                 "L_total": float(total_loss.detach().item()),
@@ -1005,6 +985,23 @@ def train(cfg: SFTConfig) -> str:
                 log_window_sums[k] = float(log_window_sums.get(k, 0.0) + float(v))
             log_window_count += 1
 
+            if micro % accum_steps != 0:
+                continue
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+
+            if step == int(cfg.warmup_steps):
+                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
+                for h in warmup_hooks:
+                    h.remove()
+                warmup_hooks = _apply_warmup_freeze(
+                    model=model,
+                    z_token_ids=z_token_ids,
+                    warmup_active=False,
+                )
+                _log(f"warmup ended at step={step}; full model unfrozen", log_path)
             if step % int(cfg.log_interval_steps) == 0:
                 denom = float(max(1, int(log_window_count)))
                 row = {"step": float(step)}
