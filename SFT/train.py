@@ -992,6 +992,49 @@ def train(cfg: SFTConfig) -> str:
             if micro % accum_steps != 0:
                 continue
 
+            found_non_finite_grad = False
+            bad_grad_param = ""
+            bad_grad_non_finite_elems = 0
+            bad_grad_total_elems = 0
+            for name, p in model.named_parameters():
+                g = p.grad
+                if g is None:
+                    continue
+                finite_mask = torch.isfinite(g)
+                if not bool(finite_mask.all().item()):
+                    found_non_finite_grad = True
+                    bad_grad_param = str(name)
+                    bad_grad_non_finite_elems = int((~finite_mask).sum().item())
+                    bad_grad_total_elems = int(g.numel())
+                    break
+            if found_non_finite_grad:
+                batch_size_cur = int(batch["input_ids"].shape[0])
+                seq_len_cur = int(batch["input_ids"].shape[1])
+                attn_tokens_mean = float(batch["attention_mask"].sum(dim=1).float().mean().item())
+                _log(
+                    "non-finite gradient tensor detected; skipping optimizer step/zero_grad | "
+                    "step={} micro={} bad_param={} non_finite_grad_elems={}/{} loss_total={} Lz={} La={} Ld={} "
+                    "cf_applied={} cf_variant={} cf_loss={} batch_size={} seq_len={} attn_tokens_mean={:.2f}".format(
+                        step,
+                        micro,
+                        bad_grad_param,
+                        bad_grad_non_finite_elems,
+                        bad_grad_total_elems,
+                        float(total_loss.detach().item()),
+                        float(loss_out.l_z.detach().item()),
+                        float(loss_out.l_answer.detach().item()),
+                        float(loss_out.l_digits.detach().item()),
+                        int(bool(cf_applied)),
+                        cf_variant_name,
+                        float(cf_loss_scalar),
+                        batch_size_cur,
+                        seq_len_cur,
+                        attn_tokens_mean,
+                    ),
+                    log_path,
+                )
+                continue
+
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.max_grad_norm))
             grad_norm_scalar = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
             grad_norm_is_finite = bool(torch.isfinite(grad_norm).all().item()) if isinstance(grad_norm, torch.Tensor) else bool(math.isfinite(grad_norm_scalar))
