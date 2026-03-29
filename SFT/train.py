@@ -1045,6 +1045,7 @@ def train(cfg: SFTConfig) -> str:
                     ),
                     log_path,
                 )
+                optimizer.zero_grad(set_to_none=True)
                 continue
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.max_grad_norm))
@@ -1074,6 +1075,7 @@ def train(cfg: SFTConfig) -> str:
                     ),
                     log_path,
                 )
+                optimizer.zero_grad(set_to_none=True)
                 continue
             log_window_grad_norm_sum += grad_norm_scalar
             log_window_grad_norm_count += 1
