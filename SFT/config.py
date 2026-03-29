@@ -48,7 +48,7 @@ class SFTConfig:
     cf_lambda: float = 1.0
     cf_kl_margin: float = 0.5
     cf_eps: float = 1e-8
-    cf_min_z_len: int = 10
+    cf_min_z_len: int = 2
     cf_trunc_range: tuple[float, float] = (0.5, 1.0)
 
     # Evaluation / generation
