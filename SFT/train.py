@@ -1011,15 +1011,27 @@ def train(cfg: SFTConfig) -> str:
                 batch_size_cur = int(batch["input_ids"].shape[0])
                 seq_len_cur = int(batch["input_ids"].shape[1])
                 attn_tokens_mean = float(batch["attention_mask"].sum(dim=1).float().mean().item())
+                loss_components = {
+                    "L_total": total_loss.detach(),
+                    "L_z": loss_out.l_z.detach(),
+                    "L_answer": loss_out.l_answer.detach(),
+                    "L_digits": loss_out.l_digits.detach(),
+                    "cf_loss": cf_loss_value.detach() if isinstance(cf_loss_value, torch.Tensor) else torch.tensor(float(cf_loss_scalar), device=device),
+                }
+                non_finite_loss_names = [
+                    name for name, val in loss_components.items() if not bool(torch.isfinite(val).all().item())
+                ]
+                suspect_loss_component = ",".join(non_finite_loss_names) if non_finite_loss_names else "all_finite"
                 _log(
                     "non-finite gradient tensor detected; skipping optimizer step/zero_grad | "
-                    "step={} micro={} bad_param={} non_finite_grad_elems={}/{} loss_total={} Lz={} La={} Ld={} "
+                    "step={} micro={} bad_param={} non_finite_grad_elems={}/{} suspect_loss_component={} loss_total={} Lz={} La={} Ld={} "
                     "cf_applied={} cf_variant={} cf_loss={} batch_size={} seq_len={} attn_tokens_mean={:.2f}".format(
                         step,
                         micro,
                         bad_grad_param,
                         bad_grad_non_finite_elems,
                         bad_grad_total_elems,
+                        suspect_loss_component,
                         float(total_loss.detach().item()),
                         float(loss_out.l_z.detach().item()),
                         float(loss_out.l_answer.detach().item()),
