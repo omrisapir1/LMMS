@@ -41,7 +41,7 @@ class SFTConfig:
 
     # Counterfactual dependence regularizer
     cf_enabled: bool = True
-    cf_every_n_steps_early: int = 2
+    cf_every_n_steps_early: int = 1
     cf_every_n_steps_late: int = 4
     cf_every_n_steps_switch_step: int = 1500
     cf_prob_tuple: tuple[float, float, float] = (0.5, 0.25, 0.25)  # (truncate, reverse, random)

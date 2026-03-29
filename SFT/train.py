@@ -994,6 +994,32 @@ def train(cfg: SFTConfig) -> str:
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.max_grad_norm))
             grad_norm_scalar = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+            grad_norm_is_finite = bool(torch.isfinite(grad_norm).all().item()) if isinstance(grad_norm, torch.Tensor) else bool(math.isfinite(grad_norm_scalar))
+            if not grad_norm_is_finite:
+                batch_size_cur = int(batch["input_ids"].shape[0])
+                seq_len_cur = int(batch["input_ids"].shape[1])
+                attn_tokens_mean = float(batch["attention_mask"].sum(dim=1).float().mean().item())
+                _log(
+                    "non-finite grad_norm detected; skipping optimizer step/zero_grad | "
+                    "step={} micro={} grad_norm={} loss_total={} Lz={} La={} Ld={} cf_applied={} cf_variant={} cf_loss={} "
+                    "batch_size={} seq_len={} attn_tokens_mean={:.2f}".format(
+                        step,
+                        micro,
+                        grad_norm_scalar,
+                        float(total_loss.detach().item()),
+                        float(loss_out.l_z.detach().item()),
+                        float(loss_out.l_answer.detach().item()),
+                        float(loss_out.l_digits.detach().item()),
+                        int(bool(cf_applied)),
+                        cf_variant_name,
+                        float(cf_loss_scalar),
+                        batch_size_cur,
+                        seq_len_cur,
+                        attn_tokens_mean,
+                    ),
+                    log_path,
+                )
+                continue
             log_window_grad_norm_sum += grad_norm_scalar
             log_window_grad_norm_count += 1
             optimizer.step()
