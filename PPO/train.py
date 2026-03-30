@@ -9,6 +9,7 @@ import os
 import random
 import shutil
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -74,6 +75,7 @@ class Trajectory:
     def __init__(
         self,
         *,
+        prompt_id: int,
         sample_id: str,
         question: str,
         prompt_ids: List[int],
@@ -94,6 +96,7 @@ class Trajectory:
         num_generated_total: int,
         num_digits_generated: int,
     ) -> None:
+        self.prompt_id = int(prompt_id)
         self.sample_id = sample_id
         self.question = question
         self.prompt_ids = prompt_ids
@@ -613,6 +616,8 @@ def _action_stats_tensors_batched(
         values_new_chunks.append(values)
         entropy_chunks.append(ent_vec)
         logp_old_chunks.append(torch.tensor(traj.logp_old, dtype=torch.float32, device=device))
+        if len(traj.advantages_norm) != len(traj.advantages):
+            raise AssertionError("advantages_norm length must match advantages length")
         adv_chunks.append(torch.tensor(traj.advantages_norm, dtype=torch.float32, device=device))
         ret_chunks.append(torch.tensor(traj.returns, dtype=torch.float32, device=device))
 
@@ -656,6 +661,7 @@ def _rollout_one_torch(
     model,
     value_head: ValueHead,
     tokenizer,
+    prompt_id: int,
     question: str,
     true_digits: Sequence[int],
     z_token_ids: Sequence[int],
@@ -796,6 +802,7 @@ def _rollout_one_torch(
     _add_reward_timing_acc(time.perf_counter() - _t_reward0)
 
     return Trajectory(
+        prompt_id=prompt_id,
         sample_id=sample_id,
         question=question,
         prompt_ids=prompt_ids,
@@ -823,6 +830,7 @@ def _build_trajectory_from_vllm_tokens(
     model,
     value_head: ValueHead,
     tokenizer,
+    prompt_id: int,
     question: str,
     true_digits: Sequence[int],
     prompt_ids: Sequence[int],
@@ -897,6 +905,7 @@ def _build_trajectory_from_vllm_tokens(
     _add_reward_timing_acc(time.perf_counter() - _t_reward0)
 
     return Trajectory(
+        prompt_id=prompt_id,
         sample_id=sample_id,
         question=question,
         prompt_ids=list(prompt_ids),
@@ -1036,6 +1045,7 @@ def _collect_rollouts_vllm_batch(
             model=model,
             value_head=value_head,
             tokenizer=tokenizer,
+            prompt_id=int(item["prompt_id"]),
             question=str(item["question"]),
             true_digits=list(item["true_digits"]),
             prompt_ids=prompt_ids,
@@ -1059,20 +1069,37 @@ def _collect_rollouts_vllm_batch(
     return trajectories
 
 
-def _normalize_advantages(trajectories: Sequence[Trajectory]) -> None:
-    flat: List[float] = []
+def _group_trajectories_by_prompt_id(trajectories: Sequence[Trajectory]) -> Dict[int, List[Trajectory]]:
+    groups: Dict[int, List[Trajectory]] = defaultdict(list)
     for t in trajectories:
-        flat.extend(t.advantages)
-    if not flat:
-        return
+        if not hasattr(t, "prompt_id") or t.prompt_id is None:
+            raise AssertionError("Trajectory is missing prompt_id")
+        groups[int(t.prompt_id)].append(t)
+    for prompt_id, group in groups.items():
+        if len(group) < 1:
+            raise AssertionError(f"prompt_id={prompt_id} has no trajectories")
+    return groups
 
-    x = torch.tensor(flat, dtype=torch.float32)
-    mean = float(x.mean().item())
-    std = float(x.std(unbiased=False).item())
-    denom = max(std, 1e-8)
 
-    for t in trajectories:
-        t.advantages_norm = [(a - mean) / denom for a in t.advantages]
+def _normalize_advantages_per_prompt(trajectories: Sequence[Trajectory]) -> None:
+    groups = _group_trajectories_by_prompt_id(trajectories)
+    for group in groups.values():
+        flat: List[float] = []
+        for t in group:
+            flat.extend(t.advantages)
+
+        if not flat:
+            continue
+
+        x = torch.tensor(flat, dtype=torch.float32)
+        mean = float(x.mean().item())
+        std = float(x.std(unbiased=False).item())
+        denom = max(std, 1e-8)
+
+        for t in group:
+            t.advantages_norm = [(a - mean) / denom for a in t.advantages]
+            if len(t.advantages_norm) != len(t.advantages):
+                raise AssertionError("advantages_norm length must match advantages length")
 
 
 def _traj_has_valid_ce_target(
@@ -1321,6 +1348,8 @@ def train(cfg: Config) -> None:
         )
     if float(cfg.ppo.batch_frac_to_apply_ce) < 0.0:
         raise ValueError("ppo.batch_frac_to_apply_ce must be >= 0")
+    if int(cfg.rollout.rollouts_per_prompt) < 1:
+        raise ValueError("rollout.rollouts_per_prompt must be >= 1")
 
     z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -1441,11 +1470,14 @@ def train(cfg: Config) -> None:
 
             trajectories: List[Trajectory] = []
             token_budget = 0
+            prompt_counter = 0
             _t_rollout0 = time.perf_counter()
 
             while len(trajectories) < cfg.rollout.episodes_per_batch:
                 remaining = cfg.rollout.episodes_per_batch - len(trajectories)
-                this_batch = min(int(cfg.rollout.vllm_batch_size), int(remaining))
+                rollouts_per_prompt = max(int(cfg.rollout.rollouts_per_prompt), 1)
+                prompts_needed = max(1, int(math.ceil(float(remaining) / float(rollouts_per_prompt))))
+                this_batch = min(int(cfg.rollout.vllm_batch_size), prompts_needed)
 
                 prepared: List[Dict[str, object]] = []
                 while len(prepared) < this_batch:
@@ -1465,9 +1497,12 @@ def train(cfg: Config) -> None:
                     prompt_pack = tokenizer(prompt_text, add_special_tokens=False, return_attention_mask=True)
                     prompt_ids = list(prompt_pack["input_ids"])
                     prompt_attn = list(prompt_pack.get("attention_mask") or [1] * len(prompt_ids))
+                    prompt_id = int(prompt_counter)
+                    prompt_counter += 1
                     prepared.append(
                         {
-                            "sample_id": f"u{update}_i{len(trajectories) + len(prepared)}",
+                            "sample_id_base": f"u{update}_p{prompt_id}",
+                            "prompt_id": prompt_id,
                             "question": question,
                             "true_digits": true_digits,
                             "prompt_text": prompt_text,
@@ -1479,13 +1514,21 @@ def train(cfg: Config) -> None:
                 if not prepared:
                     continue
 
+                prepared_rollouts: List[Dict[str, object]] = []
+                for item in prepared:
+                    sample_id_base = str(item["sample_id_base"])
+                    for rollout_idx in range(rollouts_per_prompt):
+                        expanded = dict(item)
+                        expanded["sample_id"] = f"{sample_id_base}_r{rollout_idx}"
+                        prepared_rollouts.append(expanded)
+
                 if vllm_engine is not None:
                     batch_trajs = _collect_rollouts_vllm_batch(
                         model=model,
                         value_head=value_head,
                         tokenizer=tokenizer,
                         vllm_engine=vllm_engine,
-                        prepared=prepared,
+                        prepared=prepared_rollouts,
                         cfg=cfg,
                         z_allowed_t=z_allowed_t,
                         digit_allowed_t=digit_allowed_t,
@@ -1500,6 +1543,7 @@ def train(cfg: Config) -> None:
                             model=model,
                             value_head=value_head,
                             tokenizer=tokenizer,
+                            prompt_id=int(item["prompt_id"]),
                             question=str(item["question"]),
                             true_digits=list(item["true_digits"]),
                             z_token_ids=z_token_ids,
@@ -1516,7 +1560,7 @@ def train(cfg: Config) -> None:
                             z_allowed_t=z_allowed_t,
                             digit_allowed_t=digit_allowed_t,
                         )
-                        for item in prepared
+                        for item in prepared_rollouts
                     ]
 
                 for traj in batch_trajs:
@@ -1533,14 +1577,33 @@ def train(cfg: Config) -> None:
             if not trajectories:
                 raise RuntimeError("No trajectories collected for PPO update")
 
+            prompt_groups = _group_trajectories_by_prompt_id(trajectories)
+            for t in trajectories:
+                if len(t.advantages_norm) != len(t.advantages):
+                    raise AssertionError("advantages_norm length must match advantages length")
+            unique_prompt_ids = len(prompt_groups)
+            avg_rollouts_per_prompt_actual = float(len(trajectories)) / float(max(unique_prompt_ids, 1))
+            adv_var_per_prompt: List[float] = []
+            for group in prompt_groups.values():
+                group_adv: List[float] = []
+                for traj in group:
+                    group_adv.extend(traj.advantages)
+                if group_adv:
+                    x = torch.tensor(group_adv, dtype=torch.float32)
+                    adv_var_per_prompt.append(float(x.var(unbiased=False).item()))
+            avg_adv_var_per_prompt = (
+                float(sum(adv_var_per_prompt) / len(adv_var_per_prompt)) if adv_var_per_prompt else 0.0
+            )
+
             if cfg.ppo.normalize_advantages:
-                _normalize_advantages(trajectories)
+                _normalize_advantages_per_prompt(trajectories)
 
             roll_rows: List[Dict[str, object]] = []
             for traj in trajectories:
                 row = {
                     "schema_version": 2,
                     "id": traj.sample_id,
+                    "prompt_id": int(traj.prompt_id),
                     "question": traj.question,
                     "input_ids": traj.prompt_ids,
                     "generated_z_ids": traj.generated_z_ids,
@@ -1769,6 +1832,9 @@ def train(cfg: Config) -> None:
                         f"update={update}",
                         f"episodes={len(trajectories)}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
+                        f"prompt_ids={unique_prompt_ids}",
+                        f"rollouts_per_prompt={avg_rollouts_per_prompt_actual:.2f}",
+                        f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",
                         f"exact={exact_rate:.4f}",
                         f"answer_rate={answer_rate:.4f}",
