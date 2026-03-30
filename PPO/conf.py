@@ -42,6 +42,7 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 64
+    rollouts_per_prompt: int = 8  # number of sampled completions per prompt
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
 
 
