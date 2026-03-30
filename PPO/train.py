@@ -138,6 +138,38 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _set_value_warmup_trainability(model, value_head: ValueHead, enabled: bool) -> None:
+    for p in model.parameters():
+        p.requires_grad_(not enabled)
+    for p in value_head.parameters():
+        p.requires_grad_(True)
+
+
+def _assert_value_warmup_trainability(model, value_head: ValueHead, enabled: bool) -> None:
+    backbone_trainable = [bool(p.requires_grad) for p in model.parameters()]
+    value_head_trainable = [bool(p.requires_grad) for p in value_head.parameters()]
+    if enabled:
+        if any(backbone_trainable):
+            raise AssertionError("Warmup active but backbone params require grad")
+    if not value_head_trainable or not all(value_head_trainable):
+        raise AssertionError("Value head params must be trainable")
+
+
+def _optimizer_param_id_set(optimizer: torch.optim.Optimizer) -> set[int]:
+    ids: set[int] = set()
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            ids.add(id(p))
+    return ids
+
+
+def _assert_optimizer_matches_params(optimizer: torch.optim.Optimizer, expected_params: Sequence[torch.nn.Parameter]) -> None:
+    expected = {id(p) for p in expected_params}
+    actual = _optimizer_param_id_set(optimizer)
+    if actual != expected:
+        raise AssertionError("Optimizer parameter groups do not match intended phase parameters")
+
+
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
     if not any(key.startswith(prefix) for prefix in DEFAULT_SET_ALLOWED_PREFIXES):
         raise ValueError(f"Unsupported override key '{key}'")
@@ -515,25 +547,31 @@ def _action_stats_tensors_batched(
     z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
     d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
 
-    ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
-    with torch.no_grad():
-        ref_out = ref_base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-    ref_hidden_all = ref_out.last_hidden_state  # [B,L,H]
-    ref_lm_head = ref_model.get_output_embeddings()
-    if ref_lm_head is None:
-        raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
-    ref_weight = ref_lm_head.weight
-    ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
-    ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
-    ref_bias = getattr(ref_lm_head, "bias", None)
-    ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
-    ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
+    ref_hidden_all: Optional[torch.Tensor] = None
+    ref_z_w: Optional[torch.Tensor] = None
+    ref_d_w: Optional[torch.Tensor] = None
+    ref_z_b: Optional[torch.Tensor] = None
+    ref_d_b: Optional[torch.Tensor] = None
+    if ref_model is not None:
+        ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
+        with torch.no_grad():
+            ref_out = ref_base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        ref_hidden_all = ref_out.last_hidden_state  # [B,L,H]
+        ref_lm_head = ref_model.get_output_embeddings()
+        if ref_lm_head is None:
+            raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
+        ref_weight = ref_lm_head.weight
+        ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
+        ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
+        ref_bias = getattr(ref_lm_head, "bias", None)
+        ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
+        ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
 
     logp_new_chunks: List[torch.Tensor] = []
     logp_ref_chunks: List[torch.Tensor] = []
@@ -594,20 +632,26 @@ def _action_stats_tensors_batched(
         logp_vec = torch.where(is_digit, d_chosen, z_chosen)  # [T]
         ent_vec = torch.where(is_digit, d_ent, z_ent)  # [T]
 
-        with torch.no_grad():
-            ref_h_states = ref_hidden_all[b].index_select(0, state_positions)  # [T,H]
-            ref_z_logits = (ref_h_states @ ref_z_w.t()) / float(temperature)  # [T,|Z|]
-            ref_d_logits = (ref_h_states @ ref_d_w.t()) / float(temperature)  # [T,|D|]
-            if ref_z_b is not None:
-                ref_z_logits = ref_z_logits + ref_z_b
-            if ref_d_b is not None:
-                ref_d_logits = ref_d_logits + ref_d_b
+        if ref_model is not None:
+            assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None
+            with torch.no_grad():
+                ref_h_states = ref_hidden_all[b].index_select(0, state_positions)  # [T,H]
+                ref_z_logits = (ref_h_states @ ref_z_w.t()) / float(temperature)  # [T,|Z|]
+                ref_d_logits = (ref_h_states @ ref_d_w.t()) / float(temperature)  # [T,|D|]
+                if ref_z_b is not None:
+                    ref_z_logits = ref_z_logits + ref_z_b
+                if ref_d_b is not None:
+                    ref_d_logits = ref_d_logits + ref_d_b
 
-            ref_z_logp = torch.log_softmax(ref_z_logits, dim=-1)
-            ref_d_logp = torch.log_softmax(ref_d_logits, dim=-1)
-            ref_z_chosen = ref_z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
-            ref_d_chosen = ref_d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
-            logp_ref_vec = torch.where(is_digit, ref_d_chosen, ref_z_chosen)  # [T]
+                ref_z_logp = torch.log_softmax(ref_z_logits, dim=-1)
+                ref_d_logp = torch.log_softmax(ref_d_logits, dim=-1)
+                ref_z_chosen = ref_z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
+                ref_d_chosen = ref_d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
+                logp_ref_vec = torch.where(is_digit, ref_d_chosen, ref_z_chosen)  # [T]
+        else:
+            # When KL is disabled we intentionally skip a reference model copy.
+            # Use policy log-probs as ref so KL metrics stay at 0.
+            logp_ref_vec = logp_vec.detach()
 
         values = value_head(h_states.float()).squeeze(-1)
 
@@ -795,6 +839,7 @@ def _rollout_one_torch(
         partial_scale=reward_cfg.partial_scale,
         keep_prob=reward_cfg.keep_prob,
         length_penalty=reward_cfg.length_penalty,
+        correct_length_discount=reward_cfg.correct_length_discount,
         reward_if_max_len=reward_cfg.reward_if_max_len,
         num_generated_tokens=int(seq.size(1) - len(prompt_ids)),
         generator=reward_rng,
@@ -898,6 +943,7 @@ def _build_trajectory_from_vllm_tokens(
         partial_scale=reward_cfg.partial_scale,
         keep_prob=reward_cfg.keep_prob,
         length_penalty=reward_cfg.length_penalty,
+        correct_length_discount=reward_cfg.correct_length_discount,
         reward_if_max_len=reward_cfg.reward_if_max_len,
         num_generated_tokens=len(generated_z_ids) + (1 if has_answer else 0) + len(generated_digit_ids),
         generator=reward_rng,
@@ -1332,11 +1378,17 @@ def train(cfg: Config) -> None:
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
-    ref_model = copy.deepcopy(model)
-    ref_model.to(device)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad_(False)
+    use_ref_model = float(cfg.ppo.kl_coef) > 0.0
+    ref_model: Optional[Any] = None
+    if use_ref_model:
+        ref_model = copy.deepcopy(model)
+        ref_model.to(device)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        _log("Reference model enabled (kl_coef > 0)")
+    else:
+        _log("Reference model disabled (kl_coef <= 0); skipping ref model allocation")
 
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
@@ -1350,6 +1402,10 @@ def train(cfg: Config) -> None:
         raise ValueError("ppo.batch_frac_to_apply_ce must be >= 0")
     if int(cfg.rollout.rollouts_per_prompt) < 1:
         raise ValueError("rollout.rollouts_per_prompt must be >= 1")
+    if int(cfg.ppo.value_warmup_steps) < 0:
+        raise ValueError("ppo.value_warmup_steps must be >= 0")
+    if float(cfg.ppo.value_warmup_lr) <= 0.0:
+        raise ValueError("ppo.value_warmup_lr must be > 0")
 
     z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -1398,14 +1454,26 @@ def train(cfg: Config) -> None:
             d_b=d_b_dbg,
         )
 
-    params = list(model.parameters()) + list(value_head.parameters())
-    optimizer = torch.optim.AdamW(
-        params,
+    ppo_params = list(model.parameters()) + list(value_head.parameters())
+    value_head_params = list(value_head.parameters())
+    ppo_optimizer = torch.optim.AdamW(
+        ppo_params,
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
         betas=cfg.train.betas,
         eps=cfg.train.eps,
     )
+    warmup_optimizer: Optional[torch.optim.Optimizer] = None
+    if int(cfg.ppo.value_warmup_steps) > 0:
+        warmup_optimizer = torch.optim.AdamW(
+            value_head_params,
+            lr=float(cfg.ppo.value_warmup_lr),
+            weight_decay=cfg.train.weight_decay,
+            betas=cfg.train.betas,
+            eps=cfg.train.eps,
+        )
+        _assert_optimizer_matches_params(warmup_optimizer, value_head_params)
+    _assert_optimizer_matches_params(ppo_optimizer, ppo_params)
 
     rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
     vllm_engine: Optional[Any] = None
@@ -1455,10 +1523,34 @@ def train(cfg: Config) -> None:
     rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
 
     ds_index = 0
+    prev_train_mode: Optional[str] = None
     try:
         for update in range(1, cfg.train.updates + 1):
             _t_update0 = time.perf_counter()
             _reset_reward_timing_acc()
+            value_warmup_active = (update - 1) < int(cfg.ppo.value_warmup_steps)
+            if value_warmup_active:
+                _set_value_warmup_trainability(model=model, value_head=value_head, enabled=True)
+                _assert_value_warmup_trainability(model=model, value_head=value_head, enabled=True)
+                if warmup_optimizer is None:
+                    raise AssertionError("Warmup is active but warmup optimizer is not initialized")
+                active_optimizer = warmup_optimizer
+                active_clip_params = value_head_params
+                train_mode = "value_warmup"
+            else:
+                _set_value_warmup_trainability(model=model, value_head=value_head, enabled=False)
+                _assert_value_warmup_trainability(model=model, value_head=value_head, enabled=False)
+                active_optimizer = ppo_optimizer
+                active_clip_params = ppo_params
+                train_mode = "ppo"
+
+            _assert_optimizer_matches_params(active_optimizer, active_clip_params)
+            if prev_train_mode != train_mode:
+                if train_mode == "ppo" and prev_train_mode == "value_warmup":
+                    _log(f"Warmup ended at update={update}; switching to normal PPO training")
+                else:
+                    _log(f"Training mode switch at update={update}: mode={train_mode}")
+                prev_train_mode = train_mode
 
             t_sync_sec = 0.0
             if vllm_engine is not None:
@@ -1640,7 +1732,7 @@ def train(cfg: Config) -> None:
             rollout_path = rollout_logger.write_step(step=update, rows=roll_rows)
 
             _t_backprop0 = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)
+            active_optimizer.zero_grad(set_to_none=True)
             minibatch_count = 0
 
             pol_acc = 0.0
@@ -1656,7 +1748,7 @@ def train(cfg: Config) -> None:
             order = list(range(len(trajectories)))
             random.shuffle(order)
             ce_selected_global: set[int] = set()
-            if bool(cfg.ppo.apply_ce):
+            if (not value_warmup_active) and bool(cfg.ppo.apply_ce):
                 ce_selected_global = set(
                     _select_ce_trajectory_indices(
                         batch_trajs=trajectories,
@@ -1751,7 +1843,7 @@ def train(cfg: Config) -> None:
 
                         ce_loss = torch.zeros((), dtype=torch.float32, device=logp_new_f.device)
                         ce_used = 0
-                        if bool(cfg.ppo.apply_ce) and ce_selected_global:
+                        if (not value_warmup_active) and bool(cfg.ppo.apply_ce) and ce_selected_global:
                             ce_selected_global_in_batch = [int(i) for i in batch_idx if int(i) in ce_selected_global]
                             batch_local_pos = {int(global_i): local_i for local_i, global_i in enumerate(batch_idx)}
                             ce_selected = [
@@ -1771,13 +1863,16 @@ def train(cfg: Config) -> None:
                                     ce_selected_global.discard(int(gidx))
 
                         ce_weighted = float(cfg.ppo.alpha_sft) * ce_loss
-                        loss = (
-                            policy_loss
-                            + kl_penalty
-                            + cfg.ppo.c_v * v_loss
-                            + cfg.ppo.c_ent * entropy_loss
-                            + ce_weighted
-                        )
+                        if value_warmup_active:
+                            loss = cfg.ppo.c_v * v_loss
+                        else:
+                            loss = (
+                                policy_loss
+                                + kl_penalty
+                                + cfg.ppo.c_v * v_loss
+                                + cfg.ppo.c_ent * entropy_loss
+                                + ce_weighted
+                            )
                         loss = loss / float(cfg.train.grad_accum_steps)
 
                     loss.backward()
@@ -1794,18 +1889,18 @@ def train(cfg: Config) -> None:
                     ce_examples_acc += int(ce_used)
 
                     if minibatch_count % int(cfg.train.grad_accum_steps) == 0:
-                        torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                        torch.nn.utils.clip_grad_norm_(active_clip_params, cfg.ppo.max_grad_norm)
+                        active_optimizer.step()
+                        active_optimizer.zero_grad(set_to_none=True)
 
             if minibatch_count % int(cfg.train.grad_accum_steps) != 0:
-                torch.nn.utils.clip_grad_norm_(params, cfg.ppo.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                torch.nn.utils.clip_grad_norm_(active_clip_params, cfg.ppo.max_grad_norm)
+                active_optimizer.step()
+                active_optimizer.zero_grad(set_to_none=True)
             t_backprop_sec = time.perf_counter() - _t_backprop0
 
             ref_refresh_every = max(int(cfg.ppo.update_ref_model_each_steps), 1)
-            if update % ref_refresh_every == 0:
+            if ref_model is not None and update % ref_refresh_every == 0:
                 ref_model.load_state_dict(model.state_dict())
                 ref_model.eval()
                 for p in ref_model.parameters():
@@ -1826,10 +1921,18 @@ def train(cfg: Config) -> None:
             denom = max(minibatch_count, 1)
             t_reward_sec = _get_reward_timing_acc()
             t_total_sec = time.perf_counter() - _t_update0
+            active_lr = float(active_optimizer.param_groups[0]["lr"])
+            trainable_params_count = int(
+                sum(int(p.numel()) for p in list(model.parameters()) + list(value_head.parameters()) if p.requires_grad)
+            )
             _log(
                 " | ".join(
                     [
                         f"update={update}",
+                        f"value_warmup={1 if value_warmup_active else 0}",
+                        f"train_mode={train_mode}",
+                        f"lr={active_lr:.8g}",
+                        f"trainable_params={trainable_params_count}",
                         f"episodes={len(trajectories)}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
                         f"prompt_ids={unique_prompt_ids}",
