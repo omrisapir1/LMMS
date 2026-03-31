@@ -1928,8 +1928,6 @@ def train(cfg: Config) -> None:
                 " | ".join(
                     [
                         f"update={update}",
-                        f"train_mode={train_mode}",
-                        f"lr={active_lr:.8g}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
                         f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",
@@ -1942,7 +1940,7 @@ def train(cfg: Config) -> None:
                             if float(cfg.ppo.kl_coef) > 0.0
                             else []
                         ),
-                        f"entropy_loss={ent_loss_acc / denom:.4f}",
+                        *([f"entropy_loss={ent_loss_acc / denom:.4f}"] if float(cfg.ppo.c_ent) != 0.0 else []),
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
