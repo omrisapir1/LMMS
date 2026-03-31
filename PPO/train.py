@@ -1490,6 +1490,7 @@ def train(cfg: Config) -> None:
     elif cfg.rollout.vllm_enabled:
         vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
         vllm_kwargs.setdefault("tensor_parallel_size", int(cfg.rollout.vllm_tp_size))
+        vllm_kwargs.setdefault("gpu_memory_utilization", float(cfg.rollout.gpu_memory_utilization))
         vllm_kwargs.setdefault("weight_transfer_device", str(device))
         if int(cfg.rollout.vllm_tp_size) == 1:
             vllm_cvd = str(getattr(cfg.rollout, "vllm_cuda_visible_devices", "")).strip()
