@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import bitsandbytes as bnb
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -1456,7 +1457,7 @@ def train(cfg: Config) -> None:
 
     ppo_params = list(model.parameters()) + list(value_head.parameters())
     value_head_params = list(value_head.parameters())
-    ppo_optimizer = torch.optim.AdamW(
+    ppo_optimizer = bnb.optim.AdamW8bit(
         ppo_params,
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
@@ -1465,7 +1466,7 @@ def train(cfg: Config) -> None:
     )
     warmup_optimizer: Optional[torch.optim.Optimizer] = None
     if int(cfg.ppo.value_warmup_steps) > 0:
-        warmup_optimizer = torch.optim.AdamW(
+        warmup_optimizer = bnb.optim.AdamW8bit(
             value_head_params,
             lr=float(cfg.ppo.value_warmup_lr),
             weight_decay=cfg.train.weight_decay,
