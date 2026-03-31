@@ -528,9 +528,9 @@ class VLLMRolloutEngine:
         sp = self._build_sampling_params(
             allowed_token_ids=self.z_allowed_token_ids,
             max_tokens=int(max_new_tokens),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            greedy=False,
+            # temperature=float(temperature),
+            # top_p=float(top_p),
+            greedy=True,
             stop_on_answer=True,
         )
 

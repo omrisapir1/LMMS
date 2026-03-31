@@ -11,7 +11,7 @@ import shutil
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from glob import glob
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,6 +36,7 @@ from phase1.dataset import SYSTEM_PROMPT
 
 _REWARD_TIME_ACC_SEC: float = 0.0
 _RUN_LOG_PATH: Optional[str] = None
+_COMPILED_TOKEN_STATS_KERNEL: Optional[Any] = None
 
 
 def _set_run_log_path(path: str) -> None:
@@ -123,6 +124,96 @@ class Trajectory:
         self.advantages_norm_global: List[float] = []
         self.advantages_norm_prompt: List[float] = []
         self.advantages_norm: List[float] = []
+
+
+@dataclass
+class TrajectoryDeviceCache:
+    seq_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    action_ids: torch.Tensor
+    is_digit: torch.Tensor
+    state_positions: torch.Tensor
+    prompt_len: int
+    seq_len: int
+    action_len: int
+    logp_old: torch.Tensor
+    advantages_norm: torch.Tensor
+    returns: torch.Tensor
+
+
+def _build_trajectory_device_cache(
+    *,
+    trajectories: Sequence[Trajectory],
+    device: torch.device,
+) -> List[TrajectoryDeviceCache]:
+    cached: List[TrajectoryDeviceCache] = []
+    for traj in trajectories:
+        prompt_len = int(len(traj.prompt_ids))
+        action_len = int(len(traj.actions))
+        if action_len != len(traj.action_types):
+            raise RuntimeError("Trajectory actions/action_types length mismatch")
+        if len(traj.advantages_norm) != action_len:
+            raise AssertionError("advantages_norm length must match action length before cache build")
+
+        seq_ids = torch.tensor(list(traj.prompt_ids) + list(traj.actions), dtype=torch.long, device=device)
+        attn = torch.tensor(
+            list(traj.prompt_attention_mask) + [1] * action_len,
+            dtype=torch.long,
+            device=device,
+        )
+        if action_len > 0:
+            state_positions = torch.arange(
+                prompt_len - 1,
+                prompt_len - 1 + action_len,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            state_positions = torch.empty((0,), dtype=torch.long, device=device)
+
+        cached.append(
+            TrajectoryDeviceCache(
+                seq_ids=seq_ids,
+                attention_mask=attn,
+                action_ids=torch.tensor(traj.actions, dtype=torch.long, device=device),
+                is_digit=torch.tensor([t == "digit" for t in traj.action_types], dtype=torch.bool, device=device),
+                state_positions=state_positions,
+                prompt_len=prompt_len,
+                seq_len=int(seq_ids.numel()),
+                action_len=action_len,
+                logp_old=torch.tensor(traj.logp_old, dtype=torch.float32, device=device),
+                advantages_norm=torch.tensor(traj.advantages_norm, dtype=torch.float32, device=device),
+                returns=torch.tensor(traj.returns, dtype=torch.float32, device=device),
+            )
+        )
+    return cached
+
+
+def _build_minibatch_order(
+    *,
+    seq_lens: Sequence[int],
+    use_length_bucketing: bool,
+    bucket_width: int,
+) -> List[int]:
+    indices = list(range(len(seq_lens)))
+    if not use_length_bucketing or len(indices) <= 1:
+        random.shuffle(indices)
+        return indices
+
+    width = max(int(bucket_width), 1)
+    buckets: Dict[int, List[int]] = defaultdict(list)
+    for idx in indices:
+        key = int(seq_lens[idx]) // width
+        buckets[key].append(idx)
+
+    ordered: List[int] = []
+    bucket_keys = list(buckets.keys())
+    random.shuffle(bucket_keys)
+    for key in bucket_keys:
+        rows = buckets[key]
+        random.shuffle(rows)
+        ordered.extend(rows)
+    return ordered
 
 
 def _log(msg: str) -> None:
@@ -484,18 +575,88 @@ def _action_stats_tensors(
     return logp, values, entropy
 
 
+def _token_stats_from_hidden(
+    hidden_states: torch.Tensor,
+    action_ids: torch.Tensor,
+    is_digit: torch.Tensor,
+    z_w: torch.Tensor,
+    z_b: Optional[torch.Tensor],
+    d_w: torch.Tensor,
+    d_b: Optional[torch.Tensor],
+    z_id_to_local: torch.Tensor,
+    d_id_to_local: torch.Tensor,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    local_z = z_id_to_local[action_ids]
+    local_d = d_id_to_local[action_ids]
+    invalid = torch.where(is_digit, local_d < 0, local_z < 0)
+
+    z_logits = (hidden_states @ z_w.t()) / float(temperature)
+    d_logits = (hidden_states @ d_w.t()) / float(temperature)
+    if z_b is not None:
+        z_logits = z_logits + z_b
+    if d_b is not None:
+        d_logits = d_logits + d_b
+
+    z_logp = torch.log_softmax(z_logits, dim=-1)
+    d_logp = torch.log_softmax(d_logits, dim=-1)
+    z_probs = z_logp.exp()
+    d_probs = d_logp.exp()
+
+    local_z_safe = local_z.clamp_min(0)
+    local_d_safe = local_d.clamp_min(0)
+    z_chosen = z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)
+    d_chosen = d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)
+    z_ent = -(z_probs * z_logp).sum(dim=-1)
+    d_ent = -(d_probs * d_logp).sum(dim=-1)
+
+    logp_vec = torch.where(is_digit, d_chosen, z_chosen)
+    entropy_vec = torch.where(is_digit, d_ent, z_ent)
+    return logp_vec, entropy_vec, invalid
+
+
+def _get_token_stats_kernel(*, compile_update_stats: bool):
+    global _COMPILED_TOKEN_STATS_KERNEL
+    if not compile_update_stats:
+        return _token_stats_from_hidden
+    if not hasattr(torch, "compile"):
+        return _token_stats_from_hidden
+    if _COMPILED_TOKEN_STATS_KERNEL is not None:
+        return _COMPILED_TOKEN_STATS_KERNEL
+    try:
+        _COMPILED_TOKEN_STATS_KERNEL = torch.compile(_token_stats_from_hidden, dynamic=True)
+    except Exception:
+        _COMPILED_TOKEN_STATS_KERNEL = _token_stats_from_hidden
+    return _COMPILED_TOKEN_STATS_KERNEL
+
+
+def _segment_means(values: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    if int(lengths.numel()) == 0:
+        return torch.empty((0,), dtype=values.dtype, device=values.device)
+    segment_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=values.device, dtype=torch.long),
+        lengths,
+    )
+    sums = torch.zeros((lengths.numel(),), dtype=values.dtype, device=values.device)
+    sums.scatter_add_(0, segment_ids, values)
+    denom = lengths.to(device=values.device, dtype=values.dtype).clamp_min(1.0)
+    return sums / denom
+
+
 def _action_stats_tensors_batched(
     *,
     model,
     ref_model,
     value_head: ValueHead,
     trajs: Sequence[Trajectory],
+    traj_cache: Optional[Sequence[TrajectoryDeviceCache]],
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
     z_id_to_local: torch.Tensor,
     d_id_to_local: torch.Tensor,
     temperature: float,
     pad_token_id: int,
+    token_stats_kernel,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -512,23 +673,22 @@ def _action_stats_tensors_batched(
         empty_l = torch.empty((0,), dtype=torch.long, device=device)
         return empty, empty, empty, empty, empty, empty, empty, empty_l
 
-    seqs: List[List[int]] = []
-    atts: List[List[int]] = []
-    for t in trajs:
-        seq = list(t.prompt_ids) + list(t.actions)
-        att = list(t.prompt_attention_mask) + [1] * len(t.actions)
-        seqs.append(seq)
-        atts.append(att)
+    if traj_cache is None:
+        cache = _build_trajectory_device_cache(trajectories=trajs, device=device)
+    else:
+        cache = list(traj_cache)
+        if len(cache) != len(trajs):
+            raise RuntimeError("traj_cache length must match trajs length")
 
-    max_len = max(len(s) for s in seqs)
-    bsz = len(seqs)
+    max_len = max(c.seq_len for c in cache)
+    bsz = len(cache)
     input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long, device=device)
     attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
 
-    for i, (seq, att) in enumerate(zip(seqs, atts)):
-        L = len(seq)
-        input_ids[i, :L] = torch.tensor(seq, dtype=torch.long, device=device)
-        attention_mask[i, :L] = torch.tensor(att, dtype=torch.long, device=device)
+    for i, c in enumerate(cache):
+        L = c.seq_len
+        input_ids[i, :L] = c.seq_ids
+        attention_mask[i, :L] = c.attention_mask
 
     base_model = model.get_submodule(model.base_model_prefix)
     out = base_model(
@@ -576,111 +736,79 @@ def _action_stats_tensors_batched(
         ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
         ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
 
-    logp_new_chunks: List[torch.Tensor] = []
-    logp_ref_chunks: List[torch.Tensor] = []
-    values_new_chunks: List[torch.Tensor] = []
-    entropy_chunks: List[torch.Tensor] = []
-    logp_old_chunks: List[torch.Tensor] = []
-    adv_chunks: List[torch.Tensor] = []
-    ret_chunks: List[torch.Tensor] = []
-    lengths: List[int] = []
-
-    for b, traj in enumerate(trajs):
-        t_steps = len(traj.actions)
-        if t_steps == 0:
-            continue
-        lengths.append(t_steps)
-
-        p_len = len(traj.prompt_ids)
-        state_positions = torch.arange(
-            p_len - 1,
-            p_len - 1 + t_steps,
-            device=device,
-            dtype=torch.long,
-        )
-
-        act_ids = torch.tensor(traj.actions, dtype=torch.long, device=device)  # [T]
-        is_digit = torch.tensor([t == "digit" for t in traj.action_types], dtype=torch.bool, device=device)  # [T]
-
-        local_z = z_id_to_local[act_ids]  # [T]
-        local_d = d_id_to_local[act_ids]  # [T]
-        invalid = torch.where(is_digit, local_d < 0, local_z < 0)
-        if bool(invalid.any()):
-            bad_idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)[:8]
-            bad_ids = act_ids.index_select(0, bad_idx).tolist()
-            bad_types = [traj.action_types[int(i)] for i in bad_idx.tolist()]
-            raise RuntimeError(f"Found actions not in allowed set: ids={bad_ids}, types={bad_types}")
-
-        h_states = hidden_all[b].index_select(0, state_positions)  # [T,H]
-        z_logits = (h_states @ z_w.t()) / float(temperature)  # [T,|Z|]
-        d_logits = (h_states @ d_w.t()) / float(temperature)  # [T,|D|]
-        if z_b is not None:
-            z_logits = z_logits + z_b
-        if d_b is not None:
-            d_logits = d_logits + d_b
-
-        z_logp = torch.log_softmax(z_logits, dim=-1)
-        d_logp = torch.log_softmax(d_logits, dim=-1)
-
-        z_probs = z_logp.exp()
-        d_probs = d_logp.exp()
-        z_ent = -(z_probs * z_logp).sum(dim=-1)  # [T]
-        d_ent = -(d_probs * d_logp).sum(dim=-1)  # [T]
-
-        local_z_safe = local_z.clamp_min(0)
-        local_d_safe = local_d.clamp_min(0)
-        z_chosen = z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
-        d_chosen = d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
-
-        logp_vec = torch.where(is_digit, d_chosen, z_chosen)  # [T]
-        ent_vec = torch.where(is_digit, d_ent, z_ent)  # [T]
-
-        if ref_model is not None:
-            assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None
-            with torch.no_grad():
-                ref_h_states = ref_hidden_all[b].index_select(0, state_positions)  # [T,H]
-                ref_z_logits = (ref_h_states @ ref_z_w.t()) / float(temperature)  # [T,|Z|]
-                ref_d_logits = (ref_h_states @ ref_d_w.t()) / float(temperature)  # [T,|D|]
-                if ref_z_b is not None:
-                    ref_z_logits = ref_z_logits + ref_z_b
-                if ref_d_b is not None:
-                    ref_d_logits = ref_d_logits + ref_d_b
-
-                ref_z_logp = torch.log_softmax(ref_z_logits, dim=-1)
-                ref_d_logp = torch.log_softmax(ref_d_logits, dim=-1)
-                ref_z_chosen = ref_z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)  # [T]
-                ref_d_chosen = ref_d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)  # [T]
-                logp_ref_vec = torch.where(is_digit, ref_d_chosen, ref_z_chosen)  # [T]
-        else:
-            # When KL is disabled we intentionally skip a reference model copy.
-            # Use policy log-probs as ref so KL metrics stay at 0.
-            logp_ref_vec = logp_vec.detach()
-
-        values = value_head(h_states.float()).squeeze(-1)
-
-        logp_new_chunks.append(logp_vec)
-        logp_ref_chunks.append(logp_ref_vec)
-        values_new_chunks.append(values)
-        entropy_chunks.append(ent_vec)
-        logp_old_chunks.append(torch.tensor(traj.logp_old, dtype=torch.float32, device=device))
-        if len(traj.advantages_norm) != len(traj.advantages):
-            raise AssertionError("advantages_norm length must match advantages length")
-        adv_chunks.append(torch.tensor(traj.advantages_norm, dtype=torch.float32, device=device))
-        ret_chunks.append(torch.tensor(traj.returns, dtype=torch.float32, device=device))
-
-    if not logp_new_chunks:
+    lengths_all = torch.tensor([c.action_len for c in cache], dtype=torch.long, device=device)
+    nonzero_rows = torch.nonzero(lengths_all > 0, as_tuple=False).squeeze(-1)
+    if nonzero_rows.numel() == 0:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
-        return empty, empty, empty, empty, empty, empty, empty, torch.tensor(lengths, dtype=torch.long, device=device)
+        empty_l = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty, empty, empty, empty, empty, empty, empty_l
+
+    lengths = lengths_all.index_select(0, nonzero_rows)
+    hidden_nz = hidden_all.index_select(0, nonzero_rows)
+
+    batch_ids = torch.repeat_interleave(
+        torch.arange(nonzero_rows.numel(), device=device, dtype=torch.long),
+        lengths,
+    )
+    state_positions = torch.cat([cache[int(i)].state_positions for i in nonzero_rows.tolist()], dim=0)
+    action_ids = torch.cat([cache[int(i)].action_ids for i in nonzero_rows.tolist()], dim=0)
+    is_digit = torch.cat([cache[int(i)].is_digit for i in nonzero_rows.tolist()], dim=0)
+    logp_old = torch.cat([cache[int(i)].logp_old for i in nonzero_rows.tolist()], dim=0)
+    advantages = torch.cat([cache[int(i)].advantages_norm for i in nonzero_rows.tolist()], dim=0)
+    returns = torch.cat([cache[int(i)].returns for i in nonzero_rows.tolist()], dim=0)
+
+    h_states = hidden_nz[batch_ids, state_positions]
+    logp_new, entropy_new, invalid = token_stats_kernel(
+        h_states,
+        action_ids,
+        is_digit,
+        z_w,
+        z_b,
+        d_w,
+        d_b,
+        z_id_to_local,
+        d_id_to_local,
+        float(temperature),
+    )
+    if bool(invalid.any()):
+        bad_idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)[:8]
+        bad_ids = action_ids.index_select(0, bad_idx).tolist()
+        bad_types = ["digit" if bool(x) else "z_or_answer" for x in is_digit.index_select(0, bad_idx).tolist()]
+        raise RuntimeError(f"Found actions not in allowed set: ids={bad_ids}, types={bad_types}")
+
+    if ref_model is not None:
+        assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None
+        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows)
+        ref_h_states = ref_hidden_nz[batch_ids, state_positions]
+        with torch.no_grad():
+            logp_ref, _ref_entropy, ref_invalid = token_stats_kernel(
+                ref_h_states,
+                action_ids,
+                is_digit,
+                ref_z_w,
+                ref_z_b,
+                ref_d_w,
+                ref_d_b,
+                z_id_to_local,
+                d_id_to_local,
+                float(temperature),
+            )
+        if bool(ref_invalid.any()):
+            raise RuntimeError("Reference model found actions not in allowed set")
+    else:
+        logp_ref = logp_new.detach()
+
+    values_new = value_head(h_states.float()).squeeze(-1)
 
     return (
-        torch.cat(logp_new_chunks, dim=0),
-        torch.cat(logp_ref_chunks, dim=0),
-        torch.cat(values_new_chunks, dim=0),
-        torch.cat(entropy_chunks, dim=0),
-        torch.cat(logp_old_chunks, dim=0),
-        torch.cat(adv_chunks, dim=0),
-        torch.cat(ret_chunks, dim=0),
-        torch.tensor(lengths, dtype=torch.long, device=device),
+        logp_new,
+        logp_ref,
+        values_new,
+        entropy_new,
+        logp_old,
+        advantages,
+        returns,
+        lengths,
     )
 
 
@@ -1514,6 +1642,8 @@ def train(cfg: Config) -> None:
         raise ValueError("ppo.value_warmup_steps must be >= 0")
     if float(cfg.ppo.value_warmup_lr) <= 0.0:
         raise ValueError("ppo.value_warmup_lr must be > 0")
+    if int(getattr(cfg.runtime, "length_bucket_width", 64)) <= 0:
+        raise ValueError("runtime.length_bucket_width must be > 0")
 
     z_token_ids, z_style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -1853,8 +1983,11 @@ def train(cfg: Config) -> None:
             ce_acc = 0.0
             ce_examples_acc = 0
 
-            order = list(range(len(trajectories)))
-            random.shuffle(order)
+            trajectory_cache = _build_trajectory_device_cache(trajectories=trajectories, device=device)
+            seq_lens = [c.seq_len for c in trajectory_cache]
+            token_stats_kernel = _get_token_stats_kernel(
+                compile_update_stats=bool(getattr(cfg.runtime, "compile_update_stats", False))
+            )
             ce_selected_global: set[int] = set()
             if (not value_warmup_active) and bool(cfg.ppo.apply_ce):
                 ce_selected_global = set(
@@ -1866,10 +1999,15 @@ def train(cfg: Config) -> None:
                 )
 
             for _epoch in range(cfg.ppo.ppo_epochs):
-                random.shuffle(order)
+                order = _build_minibatch_order(
+                    seq_lens=seq_lens,
+                    use_length_bucketing=bool(getattr(cfg.runtime, "use_length_bucketing", True)),
+                    bucket_width=int(getattr(cfg.runtime, "length_bucket_width", 64)),
+                )
                 for start in range(0, len(order), cfg.ppo.minibatch_size):
                     batch_idx = order[start : start + cfg.ppo.minibatch_size]
                     batch_trajs = [trajectories[idx] for idx in batch_idx]
+                    batch_cache = [trajectory_cache[idx] for idx in batch_idx]
 
                     amp_ctx = (
                         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -1891,20 +2029,23 @@ def train(cfg: Config) -> None:
                             ref_model=ref_model,
                             value_head=value_head,
                             trajs=batch_trajs,
+                            traj_cache=batch_cache,
                             z_allowed_t=z_allowed_t,
                             digit_allowed_t=digit_allowed_t,
                             z_id_to_local=z_id_to_local,
                             d_id_to_local=d_id_to_local,
                             temperature=cfg.rollout.temperature,
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
+                            token_stats_kernel=token_stats_kernel,
                         )
 
-                        lengths_list = [int(x) for x in lengths.tolist()]
-                        total_tokens = int(sum(lengths_list))
+                        total_tokens = int(lengths.sum().item())
                         if int(logp_new.numel()) != total_tokens:
                             raise RuntimeError(
                                 f"Token count mismatch: T={int(logp_new.numel())}, sum(lengths)={total_tokens}"
                             )
+                        if int(lengths.numel()) == 0:
+                            continue
 
                         logp_new_f = logp_new.float()
                         logp_old_f = logp_old.float()
@@ -1926,26 +2067,11 @@ def train(cfg: Config) -> None:
                         clipped_tok = ((ratio < lo) | (ratio > hi)).float()
                         value_loss_tok = (values_new_f - returns_f).pow(2)
 
-                        ppo_loss_split = torch.split(policy_loss_tok, lengths_list)
-                        clip_split = torch.split(clipped_tok, lengths_list)
-                        value_split = torch.split(value_loss_tok, lengths_list)
-                        entropy_split = torch.split(entropy_new_f, lengths_list)
-                        kl_split = torch.split(kl_tok, lengths_list)
-
-                        policy_means = [chunk.mean() for chunk, L in zip(ppo_loss_split, lengths_list) if L > 0]
-                        clip_means = [chunk.mean() for chunk, L in zip(clip_split, lengths_list) if L > 0]
-                        value_means = [chunk.mean() for chunk, L in zip(value_split, lengths_list) if L > 0]
-                        entropy_means = [chunk.mean() for chunk, L in zip(entropy_split, lengths_list) if L > 0]
-                        kl_means = [chunk.mean() for chunk, L in zip(kl_split, lengths_list) if L > 0]
-
-                        if not policy_means:
-                            continue
-
-                        policy_loss = torch.stack(policy_means).mean()
-                        clipfrac = torch.stack(clip_means).mean()
-                        v_loss = torch.stack(value_means).mean()
-                        entropy_mean = torch.stack(entropy_means).mean()
-                        kl_mean = torch.stack(kl_means).mean()
+                        policy_loss = _segment_means(policy_loss_tok, lengths).mean()
+                        clipfrac = _segment_means(clipped_tok, lengths).mean()
+                        v_loss = _segment_means(value_loss_tok, lengths).mean()
+                        entropy_mean = _segment_means(entropy_new_f, lengths).mean()
+                        kl_mean = _segment_means(kl_tok, lengths).mean()
                         kl_penalty = float(cfg.ppo.kl_coef) * kl_mean
                         entropy_loss = -entropy_mean
 

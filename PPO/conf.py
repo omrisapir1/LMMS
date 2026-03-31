@@ -96,6 +96,9 @@ class TrainConfig:
 class RuntimeConfig:
     use_bf16: bool = True
     debug_restricted_logits_check: bool = False
+    use_length_bucketing: bool = True
+    length_bucket_width: int = 64
+    compile_update_stats: bool = False
 
 
 @dataclass
