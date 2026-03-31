@@ -9,7 +9,7 @@ BACH_SIZE = 32
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/SFT_64"
+    init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
     trust_remote_code: bool = True
 
