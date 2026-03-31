@@ -29,8 +29,8 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
 
 
 class CodebookTrainer:
@@ -38,7 +38,7 @@ class CodebookTrainer:
         self.config = config
         _set_seed(config.seed)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda")#("cuda" if torch.cuda.is_available() else "cpu")
         self.model = Codebook(
             dim=config.dim,
             vocab_size=config.vocab_size,
@@ -55,12 +55,14 @@ class CodebookTrainer:
         os.makedirs(cfg.output_dir, exist_ok=True)
         if cfg.adjacent_overlap_tau <= 0.0:
             raise ValueError("adjacent_overlap_tau must be > 0")
+        if cfg.delete_input_files and cfg.epochs != 1:
+            raise ValueError("delete_input_files requires epochs=1")
         quantize_mode = normalize_quantize_mode(cfg.quantize_mode)
 
         print(
             f"[init] device={self.device.type} dim={cfg.dim} vocab={cfg.vocab_size} "
             f"max_vectors_per_batch={cfg.max_vectors_per_batch} max_sequences_per_batch={cfg.batch_size} epochs={cfg.epochs} "
-            f"quantize_mode={quantize_mode}"
+            f"quantize_mode={quantize_mode} delete_input_files={cfg.delete_input_files}"
         )
         print("[target] healthy run usually shows perplexity > 100 and dead_fraction trending < 0.2")
 
@@ -97,6 +99,7 @@ class CodebookTrainer:
                 max_sequences_per_batch=cfg.batch_size,
                 dim=cfg.dim,
                 read_batch_size=cfg.read_batch_size,
+                delete_input_files=cfg.delete_input_files,
             ):
                 if batch.sequence_count == 0:
                     continue

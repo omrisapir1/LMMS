@@ -9,7 +9,7 @@ BACH_SIZE = 64
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/SFT_64"
+    init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
     trust_remote_code: bool = True
 
@@ -28,8 +28,8 @@ class DataConfig:
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     max_new_tokens: int = MAX_TOKENS
-    temperature: float = 1.3
-    top_p: float = 0.98
+    temperature: float = 1.1
+    top_p: float = 0.95
     digit_greedy: bool = True
     action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
@@ -41,16 +41,18 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    episodes_per_batch: int = 64
+    episodes_per_batch: int = 512
+    rollouts_per_prompt: int = 8  # number of sampled completions per prompt
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
 
 
 @dataclass
 class RewardConfig:
-    partial_scale: float = 0.5
+    partial_scale: float = 0.25
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.0005
-    reward_if_max_len: float = -1
+    length_penalty: float = 0.001
+    reward_if_max_len: float = -0.1
+    correct_length_discount: float = 0.1
 
 
 @dataclass
@@ -64,20 +66,22 @@ class PPOConfig:
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
-    ppo_epochs: int = 1
-    minibatch_size: int = 16
+    ppo_epochs: int = 2
+    minibatch_size: int = 64
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
+    value_warmup_steps: int = 50
+    value_warmup_lr: float = 1e-5
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-5
+    lr: float = 5e-7
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 1
+    grad_accum_steps: int = 2
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 1000

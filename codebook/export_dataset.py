@@ -30,6 +30,7 @@ OUTPUT_SCHEMA = pa.schema(
     [
         pa.field("qid", pa.string()),
         pa.field("question", pa.string()),
+        pa.field("source", pa.string()),
         pa.field("answer_int", pa.int32()),
         pa.field("answer_digits", pa.list_(pa.int32())),
         pa.field("K_star", pa.int32()),
@@ -93,14 +94,15 @@ def export_dataset(
     input_dir: str,
     output_dir: str,
     codebook_path: str,
-    dim: int = 1024,
-    read_batch_size: int = 256,
-    quantize_chunk_size: int = 16_384,
+    dim: int = 1536,
+    read_batch_size: int = 1024,
+    quantize_chunk_size: int = 16_384*4,
     quantize_mode: str | None = None,
     skip_invalid_rows: bool = False,
+    delete_input_files: bool = True,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cpu')#("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt = _load_codebook(codebook_path, device=device)
     ckpt_cfg = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
     inferred_mode = "delta"
@@ -114,12 +116,15 @@ def export_dataset(
 
     input_path = Path(input_dir)
     if input_path.exists() and input_path.is_dir():
-        sources = [(shard.name, iter_parquet_rows(shard, read_batch_size=read_batch_size)) for shard in list_parquet_shards(input_dir)]
+        sources = [
+            (shard.name, shard, iter_parquet_rows(shard, read_batch_size=read_batch_size))
+            for shard in list_parquet_shards(input_dir)
+        ]
     else:
         # HF input is streamed and exported as a single parquet shard.
-        sources = [("hf_stream.parquet", iter_hf_rows(input_dir, read_batch_size=read_batch_size))]
+        sources = [("hf_stream.parquet", None, iter_hf_rows(input_dir, read_batch_size=read_batch_size))]
 
-    for source_name, row_iter in sources:
+    for source_name, source_path, row_iter in sources:
         out_path = Path(output_dir) / source_name
         writer = pq.ParquetWriter(str(out_path), OUTPUT_SCHEMA, compression="zstd")
         shard_rows = 0
@@ -152,6 +157,7 @@ def export_dataset(
                     {
                         "qid": parsed.qid,
                         "question": parsed.question,
+                        "source": parsed.source,
                         "answer_int": int(parsed.answer_int),
                         "answer_digits": [int(x) for x in parsed.answer_digits],
                         "K_star": int(parsed.k_star),
@@ -206,6 +212,13 @@ def export_dataset(
         print(
             f"[export] shard={source_name} rows={shard_rows} invalid_rows={shard_invalid_rows} -> {out_path}"
         )
+        if delete_input_files and source_path is not None:
+            if source_path.resolve() == out_path.resolve():
+                raise RuntimeError(
+                    f"Refusing to delete input shard because output path is identical: {source_path}"
+                )
+            source_path.unlink(missing_ok=True)
+            print(f"[export] deleted input shard {source_path}")
 
     print(f"[done] exported shards={total_shards} rows={total_rows} to {output_dir}")
 
@@ -220,6 +233,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quantize_chunk_size", default=16384, type=int)
     p.add_argument("--quantize_mode", default=None, choices=["raw", "delta"], type=str)
     p.add_argument("--skip_invalid_rows", action="store_true")
+    p.add_argument("--keep_input_files", action="store_true")
     return p.parse_args()
 
 
@@ -234,6 +248,7 @@ def main() -> None:
         quantize_chunk_size=args.quantize_chunk_size,
         quantize_mode=args.quantize_mode,
         skip_invalid_rows=bool(args.skip_invalid_rows),
+        delete_input_files=not bool(args.keep_input_files),
     )
 
 

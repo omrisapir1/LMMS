@@ -11,32 +11,42 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from datasets import load_dataset
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import BatchSampler, DataLoader, RandomSampler, Sampler, SequentialSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import SFTConfig
-from .dataset import (
-    HarmonyTemplateBuilder,
-    SFTCollator,
-    SFTDataset,
-    TARGET_ANALYSIS,
-    TARGET_ANALYSIS_END,
-    TARGET_IGNORE,
-    resolve_digit_token_ids,
-)
+from .dataset import ANSWER_TOKEN, SFTCollator, SFTDataset, TARGET_IGNORE
 # from .eval_vllm import evaluate_with_vllm
 from .losses import compute_counterfactual_regularizer, compute_weighted_loss, extract_digit_logits
 import gc
+
+CURRICULUM_EASY_SOURCE = "OpenMathInstruct-2"
+CURRICULUM_HARD_SOURCE = "OpenMathReasoning"
+LENGTH_BUCKET_WINDOW_MULT = 50
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _dtype_from_str(name: str) -> torch.dtype:
+    table = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    key = str(name).lower()
+    if key not in table:
+        raise ValueError(f"Unsupported torch dtype string: {name}")
+    return table[key]
 
 
 def _log(msg: str, log_path: str) -> None:
@@ -53,6 +63,8 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]
 
     existing_vocab = tokenizer.get_vocab()
     to_add = [t for t in z_tokens if t not in existing_vocab]
+    if ANSWER_TOKEN not in existing_vocab:
+        to_add.append(ANSWER_TOKEN)
 
     added = 0
     if to_add:
@@ -68,334 +80,66 @@ def _ensure_sft_tokens(tokenizer, model, vocab_size: int) -> Dict[str, List[int]
     if added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
+    answer_token_id = int(tokenizer.convert_tokens_to_ids(ANSWER_TOKEN))
+    if answer_token_id < 0:
+        raise RuntimeError("Failed to resolve <ANSWER> token id")
+
     z_token_ids = [int(tokenizer.convert_tokens_to_ids(t)) for t in z_tokens]
     if any(i < 0 for i in z_token_ids):
         raise RuntimeError("Failed to resolve one or more Z token ids")
 
-    digit_token_ids = resolve_digit_token_ids(tokenizer)
-    harmony = HarmonyTemplateBuilder(tokenizer=tokenizer)
+    digit_token_ids = []
+    for d in "0123456789":
+        ids = tokenizer.encode(d, add_special_tokens=False)
+        if len(ids) != 1:
+            raise RuntimeError(f"Digit tokenization check failed for '{d}' -> {ids}")
+        digit_token_ids.append(int(ids[0]))
 
     return {
         "z_token_ids": z_token_ids,
         "digit_token_ids": digit_token_ids,
-        "analysis_end_token_id": [int(harmony.analysis_end_token_id)],
+        "answer_token_id": [answer_token_id],
     }
 
 
-def _discover_moe_target_parameters(model, cfg: SFTConfig) -> List[str]:
-    if not bool(cfg.lora_enable_moe_target_parameters):
-        return []
-    substrs = tuple(str(x) for x in cfg.lora_moe_param_substrings)
-    out: List[str] = []
-    for name, param in model.named_parameters():
-        if ".experts." not in name:
-            continue
-        if param.ndim < 2:
-            continue
-        if substrs and not any(s in name for s in substrs):
-            continue
-        out.append(str(name))
-    return sorted(set(out))
-
-
-def _attach_lora(model, cfg: SFTConfig) -> tuple[torch.nn.Module, List[str]]:
-    try:
-        from peft import LoraConfig, TaskType, get_peft_model
-    except Exception as exc:
-        raise RuntimeError("PEFT is required for LoRA training but is not available.") from exc
-
-    task_type_map = {
-        "CAUSAL_LM": TaskType.CAUSAL_LM,
-        "SEQ_2_SEQ_LM": TaskType.SEQ_2_SEQ_LM,
-    }
-    task_type_key = str(cfg.lora_task_type).upper().strip()
-    if task_type_key not in task_type_map:
-        raise ValueError(f"Unsupported lora_task_type={cfg.lora_task_type}")
-
-    target_parameters = _discover_moe_target_parameters(model, cfg)
-    lora_cfg = LoraConfig(
-        r=int(cfg.lora_r),
-        lora_alpha=int(cfg.lora_alpha),
-        lora_dropout=float(cfg.lora_dropout),
-        bias=str(cfg.lora_bias),
-        task_type=task_type_map[task_type_key],
-        target_modules=str(cfg.lora_target_modules),
-        target_parameters=target_parameters if target_parameters else None,
-    )
-    model = get_peft_model(model, lora_cfg)
-    return model, target_parameters
-
-
-class RowDeltaAdapter(torch.nn.Module):
-    def __init__(
-        self,
-        *,
-        z_token_ids: Sequence[int],
-        vocab_size: int,
-        hidden_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        super().__init__()
-        if len(z_token_ids) <= 0:
-            raise ValueError("z_token_ids must be non-empty")
-        z_ids = torch.as_tensor([int(x) for x in z_token_ids], dtype=torch.long, device=device)
-        self.register_buffer("z_token_ids", z_ids, persistent=True)
-
-        token_to_compact = torch.full((int(vocab_size),), -1, dtype=torch.long, device=device)
-        token_to_compact[z_ids] = torch.arange(int(z_ids.numel()), dtype=torch.long, device=device)
-        self.register_buffer("token_to_compact", token_to_compact, persistent=True)
-
-        self.embedding_row_deltas = torch.nn.Parameter(
-            torch.zeros((int(z_ids.numel()), int(hidden_size)), dtype=dtype, device=device)
-        )
-        self.lm_head_row_deltas = torch.nn.Parameter(
-            torch.zeros((int(z_ids.numel()), int(hidden_size)), dtype=dtype, device=device)
-        )
-
-
-def _setup_trainable_parameters(
-    model: torch.nn.Module,
+def _apply_warmup_freeze(
     *,
+    model,
     z_token_ids: Sequence[int],
-    device: torch.device,
-) -> RowDeltaAdapter:
+    warmup_active: bool,
+) -> List[torch.utils.hooks.RemovableHandle]:
     for p in model.parameters():
-        p.requires_grad_(False)
-    for name, p in model.named_parameters():
-        if "lora_" in name:
-            p.requires_grad_(True)
+        p.requires_grad = True
 
-    emb_w = model.get_input_embeddings().weight
-    lm_w = model.get_output_embeddings().weight
-    emb_w.requires_grad_(False)
-    lm_w.requires_grad_(False)
-    adapter = RowDeltaAdapter(
-        z_token_ids=z_token_ids,
-        vocab_size=int(emb_w.shape[0]),
-        hidden_size=int(emb_w.shape[1]),
-        dtype=emb_w.dtype,
-        device=device,
-    )
-    return adapter
+    if not warmup_active:
+        return []
 
+    for p in model.parameters():
+        p.requires_grad = False
 
-def _gather_trainable_parameters(model: torch.nn.Module, row_adapter: RowDeltaAdapter) -> List[torch.nn.Parameter]:
-    out: List[torch.nn.Parameter] = [p for p in model.parameters() if p.requires_grad]
-    out.extend([p for p in row_adapter.parameters() if p.requires_grad])
-    return out
+    embed = model.get_input_embeddings().weight
+    embed.requires_grad = True
 
+    lm_head = model.get_output_embeddings().weight
+    same_param = lm_head.data_ptr() == embed.data_ptr()
+    if not same_param:
+        lm_head.requires_grad = True
 
-def _log_trainable_summary(
-    *,
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-    log_path: str,
-) -> None:
-    total_params = int(sum(p.numel() for p in model.parameters())) + int(
-        sum(p.numel() for p in row_adapter.parameters())
-    )
-    trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad)) + int(
-        sum(p.numel() for p in row_adapter.parameters() if p.requires_grad)
-    )
-    trainable_pct = (100.0 * float(trainable_params) / float(max(1, total_params)))
+    allowed = torch.zeros(embed.shape[0], dtype=torch.bool, device=embed.device)
+    allowed[torch.as_tensor(list(z_token_ids), dtype=torch.long, device=embed.device)] = True
 
-    lora_params = 0
-    trainable_names: List[str] = []
-    for name, p in model.named_parameters():
-        if p.requires_grad:
-            trainable_names.append(name)
-            if "lora_" in name:
-                lora_params += int(p.numel())
+    handles: List[torch.utils.hooks.RemovableHandle] = []
 
-    emb_rows = int(row_adapter.embedding_row_deltas.numel())
-    head_rows = int(row_adapter.lm_head_row_deltas.numel())
+    def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
+        out = grad.clone()
+        out[~allowed] = 0
+        return out
 
-    _log(
-        f"params total={total_params} trainable={trainable_params} trainable_pct={trainable_pct:.4f}%",
-        log_path,
-    )
-    _log(
-        "trainable_breakdown "
-        f"lora={int(lora_params)} "
-        f"embedding_rows={emb_rows} "
-        f"lm_head_rows={head_rows} "
-        f"row_local_trainables={emb_rows + head_rows}",
-        log_path,
-    )
+    handles.append(embed.register_hook(_mask_grad))
+    if not same_param:
+        handles.append(lm_head.register_hook(_mask_grad))
 
-    trainable_names.extend(
-        [
-            "row_adapter.embedding_row_deltas",
-            "row_adapter.lm_head_row_deltas",
-        ]
-    )
-    preview = trainable_names[:40]
-    _log(f"trainable_param_names_preview(count={len(trainable_names)}): {preview}", log_path)
-
-
-def _collect_row_effective_state(
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-) -> Dict[str, torch.Tensor]:
-    emb_w = model.get_input_embeddings().weight.detach()
-    head_w = model.get_output_embeddings().weight.detach()
-    z_ids = row_adapter.z_token_ids.to(emb_w.device)
-    emb_base_rows = emb_w.index_select(0, z_ids)
-    head_base_rows = head_w.index_select(0, z_ids.to(head_w.device))
-    emb_eff = emb_base_rows + row_adapter.embedding_row_deltas.detach().to(emb_base_rows.dtype)
-    head_eff = head_base_rows + row_adapter.lm_head_row_deltas.detach().to(head_base_rows.dtype)
-    return {
-        "z_token_ids": row_adapter.z_token_ids.detach().cpu(),
-        "embedding_rows_effective": emb_eff.detach().cpu(),
-        "lm_head_rows_effective": head_eff.detach().cpu(),
-    }
-
-
-def _build_base_load_kwargs(cfg: SFTConfig) -> Dict[str, object]:
-    try:
-        from transformers import Mxfp4Config
-    except Exception as exc:
-        raise RuntimeError("transformers.Mxfp4Config is required for GPT-OSS loading.") from exc
-    quant_cfg = Mxfp4Config(dequantize=bool(cfg.dequantize_mxfp4))
-    kwargs: Dict[str, object] = {
-        "quantization_config": quant_cfg,
-        "attn_implementation": str(cfg.attn_implementation),
-    }
-    if bool(cfg.force_bfloat16):
-        kwargs["torch_dtype"] = torch.bfloat16
-    return kwargs
-
-
-def _build_full_model_for_save(
-    *,
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-    tokenizer,
-    base_model_name: str,
-    cfg: SFTConfig,
-    adapter_dir: str,
-) -> torch.nn.Module:
-    try:
-        from peft import PeftModel
-    except Exception as exc:
-        raise RuntimeError("PEFT is required to reconstruct merged full model.") from exc
-
-    load_kwargs = _build_base_load_kwargs(cfg)
-    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
-    if int(base_model.get_input_embeddings().weight.shape[0]) != len(tokenizer):
-        base_model.resize_token_embeddings(len(tokenizer))
-    peft_model = PeftModel.from_pretrained(base_model, adapter_dir)
-    merged_model = peft_model.merge_and_unload()
-    merged_model.eval()
-
-    row_state = _collect_row_effective_state(model, row_adapter)
-    z_ids_t = torch.as_tensor(row_state["z_token_ids"], dtype=torch.long)
-    emb_rows = torch.as_tensor(
-        row_state["embedding_rows_effective"],
-        dtype=merged_model.get_input_embeddings().weight.dtype,
-    )
-    head_rows = torch.as_tensor(
-        row_state["lm_head_rows_effective"],
-        dtype=merged_model.get_output_embeddings().weight.dtype,
-    )
-    if int(emb_rows.shape[0]) != int(z_ids_t.numel()):
-        raise RuntimeError(
-            f"embedding rows mismatch: emb_rows.shape[0]={int(emb_rows.shape[0])} "
-            f"vs z_ids={int(z_ids_t.numel())}"
-        )
-    if int(head_rows.shape[0]) != int(z_ids_t.numel()):
-        raise RuntimeError(
-            f"lm_head rows mismatch: head_rows.shape[0]={int(head_rows.shape[0])} "
-            f"vs z_ids={int(z_ids_t.numel())}"
-        )
-    emb_hidden = int(merged_model.get_input_embeddings().weight.shape[1])
-    head_hidden = int(merged_model.get_output_embeddings().weight.shape[1])
-    if int(emb_rows.shape[1]) != emb_hidden:
-        raise RuntimeError(
-            f"embedding hidden dim mismatch: emb_rows.shape[1]={int(emb_rows.shape[1])} "
-            f"vs destination={emb_hidden}"
-        )
-    if int(head_rows.shape[1]) != head_hidden:
-        raise RuntimeError(
-            f"lm_head hidden dim mismatch: head_rows.shape[1]={int(head_rows.shape[1])} "
-            f"vs destination={head_hidden}"
-        )
-    emb_dev = merged_model.get_input_embeddings().weight.device
-    head_dev = merged_model.get_output_embeddings().weight.device
-    merged_model.get_input_embeddings().weight.data.index_copy_(
-        0, z_ids_t.to(emb_dev), emb_rows.to(emb_dev)
-    )
-    merged_model.get_output_embeddings().weight.data.index_copy_(
-        0, z_ids_t.to(head_dev), head_rows.to(head_dev)
-    )
-    return merged_model
-
-
-def _save_checkpoint_bundle(
-    *,
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-    tokenizer,
-    out_dir: str,
-    base_model_name: str,
-    cfg: SFTConfig,
-    step: int,
-    kind: str,
-    best_pass_at_n: Optional[float] = None,
-    metric: Optional[float] = None,
-) -> str:
-    if os.path.isdir(out_dir):
-        shutil.rmtree(out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-
-    adapter_dir = os.path.join(out_dir, "adapter")
-    full_model_dir = os.path.join(out_dir, "full_model")
-    tokenizer_dir = os.path.join(out_dir, "tokenizer")
-    os.makedirs(adapter_dir, exist_ok=True)
-    os.makedirs(full_model_dir, exist_ok=True)
-    os.makedirs(tokenizer_dir, exist_ok=True)
-
-    # Standard PEFT adapter artifact.
-    if not hasattr(model, "peft_config"):
-        raise RuntimeError("Expected PEFT model for adapter save, but peft_config is missing.")
-    model.save_pretrained(adapter_dir)
-
-    # Explicit tokenizer artifact.
-    tokenizer.save_pretrained(tokenizer_dir)
-
-    # Build standard full model artifact (no PEFT wrapper required for loading).
-    full_model = _build_full_model_for_save(
-        model=model,
-        row_adapter=row_adapter,
-        tokenizer=tokenizer,
-        base_model_name=base_model_name,
-        cfg=cfg,
-        adapter_dir=adapter_dir,
-    )
-    if int(full_model.get_input_embeddings().weight.shape[0]) != len(tokenizer):
-        raise RuntimeError("full_model vocab size does not match tokenizer length")
-    full_model.save_pretrained(full_model_dir)
-    tokenizer.save_pretrained(full_model_dir)
-    del full_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    meta_payload: Dict[str, object] = {
-        "step": int(step),
-        "kind": str(kind),
-        "base_model_or_checkpoint": str(base_model_name),
-        "save_format": "full_model_plus_lora_adapter",
-        "config": asdict(cfg),
-    }
-    if best_pass_at_n is not None:
-        meta_payload["best_pass_at_n"] = float(best_pass_at_n)
-    if metric is not None:
-        meta_payload["metric"] = float(metric)
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta_payload, f, indent=2)
-    return out_dir
+    return handles
 
 
 def _make_run_dir(cfg: SFTConfig) -> str:
@@ -408,6 +152,14 @@ def _make_run_dir(cfg: SFTConfig) -> str:
     os.makedirs(os.path.join(run_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
     return run_dir
+
+
+def _save_model_dir(model, tokenizer, out_dir: str) -> None:
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
 
 
 def _retain_periodic(ckpt_root: str, keep_last_k: int) -> None:
@@ -432,25 +184,20 @@ def _save_last(
     *,
     run_dir: str,
     model,
-    row_adapter: RowDeltaAdapter,
     tokenizer,
-    base_model_name: str,
     cfg: SFTConfig,
     step: int,
     best_pass_at_n: float,
 ) -> str:
     out_dir = os.path.join(run_dir, "last")
-    _save_checkpoint_bundle(
-        model=model,
-        row_adapter=row_adapter,
-        tokenizer=tokenizer,
-        out_dir=out_dir,
-        base_model_name=base_model_name,
-        cfg=cfg,
-        step=int(step),
-        kind="last",
-        best_pass_at_n=float(best_pass_at_n),
-    )
+    _save_model_dir(model, tokenizer, out_dir)
+    payload = {
+        "step": int(step),
+        "best_pass_at_n": float(best_pass_at_n),
+        "config": asdict(cfg),
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
     return out_dir
 
 
@@ -458,80 +205,192 @@ def _save_periodic(
     *,
     run_dir: str,
     model,
-    row_adapter: RowDeltaAdapter,
     tokenizer,
-    base_model_name: str,
-    cfg: SFTConfig,
     step: int,
     keep_last_k: int,
 ) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", f"step_{step:05d}")
-    _save_checkpoint_bundle(
-        model=model,
-        row_adapter=row_adapter,
-        tokenizer=tokenizer,
-        out_dir=out_dir,
-        base_model_name=base_model_name,
-        cfg=cfg,
-        step=int(step),
-        kind="periodic",
-    )
+    _save_model_dir(model, tokenizer, out_dir)
     _retain_periodic(os.path.join(run_dir, "checkpoints"), keep_last_k=keep_last_k)
     return out_dir
 
 
-def _save_best(
-    *,
-    run_dir: str,
-    model,
-    row_adapter: RowDeltaAdapter,
-    tokenizer,
-    base_model_name: str,
-    cfg: SFTConfig,
-    step: int,
-    metric: float,
-) -> str:
+def _save_best(*, run_dir: str, model, tokenizer, step: int, metric: float) -> str:
     out_dir = os.path.join(run_dir, "checkpoints", "best")
-    _save_checkpoint_bundle(
-        model=model,
-        row_adapter=row_adapter,
-        tokenizer=tokenizer,
-        out_dir=out_dir,
-        base_model_name=base_model_name,
-        cfg=cfg,
-        step=int(step),
-        kind="best",
-        metric=float(metric),
-    )
+    _save_model_dir(model, tokenizer, out_dir)
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"step": int(step), "pass_at_n": float(metric)}, f, indent=2)
     return out_dir
 
 
-def _save_ppo_init(
-    *,
-    run_dir: str,
-    model,
-    row_adapter: RowDeltaAdapter,
-    tokenizer,
-    base_model_name: str,
-    cfg: SFTConfig,
-) -> str:
+def _save_ppo_init(*, run_dir: str, model, tokenizer) -> str:
     out_dir = os.path.join(run_dir, "ppo_init")
-    _save_checkpoint_bundle(
-        model=model,
-        row_adapter=row_adapter,
-        tokenizer=tokenizer,
-        out_dir=out_dir,
-        base_model_name=base_model_name,
-        cfg=cfg,
-        step=0,
-        kind="ppo_init",
-    )
+    _save_model_dir(model, tokenizer, out_dir)
     return out_dir
+
+
+def _build_optimizer_8bit(*, model, cfg: SFTConfig):
+    try:
+        import bitsandbytes as bnb  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "8-bit optimizer requested but bitsandbytes is not available. "
+            "Install bitsandbytes to run SFT with 8-bit AdamW."
+        ) from exc
+
+    return bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=float(cfg.learning_rate),
+        weight_decay=float(cfg.weight_decay),
+    )
 
 
 def _load_hf_records(dataset_name: str, split: str) -> List[Dict]:
     ds = load_dataset(dataset_name, split=split)
     return [dict(x) for x in ds]
+
+
+class LinearSourceCurriculumSampler(Sampler[int]):
+    def __init__(
+        self,
+        *,
+        easy_indices: Sequence[int],
+        hard_indices: Sequence[int],
+        easy_start: float,
+        easy_end: float,
+        seed: int,
+    ) -> None:
+        self.easy_indices = [int(i) for i in easy_indices]
+        self.hard_indices = [int(i) for i in hard_indices]
+        self.easy_start = float(easy_start)
+        self.easy_end = float(easy_end)
+        self.seed = int(seed)
+        self._epoch = 0
+        self._total = len(self.easy_indices) + len(self.hard_indices)
+
+    def __len__(self) -> int:
+        return self._total
+
+    def _p_easy(self, pos: int) -> float:
+        if self._total <= 1:
+            return self.easy_start
+        t = float(pos) / float(self._total - 1)
+        return self.easy_start + (self.easy_end - self.easy_start) * t
+
+    def __iter__(self) -> Iterator[int]:
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+
+        easy_perm = list(self.easy_indices)
+        hard_perm = list(self.hard_indices)
+        rng.shuffle(easy_perm)
+        rng.shuffle(hard_perm)
+
+        used_easy = 0
+        used_hard = 0
+        target_easy_prefix = 0.0
+        order: List[int] = []
+
+        for pos in range(self._total):
+            target_easy_prefix += self._p_easy(pos)
+            remaining = self._total - pos
+            rem_easy = len(easy_perm) - used_easy
+            rem_hard = len(hard_perm) - used_hard
+
+            if rem_easy == remaining:
+                pick_easy = True
+            elif rem_hard == remaining:
+                pick_easy = False
+            else:
+                pick_easy = used_easy < target_easy_prefix
+                if pick_easy and rem_easy <= 0:
+                    pick_easy = False
+                elif (not pick_easy) and rem_hard <= 0:
+                    pick_easy = True
+
+            if pick_easy:
+                order.append(easy_perm[used_easy])
+                used_easy += 1
+            else:
+                order.append(hard_perm[used_hard])
+                used_hard += 1
+
+        if len(order) != self._total:
+            raise RuntimeError(f"sampler produced {len(order)} indices, expected {self._total}")
+
+        return iter(order)
+
+
+class WindowedLengthBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        sampler: Sampler[int],
+        lengths: Sequence[int],
+        batch_size: int,
+        drop_last: bool,
+        window_mult: int = LENGTH_BUCKET_WINDOW_MULT,
+    ) -> None:
+        self.sampler = sampler
+        self.lengths = lengths
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.window_size = max(self.batch_size, int(window_mult) * self.batch_size)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        window: List[int] = []
+        for idx in self.sampler:
+            window.append(int(idx))
+            if len(window) >= self.window_size:
+                yield from self._emit_window(window)
+                window = []
+        if window:
+            yield from self._emit_window(window)
+
+    def _emit_window(self, window: List[int]) -> Iterator[List[int]]:
+        window.sort(key=lambda i: int(self.lengths[i]))
+        for start in range(0, len(window), self.batch_size):
+            batch = window[start : start + self.batch_size]
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
+
+    def __len__(self) -> int:
+        total = len(self.sampler)
+        if self.drop_last:
+            return total // self.batch_size
+        return (total + self.batch_size - 1) // self.batch_size
+
+
+def _build_source_curriculum_sampler(*, ds: SFTDataset, cfg: SFTConfig) -> LinearSourceCurriculumSampler:
+    easy_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_EASY_SOURCE]
+    hard_indices = [i for i, s in enumerate(ds.samples) if s.source == CURRICULUM_HARD_SOURCE]
+    unknown_sources = sorted({s.source for s in ds.samples if s.source not in (CURRICULUM_EASY_SOURCE, CURRICULUM_HARD_SOURCE)})
+    if unknown_sources:
+        raise ValueError(
+            "Train dataset contains sources that are not part of the curriculum mapping: "
+            f"{unknown_sources}. Expected only {CURRICULUM_EASY_SOURCE!r} and {CURRICULUM_HARD_SOURCE!r}."
+        )
+    if not easy_indices or not hard_indices:
+        raise ValueError(
+            "Curriculum requires both source groups to be present. "
+            f"Found easy={len(easy_indices)} for {CURRICULUM_EASY_SOURCE!r}, "
+            f"hard={len(hard_indices)} for {CURRICULUM_HARD_SOURCE!r}."
+        )
+    easy_start = float(cfg.curriculum_easy_start)
+    easy_end = float(cfg.curriculum_easy_end)
+    if not (0.0 <= easy_start <= 1.0 and 0.0 <= easy_end <= 1.0):
+        raise ValueError(
+            f"curriculum_easy_start/end must be in [0,1], got start={easy_start}, end={easy_end}"
+        )
+
+    return LinearSourceCurriculumSampler(
+        easy_indices=easy_indices,
+        hard_indices=hard_indices,
+        easy_start=easy_start,
+        easy_end=easy_end,
+        seed=int(cfg.seed),
+    )
 
 
 def _build_loader(
@@ -553,13 +412,28 @@ def _build_loader(
     collator = SFTCollator(tokenizer=tokenizer, max_length=cfg.max_length)
     num_workers = int(cfg.dataloader_num_workers if train else cfg.eval_dataloader_num_workers)
     loader_kwargs = {
-        "batch_size": int(cfg.batch_size if train else cfg.eval_batch_size),
-        "shuffle": bool(shuffle),
         "collate_fn": collator,
-        "drop_last": False,
         "num_workers": max(0, num_workers),
         "pin_memory": bool(cfg.dataloader_pin_memory),
     }
+    if train:
+        batch_size = int(cfg.batch_size)
+        if bool(cfg.curriculum_enabled):
+            base_sampler: Sampler[int] = _build_source_curriculum_sampler(ds=ds, cfg=cfg)
+        elif bool(shuffle):
+            base_sampler = RandomSampler(ds)
+        else:
+            base_sampler = SequentialSampler(ds)
+        loader_kwargs["batch_sampler"] = WindowedLengthBatchSampler(
+            sampler=base_sampler,
+            lengths=ds.sample_lengths,
+            batch_size=batch_size,
+            drop_last=False,
+        )
+    else:
+        loader_kwargs["batch_size"] = int(cfg.eval_batch_size)
+        loader_kwargs["shuffle"] = bool(shuffle)
+        loader_kwargs["drop_last"] = False
     if loader_kwargs["num_workers"] > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(max(1, cfg.dataloader_prefetch_factor))
@@ -624,9 +498,22 @@ def _get_scheduled_loss_weights(cfg: SFTConfig, step: int) -> tuple[float, float
     return w_answer, w_digits
 
 
+def _get_cf_every_n_steps(cfg: SFTConfig, step: int) -> int:
+    switch_step = int(cfg.cf_every_n_steps_switch_step)
+    if switch_step <= 0:
+        return max(1, int(cfg.cf_every_n_steps_late))
+    if int(step) < switch_step:
+        return max(1, int(cfg.cf_every_n_steps_early))
+    return max(1, int(cfg.cf_every_n_steps_late))
+
+
 def _validate_cf_config(cfg: SFTConfig) -> None:
-    if int(cfg.cf_every_n_steps) <= 0:
-        raise ValueError("cf_every_n_steps must be > 0")
+    if int(cfg.cf_every_n_steps_early) <= 0:
+        raise ValueError("cf_every_n_steps_early must be > 0")
+    if int(cfg.cf_every_n_steps_late) <= 0:
+        raise ValueError("cf_every_n_steps_late must be > 0")
+    if int(cfg.cf_every_n_steps_switch_step) < 0:
+        raise ValueError("cf_every_n_steps_switch_step must be >= 0")
     if float(cfg.cf_lambda) < 0.0:
         raise ValueError("cf_lambda must be >= 0")
     if float(cfg.cf_eps) <= 0.0:
@@ -657,297 +544,210 @@ def _build_counterfactual_batch(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    target_class: torch.Tensor,
+    target_class: Optional[torch.Tensor],
+    answer_token_id: int,
     z_token_ids: Sequence[int],
     pad_token_id: int,
     cf_min_z_len: int,
     variant_name: str,
     trunc_range: Tuple[float, float],
     rng: random.Random,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_ids_cf = input_ids.clone()
-    attention_mask_cf = attention_mask.clone()
-    target_class_cf = target_class.clone()
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    device = input_ids.device
+    input_ids_cpu = input_ids.detach().cpu()
+    attention_mask_cpu = attention_mask.detach().cpu()
+    target_class_cpu = target_class.detach().cpu() if target_class is not None else None
 
+    input_ids_cf_cpu = input_ids_cpu.clone()
+    attention_mask_cf_cpu = attention_mask_cpu.clone()
+    target_class_cf_cpu = target_class_cpu.clone() if target_class_cpu is not None else None
+
+    z_set = set(int(x) for x in z_token_ids)
     bsz, _ = input_ids.shape
-    eligible_mask = torch.zeros((bsz,), dtype=torch.bool, device=input_ids.device)
-    visible_z_counts = torch.zeros((bsz,), dtype=torch.long, device=input_ids.device)
+    eligible_mask_cpu = torch.zeros((bsz,), dtype=torch.bool)
+    visible_z_counts_cpu = torch.zeros((bsz,), dtype=torch.long)
 
     lo, hi = float(trunc_range[0]), float(trunc_range[1])
-    analysis_token_mask = torch.zeros_like(target_class, dtype=torch.bool)
-    analysis_token_mask[:, 1:] = target_class[:, :-1] == int(TARGET_ANALYSIS)
-    analysis_end_token_mask = torch.zeros_like(target_class, dtype=torch.bool)
-    analysis_end_token_mask[:, 1:] = target_class[:, :-1] == int(TARGET_ANALYSIS_END)
-
-    def _token_class_from_target_row(tc_row: torch.Tensor, valid_len: int) -> List[int]:
-        out = [int(TARGET_IGNORE)] * int(valid_len)
-        for j in range(1, int(valid_len)):
-            out[j] = int(tc_row[j - 1].item())
-        return out
-
-    def _target_from_token_class(token_class: List[int], row_len: int) -> torch.Tensor:
-        t = torch.full((int(row_len),), int(TARGET_IGNORE), dtype=torch.long, device=input_ids.device)
-        n = len(token_class)
-        for j in range(max(0, n - 1)):
-            t[j] = int(token_class[j + 1])
-        return t
-
-    def _validate_truncate_row(
-        *,
-        row_ids: torch.Tensor,
-        row_attn: torch.Tensor,
-        row_target: torch.Tensor,
-        row_pad_id: int,
-    ) -> None:
-        valid_len_local = int(row_attn.sum().item())
-        if valid_len_local <= 0:
-            raise RuntimeError("truncate validation failed: empty valid sequence")
-        valid_ids = row_ids[:valid_len_local]
-        valid_target = row_target[:valid_len_local]
-        local_analysis_end = (valid_target == int(TARGET_ANALYSIS_END)).sum().item()
-        if int(local_analysis_end) != 1:
-            raise RuntimeError(
-                f"truncate validation failed: expected 1 analysis-end target, got {int(local_analysis_end)}"
-            )
-        local_digits = int((valid_target == 3).sum().item())
-        if local_digits != 5:
-            raise RuntimeError(
-                f"truncate validation failed: expected 5 digit targets, got {local_digits}"
-            )
-        if bool((valid_ids == int(row_pad_id)).any()):
-            raise RuntimeError("truncate validation failed: pad token found inside valid region")
-        if valid_len_local < int(row_ids.numel()):
-            tail = row_ids[valid_len_local:]
-            if not bool((tail == int(row_pad_id)).all()):
-                raise RuntimeError("truncate validation failed: non-pad token found after valid region")
-            attn_tail = row_attn[valid_len_local:]
-            if bool((attn_tail != 0).any()):
-                raise RuntimeError("truncate validation failed: non-zero attention after valid region")
 
     for b in range(bsz):
-        valid_len = int(attention_mask[b].sum().item())
+        valid_len = int(attention_mask_cpu[b].sum().item())
         if valid_len <= 0:
             continue
-        z_pos = analysis_token_mask[b, :valid_len].nonzero(as_tuple=False).view(-1).tolist()
+        row = input_ids_cpu[b, :valid_len]
+        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
+        if int(ans_idx.numel()) == 0:
+            continue
+        ans_pos = int(ans_idx[0].item())
+        z_pos: List[int] = []
+        for j in range(ans_pos):
+            if int(row[j].item()) in z_set:
+                z_pos.append(j)
         lz = len(z_pos)
         if lz < int(cf_min_z_len):
             continue
 
-        eligible_mask[b] = True
+        eligible_mask_cpu[b] = True
 
         if variant_name == "reverse":
-            src = input_ids[b, z_pos].clone()
-            input_ids_cf[b, z_pos] = src.flip(0)
-            visible_z_counts[b] = int(lz)
+            src = input_ids_cpu[b, z_pos].clone()
+            input_ids_cf_cpu[b, z_pos] = src.flip(0)
+            visible_z_counts_cpu[b] = int(lz)
         elif variant_name == "random":
             vals = [int(rng.choice(z_token_ids)) for _ in z_pos]
             if vals:
-                input_ids_cf[b, z_pos] = torch.as_tensor(vals, dtype=input_ids.dtype, device=input_ids.device)
-            visible_z_counts[b] = int(lz)
+                input_ids_cf_cpu[b, z_pos] = torch.as_tensor(vals, dtype=input_ids_cpu.dtype)
+            visible_z_counts_cpu[b] = int(lz)
         elif variant_name == "truncate":
             r = float(rng.uniform(lo, hi))
             remove_count = int(math.ceil(r * lz))
             keep_k = max(0, lz - remove_count)
-            row_len = int(input_ids.shape[1])
-            row_ids = input_ids[b]
-            row_attn = attention_mask[b]
-            row_target = target_class[b]
-            valid_row_ids = row_ids[:valid_len]
-            token_class = _token_class_from_target_row(tc_row=row_target, valid_len=valid_len)
+            remove_pos = z_pos[keep_k:]
+            if remove_pos:
+                # Truncate by compacting the visible sequence (no attention holes),
+                # then right-pad to preserve tensor shape.
+                keep_mask = torch.ones((valid_len,), dtype=torch.bool)
+                remove_tensor = torch.as_tensor(remove_pos, dtype=torch.long)
+                keep_mask[remove_tensor] = False
+                compact_ids = row[keep_mask]
+                new_valid_len = int(compact_ids.shape[0])
+                input_ids_cf_cpu[b, :new_valid_len] = compact_ids
+                attention_mask_cf_cpu[b, :new_valid_len] = 1
+                input_ids_cf_cpu[b, new_valid_len:] = int(pad_token_id)
+                attention_mask_cf_cpu[b, new_valid_len:] = 0
 
-            analysis_pos = z_pos
-            analysis_start = int(analysis_pos[0])
-            analysis_end_pos_vec = analysis_end_token_mask[b, :valid_len].nonzero(as_tuple=False).view(-1)
-            if int(analysis_end_pos_vec.numel()) != 1:
-                raise RuntimeError(
-                    f"truncate expects exactly one analysis-end token position; got {int(analysis_end_pos_vec.numel())}"
-                )
-            analysis_end_pos = int(analysis_end_pos_vec[0].item())
-            if analysis_end_pos <= analysis_pos[-1]:
-                raise RuntimeError("analysis-end token must come after analysis z span")
-
-            prefix_ids = valid_row_ids[:analysis_start].tolist()
-            kept_z_ids = valid_row_ids[analysis_start : analysis_start + keep_k].tolist()
-            analysis_end_token_id = int(valid_row_ids[analysis_end_pos].item())
-            final_segment_ids = valid_row_ids[analysis_end_pos + 1 :].tolist()
-
-            prefix_tc = token_class[:analysis_start]
-            final_tc = token_class[analysis_end_pos + 1 : valid_len]
-            if len(final_tc) != len(final_segment_ids):
-                raise RuntimeError("truncate internal mismatch: final token_class length mismatch")
-
-            new_valid_ids = prefix_ids + kept_z_ids + [analysis_end_token_id] + final_segment_ids
-            new_token_class = prefix_tc + [int(TARGET_ANALYSIS)] * int(keep_k) + [int(TARGET_ANALYSIS_END)] + final_tc
-            if len(new_valid_ids) != len(new_token_class):
-                raise RuntimeError("truncate internal mismatch: new ids/token_class length mismatch")
-            if len(final_segment_ids) > 0:
-                if new_valid_ids[-len(final_segment_ids) :] != final_segment_ids:
-                    raise RuntimeError("truncate failed to preserve final segment verbatim")
-
-            new_valid_len = len(new_valid_ids)
-            if new_valid_len <= 0 or new_valid_len > row_len:
-                raise RuntimeError(
-                    f"truncate produced invalid new length: {new_valid_len} (row_len={row_len})"
-                )
-
-            rebuilt_ids = torch.full((row_len,), int(pad_token_id), dtype=input_ids.dtype, device=input_ids.device)
-            rebuilt_attn = torch.zeros((row_len,), dtype=attention_mask.dtype, device=input_ids.device)
-            rebuilt_ids[:new_valid_len] = torch.as_tensor(new_valid_ids, dtype=input_ids.dtype, device=input_ids.device)
-            rebuilt_attn[:new_valid_len] = 1
-            rebuilt_target = _target_from_token_class(new_token_class, row_len=row_len)
-
-            input_ids_cf[b] = rebuilt_ids
-            attention_mask_cf[b] = rebuilt_attn
-            target_class_cf[b] = rebuilt_target
-
-            _validate_truncate_row(
-                row_ids=input_ids_cf[b],
-                row_attn=attention_mask_cf[b],
-                row_target=target_class_cf[b],
-                row_pad_id=int(pad_token_id),
-            )
-            visible_z_counts[b] = int(keep_k)
+                if target_class_cf_cpu is not None:
+                    row_tc = target_class_cpu[b, :valid_len]
+                    compact_tc = row_tc[keep_mask]
+                    target_class_cf_cpu[b, :new_valid_len] = compact_tc
+                    target_class_cf_cpu[b, new_valid_len:] = int(TARGET_IGNORE)
+            visible_z_counts_cpu[b] = int(keep_k)
         else:
             raise ValueError(f"unknown counterfactual variant: {variant_name}")
 
-    return input_ids_cf, attention_mask_cf, target_class_cf, eligible_mask, visible_z_counts
+    input_ids_cf = input_ids_cf_cpu.to(device=device, non_blocking=True)
+    attention_mask_cf = attention_mask_cf_cpu.to(device=device, non_blocking=True)
+    eligible_mask = eligible_mask_cpu.to(device=device, non_blocking=True)
+    visible_z_counts = visible_z_counts_cpu.to(device=device, non_blocking=True)
+    target_class_cf = (
+        target_class_cf_cpu.to(device=device, non_blocking=True)
+        if target_class_cf_cpu is not None
+        else None
+    )
+
+    return input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts, target_class_cf
 
 
-def _print_startup_examples(
+def _log_full_sequence_example(*, tokenizer, batch: Dict[str, torch.Tensor], log_path: str, step: int) -> None:
+    if "input_ids" not in batch or "attention_mask" not in batch:
+        return
+    if int(batch["input_ids"].shape[0]) == 0:
+        return
+    ids = batch["input_ids"][0].detach().cpu()
+    mask = batch["attention_mask"][0].detach().cpu()
+    seq_len = int(mask.sum().item())
+    if seq_len <= 0:
+        return
+    text = tokenizer.decode(ids[:seq_len].tolist(), skip_special_tokens=False)
+    _log(f"[example@warmup_end step={step}] {text}", log_path)
+
+
+def _log_start_counterfactual_examples(
     *,
     tokenizer,
     batch: Dict[str, torch.Tensor],
+    log_path: str,
+    answer_token_id: int,
     z_token_ids: Sequence[int],
-    pad_token_id: int,
     cf_min_z_len: int,
     cf_trunc_range: Tuple[float, float],
+    pad_token_id: int,
     seed: int,
 ) -> None:
-    if int(batch["input_ids"].shape[0]) <= 0:
-        print("===== STARTUP DEBUG: EMPTY BATCH =====")
+    def _decode_visible(ids_1d: torch.Tensor, mask_1d: torch.Tensor) -> str:
+        keep = mask_1d.to(dtype=torch.bool)
+        visible_ids = ids_1d[keep]
+        if int(visible_ids.numel()) == 0:
+            return ""
+        return tokenizer.decode(visible_ids.tolist(), skip_special_tokens=False)
+
+    if "input_ids" not in batch or "attention_mask" not in batch:
+        return
+    if "target_class" not in batch:
+        return
+    if int(batch["input_ids"].shape[0]) == 0:
         return
 
-    row_idx = 0
-    input_ids_row = batch["input_ids"][row_idx].detach().cpu().tolist()
-    attention_row = batch["attention_mask"][row_idx].detach().cpu().tolist()
-    labels_row = batch["labels"][row_idx].detach().cpu().tolist()
-    target_class_row = batch["target_class"][row_idx].detach().cpu().tolist()
-    valid_len = int(sum(int(x) for x in attention_row))
-    valid_ids = input_ids_row[:valid_len]
-    valid_labels = labels_row[:valid_len]
-    valid_target_class = target_class_row[:valid_len]
+    input_ids = batch["input_ids"].detach().cpu()
+    attention_mask = batch["attention_mask"].detach().cpu()
+    z_set = set(int(x) for x in z_token_ids)
 
-    print("===== STARTUP REGULAR EXAMPLE =====")
-    print("decoded_text:")
-    print(tokenizer.decode(valid_ids, skip_special_tokens=False))
-    print("tokens:")
-    print(tokenizer.convert_ids_to_tokens(valid_ids))
-    print("input_ids:")
-    print(input_ids_row)
-    print("target_class:")
-    print(valid_target_class)
-    print("labels:")
-    print(valid_labels)
+    sample_idx = None
+    for b in range(int(input_ids.shape[0])):
+        valid_len = int(attention_mask[b].sum().item())
+        if valid_len <= 0:
+            continue
+        row = input_ids[b, :valid_len]
+        ans_idx = (row == int(answer_token_id)).nonzero(as_tuple=False).view(-1)
+        if int(ans_idx.numel()) == 0:
+            continue
+        ans_pos = int(ans_idx[0].item())
+        lz = 0
+        for j in range(ans_pos):
+            if int(row[j].item()) in z_set:
+                lz += 1
+        if lz >= int(cf_min_z_len):
+            sample_idx = b
+            break
 
-    def _print_cf_variant(variant_name: str, rng_seed: int) -> None:
-        debug_rng = random.Random(int(rng_seed))
-        input_ids_cf, attention_cf, target_class_cf, _eligible_mask, _visible_z_counts = _build_counterfactual_batch(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            target_class=batch["target_class"],
+    if sample_idx is None:
+        _log("[example@train_start] no eligible sequence found for counterfactual preview", log_path)
+        return
+
+    sample_ids = input_ids[sample_idx : sample_idx + 1].clone()
+    sample_mask = attention_mask[sample_idx : sample_idx + 1].clone()
+    sample_target_class = batch["target_class"].detach().cpu()[sample_idx : sample_idx + 1].clone()
+    if int(sample_mask[0].sum().item()) <= 0:
+        return
+
+    full_text = _decode_visible(sample_ids[0], sample_mask[0])
+    _log(f"[example@train_start full] {full_text}", log_path)
+
+    for variant_name, display_name, seed_offset in (
+        ("random", "random", 10_001),
+        ("reverse", "reverse", 10_002),
+        ("truncate", "truncated", 10_003),
+    ):
+        preview_rng = random.Random(int(seed) + int(seed_offset))
+        ids_cf, mask_cf, eligible_mask, _, _ = _build_counterfactual_batch(
+            input_ids=sample_ids,
+            attention_mask=sample_mask,
+            target_class=sample_target_class,
+            answer_token_id=answer_token_id,
             z_token_ids=z_token_ids,
             pad_token_id=int(pad_token_id),
             cf_min_z_len=int(cf_min_z_len),
-            variant_name=str(variant_name),
+            variant_name=variant_name,
             trunc_range=cf_trunc_range,
-            rng=debug_rng,
+            rng=preview_rng,
         )
-
-        input_ids_cf_row = input_ids_cf[row_idx].detach().cpu().tolist()
-        attention_cf_row = attention_cf[row_idx].detach().cpu().tolist()
-        target_class_cf_row = target_class_cf[row_idx].detach().cpu().tolist()
-        valid_cf_len = int(sum(int(x) for x in attention_cf_row))
-        valid_cf_ids = input_ids_cf_row[:valid_cf_len]
-        valid_cf_target_class = target_class_cf_row[:valid_cf_len]
-
-        print("===== STARTUP COUNTERFACTUAL EXAMPLE =====")
-        print("counterfactual_variant:")
-        print(str(variant_name))
-        print("decoded_text:")
-        print(tokenizer.decode(valid_cf_ids, skip_special_tokens=False))
-        print("tokens:")
-        print(tokenizer.convert_ids_to_tokens(valid_cf_ids))
-        print("input_ids:")
-        print(input_ids_cf_row)
-        print("attention_mask:")
-        print(attention_cf_row)
-        print("target_class:")
-        print(valid_cf_target_class)
-
-    _print_cf_variant("truncate", int(seed) + 101)
-    _print_cf_variant("reverse", int(seed) + 202)
-    _print_cf_variant("random", int(seed) + 303)
-
-
-def _forward_with_row_deltas(
-    *,
-    model: torch.nn.Module,
-    row_adapter: RowDeltaAdapter,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-):
-    with torch.no_grad():
-        inputs_embeds = model.get_input_embeddings()(input_ids)
-
-    compact = row_adapter.token_to_compact.index_select(0, input_ids.view(-1)).view_as(input_ids)
-    mask = compact >= 0
-    if bool(mask.any()):
-        inputs_embeds = inputs_embeds.clone()
-        delta = row_adapter.embedding_row_deltas.index_select(0, compact[mask])
-        inputs_embeds[mask] = inputs_embeds[mask] + delta
-
-    output_head = model.get_output_embeddings()
-    captured_hidden: Dict[str, torch.Tensor] = {}
-
-    def _capture_lm_head_input(_module, args):
-        if len(args) == 0:
-            raise RuntimeError("LM head pre-hook received empty args")
-        captured_hidden["x"] = args[0]
-
-    hook = output_head.register_forward_pre_hook(_capture_lm_head_input)
-    try:
-        out = model(
-            input_ids=None,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=False,
-            use_cache=False,
-        )
-    finally:
-        hook.remove()
-
-    if "x" not in captured_hidden:
-        raise RuntimeError("Failed to capture LM head input activations for row-delta correction")
-    hidden = captured_hidden["x"]
-    corr = torch.matmul(hidden, row_adapter.lm_head_row_deltas.transpose(0, 1))  # [B,L,Z]
-    logits = out.logits
-    z_ids = row_adapter.z_token_ids.to(logits.device)
-    z_logits = logits.index_select(-1, z_ids)
-    z_logits = z_logits + corr
-    logits.index_copy_(-1, z_ids, z_logits)
-    out.logits = logits
-    return out
+        if not bool(eligible_mask[0].item()):
+            _log(f"[example@train_start {display_name}] not eligible", log_path)
+            continue
+        cf_text = _decode_visible(ids_cf[0], mask_cf[0])
+        _log(f"[example@train_start {display_name}] {cf_text}", log_path)
 
 
 def train(cfg: SFTConfig) -> str:
     if not cfg.base_model_or_checkpoint.strip():
-        raise ValueError("config.base_model_or_checkpoint is empty; fill with GPT-OSS model path")
+        raise ValueError("config.base_model_or_checkpoint is empty; fill with Phase1 checkpoint path")
     if not cfg.train_dataset_name.strip():
         raise ValueError("config.train_dataset_name is empty; fill with HF dataset path")
     if not cfg.eval_dataset_name.strip():
         raise ValueError("config.eval_dataset_name is empty; fill with HF dataset path")
     if int(cfg.vocab_size) <= 0:
         raise ValueError("config.vocab_size must be > 0")
+    if float(cfg.max_grad_norm) <= 0.0:
+        raise ValueError("config.max_grad_norm must be > 0")
     _validate_cf_config(cfg)
 
     _set_seed(cfg.seed)
@@ -965,21 +765,10 @@ def train(cfg: SFTConfig) -> str:
     else:
         device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_or_checkpoint, use_fast=True)
-    try:
-        from transformers import Mxfp4Config
-    except Exception as exc:
-        raise RuntimeError(
-            "transformers.Mxfp4Config is required for GPT-OSS loading but is unavailable."
-        ) from exc
-
-    quant_cfg = Mxfp4Config(dequantize=bool(cfg.dequantize_mxfp4))
-    load_kwargs = {
-        "quantization_config": quant_cfg,
-        "attn_implementation": str(cfg.attn_implementation),
-    }
-    if bool(cfg.force_bfloat16):
-        load_kwargs["torch_dtype"] = torch.bfloat16
-    model = AutoModelForCausalLM.from_pretrained(cfg.base_model_or_checkpoint, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.base_model_or_checkpoint,#
+        torch_dtype=_dtype_from_str("bfloat16") if torch.cuda.is_available() else torch.float32,
+    )
     model.to(device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -989,13 +778,8 @@ def train(cfg: SFTConfig) -> str:
     token_info = _ensure_sft_tokens(tokenizer, model, cfg.vocab_size)
     z_token_ids = token_info["z_token_ids"]
     digit_token_ids = token_info["digit_token_ids"]
-    analysis_end_token_id = token_info["analysis_end_token_id"][0]
-    z_and_analysis_end_allowed = list(z_token_ids) + [int(analysis_end_token_id)]
-
-    model, moe_target_parameters = _attach_lora(model, cfg)
-    row_adapter = _setup_trainable_parameters(model, z_token_ids=z_token_ids, device=device)
-    _log(f"moe_target_parameters_count={len(moe_target_parameters)}", log_path)
-    _log_trainable_summary(model=model, row_adapter=row_adapter, log_path=log_path)
+    answer_token_id = token_info["answer_token_id"][0]
+    z_and_answer_allowed = list(z_token_ids) + [int(answer_token_id)]
 
     tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
 
@@ -1003,44 +787,34 @@ def train(cfg: SFTConfig) -> str:
     eval_records = _load_hf_records(cfg.eval_dataset_name, cfg.eval_dataset_split)
 
     train_loader = _build_loader(records=train_records, tokenizer=tokenizer, cfg=cfg, shuffle=True, train=True)
+    train_sampler = getattr(train_loader, "sampler", None)
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if isinstance(batch_sampler, WindowedLengthBatchSampler):
+        train_sampler = batch_sampler.sampler
+    if isinstance(train_sampler, LinearSourceCurriculumSampler):
+        _log(
+            "source curriculum enabled: easy_source={!r} hard_source={!r} easy_count={} hard_count={} easy_schedule=({:.3f}->{:.3f})".format(
+                CURRICULUM_EASY_SOURCE,
+                CURRICULUM_HARD_SOURCE,
+                len(train_sampler.easy_indices),
+                len(train_sampler.hard_indices),
+                float(cfg.curriculum_easy_start),
+                float(cfg.curriculum_easy_end),
+            ),
+            log_path,
+        )
 
-    startup_batch = next(iter(train_loader))
-    _print_startup_examples(
-        tokenizer=tokenizer,
-        batch=startup_batch,
-        z_token_ids=z_token_ids,
-        pad_token_id=int(tokenizer.pad_token_id),
-        cf_min_z_len=int(cfg.cf_min_z_len),
-        cf_trunc_range=cfg.cf_trunc_range,
-        seed=int(cfg.seed),
-    )
-
-    trainable_params = _gather_trainable_parameters(model, row_adapter)
-    if len(trainable_params) == 0:
-        raise RuntimeError("No trainable parameters found after LoRA/row-selective setup.")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    optimizer = _build_optimizer_8bit(model=model, cfg=cfg)
     train_rng = random.Random(int(cfg.seed))
 
     step = 0
     micro = 0
     best_pass = -math.inf
+    log_window_sums: Dict[str, float] = {}
+    log_window_count = 0
+    log_window_grad_norm_sum = 0.0
+    log_window_grad_norm_count = 0
     scaler_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
-    accum_log = {
-        "weight_sum": 0.0,
-        "L_total_sum": 0.0,
-        "L_analysis_sum": 0.0,
-        "L_analysis_end_sum": 0.0,
-        "L_digits_sum": 0.0,
-        "analysis_acc_sum": 0.0,
-        "digit_exact_match_sum": 0.0,
-        "avg_z_len_sum": 0.0,
-        "w_answer_sum": 0.0,
-        "w_digits_sum": 0.0,
-        "batch_seen_sum": 0.0,
-        "batch_kept_sum": 0.0,
-        "batch_dropped_invalid_after_clip_sum": 0.0,
-        "total_dropped_invalid_after_clip_last": 0.0,
-    }
 
     _log(f"run_dir={run_dir}", log_path)
     _log(f"train_size={len(train_records)} eval_size={len(eval_records)}", log_path)
@@ -1048,10 +822,13 @@ def train(cfg: SFTConfig) -> str:
         f"torch_device={device} vllm_cuda_visible_devices={cfg.vllm_cuda_visible_devices}",
         log_path,
     )
+    _log("optimizer=bitsandbytes.optim.AdamW8bit", log_path)
     _log(
-        "counterfactual enabled={} every_n_steps={} prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
+        "counterfactual enabled={} schedule(early/late/switch)=({}/{}/{}) prob={} lambda={} kl_margin={} min_z_len={} trunc_range={}".format(
             bool(cfg.cf_enabled),
-            int(cfg.cf_every_n_steps),
+            int(cfg.cf_every_n_steps_early),
+            int(cfg.cf_every_n_steps_late),
+            int(cfg.cf_every_n_steps_switch_step),
             tuple(float(x) for x in cfg.cf_prob_tuple),
             float(cfg.cf_lambda),
             float(cfg.cf_kl_margin),
@@ -1061,18 +838,36 @@ def train(cfg: SFTConfig) -> str:
         log_path,
     )
 
+    warmup_hooks = _apply_warmup_freeze(model=model, z_token_ids=z_token_ids, warmup_active=cfg.warmup_steps > 0)
+    start_examples_logged = False
+
     while step < int(cfg.max_steps):
         for batch in train_loader:
             if step >= int(cfg.max_steps):
                 break
 
+            if not start_examples_logged:
+                _log_start_counterfactual_examples(
+                    tokenizer=tokenizer,
+                    batch=batch,
+                    log_path=log_path,
+                    answer_token_id=int(answer_token_id),
+                    z_token_ids=z_token_ids,
+                    cf_min_z_len=int(cfg.cf_min_z_len),
+                    cf_trunc_range=cfg.cf_trunc_range,
+                    pad_token_id=int(tokenizer.pad_token_id),
+                    seed=int(cfg.seed),
+                )
+                start_examples_logged = True
+
             model.train()
             for k in ("input_ids", "attention_mask", "labels", "target_class"):
-                batch[k] = batch[k].to(device)
+                batch[k] = batch[k].to(device, non_blocking=True)
 
             accum_steps = max(1, int(cfg.gradient_accumulation_steps))
             will_step = ((micro + 1) % accum_steps) == 0
-            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % int(cfg.cf_every_n_steps)) == 0)
+            cur_cf_every = _get_cf_every_n_steps(cfg, step)
+            cf_trigger = bool(cfg.cf_enabled) and will_step and (((step + 1) % cur_cf_every) == 0)
             cf_applied = False
             cf_variant_name = "none"
             cf_loss_scalar = 0.0
@@ -1084,17 +879,12 @@ def train(cfg: SFTConfig) -> str:
             cur_w_answer, cur_w_digits = _get_scheduled_loss_weights(cfg, step)
 
             with scaler_ctx:
-                out = _forward_with_row_deltas(
-                    model=model,
-                    row_adapter=row_adapter,
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                )
+                out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
                 loss_out = compute_weighted_loss(
                     logits=out.logits,
                     labels=batch["labels"],
                     target_class=batch["target_class"],
-                    analysis_allowed_ids=z_and_analysis_end_allowed,
+                    z_allowed_ids=z_and_answer_allowed,
                     digit_allowed_ids=digit_token_ids,
                     w_z=cfg.w_z,
                     w_answer=cur_w_answer,
@@ -1106,10 +896,11 @@ def train(cfg: SFTConfig) -> str:
 
                 if cf_trigger:
                     cf_variant_name = _sample_cf_variant(cfg, train_rng)
-                    input_ids_cf, attention_mask_cf, target_class_cf, eligible_mask, visible_z_counts = _build_counterfactual_batch(
+                    input_ids_cf, attention_mask_cf, eligible_mask, visible_z_counts, target_class_cf = _build_counterfactual_batch(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         target_class=batch["target_class"],
+                        answer_token_id=answer_token_id,
                         z_token_ids=z_token_ids,
                         pad_token_id=int(tokenizer.pad_token_id),
                         cf_min_z_len=int(cfg.cf_min_z_len),
@@ -1120,12 +911,7 @@ def train(cfg: SFTConfig) -> str:
                     cf_eligible_count = float(eligible_mask.float().sum().item())
                     if cf_eligible_count > 0:
                         cf_applied = True
-                        out_cf = _forward_with_row_deltas(
-                            model=model,
-                            row_adapter=row_adapter,
-                            input_ids=input_ids_cf,
-                            attention_mask=attention_mask_cf,
-                        )
+                        out_cf = model(input_ids=input_ids_cf, attention_mask=attention_mask_cf)
                         clean_digit_logits, digit_valid_mask = extract_digit_logits(
                             logits=out.logits,
                             target_class=batch["target_class"],
@@ -1133,7 +919,7 @@ def train(cfg: SFTConfig) -> str:
                         )
                         cf_digit_logits, cf_digit_valid_mask = extract_digit_logits(
                             logits=out_cf.logits,
-                            target_class=target_class_cf,
+                            target_class=target_class_cf if target_class_cf is not None else batch["target_class"],
                             digit_allowed_ids=digit_token_ids,
                         )
                         del out_cf
@@ -1173,115 +959,194 @@ def train(cfg: SFTConfig) -> str:
                 loss = total_loss / accum_steps
 
             loss.backward()
-
-            micro_weight = float(batch["input_ids"].shape[0])
-            accum_log["weight_sum"] += micro_weight
-            accum_log["L_total_sum"] += float(total_loss.detach().item()) * micro_weight
-            accum_log["L_analysis_sum"] += float(loss_out.l_analysis.detach().item()) * micro_weight
-            accum_log["L_analysis_end_sum"] += float(loss_out.l_analysis_end.detach().item()) * micro_weight
-            accum_log["L_digits_sum"] += float(loss_out.l_digits.detach().item()) * micro_weight
-            accum_log["analysis_acc_sum"] += float(loss_out.analysis_acc) * micro_weight
-            accum_log["digit_exact_match_sum"] += float(loss_out.digit_exact_match) * micro_weight
-            accum_log["avg_z_len_sum"] += float(batch["z_lens"].float().mean().item()) * micro_weight
-            accum_log["w_answer_sum"] += float(cur_w_answer) * micro_weight
-            accum_log["w_digits_sum"] += float(cur_w_digits) * micro_weight
-            accum_log["batch_seen_sum"] += float(int(batch.get("batch_seen", batch["input_ids"].shape[0])))
-            accum_log["batch_kept_sum"] += float(int(batch.get("batch_kept", batch["input_ids"].shape[0])))
-            accum_log["batch_dropped_invalid_after_clip_sum"] += float(
-                int(batch.get("batch_dropped_invalid_after_clip", 0))
-            )
-            accum_log["total_dropped_invalid_after_clip_last"] = float(
-                int(batch.get("total_dropped_invalid_after_clip", 0))
-            )
-
             micro += 1
+
+            mean_z_len = float(batch["z_lens"].float().mean().item())
+            row_step = {
+                "L_total": float(total_loss.detach().item()),
+                "L_z": float(loss_out.l_z.detach().item()),
+                "L_answer": float(loss_out.l_answer.detach().item()),
+                "L_digits": float(loss_out.l_digits.detach().item()),
+                "z_acc": float(loss_out.z_acc),
+                "digit_exact_match": float(loss_out.digit_exact_match),
+                "avg_z_len": float(mean_z_len),
+                "no_answer_before_kmax": 0.0,
+                "cf_enabled": float(bool(cfg.cf_enabled)),
+                "cf_applied": float(bool(cf_applied)),
+                "cf_every_n_steps": float(cur_cf_every),
+                "cf_loss": float(cf_loss_scalar),
+                "cf_variant_truncate": float(cf_variant_name == "truncate"),
+                "cf_variant_reverse": float(cf_variant_name == "reverse"),
+                "cf_variant_random": float(cf_variant_name == "random"),
+                "cf_mean_sym_kl": float(cf_mean_sym_kl),
+                "cf_mean_entropy": float(cf_mean_entropy),
+                "cf_eligible_count": float(cf_eligible_count),
+                "cf_visible_z_mean": float(cf_visible_z_mean),
+                "w_answer": float(cur_w_answer),
+                "w_digits": float(cur_w_digits),
+            }
+            for k, v in row_step.items():
+                log_window_sums[k] = float(log_window_sums.get(k, 0.0) + float(v))
+            log_window_count += 1
 
             if micro % accum_steps != 0:
                 continue
 
+            found_non_finite_grad = False
+            bad_grad_param = ""
+            bad_grad_non_finite_elems = 0
+            bad_grad_total_elems = 0
+            for name, p in model.named_parameters():
+                g = p.grad
+                if g is None:
+                    continue
+                finite_mask = torch.isfinite(g)
+                if not bool(finite_mask.all().item()):
+                    found_non_finite_grad = True
+                    bad_grad_param = str(name)
+                    bad_grad_non_finite_elems = int((~finite_mask).sum().item())
+                    bad_grad_total_elems = int(g.numel())
+                    break
+            if found_non_finite_grad:
+                batch_size_cur = int(batch["input_ids"].shape[0])
+                seq_len_cur = int(batch["input_ids"].shape[1])
+                attn_tokens_mean = float(batch["attention_mask"].sum(dim=1).float().mean().item())
+                loss_components = {
+                    "L_total": total_loss.detach(),
+                    "L_z": loss_out.l_z.detach(),
+                    "L_answer": loss_out.l_answer.detach(),
+                    "L_digits": loss_out.l_digits.detach(),
+                    "cf_loss": cf_loss_value.detach() if isinstance(cf_loss_value, torch.Tensor) else torch.tensor(float(cf_loss_scalar), device=device),
+                }
+                non_finite_loss_names = [
+                    name for name, val in loss_components.items() if not bool(torch.isfinite(val).all().item())
+                ]
+                suspect_loss_component = ",".join(non_finite_loss_names) if non_finite_loss_names else "all_finite"
+                _log(
+                    "non-finite gradient tensor detected; skipping optimizer step/zero_grad | "
+                    "step={} micro={} bad_param={} non_finite_grad_elems={}/{} suspect_loss_component={} loss_total={} Lz={} La={} Ld={} "
+                    "cf_applied={} cf_variant={} cf_loss={} batch_size={} seq_len={} attn_tokens_mean={:.2f}".format(
+                        step,
+                        micro,
+                        bad_grad_param,
+                        bad_grad_non_finite_elems,
+                        bad_grad_total_elems,
+                        suspect_loss_component,
+                        float(total_loss.detach().item()),
+                        float(loss_out.l_z.detach().item()),
+                        float(loss_out.l_answer.detach().item()),
+                        float(loss_out.l_digits.detach().item()),
+                        int(bool(cf_applied)),
+                        cf_variant_name,
+                        float(cf_loss_scalar),
+                        batch_size_cur,
+                        seq_len_cur,
+                        attn_tokens_mean,
+                    ),
+                    log_path,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.max_grad_norm))
+            grad_norm_scalar = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+            grad_norm_is_finite = bool(torch.isfinite(grad_norm).all().item()) if isinstance(grad_norm, torch.Tensor) else bool(math.isfinite(grad_norm_scalar))
+            if not grad_norm_is_finite:
+                batch_size_cur = int(batch["input_ids"].shape[0])
+                seq_len_cur = int(batch["input_ids"].shape[1])
+                attn_tokens_mean = float(batch["attention_mask"].sum(dim=1).float().mean().item())
+                _log(
+                    "non-finite grad_norm detected; skipping optimizer step/zero_grad | "
+                    "step={} micro={} grad_norm={} loss_total={} Lz={} La={} Ld={} cf_applied={} cf_variant={} cf_loss={} "
+                    "batch_size={} seq_len={} attn_tokens_mean={:.2f}".format(
+                        step,
+                        micro,
+                        grad_norm_scalar,
+                        float(total_loss.detach().item()),
+                        float(loss_out.l_z.detach().item()),
+                        float(loss_out.l_answer.detach().item()),
+                        float(loss_out.l_digits.detach().item()),
+                        int(bool(cf_applied)),
+                        cf_variant_name,
+                        float(cf_loss_scalar),
+                        batch_size_cur,
+                        seq_len_cur,
+                        attn_tokens_mean,
+                    ),
+                    log_path,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            log_window_grad_norm_sum += grad_norm_scalar
+            log_window_grad_norm_count += 1
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
-
-
+            if step == int(cfg.warmup_steps):
+                _log_full_sequence_example(tokenizer=tokenizer, batch=batch, log_path=log_path, step=step)
+                for h in warmup_hooks:
+                    h.remove()
+                warmup_hooks = _apply_warmup_freeze(
+                    model=model,
+                    z_token_ids=z_token_ids,
+                    warmup_active=False,
+                )
+                _log(f"warmup ended at step={step}; full model unfrozen", log_path)
             if step % int(cfg.log_interval_steps) == 0:
-                denom = max(1e-9, float(accum_log["weight_sum"]))
-                row = {
-                    "step": float(step),
-                    "L_total": float(accum_log["L_total_sum"] / denom),
-                    "L_analysis": float(accum_log["L_analysis_sum"] / denom),
-                    "L_analysis_end": float(accum_log["L_analysis_end_sum"] / denom),
-                    "L_digits": float(accum_log["L_digits_sum"] / denom),
-                    "analysis_acc": float(accum_log["analysis_acc_sum"] / denom),
-                    "digit_exact_match": float(accum_log["digit_exact_match_sum"] / denom),
-                    "avg_z_len": float(accum_log["avg_z_len_sum"] / denom),
-                    "no_analysis_end_before_kmax": 0.0,
-                    "cf_enabled": float(bool(cfg.cf_enabled)),
-                    "cf_applied": float(bool(cf_applied)),
-                    "cf_loss": float(cf_loss_scalar),
-                    "cf_variant_truncate": float(cf_variant_name == "truncate"),
-                    "cf_variant_reverse": float(cf_variant_name == "reverse"),
-                    "cf_variant_random": float(cf_variant_name == "random"),
-                    "cf_mean_sym_kl": float(cf_mean_sym_kl),
-                    "cf_mean_entropy": float(cf_mean_entropy),
-                    "cf_eligible_count": float(cf_eligible_count),
-                    "cf_visible_z_mean": float(cf_visible_z_mean),
-                    "w_answer": float(accum_log["w_answer_sum"] / denom),
-                    "w_digits": float(accum_log["w_digits_sum"] / denom),
-                    "batch_seen": float(accum_log["batch_seen_sum"]),
-                    "batch_kept": float(accum_log["batch_kept_sum"]),
-                    "batch_dropped_invalid_after_clip": float(accum_log["batch_dropped_invalid_after_clip_sum"]),
-                    "total_dropped_invalid_after_clip": float(accum_log["total_dropped_invalid_after_clip_last"]),
-                }
+                denom = float(max(1, int(log_window_count)))
+                row = {"step": float(step)}
+                for k, v in log_window_sums.items():
+                    row[k] = float(v / denom)
+                grad_norm_denom = float(max(1, int(log_window_grad_norm_count)))
+                row["grad_norm"] = float(log_window_grad_norm_sum / grad_norm_denom)
+
                 _append_metrics_csv(metrics_csv, row)
+
+                cf_trunc_p = float(row.get("cf_variant_truncate", 0.0))
+                cf_rev_p = float(row.get("cf_variant_reverse", 0.0))
+                cf_rand_p = float(row.get("cf_variant_random", 0.0))
+                dominant_variant = "truncate"
+                if cf_rev_p >= cf_trunc_p and cf_rev_p >= cf_rand_p:
+                    dominant_variant = "reverse"
+                elif cf_rand_p >= cf_trunc_p and cf_rand_p >= cf_rev_p:
+                    dominant_variant = "random"
+
                 _log(
-                    "step={} L={:.4f} Lan={:.4f} Lae={:.4f} Ld={:.4f} an_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} clip_drop_batch={} clip_drop_total={} cf_on={} cf_applied={} cf_variant={} cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
+                    "step={} L={:.4f} Lz={:.4f} La={:.4f} Ld={:.4f} z_acc={:.3f} d_em={:.3f} z_len={:.2f} wa={:.4f} wd={:.4f} gnorm={:.4f} cf_on={:.2f} cf_applied={:.2f} cf_variant={} cf_variant_p(t/r/rnd)=({:.2f}/{:.2f}/{:.2f}) cf_loss={:.4f} cf_kl={:.4f} cf_H={:.4f}".format(
                         step,
                         row["L_total"],
-                        row["L_analysis"],
-                        row["L_analysis_end"],
+                        row["L_z"],
+                        row["L_answer"],
                         row["L_digits"],
-                        row["analysis_acc"],
+                        row["z_acc"],
                         row["digit_exact_match"],
                         row["avg_z_len"],
                         row["w_answer"],
                         row["w_digits"],
-                        int(row["batch_dropped_invalid_after_clip"]),
-                        int(row["total_dropped_invalid_after_clip"]),
-                        int(bool(cfg.cf_enabled)),
-                        int(bool(cf_applied)),
-                        cf_variant_name,
+                        row["grad_norm"],
+                        row["cf_enabled"],
+                        row["cf_applied"],
+                        dominant_variant,
+                        cf_trunc_p,
+                        cf_rev_p,
+                        cf_rand_p,
                         row["cf_loss"],
                         row["cf_mean_sym_kl"],
                         row["cf_mean_entropy"],
                     ),
                     log_path,
                 )
-            accum_log = {
-                "weight_sum": 0.0,
-                "L_total_sum": 0.0,
-                "L_analysis_sum": 0.0,
-                "L_analysis_end_sum": 0.0,
-                "L_digits_sum": 0.0,
-                "analysis_acc_sum": 0.0,
-                "digit_exact_match_sum": 0.0,
-                "avg_z_len_sum": 0.0,
-                "w_answer_sum": 0.0,
-                "w_digits_sum": 0.0,
-                "batch_seen_sum": 0.0,
-                "batch_kept_sum": 0.0,
-                "batch_dropped_invalid_after_clip_sum": 0.0,
-                "total_dropped_invalid_after_clip_last": 0.0,
-            }
+                log_window_sums = {}
+                log_window_count = 0
+                log_window_grad_norm_sum = 0.0
+                log_window_grad_norm_count = 0
 
             if step % int(cfg.save_interval_steps) == 0:
                 _save_last(
                     run_dir=run_dir,
                     model=model,
-                    row_adapter=row_adapter,
                     tokenizer=tokenizer,
-                    base_model_name=cfg.base_model_or_checkpoint,
                     cfg=cfg,
                     step=step,
                     best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
@@ -1292,101 +1157,85 @@ def train(cfg: SFTConfig) -> str:
                 p = _save_periodic(
                     run_dir=run_dir,
                     model=model,
-                    row_adapter=row_adapter,
                     tokenizer=tokenizer,
-                    base_model_name=cfg.base_model_or_checkpoint,
-                    cfg=cfg,
                     step=step,
                     keep_last_k=int(cfg.keep_last_k),
                 )
                 _log(f"saved periodic checkpoint {p}", log_path)
 
+            warmup_steps = int(cfg.warmup_steps)
+            eval_ready = (warmup_steps <= 0) or (step >= warmup_steps)
             eval_on_interval = step % int(cfg.eval_interval_steps) == 0
-            if eval_on_interval:
-                eval_model_path = _save_last(
-                    run_dir=run_dir,
-                    model=model,
-                    row_adapter=row_adapter,
-                    tokenizer=tokenizer,
-                    base_model_name=cfg.base_model_or_checkpoint,
-                    cfg=cfg,
-                    step=step,
-                    best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
-                )
-                eval_model_path = os.path.join(eval_model_path, "full_model")
-                model.train(False)
-                torch.cuda.empty_cache()
-                # metrics = evaluate_with_vllm(
-                #     model_path=eval_model_path,
-                #     records=eval_records,
-                #     pass_at_n=cfg.pass_at_n,
-                #     k_max=cfg.k_max,
-                #     temperature=cfg.temperature,
-                #     top_p=cfg.top_p,
-                #     vocab_size=cfg.vocab_size,
-                #     vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
-                #     output_jsonl_path=eval_jsonl,
-                # )
-
-                # gc.collect()
-                # torch.cuda.empty_cache()
-                # _log(
-                #     "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
-                #         step,
-                #         cfg.pass_at_n,
-                #         metrics.pass_at_n,
-                #         metrics.greedy_exact_match,
-                #         metrics.mean_z_len,
-                #         metrics.no_answer_before_kmax_rate,
-                #     ),
-                #     log_path,
-                # )
-                # _log(f"eval generations appended to {eval_jsonl}", log_path)
-                #
-                # _append_metrics_csv(
-                #     metrics_csv,
-                #     {
-                #         "step": float(step),
-                #         "pass_at_n": float(metrics.pass_at_n),
-                #         "greedy_exact_match": float(metrics.greedy_exact_match),
-                #         "eval_mean_z_len": float(metrics.mean_z_len),
-                #         "eval_no_analysis_end_before_kmax": float(metrics.no_answer_before_kmax_rate),
-                #     },
-                # )
-                #
-                # if cfg.save_best and metrics.pass_at_n > best_pass:
-                #     best_pass = metrics.pass_at_n
-                #     best_path = _save_best(
-                #         run_dir=run_dir,
-                #         model=model,
-                #         row_adapter=row_adapter,
-                #         tokenizer=tokenizer,
-                #         base_model_name=cfg.base_model_or_checkpoint,
-                #         cfg=cfg,
-                #         step=step,
-                #         metric=best_pass,
-                #     )
-                #     _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
+            # if eval_on_interval:
+            #     eval_model_path = _save_last(
+            #         run_dir=run_dir,
+            #         model=model,
+            #         tokenizer=tokenizer,
+            #         cfg=cfg,
+            #         step=step,
+            #         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
+            #     )
+            #     model.train(False)
+            #     torch.cuda.empty_cache()
+            #     metrics = evaluate_with_vllm(
+            #         model_path=eval_model_path,
+            #         records=eval_records,
+            #         pass_at_n=cfg.pass_at_n,
+            #         k_max=cfg.k_max,
+            #         temperature=cfg.temperature,
+            #         top_p=cfg.top_p,
+            #         vocab_size=cfg.vocab_size,
+            #         vllm_cuda_visible_devices=cfg.vllm_cuda_visible_devices,
+            #         output_jsonl_path=eval_jsonl,
+            #     )
+            #
+            #     gc.collect()
+            #     torch.cuda.empty_cache()
+            #     _log(
+            #         "eval step={} pass@{}={:.4f} greedy={:.4f} z_len={:.2f} no_answer={:.4f}".format(
+            #             step,
+            #             cfg.pass_at_n,
+            #             metrics.pass_at_n,
+            #             metrics.greedy_exact_match,
+            #             metrics.mean_z_len,
+            #             metrics.no_answer_before_kmax_rate,
+            #         ),
+            #         log_path,
+            #     )
+            #     _log(f"eval generations appended to {eval_jsonl}", log_path)
+            #
+            #     _append_metrics_csv(
+            #         metrics_csv,
+            #         {
+            #             "step": float(step),
+            #             "pass_at_n": float(metrics.pass_at_n),
+            #             "greedy_exact_match": float(metrics.greedy_exact_match),
+            #             "eval_mean_z_len": float(metrics.mean_z_len),
+            #             "eval_no_answer_before_kmax": float(metrics.no_answer_before_kmax_rate),
+            #         },
+            #     )
+            #
+            #     if cfg.save_best and metrics.pass_at_n > best_pass:
+            #         best_pass = metrics.pass_at_n
+            #         best_path = _save_best(
+            #             run_dir=run_dir,
+            #             model=model,
+            #             tokenizer=tokenizer,
+            #             step=step,
+            #             metric=best_pass,
+            #         )
+            #         _log(f"new best pass@{cfg.pass_at_n}={best_pass:.4f}; saved {best_path}", log_path)
 
     _save_last(
         run_dir=run_dir,
         model=model,
-        row_adapter=row_adapter,
         tokenizer=tokenizer,
-        base_model_name=cfg.base_model_or_checkpoint,
         cfg=cfg,
         step=step,
         best_pass_at_n=best_pass if best_pass > -math.inf else 0.0,
     )
     if cfg.save_ppo_init:
-        p = _save_ppo_init(
-            run_dir=run_dir,
-            model=model,
-            row_adapter=row_adapter,
-            tokenizer=tokenizer,
-            base_model_name=cfg.base_model_or_checkpoint,
-            cfg=cfg,
-        )
+        p = _save_ppo_init(run_dir=run_dir, model=model, tokenizer=tokenizer)
         _log(f"saved ppo_init snapshot at {p}", log_path)
 
     _log("training complete", log_path)
@@ -1395,7 +1244,7 @@ def train(cfg: SFTConfig) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase3 SFT over discrete latent Z-programs")
-    p.add_argument("--base_model_or_checkpoint", type=str, default="openai/gpt-oss-20b")
+    p.add_argument("--base_model_or_checkpoint", type=str, default="")
     p.add_argument("--train_dataset_name", type=str, default="")
     p.add_argument("--train_dataset_split", type=str, default="train")
     p.add_argument("--eval_dataset_name", type=str, default="")
@@ -1407,25 +1256,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--max_steps", type=int, default=10000)
+    p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_length", type=int, default=2048)
     p.add_argument("--torch_device", type=str, default="cuda:0")
-    p.add_argument("--attn_implementation", type=str, default="eager")
-    p.add_argument("--dequantize_mxfp4", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--force_bfloat16", action=argparse.BooleanOptionalAction, default=True)
-
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.0)
-    p.add_argument("--lora_bias", type=str, default="none")
-    p.add_argument("--lora_task_type", type=str, default="CAUSAL_LM")
-    p.add_argument("--lora_target_modules", type=str, default="all-linear")
-    p.add_argument("--lora_enable_moe_target_parameters", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument(
-        "--lora_moe_param_substrings",
-        type=str,
-        default="gate_up_proj,down_proj,up_proj,gate_proj,w1,w2,w3",
-    )
 
     p.add_argument("--z_label_smoothing", type=float, default=0.05)
     p.add_argument("--w_z", type=float, default=0.1)
@@ -1436,7 +1271,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start_weights_steps", type=int, default=500)
     p.add_argument("--goes_up_weights_steps", type=int, default=1500)
     p.add_argument("--cf_enabled", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--cf_every_n_steps", type=int, default=4)
+    p.add_argument("--cf_every_n_steps_early", type=int, default=1)
+    p.add_argument("--cf_every_n_steps_late", type=int, default=8)
+    p.add_argument("--cf_every_n_steps_switch_step", type=int, default=1500)
     p.add_argument("--cf_prob_tuple", type=str, default="0.5,0.25,0.25")
     p.add_argument("--cf_lambda", type=float, default=0.1)
     p.add_argument("--cf_kl_margin", type=float, default=0.5)
@@ -1458,6 +1295,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_last_k", type=int, default=3)
     p.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save_ppo_init", action="store_true")
+    p.add_argument("--curriculum_enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--curriculum_easy_start", type=float, default=0.9)
+    p.add_argument("--curriculum_easy_end", type=float, default=0.1)
 
     return p.parse_args()
 
@@ -1466,9 +1306,6 @@ def main() -> None:
     args = parse_args()
     cf_prob_tuple = _parse_prob_tuple(args.cf_prob_tuple)
     cf_trunc_range = _parse_range_tuple(args.cf_trunc_range)
-    lora_moe_substrings = tuple(
-        s.strip() for s in str(args.lora_moe_param_substrings).split(",") if s.strip()
-    )
     cfg = SFTConfig(
         base_model_or_checkpoint=args.base_model_or_checkpoint,
         train_dataset_name=args.train_dataset_name,
@@ -1481,20 +1318,11 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=float(args.max_grad_norm),
         max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
         max_length=args.max_length,
         torch_device=args.torch_device,
-        attn_implementation=args.attn_implementation,
-        dequantize_mxfp4=bool(args.dequantize_mxfp4),
-        force_bfloat16=bool(args.force_bfloat16),
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        lora_bias=args.lora_bias,
-        lora_task_type=args.lora_task_type,
-        lora_target_modules=args.lora_target_modules,
-        lora_enable_moe_target_parameters=bool(args.lora_enable_moe_target_parameters),
-        lora_moe_param_substrings=lora_moe_substrings,
         z_label_smoothing=args.z_label_smoothing,
         w_z=args.w_z,
         w_start_answer=args.w_start_answer,
@@ -1504,7 +1332,9 @@ def main() -> None:
         start_weights_steps=args.start_weights_steps,
         goes_up_weights_steps=args.goes_up_weights_steps,
         cf_enabled=bool(args.cf_enabled),
-        cf_every_n_steps=args.cf_every_n_steps,
+        cf_every_n_steps_early=int(args.cf_every_n_steps_early),
+        cf_every_n_steps_late=int(args.cf_every_n_steps_late),
+        cf_every_n_steps_switch_step=int(args.cf_every_n_steps_switch_step),
         cf_prob_tuple=cf_prob_tuple,
         cf_lambda=args.cf_lambda,
         cf_kl_margin=args.cf_kl_margin,
@@ -1524,6 +1354,9 @@ def main() -> None:
         keep_last_k=args.keep_last_k,
         save_best=bool(args.save_best),
         save_ppo_init=bool(args.save_ppo_init),
+        curriculum_enabled=bool(args.curriculum_enabled),
+        curriculum_easy_start=float(args.curriculum_easy_start),
+        curriculum_easy_end=float(args.curriculum_easy_end),
     )
     train(cfg)
 

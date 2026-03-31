@@ -1,6 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="VcsDirectoryMappings">
+    <mapping directory="$USER_HOME$/hiredscore/git/HSAccountSettings" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/HSConfiguration" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/Hackathon_recruiter_agent" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/application_insights" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/application_service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/brain" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/brain_agents" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/brain_mlops" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/brain_models_creation" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/candidate_parsing" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/cicd" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/company-db-api" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/config-resolver" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/data_access_service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/dotfiles" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/gimme" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/gitops" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/grading" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/hiring-navigator-agent" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/hs_analytics" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/integration" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/past_candidates" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/pdf_converter_service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/pipeline_celery_contracts" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/professions-nd-service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/professions-service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/recommendations-api" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/req_processor" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/screenit" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/scripts" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/skills-service" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/smith" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
   </component>
 </project>

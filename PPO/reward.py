@@ -67,6 +67,7 @@ def compute_reward(
     partial_scale: float,
     keep_prob: Sequence[float],
     length_penalty: float,
+    correct_length_discount: float,
     reward_if_max_len: float,
     num_generated_tokens: int,
     generator: Optional[torch.Generator],
@@ -85,6 +86,7 @@ def compute_reward(
             "correct_count": 0,
             "reward_partial": 0.0,
             "length_penalty": float(length_penalty),
+            "correct_length_discount": float(correct_length_discount),
             "reward_if_max_len": float(reward_if_max_len),
             "reward": float(reward_if_max_len),
             "reward_final": float(reward_if_max_len),
@@ -94,14 +96,14 @@ def compute_reward(
         raise ValueError("pred_digits must have length 5 when terminated_reason=answer_with_5_digits")
 
     exact_match = all(int(a) == int(b) for a, b in zip(pred_digits, true_digits))
-
+    length_reward = float(length_penalty) * float(num_generated_tokens)
     if exact_match:
         reward = 1.0
         partial = 1.0
         applied_mask = [1, 1, 1, 1, 1]
         applied_count = 5
         correct_count = 5
-        length_reward = 0.0
+        length_reward *= correct_length_discount
     else:
         applied_mask = sample_keep_mask(true_digits=true_digits, pred_digits=pred_digits, keep_prob=keep_prob, generator=generator)
         applied_count = int(sum(applied_mask))
@@ -112,7 +114,7 @@ def compute_reward(
             partial = float(partial_scale) * (float(correct_count) / float(applied_count))
         partial = max(0.0, min(1.0, partial))
         reward = partial
-        length_reward = float(length_penalty) * float(num_generated_tokens)
+
 
     # reward_final = max(0.0, float(reward) - float(length_penalty) * float(num_generated_tokens))
     # reward_final = float(reward) - float(length_penalty) * float(num_generated_tokens)
@@ -127,6 +129,7 @@ def compute_reward(
         "correct_count": int(correct_count),
         "reward_partial": float(partial),
         "length_penalty": float(length_penalty),
+        "correct_length_discount": float(correct_length_discount),
         "reward_if_max_len": float(reward_if_max_len),
         "reward": float(reward),
         "reward_final": float(reward_final),

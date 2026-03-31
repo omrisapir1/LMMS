@@ -7,8 +7,8 @@ from dataclasses import dataclass
 class CodebookConfig:
     input_dir: str = "omrisap/nvidia-math-vectorized"
     output_dir: str = "runs/codebook"
-    vocab_size: int = 64
-    dim: int = 1024
+    vocab_size: int = 512
+    dim: int = 1536
     batch_size: int = 128  # max sequences per step
     max_vectors_per_batch: int = 8_192
     epochs: int = 3
@@ -28,6 +28,7 @@ class CodebookConfig:
     export_quantize_chunk_size: int = 16_384
     log_interval: int = 5
     quantize_mode: str = "delta"
+    delete_input_files: bool = False
 
     # Fixed constants requested by the spec
     usage_laplace_alpha: float = 1.0
