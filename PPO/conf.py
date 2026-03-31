@@ -36,7 +36,7 @@ class RolloutConfig:
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
     vllm_tp_size: int = 1
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.5
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
