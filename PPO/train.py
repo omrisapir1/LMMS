@@ -2159,9 +2159,6 @@ def train(cfg: Config) -> None:
                 " | ".join(
                     [
                         f"update={update}",
-                        f"avg_rollouts_per_prompt={avg_rollouts_per_prompt_actual:.2f}",
-                        f"homogeneous_prompt_frac={homogeneous_prompt_frac:.4f}",
-                        f"mixed_prompt_frac={mixed_prompt_frac:.4f}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
                         f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",

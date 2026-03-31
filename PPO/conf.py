@@ -75,12 +75,12 @@ class PPOConfig:
     adv_norm_hybrid_alpha: float = 0.7
     adv_norm_use_global_for_homogeneous_prompts: bool = True
     value_warmup_steps: int = 25
-    value_warmup_lr: float = 3e-5
+    value_warmup_lr: float = 1e-6
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-5
+    lr: float = 3e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
