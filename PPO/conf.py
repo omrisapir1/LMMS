@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 
 MAX_TOKENS = 512
-BACH_SIZE = 32
+BACH_SIZE = 64
 
 @dataclass
 class ModelConfig:
@@ -67,7 +67,7 @@ class PPOConfig:
     ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 2
-    minibatch_size: int = 32
+    minibatch_size: int = 64
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
     value_warmup_steps: int = 50
@@ -81,7 +81,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 2
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 1000

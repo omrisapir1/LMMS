@@ -1923,37 +1923,34 @@ def train(cfg: Config) -> None:
             t_reward_sec = _get_reward_timing_acc()
             t_total_sec = time.perf_counter() - _t_update0
             active_lr = float(active_optimizer.param_groups[0]["lr"])
-            trainable_params_count = int(
-                sum(int(p.numel()) for p in list(model.parameters()) + list(value_head.parameters()) if p.requires_grad)
-            )
             _log(
                 " | ".join(
                     [
                         f"update={update}",
-                        f"value_warmup={1 if value_warmup_active else 0}",
                         f"train_mode={train_mode}",
                         f"lr={active_lr:.8g}",
-                        f"trainable_params={trainable_params_count}",
-                        f"episodes={len(trajectories)}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
-                        f"prompt_ids={unique_prompt_ids}",
-                        f"rollouts_per_prompt={avg_rollouts_per_prompt_actual:.2f}",
                         f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",
                         f"exact={exact_rate:.4f}",
                         f"answer_rate={answer_rate:.4f}",
                         f"avg_len={avg_len:.2f}",
                         f"entropy={ent_acc / denom:.4f}",
-                        f"kl={kl_acc / denom:.4f}",
-                        f"kl_penalty={kl_pen_acc / denom:.4f}",
+                        *(
+                            [f"kl={kl_acc / denom:.4f}", f"kl_penalty={kl_pen_acc / denom:.4f}"]
+                            if float(cfg.ppo.kl_coef) > 0.0
+                            else []
+                        ),
                         f"entropy_loss={ent_loss_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
-                        f"ce_loss={ce_acc / denom:.4f}",
-                        f"ce_examples={ce_examples_acc}",
+                        *(
+                            [f"ce_loss={ce_acc / denom:.4f}", f"ce_examples={ce_examples_acc}"]
+                            if bool(cfg.ppo.apply_ce)
+                            else []
+                        ),
                         f"explained_var={ev:.4f}",
-                        f"rollouts={rollout_path}",
                         f"t_sync={t_sync_sec:.3f}s",
                         f"t_rollout={t_rollout_sec:.3f}s",
                         f"t_reward={t_reward_sec:.3f}s",
