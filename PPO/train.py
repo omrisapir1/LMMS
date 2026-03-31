@@ -120,7 +120,9 @@ class Trajectory:
 
         self.returns = [float(self.reward_info["reward_final"])] * len(actions)
         self.advantages = [float(self.reward_info["reward_final"]) - float(v) for v in values_old]
-        self.advantages_norm = list(self.advantages)
+        self.advantages_norm_global: List[float] = []
+        self.advantages_norm_prompt: List[float] = []
+        self.advantages_norm: List[float] = []
 
 
 def _log(msg: str) -> None:
@@ -1128,13 +1130,30 @@ def _group_trajectories_by_prompt_id(trajectories: Sequence[Trajectory]) -> Dict
     return groups
 
 
+def _normalize_advantages_global(trajectories: Sequence[Trajectory]) -> None:
+    flat: List[float] = []
+    for t in trajectories:
+        flat.extend(t.advantages)
+    if not flat:
+        return
+
+    x = torch.tensor(flat, dtype=torch.float32)
+    mean = float(x.mean().item())
+    std = float(x.std(unbiased=False).item())
+    denom = max(std, 1e-8)
+
+    for t in trajectories:
+        t.advantages_norm_global = [(a - mean) / denom for a in t.advantages]
+        if len(t.advantages_norm_global) != len(t.advantages):
+            raise AssertionError("advantages_norm_global length must match advantages length")
+
+
 def _normalize_advantages_per_prompt(trajectories: Sequence[Trajectory]) -> None:
     groups = _group_trajectories_by_prompt_id(trajectories)
     for group in groups.values():
         flat: List[float] = []
         for t in group:
             flat.extend(t.advantages)
-
         if not flat:
             continue
 
@@ -1144,9 +1163,89 @@ def _normalize_advantages_per_prompt(trajectories: Sequence[Trajectory]) -> None
         denom = max(std, 1e-8)
 
         for t in group:
-            t.advantages_norm = [(a - mean) / denom for a in t.advantages]
+            t.advantages_norm_prompt = [(a - mean) / denom for a in t.advantages]
+            if len(t.advantages_norm_prompt) != len(t.advantages):
+                raise AssertionError("advantages_norm_prompt length must match advantages length")
+
+
+def _combine_advantages_hybrid(
+    trajectories: Sequence[Trajectory],
+    alpha: float,
+    use_global_for_homogeneous_prompts: bool,
+) -> None:
+    groups = _group_trajectories_by_prompt_id(trajectories)
+    alpha_f = float(alpha)
+    for group in groups.values():
+        rewards = [float(t.reward_info["reward_final"]) for t in group]
+        homogeneous = len(set(rewards)) <= 1
+        for t in group:
+            if len(t.advantages_norm_global) != len(t.advantages):
+                raise AssertionError("Hybrid mode requires advantages_norm_global before combine")
+            if len(t.advantages_norm_prompt) != len(t.advantages):
+                raise AssertionError("Hybrid mode requires advantages_norm_prompt before combine")
+
+            if homogeneous and bool(use_global_for_homogeneous_prompts):
+                t.advantages_norm = list(t.advantages_norm_global)
+            else:
+                t.advantages_norm = [
+                    alpha_f * ag + (1.0 - alpha_f) * ap
+                    for ag, ap in zip(t.advantages_norm_global, t.advantages_norm_prompt)
+                ]
             if len(t.advantages_norm) != len(t.advantages):
                 raise AssertionError("advantages_norm length must match advantages length")
+
+
+def _prepare_normalized_advantages(trajectories: Sequence[Trajectory], cfg: Config) -> None:
+    mode = str(cfg.ppo.adv_norm_mode).strip().lower()
+    normalize_enabled = bool(cfg.ppo.normalize_advantages)
+    if not normalize_enabled:
+        mode = "none"
+
+    for t in trajectories:
+        t.advantages_norm_global = []
+        t.advantages_norm_prompt = []
+        t.advantages_norm = []
+
+    if mode == "none":
+        for t in trajectories:
+            t.advantages_norm = list(t.advantages)
+    elif mode == "global":
+        _normalize_advantages_global(trajectories)
+        for t in trajectories:
+            t.advantages_norm = list(t.advantages_norm_global)
+    elif mode == "per_prompt":
+        _normalize_advantages_per_prompt(trajectories)
+        for t in trajectories:
+            t.advantages_norm = list(t.advantages_norm_prompt)
+    elif mode == "hybrid":
+        _normalize_advantages_global(trajectories)
+        _normalize_advantages_per_prompt(trajectories)
+        _combine_advantages_hybrid(
+            trajectories,
+            alpha=float(cfg.ppo.adv_norm_hybrid_alpha),
+            use_global_for_homogeneous_prompts=bool(cfg.ppo.adv_norm_use_global_for_homogeneous_prompts),
+        )
+    else:
+        raise ValueError(f"Unsupported ppo.adv_norm_mode={cfg.ppo.adv_norm_mode!r}")
+
+    for t in trajectories:
+        if len(t.advantages_norm) != len(t.advantages):
+            raise AssertionError("advantages_norm length must match advantages length")
+
+
+def _prompt_reward_homogeneity_stats(groups: Dict[int, List[Trajectory]]) -> Tuple[float, float]:
+    if not groups:
+        return 0.0, 0.0
+    homogeneous = 0
+    mixed = 0
+    for group in groups.values():
+        rewards = {float(t.reward_info["reward_final"]) for t in group}
+        if len(rewards) <= 1:
+            homogeneous += 1
+        else:
+            mixed += 1
+    total = max(len(groups), 1)
+    return float(homogeneous) / float(total), float(mixed) / float(total)
 
 
 def _traj_has_valid_ce_target(
@@ -1399,6 +1498,14 @@ def train(cfg: Config) -> None:
         raise ValueError(
             f"Unsupported ppo.ce_mode={cfg.ppo.ce_mode!r}; expected 'successful_traces' or 'random'"
         )
+    adv_norm_mode = str(cfg.ppo.adv_norm_mode).strip().lower()
+    if adv_norm_mode not in ("global", "per_prompt", "hybrid", "none"):
+        raise ValueError(
+            f"Unsupported ppo.adv_norm_mode={cfg.ppo.adv_norm_mode!r}; expected "
+            "'global', 'per_prompt', 'hybrid', or 'none'"
+        )
+    if float(cfg.ppo.adv_norm_hybrid_alpha) < 0.0 or float(cfg.ppo.adv_norm_hybrid_alpha) > 1.0:
+        raise ValueError("ppo.adv_norm_hybrid_alpha must be in [0, 1]")
     if float(cfg.ppo.batch_frac_to_apply_ce) < 0.0:
         raise ValueError("ppo.batch_frac_to_apply_ce must be >= 0")
     if int(cfg.rollout.rollouts_per_prompt) < 1:
@@ -1672,25 +1779,24 @@ def train(cfg: Config) -> None:
                 raise RuntimeError("No trajectories collected for PPO update")
 
             prompt_groups = _group_trajectories_by_prompt_id(trajectories)
-            for t in trajectories:
-                if len(t.advantages_norm) != len(t.advantages):
-                    raise AssertionError("advantages_norm length must match advantages length")
             unique_prompt_ids = len(prompt_groups)
             avg_rollouts_per_prompt_actual = float(len(trajectories)) / float(max(unique_prompt_ids, 1))
+            homogeneous_prompt_frac, mixed_prompt_frac = _prompt_reward_homogeneity_stats(prompt_groups)
+            _prepare_normalized_advantages(trajectories=trajectories, cfg=cfg)
             adv_var_per_prompt: List[float] = []
             for group in prompt_groups.values():
                 group_adv: List[float] = []
                 for traj in group:
-                    group_adv.extend(traj.advantages)
+                    group_adv.extend(traj.advantages_norm)
                 if group_adv:
                     x = torch.tensor(group_adv, dtype=torch.float32)
                     adv_var_per_prompt.append(float(x.var(unbiased=False).item()))
             avg_adv_var_per_prompt = (
                 float(sum(adv_var_per_prompt) / len(adv_var_per_prompt)) if adv_var_per_prompt else 0.0
             )
-
-            if cfg.ppo.normalize_advantages:
-                _normalize_advantages_per_prompt(trajectories)
+            adv_norm_mode_effective = (
+                str(cfg.ppo.adv_norm_mode).strip().lower() if bool(cfg.ppo.normalize_advantages) else "none"
+            )
 
             roll_rows: List[Dict[str, object]] = []
             for traj in trajectories:
@@ -1923,11 +2029,16 @@ def train(cfg: Config) -> None:
             denom = max(minibatch_count, 1)
             t_reward_sec = _get_reward_timing_acc()
             t_total_sec = time.perf_counter() - _t_update0
-            active_lr = float(active_optimizer.param_groups[0]["lr"])
             _log(
                 " | ".join(
                     [
                         f"update={update}",
+                        f"adv_norm_mode={adv_norm_mode_effective}",
+                        f"adv_norm_hybrid_alpha={float(cfg.ppo.adv_norm_hybrid_alpha):.3f}",
+                        f"unique_prompts={unique_prompt_ids}",
+                        f"avg_rollouts_per_prompt={avg_rollouts_per_prompt_actual:.2f}",
+                        f"homogeneous_prompt_frac={homogeneous_prompt_frac:.4f}",
+                        f"mixed_prompt_frac={mixed_prompt_frac:.4f}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
                         f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",

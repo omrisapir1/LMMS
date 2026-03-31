@@ -16,6 +16,7 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/PPO/conf.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/conf.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
