@@ -1,377 +1,182 @@
-# Phase 3 — Discrete Latent SFT (Z-Program Supervision)
+# SFT (Harmony + GPT-OSS-20B PEFT)
 
-This stage trains a pretrained decoder-only LLM to execute **discrete latent programs** learned from Phase2 (codebook) and to emit a correct 5-digit answer.
+This stage trains a Harmony-formatted SFT policy over discrete Z programs.
 
-This phase serves as the bridge:
+Current implementation uses:
+- Harmony chat-template serialization (tokenizer-native defaults)
+- Restricted supervised CE objective over analysis and final-digit regions
+- GPT-OSS-20B base loading with MXFP4 dequantized training path
+- PEFT/LoRA + row-local Z-token training (embedding + LM-head)
 
-Phase1 (Coconut continuous latent)  
-→ Phase2 (VQ Codebook → discrete Z)  
-→ Phase3 (SFT over Z programs)  
-→ Phase4 (PPO over Z actions)
-
-The model learns to generate:
-
-prompt + Z_17 Z_153 Z_8 <ANSWER> 01589
-
-with:
-
-- CE supervision on Z tokens
-- CE supervision on `<ANSWER>`
-- CE supervision on 5 digit tokens
-- No loss on the prompt
-
-This is **not RL**. This is supervised behavior cloning over discrete latent programs.
+This stage is supervised learning (not PPO).
 
 ---
 
-# 1) High-Level Objective
+## 1) Data Contract
 
-Given a training example:
-
-- `question`
-- `z_ids: List[int]`
-- `answer_digits: List[int]` (exactly 5 digits)
-
-We train the model autoregressively to predict:
-
-prompt → Z tokens → <ANSWER> → 5 digits
-
-with structured masking and weighted losses.
-
-This produces a policy that:
-
-- Knows how to generate latent programs
-- Knows how to stop with `<ANSWER>`
-- Knows how to produce 5-digit numeric answers
-- Is structurally constrained for PPO
-
----
-
-# 2) Dataset Contract
-
-## 2.1 Training Dataset (HF path provided)
-
-Each row must contain:
-
+Each training row must contain:
 - `question: str`
-- `z_ids: List[int]`  (length = K)
-- `answer_digits: List[int]` (length = 5)
+- `z_ids: List[int]` (indices into `<z_0> ... <z_{vocab_size-1}>`)
+- `answer_digits: List[int]` of length 5 (or `answer_int` in `[0, 99999]`)
 
-The dataset is the output of Phase2 export.
-
-## 2.2 Evaluation Dataset
-
-Separate HF path.
-
-Used for pass@N evaluation via vLLM.
+`answer_digits` are always interpreted as exactly 5 digits.
 
 ---
 
-# 3) Tokenization Contract
+## 2) Harmony Sequence Shape
 
-## 3.1 Required Tokens
+Examples are built through `tokenizer.apply_chat_template(...)` with assistant `thinking` + `content` structure, conceptually:
 
-We must add:
+- system (tokenizer default)
+- user question
+- assistant `analysis` channel containing Z tokens, closed by one analysis `<|end|>`
+- assistant `final` channel containing exactly 5 digit tokens
 
-<z_0> ... <z_{V-1}>
+Supervision is token-class based:
+- `TARGET_IGNORE`
+- `TARGET_ANALYSIS`
+- `TARGET_ANALYSIS_END`
+- `TARGET_DIGIT`
 
-Where:
-
-- `V` = vocab_size from CodebookConfig
-- V is configurable (since multiple codebooks exist)
-
-`<ANSWER>` already exists from Phase1.
-
-## 3.2 Tokenizer Requirements
-
-- Each `<z_i>` must tokenize to **exactly one token**
-- `<ANSWER>` must tokenize to one token
-- Digits `"0".."9"` must be single tokens
-
-After adding Z tokens:
-
-```python
-tokenizer.add_tokens(z_tokens)
-model.resize_token_embeddings(len(tokenizer))
-```
+Only one specific analysis-closing `<|end|>` is supervised (not all `<|end|>` tokens globally).
 
 ---
 
-# 4) Model Modifications
+## 3) Supervision / Loss Regions
 
-## 4.1 Embedding Matrix
+No CE loss on:
+- structural prompt/header tokens
+- final structural tail tokens (for example `<|return|>`)
 
-New rows added for:
+Restricted CE on analysis:
+- all `TARGET_ANALYSIS` positions
+- the single `TARGET_ANALYSIS_END` position
+- allowed ids: `{z_token_ids} ∪ {analysis_end_token_id}`
 
-- `<z_0> ... <z_{V-1}>`
+Restricted CE on final answer:
+- exactly 5 `TARGET_DIGIT` positions
+- allowed ids: `{digit_token_ids for 0..9}`
 
-## 4.2 LM Head
+Total weighted loss:
+- `L_total = w_z * L_analysis + w_answer * L_analysis_end + w_digits * L_digits`
 
-LM head is **NOT tied** to embeddings.
-
-Therefore:
-
-- New rows must also be added to `lm_head.weight`
-
----
-
-# 5) Warmup Phase
-
-Before full SFT, perform a warmup phase.
-
-## 5.1 Goal
-
-Train only the newly added token rows:
-
-- embedding rows for Z tokens
-- lm_head rows for Z tokens
-
-All other parameters remain frozen.
-
-## 5.2 Config Parameter
-
-```
-warmup_steps: int
-```
-
-During warmup:
-
-- Freeze all parameters
-- Unfreeze only:
-  - `embedding.weight[z_token_ids]`
-  - `lm_head.weight[z_token_ids]`
-
-After `warmup_steps`, unfreeze full model.
+Counterfactual regularizer is also applied per config (truncate/reverse/random variants).
 
 ---
 
-# 6) Sequence Construction
+## 4) Digit Tokenization Contract
 
-For each example:
+The pipeline enforces:
+- each digit `"0" ... "9"` maps to exactly one token id
+- final answer supervision always uses exactly 5 digit-token positions
 
-```
-input = prompt + Z tokens + <ANSWER> + 5 digits
-```
-
-Example:
-
-```
-<system+user prompt>
-<z_17> <z_153> <z_8> <ANSWER> 0 1 5 8 9
-```
+Important: the code does not rely on tokenizing a raw string like `"00006"` as one chunk.
 
 ---
 
-# 7) Two-Phase Restricted Logits Masking
+## 5) Clipping Safety (Fail-Closed)
 
-Restricted masking is applied:
+After max-length clipping, an example is kept only if it still has:
+- exactly one supervised analysis-end position
+- exactly five supervised digit positions
 
-- During training forward pass
-- During evaluation generation
+Otherwise it is dropped.
 
-## 7.1 Z Phase
+If an entire collated batch becomes invalid after clipping, training raises an error instead of continuing with corrupted supervision.
 
-While generating Z tokens and `<ANSWER>`:
-
-Allowed tokens:
-
-```
-{Z tokens} ∪ {<ANSWER>}
-```
-
-All other tokens must be masked to `-inf`.
-
-Digits are NOT allowed before `<ANSWER>`.
-
-## 7.2 Digit Phase
-
-After `<ANSWER>` is emitted:
-
-Allowed tokens:
-
-```
-{"0".."9"}
-```
-
-No Z tokens allowed.
-
-Exactly 5 digits are generated.
+Collator emits clipping-drop stats (batch and cumulative), which are logged in training metrics.
 
 ---
 
-# 8) Loss Definition
+## 6) Model/Training Setup
 
-Loss is computed only on:
+### 6.1 Base Model Loading
 
-- Z tokens
-- `<ANSWER>` token
-- 5 digit tokens
+Current defaults target GPT-OSS-20B:
+- `base_model_or_checkpoint = "openai/gpt-oss-20b"`
+- `Mxfp4Config(dequantize=True)`
+- `torch_dtype=torch.bfloat16` (configurable)
+- `attn_implementation="eager"`
+- `use_cache=False`
 
-Prompt tokens are fully masked.
+### 6.2 PEFT/LoRA
 
-## 8.1 Loss Weights
+LoRA is attached via PEFT with:
+- `target_modules="all-linear"`
+- optional MoE-aware `target_parameters` discovery from expert parameter names
 
-```
-w_z = 0.1
-w_answer = 0.5
-w_digits = 1.0
-```
+### 6.3 Row-Local Z Training (True Row-Only Optimizer State)
 
-These are configurable.
+In addition to LoRA, the code trains compact row-local parameters for Z rows only:
+- `embedding_row_deltas: [num_z, hidden_dim]`
+- `lm_head_row_deltas: [num_z, hidden_dim]`
 
-## 8.2 Z Label Smoothing
+`num_z = cfg.vocab_size`, corresponding to `<z_0> ... <z_{num_z-1}>`.
 
-Apply label smoothing only to Z tokens:
+Base embedding/lm_head full tensors remain frozen and are not optimizer parameters.
 
-```
-z_label_smoothing = 0.05
-```
+Forward path applies row deltas by:
+- adding embedding delta at input positions whose token id is in Z ids
+- adding Z-column logits correction using final LM-head input activations
 
-Digit tokens use standard CE (no smoothing).
-
-## 8.3 Total Loss
-
-Let:
-
-- `L_z` = CE over Z tokens
-- `L_answer` = CE over `<ANSWER>`
-- `L_digits` = CE over 5 digits
-
-Then:
-
-```
-L_total = w_z * L_z
-        + w_answer * L_answer
-        + w_digits * L_digits
-```
+Optimizer includes only:
+- LoRA trainables
+- `embedding_row_deltas`
+- `lm_head_row_deltas`
 
 ---
 
-# 9) Training Forward Masking (Important)
+## 7) Startup Diagnostics
 
-Restricted logits masking is applied during forward pass.
+At startup, training prints once:
+- one regular example from a real collated batch
+- one counterfactual example (deterministic truncate variant)
 
-This ensures:
+Each section prints decoded text, token strings, ids, and supervision metadata to verify sequence construction.
 
-- Model cannot allocate probability to illegal tokens
-- Model respects grammar
-- PPO transition is smooth
-
-This is mandatory.
-
----
-
-# 10) Evaluation Protocol
-
-Evaluation uses vLLM.
-
-## 10.1 Generation
-
-For each prompt:
-
-1. Generate tokens with restricted mask:
-   - Only Z tokens + `<ANSWER>`
-2. Stop when `<ANSWER>` is emitted OR when `Kmax` reached.
-3. After `<ANSWER>`, allow only digit tokens.
-4. Generate exactly 5 digits.
-
-## 10.2 pass@N Metric
-
-For each question:
-
-- Sample `N` solutions (e.g. 8, 16)
-- Compute whether at least one solution matches ground-truth digits
-
-Metric:
-
-```
-pass@N = fraction of questions with ≥1 correct solution
-```
-
-We do NOT use greedy-only accuracy as primary metric.
+Training logs also report:
+- total/trainable parameter counts and percentage
+- LoRA trainable count
+- row-local embedding/lm-head parameter counts
+- clipping-drop counters
 
 ---
 
-# 11) Config Parameters
+## 8) Checkpointing / Export
 
-Example SFT config:
+Saved artifacts include:
+- tokenizer
+- PEFT adapter
+- row state file: `row_state.pt`
 
-```python
-vocab_size: int
-warmup_steps: int
-z_label_smoothing: float = 0.05
+`row_state.pt` stores **full effective trained Z rows** (not just deltas):
+- `embedding_rows_effective`
+- `lm_head_rows_effective`
+- `z_token_ids`
 
-w_z: float = 0.1
-w_answer: float = 0.5
-w_digits: float = 1.0
+Merged export path:
+1. load base model
+2. resize embeddings to tokenizer size
+3. load + merge LoRA adapter
+4. overwrite Z rows directly with saved effective rows
 
-eval_interval_steps: int
-pass_at_n: int
-k_max: int
-```
-
----
-
-# 12) Metrics to Log
-
-During training:
-
-- `L_total`
-- `L_z`
-- `L_answer`
-- `L_digits`
-- Z token accuracy
-- Digit exact match accuracy
-- Average Z length
-- Rate of “no `<ANSWER>` before Kmax”
-
-During eval:
-
-- pass@N
-- Greedy exact match (secondary)
-- Distribution of generated Z lengths
+This is designed to make Z-row reconstruction faithful.
 
 ---
 
-# 13) Why This Is the Correct Bridge to PPO
+## 9) Key Config Fields
 
-After SFT:
-
-- Z tokens represent discrete actions
-- `<ANSWER>` represents stop action
-- Model already trained to respect grammar
-- Digit head trained to map latent program to final answer
-
-PPO will:
-
-- Replace CE objective
-- Use digit correctness reward
-- Adjust Z policy for better reward
-- Potentially shorten programs
-
-Because masking and grammar are already enforced in SFT,
-PPO only needs to optimize action selection, not structure.
+Main knobs in `SFT/config.py`:
+- data/training: `vocab_size`, `batch_size`, `max_steps`, `max_length`, `learning_rate`
+- objective: `w_z`, `w_start_answer`, `w_end_answer`, `w_start_digits`, `w_end_digits`, `z_label_smoothing`
+- counterfactual: `cf_enabled`, `cf_every_n_steps`, `cf_lambda`, `cf_prob_tuple`, `cf_trunc_range`
+- GPT-OSS loading: `dequantize_mxfp4`, `force_bfloat16`, `attn_implementation`
+- LoRA: `lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules`, MoE targeting fields
+- export: `save_merged_for_eval`
 
 ---
 
-# 14) Failure Modes to Watch
+## 10) Notes
 
-1. Z collapse (low entropy)
-2. Model emits digits before `<ANSWER>` (masking bug)
-3. Model fails to emit `<ANSWER>`
-4. Z loss dominates digit loss (wrong weights)
-5. Overfitting to teacher Z sequences (too high `w_z`)
-
----
-
-# 15) Final Summary
-
-Phase 3 (SFT over discrete Z programs):
-
-- Converts discrete codebook latents into executable programs
-- Teaches stop behavior
-- Supervises final answer digits
-- Enforces strict structural grammar
-- Prepares policy for PPO optimization
-
-This phase is purely supervised and forms the stable initialization for RL fine-tuning.
+- This README reflects the current SFT code path in `SFT/train.py`, `SFT/dataset.py`, and `SFT/losses.py`.
+- PPO integration is out of scope for this stage.
