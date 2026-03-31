@@ -28,8 +28,8 @@ class DataConfig:
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     max_new_tokens: int = MAX_TOKENS
-    temperature: float = 1.3
-    top_p: float = 0.98
+    temperature: float = 1.0
+    top_p: float = 0.95
     digit_greedy: bool = True
     action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
     vllm_enabled: bool = True
@@ -67,7 +67,7 @@ class PPOConfig:
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
-    ppo_epochs: int = 2
+    ppo_epochs: int = 1
     minibatch_size: int = 64
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
@@ -80,7 +80,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 5e-7
+    lr: float = 3e-6
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8

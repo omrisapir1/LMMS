@@ -530,7 +530,7 @@ class VLLMRolloutEngine:
             max_tokens=int(max_new_tokens),
             temperature=float(temperature),
             top_p=float(top_p),
-            greedy=True,
+            greedy=False,
             stop_on_answer=True,
         )
 
