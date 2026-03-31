@@ -59,7 +59,7 @@ class RewardConfig:
 @dataclass
 class PPOConfig:
     clip_range: float = 0.2
-    c_v: float = 0.5
+    c_v: float = 0.25
     c_ent: float = 0.000
     kl_coef: float = 0.00
     apply_ce: bool = False
@@ -75,12 +75,12 @@ class PPOConfig:
     adv_norm_hybrid_alpha: float = 0.7
     adv_norm_use_global_for_homogeneous_prompts: bool = True
     value_warmup_steps: int = 25
-    value_warmup_lr: float = 1e-5
+    value_warmup_lr: float = 3e-5
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-6
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8

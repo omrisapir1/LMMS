@@ -2159,9 +2159,6 @@ def train(cfg: Config) -> None:
                 " | ".join(
                     [
                         f"update={update}",
-                        f"adv_norm_mode={adv_norm_mode_effective}",
-                        f"adv_norm_hybrid_alpha={float(cfg.ppo.adv_norm_hybrid_alpha):.3f}",
-                        f"unique_prompts={unique_prompt_ids}",
                         f"avg_rollouts_per_prompt={avg_rollouts_per_prompt_actual:.2f}",
                         f"homogeneous_prompt_frac={homogeneous_prompt_frac:.4f}",
                         f"mixed_prompt_frac={mixed_prompt_frac:.4f}",
