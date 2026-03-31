@@ -70,7 +70,7 @@ class PPOConfig:
     minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
-    value_warmup_steps: int = 100
+    value_warmup_steps: int = 50
     value_warmup_lr: float = 1e-5
 
 
