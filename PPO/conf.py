@@ -68,7 +68,7 @@ class PPOConfig:
     ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 1
-    minibatch_size: int = 64
+    minibatch_size: int = 32
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
     adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
@@ -85,7 +85,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 2
+    grad_accum_steps: int = 4
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 1000
