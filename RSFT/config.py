@@ -24,8 +24,8 @@ class DataConfig:
 @dataclass
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
-    vllm_batch_size: int = 64
-    rollouts_per_prompt: int = 8
+    vllm_batch_size: int = 1
+    rollouts_per_prompt: int = 1
     max_new_tokens: int = 512
     temperature: float = 1.2
     top_p: float = 0.95
