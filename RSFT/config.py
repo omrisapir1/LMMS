@@ -43,7 +43,7 @@ class RolloutConfig:
 
 @dataclass
 class TrainConfig:
-    train_batch_size: int = 4
+    train_batch_size: int = 2
     lr: float = 4e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
