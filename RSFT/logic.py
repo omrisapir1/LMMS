@@ -102,7 +102,7 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
     for cand in candidates:
         if not exact_digit_match(cand.pred_digits, cand.true_digits):
             continue
-        if best is None or len(cand.z_token_ids) < len(best.z_token_ids):
+        if best is None or len(cand.z_token_ids) > len(best.z_token_ids):
             best = cand
     if best is None:
         return None
