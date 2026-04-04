@@ -33,7 +33,7 @@ class RolloutConfig:
     repetition_penalty: float = 1.05
     digit_greedy: bool = False
     vllm_tp_size: int = 1
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.25
     vllm_seed: Optional[int] = None
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
