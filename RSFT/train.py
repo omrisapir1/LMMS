@@ -233,7 +233,7 @@ def _make_rollout_engine(
         engine_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
         engine_kwargs.setdefault("tensor_parallel_size", int(cfg.rollout.vllm_tp_size))
         engine_kwargs.setdefault("gpu_memory_utilization", float(cfg.rollout.gpu_memory_utilization))
-        engine_kwargs.setdefault("cuda_visible_devices", str(cfg.rollout.vllm_cuda_visible_devices))
+        # engine_kwargs.setdefault("cuda_visible_devices", str(cfg.rollout.vllm_cuda_visible_devices))
         return VLLMRolloutEngine(
             init_ckpt=str(cfg.model.init_ckpt),
             tokenizer=tokenizer,
