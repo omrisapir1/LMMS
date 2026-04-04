@@ -94,6 +94,7 @@ class HFRolloutEngine:
         repetition_penalty: float,
         greedy: bool,
         eos_token_id: Optional[int],
+        num_return_sequences: int = 1,
     ) -> List[List[int]]:
         if self._model is None:
             raise RuntimeError("HF rollout model is not set; call maybe_sync_from_torch first")
@@ -133,6 +134,7 @@ class HFRolloutEngine:
             "do_sample": bool(do_sample),
             "pad_token_id": int(pad_token_id),
             "eos_token_id": None if eos_token_id is None else int(eos_token_id),
+            "num_return_sequences": int(num_return_sequences),
         }
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
@@ -151,7 +153,8 @@ class HFRolloutEngine:
         out_cpu = out.detach().to("cpu")
         prompt_len = int(inpt.shape[1])
         rows: List[List[int]] = []
-        for i in range(batch_size):
+        total_rows = int(out_cpu.shape[0])
+        for i in range(total_rows):
             full = out_cpu[i].tolist()
             gen = [int(x) for x in full[prompt_len:]]
             rows.append(gen)
@@ -162,6 +165,7 @@ class HFRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         max_new_tokens: int,
         temperature: float,
         top_p: float,
@@ -180,6 +184,7 @@ class HFRolloutEngine:
             try:
                 with torch.no_grad():
                     z_allowed = sorted(set(int(x) for x in self.z_allowed_token_ids) | {int(self.answer_token_id)})
+                    n = max(1, int(num_samples_per_prompt))
                     gens = self._run_generate_batch(
                         input_ids_rows=inputs,
                         allowed_token_ids=z_allowed,
@@ -191,6 +196,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=int(self.answer_token_id),
+                        num_return_sequences=n,
                     )
                     for gen in gens:
                         ended_on_answer = len(gen) > 0 and int(gen[-1]) == int(self.answer_token_id)

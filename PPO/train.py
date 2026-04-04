@@ -1112,6 +1112,7 @@ def _collect_rollouts_vllm_batch(
     tokenizer,
     vllm_engine: Any,
     prepared: Sequence[Dict[str, object]],
+    rollouts_per_prompt: int,
     cfg: Config,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
@@ -1120,16 +1121,26 @@ def _collect_rollouts_vllm_batch(
     reward_rng: torch.Generator,
     logger,
 ) -> List[Trajectory]:
+    if len(prepared) == 0:
+        return []
+    num_samples_per_prompt = max(1, int(rollouts_per_prompt))
     supports_token_prompts = vllm_engine.supports_prompt_token_ids()
     prompt_texts = [str(x["prompt_text"]) for x in prepared]
     prompt_ids_batch = [list(map(int, x["prompt_ids"])) for x in prepared]
     z_gen_rows = vllm_engine.generate_z(
         prompts=prompt_texts,
         prompt_token_ids=prompt_ids_batch if supports_token_prompts else None,
+        num_samples_per_prompt=num_samples_per_prompt,
         max_new_tokens=cfg.rollout.max_new_tokens,
         temperature=cfg.rollout.temperature,
         top_p=cfg.rollout.top_p,
     )
+    expected_rows = len(prepared) * int(num_samples_per_prompt)
+    if len(z_gen_rows) != expected_rows:
+        raise RuntimeError(
+            f"vLLM generate_z returned {len(z_gen_rows)} rows, expected {expected_rows} "
+            f"(batch={len(prepared)} n={num_samples_per_prompt})"
+        )
 
     with_answer_idx: List[int] = []
     z_prefix_by_idx: Dict[int, List[int]] = {}
@@ -1138,6 +1149,8 @@ def _collect_rollouts_vllm_batch(
 
     logged_example = False
     for i, row in enumerate(z_gen_rows):
+        base_idx = i // int(num_samples_per_prompt)
+        base_item = prepared[base_idx]
         seq_raw = [int(x) for x in list(row.get("token_ids", []))][: int(cfg.rollout.max_new_tokens)]
         stop_reason = row.get("stop_reason")
         finish_reason = row.get("finish_reason")
@@ -1166,9 +1179,9 @@ def _collect_rollouts_vllm_batch(
         if has_answer:
             z_prefix_by_idx[i] = z_prefix
             with_answer_idx.append(i)
-            digit_prompt_ids = list(map(int, prepared[i]["prompt_ids"])) + z_prefix + [int(answer_token_id)]
+            digit_prompt_ids = list(map(int, base_item["prompt_ids"])) + z_prefix + [int(answer_token_id)]
             assert digit_prompt_ids[-1] == int(answer_token_id)
-            prepared_prompt_ids = list(map(int, prepared[i]["prompt_ids"]))
+            prepared_prompt_ids = list(map(int, base_item["prompt_ids"]))
             if int(answer_token_id) not in prepared_prompt_ids:
                 assert int(answer_token_id) not in digit_prompt_ids[:-1]
             digit_prompt_ids_batch.append(digit_prompt_ids)
@@ -1203,7 +1216,10 @@ def _collect_rollouts_vllm_batch(
             digit_map[idx] = digits
 
     trajectories: List[Trajectory] = []
-    for i, item in enumerate(prepared):
+    for i in range(len(z_gen_rows)):
+        base_idx = i // int(num_samples_per_prompt)
+        rollout_idx = i % int(num_samples_per_prompt)
+        item = prepared[base_idx]
         prompt_ids = list(item["prompt_ids"])
         prompt_attn = list(item["prompt_attention_mask"])
         z_prefix = z_prefix_by_idx[i]
@@ -1235,7 +1251,7 @@ def _collect_rollouts_vllm_batch(
             action_scope=cfg.rollout.action_scope,
             reward_cfg=cfg.reward,
             reward_rng=reward_rng,
-            sample_id=str(item["sample_id"]),
+            sample_id=f"{str(item['sample_id_base'])}_r{rollout_idx}",
             z_allowed_t=z_allowed_t,
             digit_allowed_t=digit_allowed_t,
             temperature=cfg.rollout.temperature,
@@ -1845,21 +1861,14 @@ def train(cfg: Config) -> None:
                 if not prepared:
                     continue
 
-                prepared_rollouts: List[Dict[str, object]] = []
-                for item in prepared:
-                    sample_id_base = str(item["sample_id_base"])
-                    for rollout_idx in range(rollouts_per_prompt):
-                        expanded = dict(item)
-                        expanded["sample_id"] = f"{sample_id_base}_r{rollout_idx}"
-                        prepared_rollouts.append(expanded)
-
                 if vllm_engine is not None:
                     batch_trajs = _collect_rollouts_vllm_batch(
                         model=model,
                         value_head=value_head,
                         tokenizer=tokenizer,
                         vllm_engine=vllm_engine,
-                        prepared=prepared_rollouts,
+                        prepared=prepared,
+                        rollouts_per_prompt=rollouts_per_prompt,
                         cfg=cfg,
                         z_allowed_t=z_allowed_t,
                         digit_allowed_t=digit_allowed_t,
@@ -1869,6 +1878,13 @@ def train(cfg: Config) -> None:
                         logger=_log,
                     )
                 else:
+                    prepared_rollouts: List[Dict[str, object]] = []
+                    for item in prepared:
+                        sample_id_base = str(item["sample_id_base"])
+                        for rollout_idx in range(rollouts_per_prompt):
+                            expanded = dict(item)
+                            expanded["sample_id"] = f"{sample_id_base}_r{rollout_idx}"
+                            prepared_rollouts.append(expanded)
                     batch_trajs = [
                         _rollout_one_torch(
                             model=model,

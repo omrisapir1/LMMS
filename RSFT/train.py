@@ -537,13 +537,9 @@ def train(cfg: Optional[Config] = None) -> str:
                     break
 
                 prompts_sampled += len(prompt_batch)
-                prompt_ids_flat: List[List[int]] = []
-                for ex in prompt_batch:
-                    for _ in range(int(cfg.rollout.rollouts_per_prompt)):
-                        prompt_ids_flat.append(list(ex.prompt_ids))
-
                 z_rows = engine.generate_z(
-                    prompt_token_ids=prompt_ids_flat,
+                    prompt_token_ids=[list(ex.prompt_ids) for ex in prompt_batch],
+                    num_samples_per_prompt=int(cfg.rollout.rollouts_per_prompt),
                     max_new_tokens=int(cfg.rollout.max_new_tokens),
                     temperature=float(cfg.rollout.temperature),
                     top_p=float(cfg.rollout.top_p),

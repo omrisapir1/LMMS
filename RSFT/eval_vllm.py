@@ -1,12 +1,3 @@
-
-
-from typing import Dict, List, Sequence
-
-from RSFT.config import Config
-from RSFT.dataset import PromptExample
-from RSFT.logic import decode_digit_tokens, exact_digit_match, extract_z_before_answer_from_row, mean_or_zero
-
-
 from typing import Dict, List, Sequence
 
 from RSFT.config import Config
@@ -67,9 +58,9 @@ def evaluate_with_rollout_engine(
 
         # pass@N and no-answer metrics
         n = int(cfg.eval.pass_at_n)
-        prompt_batch = [list(ex.prompt_ids) for _ in range(n)]
         z_rows = engine.generate_z(
-            prompt_token_ids=prompt_batch,
+            prompt_token_ids=[list(ex.prompt_ids)],
+            num_samples_per_prompt=n,
             max_new_tokens=int(cfg.eval.k_max),
             temperature=float(cfg.rollout.temperature),
             top_p=float(cfg.rollout.top_p),

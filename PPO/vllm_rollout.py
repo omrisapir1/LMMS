@@ -330,6 +330,7 @@ class VLLMRolloutEngine:
         min_p: float,
         repetition_penalty: float,
         greedy: bool,
+        n: int = 1,
         min_tokens: Optional[int] = None,
         stop_on_answer: bool = False,
     ):
@@ -342,7 +343,7 @@ class VLLMRolloutEngine:
             "top_p": 1.0 if greedy else float(top_p),
             "min_p": 0.0 if greedy else float(min_p),
             "repetition_penalty": float(repetition_penalty),
-            "n": 1,
+            "n": int(n),
         }
         if min_tokens is not None:
             kwargs["min_tokens"] = int(min_tokens)
@@ -523,6 +524,7 @@ class VLLMRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         max_new_tokens: int,
         temperature: float,
         top_p: float,
@@ -532,6 +534,7 @@ class VLLMRolloutEngine:
     ) -> List[Dict[str, object]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
+        n = max(1, int(num_samples_per_prompt))
         sp = self._build_sampling_params(
             allowed_token_ids=self.z_allowed_token_ids,
             max_tokens=int(max_new_tokens),
@@ -540,6 +543,7 @@ class VLLMRolloutEngine:
             min_p=float(min_p),
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
+            n=n,
             stop_on_answer=True,
         )
 
@@ -554,14 +558,14 @@ class VLLMRolloutEngine:
 
         rows: List[Dict[str, object]] = []
         for o in outs:
-            out0 = o.outputs[0]
-            rows.append(
-                {
-                    "token_ids": list(getattr(out0, "token_ids", []) or []),
-                    "stop_reason": getattr(out0, "stop_reason", None),
-                    "finish_reason": getattr(out0, "finish_reason", None),
-                }
-            )
+            for out_j in list(getattr(o, "outputs", []) or []):
+                rows.append(
+                    {
+                        "token_ids": list(getattr(out_j, "token_ids", []) or []),
+                        "stop_reason": getattr(out_j, "stop_reason", None),
+                        "finish_reason": getattr(out_j, "finish_reason", None),
+                    }
+                )
         return rows
 
     def generate_digits(
