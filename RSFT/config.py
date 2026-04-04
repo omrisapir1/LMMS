@@ -33,11 +33,11 @@ class RolloutConfig:
     repetition_penalty: float = 1.05
     digit_greedy: bool = False
     vllm_tp_size: int = 1
-    gpu_memory_utilization: float = 0.95
+    gpu_memory_utilization: float = 0.5
     vllm_seed: Optional[int] = None
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
-    vllm_cuda_visible_devices: str = "1"
+    vllm_cuda_visible_devices: str = "0"
     sync_every_n_steps: int = 1
 
 
@@ -67,7 +67,7 @@ class LossConfig:
 @dataclass
 class EvalConfig:
     eval_every_steps: int = 500
-    eval_at_start: bool = True
+    eval_at_start: bool = False
     pass_at_n: int = 16
     k_max: int = 512
     max_eval_questions: int = 1024
