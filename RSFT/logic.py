@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -98,14 +99,10 @@ def exact_digit_match(pred_digits: Sequence[int], true_digits: Sequence[int]) ->
 
 
 def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[AcceptedExample]:
-    best: Optional[RolloutCandidate] = None
-    for cand in candidates:
-        if not exact_digit_match(cand.pred_digits, cand.true_digits):
-            continue
-        if best is None or len(cand.z_token_ids) > len(best.z_token_ids):
-            best = cand
-    if best is None:
+    valid = [cand for cand in candidates if exact_digit_match(cand.pred_digits, cand.true_digits)]
+    if not valid:
         return None
+    best = random.choice(valid)
     return AcceptedExample(
         prompt_idx=int(best.prompt_idx),
         rollout_idx=int(best.rollout_idx),
