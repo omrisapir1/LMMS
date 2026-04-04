@@ -13,7 +13,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "omrisap/LMMS_PPO_200K"
+    dataset_name: str = "omrisap/numina_openmath"
     train_split: str = "train"
     eval_split: str = "eval"
     question_field: str = "question"

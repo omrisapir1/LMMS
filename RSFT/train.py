@@ -509,6 +509,7 @@ def train(cfg: Optional[Config] = None) -> str:
         )
 
     try:
+        printed_full_generation = False
         for step in range(1, int(cfg.train.max_steps) + 1):
             t_step_start = time.perf_counter()
             accepted_rows: List[Dict[str, List[int]]] = []
@@ -547,6 +548,24 @@ def train(cfg: Optional[Config] = None) -> str:
                     repetition_penalty=float(cfg.rollout.repetition_penalty),
                 )
                 total_rollouts += len(z_rows)
+                if (not printed_full_generation) and len(prompt_batch) > 0 and len(z_rows) > 0:
+                    sample_prompt_ids = list(prompt_batch[0].prompt_ids)
+                    sample_gen_ids = [int(x) for x in list(z_rows[0].get("token_ids", []))]
+                    sample_prompt_text = tokenizer.decode(
+                        sample_prompt_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    sample_gen_text = tokenizer.decode(
+                        sample_gen_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    _log("debug_sample_prompt_ids=" + str(sample_prompt_ids), log_path)
+                    _log("debug_sample_prompt_text=" + sample_prompt_text, log_path)
+                    _log("debug_sample_generation_ids=" + str(sample_gen_ids), log_path)
+                    _log("debug_sample_generation_text=" + sample_gen_text, log_path)
+                    printed_full_generation = True
 
                 valid_prompts_for_digits: List[List[int]] = []
                 for flat_idx, row in enumerate(z_rows):
