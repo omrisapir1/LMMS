@@ -1,11 +1,11 @@
-from __future__ import annotations
+
 
 from typing import Dict, List, Sequence
 
 from RSFT.config import Config
 from RSFT.dataset import PromptExample
 from RSFT.logic import decode_digit_tokens, exact_digit_match, extract_z_before_answer_from_row, mean_or_zero
-from __future__ import annotations
+
 
 from typing import Dict, List, Sequence
 
