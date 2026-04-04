@@ -7,6 +7,8 @@
     <list default="true" id="acd00e1c-b137-4c66-ae6e-7c76fadcc727" name="Changes" comment="important">
       <change afterPath="$USER_HOME$/hiredscore/git/hiring-navigator-agent/src/brain_agents_service/hs_brain_agents/recruiter_agent/__init__.py" afterDir="false" />
       <change afterPath="$USER_HOME$/hiredscore/git/hiring-navigator-agent/src/brain_agents_service/hs_brain_agents/recruiter_agent/graph.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/RSFT/RSFT_README.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/RSFT/__init__.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/application_insights/application_insights_service/hs_application_insights_service/skills.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/application_insights/application_insights_service/hs_application_insights_service/skills.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pdm.lock" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pdm.lock" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pyproject.toml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pyproject.toml" afterDir="false" />
@@ -16,6 +18,8 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/hf_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/hf_rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/vllm_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/vllm_rollout.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -83,7 +87,7 @@
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "main",
-    "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/thought_embedding",
+    "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/PPO/RSFT",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
@@ -95,6 +99,7 @@
 }]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/PPO/RSFT" />
       <recent name="$PROJECT_DIR$/thought_embedding" />
       <recent name="$PROJECT_DIR$/z_pipeline" />
     </key>

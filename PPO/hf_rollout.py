@@ -90,6 +90,8 @@ class HFRolloutEngine:
         min_new_tokens: Optional[int],
         temperature: float,
         top_p: float,
+        min_p: float,
+        repetition_penalty: float,
         greedy: bool,
         eos_token_id: Optional[int],
     ) -> List[List[int]]:
@@ -135,10 +137,17 @@ class HFRolloutEngine:
         if do_sample:
             gen_kwargs["temperature"] = float(temperature)
             gen_kwargs["top_p"] = float(top_p)
+            gen_kwargs["min_p"] = float(min_p)
+        gen_kwargs["repetition_penalty"] = float(repetition_penalty)
         if min_new_tokens is not None:
             gen_kwargs["min_new_tokens"] = int(min_new_tokens)
 
-        out = self._model.generate(**gen_kwargs)
+        try:
+            out = self._model.generate(**gen_kwargs)
+        except TypeError:
+            # Backward compatibility for transformers builds without min_p support.
+            gen_kwargs.pop("min_p", None)
+            out = self._model.generate(**gen_kwargs)
         out_cpu = out.detach().to("cpu")
         prompt_len = int(inpt.shape[1])
         rows: List[List[int]] = []
@@ -156,6 +165,9 @@ class HFRolloutEngine:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        greedy: bool = False,
     ) -> List[Dict[str, object]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[Dict[str, object]] = []
@@ -175,7 +187,9 @@ class HFRolloutEngine:
                         min_new_tokens=None,
                         temperature=float(temperature),
                         top_p=float(top_p),
-                        greedy=False,
+                        min_p=float(min_p),
+                        repetition_penalty=float(repetition_penalty),
+                        greedy=bool(greedy),
                         eos_token_id=int(self.answer_token_id),
                     )
                     for gen in gens:
@@ -200,6 +214,8 @@ class HFRolloutEngine:
         temperature: float,
         top_p: float,
         greedy: bool,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
     ) -> List[List[int]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[List[int]] = []
@@ -218,6 +234,8 @@ class HFRolloutEngine:
                         min_new_tokens=5,
                         temperature=float(temperature),
                         top_p=float(top_p),
+                        min_p=float(min_p),
+                        repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
                     )

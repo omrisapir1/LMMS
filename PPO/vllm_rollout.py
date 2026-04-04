@@ -327,6 +327,8 @@ class VLLMRolloutEngine:
         max_tokens: int,
         temperature: float,
         top_p: float,
+        min_p: float,
+        repetition_penalty: float,
         greedy: bool,
         min_tokens: Optional[int] = None,
         stop_on_answer: bool = False,
@@ -338,6 +340,8 @@ class VLLMRolloutEngine:
             "max_tokens": int(max_tokens),
             "temperature": 0.0 if greedy else float(temperature),
             "top_p": 1.0 if greedy else float(top_p),
+            "min_p": 0.0 if greedy else float(min_p),
+            "repetition_penalty": float(repetition_penalty),
             "n": 1,
         }
         if min_tokens is not None:
@@ -522,6 +526,9 @@ class VLLMRolloutEngine:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        greedy: bool = False,
     ) -> List[Dict[str, object]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
@@ -530,7 +537,9 @@ class VLLMRolloutEngine:
             max_tokens=int(max_new_tokens),
             temperature=float(temperature),
             top_p=float(top_p),
-            greedy=False,
+            min_p=float(min_p),
+            repetition_penalty=float(repetition_penalty),
+            greedy=bool(greedy),
             stop_on_answer=True,
         )
 
@@ -563,6 +572,8 @@ class VLLMRolloutEngine:
         temperature: float,
         top_p: float,
         greedy: bool,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
     ) -> List[List[int]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
@@ -572,6 +583,8 @@ class VLLMRolloutEngine:
             min_tokens=5,
             temperature=float(temperature),
             top_p=float(top_p),
+            min_p=float(min_p),
+            repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
         )
 
