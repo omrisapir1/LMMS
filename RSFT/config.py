@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = ""
+    init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
     trust_remote_code: bool = True
 
