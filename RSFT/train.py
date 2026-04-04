@@ -4,7 +4,6 @@ import argparse
 import ast
 import csv
 import json
-import math
 import os
 import random
 import shutil
@@ -269,13 +268,11 @@ def _append_metrics_csv(path: str, row: Dict[str, object]) -> None:
         writer.writerow(row)
 
 
-def _chunk_examples(rows: Sequence[Dict[str, List[int]]], parts: int) -> List[List[Dict[str, List[int]]]]:
-    n = len(rows)
-    if n <= 0:
+def _chunk_examples(rows: Sequence[Dict[str, List[int]]], chunk_size: int) -> List[List[Dict[str, List[int]]]]:
+    if len(rows) <= 0:
         return []
-    k = max(1, int(parts))
-    chunk_size = int(math.ceil(n / k))
-    return [list(rows[i : i + chunk_size]) for i in range(0, n, chunk_size)]
+    k = max(1, int(chunk_size))
+    return [list(rows[i : i + k]) for i in range(0, len(rows), k)]
 
 
 def _next_unique_batch(
@@ -520,10 +517,7 @@ def train(cfg: Optional[Config] = None) -> str:
             exact_rollouts = 0
 
             prompt_batches_used = 0
-            while (
-                len(accepted_rows) < int(cfg.train.train_batch_size)
-                and prompt_batches_used < int(cfg.train.max_prompt_batches_per_step)
-            ):
+            while prompt_batches_used < int(cfg.train.max_prompt_batches_per_step):
                 prompt_batches_used += 1
                 prompt_batch, order_cursor = _next_unique_batch(
                     examples=train_examples,
@@ -605,10 +599,6 @@ def train(cfg: Optional[Config] = None) -> str:
 
                 step_rollout_logs.extend(rollout_log_rows)
 
-                if len(accepted_rows) >= int(cfg.train.train_batch_size):
-                    accepted_rows = accepted_rows[: int(cfg.train.train_batch_size)]
-                    break
-
             rollout_path = rollout_logger.write_step(step, step_rollout_logs)
 
             l_z_ans_val = 0.0
@@ -624,7 +614,7 @@ def train(cfg: Optional[Config] = None) -> str:
                 _log(f"step={step} no accepted examples; skipping optimizer step", log_path)
             else:
                 t_train = time.perf_counter()
-                micro_batches = _chunk_examples(accepted_rows, int(cfg.train.grad_accum_steps))
+                micro_batches = _chunk_examples(accepted_rows, int(cfg.train.train_batch_size))
                 num_micro = max(1, len(micro_batches))
 
                 optimizer.zero_grad(set_to_none=True)

@@ -44,7 +44,6 @@ class RolloutConfig:
 @dataclass
 class TrainConfig:
     train_batch_size: int = 4
-    grad_accum_steps: int = 8
     lr: float = 4e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
@@ -67,7 +66,7 @@ class LossConfig:
 @dataclass
 class EvalConfig:
     eval_every_steps: int = 500
-    eval_at_start: bool = False
+    eval_at_start: bool = True
     pass_at_n: int = 16
     k_max: int = 512
     max_eval_questions: int = 1024
