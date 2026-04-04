@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -16,6 +17,52 @@ class PromptExample:
     true_digits: List[int]
 
 
+_BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
+_SIGNED_INT_RE = re.compile(r"^[+-]?\d+$")
+_SIGNED_INT_WITH_ZERO_DECIMAL_RE = re.compile(r"^[+-]?\d+\.0+$")
+
+
+def _digits_from_nonnegative_int(value: int) -> Optional[List[int]]:
+    if value < 0 or value > 99999:
+        return None
+    return [int(ch) for ch in f"{value:05d}"]
+
+
+def _parse_final_answer_relaxed(raw: object) -> Optional[List[int]]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    # Direct strict parser first.
+    parsed = parse_final_answer_to_digits(text)
+    if parsed is not None:
+        return parsed
+
+    # Handle patterns like \boxed{123} or \boxed{123.0}
+    m_box = _BOXED_RE.search(text)
+    if m_box is not None:
+        inner = m_box.group(1).strip()
+        p_inner = _parse_final_answer_relaxed(inner)
+        if p_inner is not None:
+            return p_inner
+
+    compact = text.replace(",", "").replace("_", "").replace(" ", "")
+    if _SIGNED_INT_RE.fullmatch(compact):
+        try:
+            return _digits_from_nonnegative_int(int(compact))
+        except Exception:
+            return None
+    if _SIGNED_INT_WITH_ZERO_DECIMAL_RE.fullmatch(compact):
+        try:
+            return _digits_from_nonnegative_int(int(compact.split(".", 1)[0]))
+        except Exception:
+            return None
+
+    return None
+
+
 def build_prompt_text(tokenizer, question: str) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -29,7 +76,7 @@ def parse_true_digits(row: Dict[str, object], *, answer_digits_field: str, answe
         parsed = parse_answer_digits(row.get(answer_digits_field))
         if parsed is not None:
             return parsed
-    return parse_final_answer_to_digits(row.get(answer_field))
+    return _parse_final_answer_relaxed(row.get(answer_field))
 
 
 def load_hf_records(dataset_name: str, split: str) -> List[Dict[str, object]]:
@@ -48,6 +95,10 @@ def prepare_prompt_examples(
     out: List[PromptExample] = []
     for row in records:
         q = row.get(question_field)
+        if q is None and question_field != "question":
+            q = row.get("question")
+        if q is None and question_field != "problem":
+            q = row.get("problem")
         if q is None:
             continue
         true_digits = parse_true_digits(row, answer_digits_field=answer_digits_field, answer_field=answer_field)
