@@ -67,6 +67,7 @@ class LossConfig:
 class EvalConfig:
     eval_every_steps: int = 500
     eval_at_start: bool = True
+    vllm_batch_size: int = 256
     pass_at_n: int = 16
     k_max: int = 512
     max_eval_questions: int = 1024
