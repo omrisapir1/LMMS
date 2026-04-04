@@ -51,7 +51,6 @@ class TrainConfig:
     max_steps: int = 10000
     max_grad_norm: float = 1.0
     max_length: int = 1024
-    max_prompt_batches_per_step: int = 32
     seed: int = 42
     use_bf16: bool = True
     optimizer_8bit: bool = True
@@ -66,7 +65,7 @@ class LossConfig:
 @dataclass
 class EvalConfig:
     eval_every_steps: int = 500
-    eval_at_start: bool = True
+    eval_at_start: bool = False
     vllm_batch_size: int = 256
     pass_at_n: int = 16
     k_max: int = 512

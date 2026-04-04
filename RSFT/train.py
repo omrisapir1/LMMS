@@ -516,20 +516,15 @@ def train(cfg: Optional[Config] = None) -> str:
             total_rollouts = 0
             exact_rollouts = 0
 
-            prompt_batches_used = 0
-            while prompt_batches_used < int(cfg.train.max_prompt_batches_per_step):
-                prompt_batches_used += 1
-                prompt_batch, order_cursor = _next_unique_batch(
-                    examples=train_examples,
-                    ordered_indices=ordered_indices,
-                    cursor=order_cursor,
-                    batch_size=int(cfg.rollout.vllm_batch_size),
-                    step_seen_questions=step_seen_questions,
-                    rng=rng,
-                )
-                if not prompt_batch:
-                    break
-
+            prompt_batch, order_cursor = _next_unique_batch(
+                examples=train_examples,
+                ordered_indices=ordered_indices,
+                cursor=order_cursor,
+                batch_size=int(cfg.rollout.vllm_batch_size),
+                step_seen_questions=step_seen_questions,
+                rng=rng,
+            )
+            if prompt_batch:
                 prompts_sampled += len(prompt_batch)
                 z_rows = engine.generate_z(
                     prompt_token_ids=[list(ex.prompt_ids) for ex in prompt_batch],
