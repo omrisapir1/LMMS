@@ -396,16 +396,9 @@ def _build_rollout_candidates(
     return by_prompt, logs, int(exact_rollouts)
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    cfg = Config()
-    for item in args.set:
-        if "=" not in item:
-            raise ValueError(f"Invalid --set value: {item!r}; expected key=value")
-        k, v = item.split("=", 1)
-        _apply_override(cfg, k.strip(), v.strip())
+def train(cfg: Optional[Config] = None) -> str:
+    if cfg is None:
+        cfg = Config()
 
     _set_seed(int(cfg.train.seed))
     run_dir = _make_run_dir(str(cfg.logging.output_dir))
@@ -779,6 +772,20 @@ def main() -> None:
             engine.close()
         except Exception:
             pass
+    return run_dir
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    cfg = Config()
+    for item in args.set:
+        if "=" not in item:
+            raise ValueError(f"Invalid --set value: {item!r}; expected key=value")
+        k, v = item.split("=", 1)
+        _apply_override(cfg, k.strip(), v.strip())
+    train(cfg)
 
 
 if __name__ == "__main__":
