@@ -51,6 +51,7 @@ class VLLMRolloutEngine:
         self._wt_rank_offset = 1
         self._update_fail_streak = 0
         self._debug_api_logged = False
+        self._debug_z_allowed_logged = False
 
         self._llm_cls = None
         self._sampling_params_cls = None
@@ -535,8 +536,23 @@ class VLLMRolloutEngine:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
         n = max(1, int(num_samples_per_prompt))
+        z_allowed_for_sampling = [int(x) for x in self.z_allowed_token_ids]
+        if int(self.answer_token_id) not in z_allowed_for_sampling:
+            z_allowed_for_sampling.append(int(self.answer_token_id))
+        if not self._debug_z_allowed_logged:
+            self._log(
+                "z_generation_allowed_token_ids(count={})={}".format(
+                    len(z_allowed_for_sampling),
+                    z_allowed_for_sampling,
+                )
+            )
+            self._log(
+                f"z_generation_answer_token_id={int(self.answer_token_id)} "
+                f"present_in_allowed={int(self.answer_token_id) in set(z_allowed_for_sampling)}"
+            )
+            self._debug_z_allowed_logged = True
         sp = self._build_sampling_params(
-            allowed_token_ids=self.z_allowed_token_ids,
+            allowed_token_ids=z_allowed_for_sampling,
             max_tokens=int(max_new_tokens),
             temperature=float(temperature),
             top_p=float(top_p),
