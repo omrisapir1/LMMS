@@ -26,6 +26,7 @@ class RolloutCandidate:
 @dataclass
 class AcceptedExample:
     prompt_idx: int
+    rollout_idx: int
     z_token_ids: List[int]
     digit_token_ids: List[int]
     pred_digits: List[int]
@@ -107,6 +108,7 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
         return None
     return AcceptedExample(
         prompt_idx=int(best.prompt_idx),
+        rollout_idx=int(best.rollout_idx),
         z_token_ids=list(best.z_token_ids),
         digit_token_ids=list(best.digit_token_ids),
         pred_digits=list(best.pred_digits),
