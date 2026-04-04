@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import random
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -102,7 +101,12 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
     valid = [cand for cand in candidates if exact_digit_match(cand.pred_digits, cand.true_digits)]
     if not valid:
         return None
-    best = random.choice(valid)
+    valid_sorted = sorted(
+        valid,
+        key=lambda c: (len(c.z_token_ids), int(c.rollout_idx)),
+    )
+    mid = len(valid_sorted) // 2  # upper-middle for even counts
+    best = valid_sorted[mid]
     return AcceptedExample(
         prompt_idx=int(best.prompt_idx),
         rollout_idx=int(best.rollout_idx),
