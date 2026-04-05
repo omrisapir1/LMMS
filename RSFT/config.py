@@ -44,7 +44,7 @@ class RolloutConfig:
 @dataclass
 class TrainConfig:
     train_batch_size: int = 2
-    lr: float = 4e-5
+    lr: float = 1e-4
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -76,7 +76,7 @@ class EvalConfig:
 class LoggingConfig:
     output_dir: str = "./runs/rsft"
     log_every: int = 1
-    save_every: int = 500
+    save_every: int = 5000
     keep_last: int = 3
 
 
