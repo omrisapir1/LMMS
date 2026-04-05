@@ -18,6 +18,7 @@ class RolloutCandidate:
     prompt_idx: int
     rollout_idx: int
     z_token_ids: List[int]
+    z_avg_logprob: Optional[float]
     digit_token_ids: List[int]
     pred_digits: List[int]
     true_digits: List[int]
@@ -101,12 +102,18 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
     valid = [cand for cand in candidates if exact_digit_match(cand.pred_digits, cand.true_digits)]
     if not valid:
         return None
-    valid_sorted = sorted(
-        valid,
-        key=lambda c: (len(c.z_token_ids), int(c.rollout_idx)),
-    )
-    mid = len(valid_sorted) // 2  # upper-middle for even counts
-    best = valid_sorted[mid]
+    scored = [cand for cand in valid if cand.z_avg_logprob is not None]
+    if scored:
+        # Lower average logprob => lower sequence probability.
+        best = min(scored, key=lambda c: (float(c.z_avg_logprob), int(c.rollout_idx)))
+    else:
+        # Fallback if backend does not provide token logprobs.
+        valid_sorted = sorted(
+            valid,
+            key=lambda c: (len(c.z_token_ids), int(c.rollout_idx)),
+        )
+        mid = len(valid_sorted) // 2  # upper-middle for even counts
+        best = valid_sorted[mid]
     return AcceptedExample(
         prompt_idx=int(best.prompt_idx),
         rollout_idx=int(best.rollout_idx),

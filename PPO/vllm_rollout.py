@@ -331,6 +331,7 @@ class VLLMRolloutEngine:
         repetition_penalty: float,
         greedy: bool,
         n: int = 1,
+        logprobs: Optional[int] = None,
         min_tokens: Optional[int] = None,
         stop_on_answer: bool = False,
     ):
@@ -349,6 +350,8 @@ class VLLMRolloutEngine:
             kwargs["min_tokens"] = int(min_tokens)
         if stop_on_answer:
             kwargs["stop_token_ids"] = [int(self.answer_token_id)]
+        if logprobs is not None:
+            kwargs["logprobs"] = int(logprobs)
 
         try:
             return self._sampling_params_cls(
@@ -547,6 +550,7 @@ class VLLMRolloutEngine:
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
             n=n,
+            logprobs=1,
             stop_on_answer=True,
         )
 
@@ -562,14 +566,80 @@ class VLLMRolloutEngine:
         rows: List[Dict[str, object]] = []
         for o in outs:
             for out_j in list(getattr(o, "outputs", []) or []):
+                token_ids = [int(x) for x in list(getattr(out_j, "token_ids", []) or [])]
+                token_logprobs = self._extract_token_logprobs_for_sample(
+                    token_ids=token_ids,
+                    logprobs_payload=getattr(out_j, "logprobs", None),
+                )
                 rows.append(
                     {
-                        "token_ids": list(getattr(out_j, "token_ids", []) or []),
+                        "token_ids": token_ids,
+                        "token_logprobs": token_logprobs,
                         "stop_reason": getattr(out_j, "stop_reason", None),
                         "finish_reason": getattr(out_j, "finish_reason", None),
                     }
                 )
         return rows
+
+    @staticmethod
+    def _extract_token_logprobs_for_sample(token_ids: Sequence[int], logprobs_payload: Any) -> Optional[List[Optional[float]]]:
+        if logprobs_payload is None:
+            return None
+        entries = list(logprobs_payload or [])
+        if len(entries) == 0:
+            return []
+        out: List[Optional[float]] = []
+        for idx, tok in enumerate(token_ids):
+            entry = entries[idx] if idx < len(entries) else None
+            out.append(VLLMRolloutEngine._extract_one_token_logprob(entry=entry, token_id=int(tok)))
+        return out
+
+    @staticmethod
+    def _extract_one_token_logprob(entry: Any, token_id: int) -> Optional[float]:
+        if entry is None:
+            return None
+        if isinstance(entry, (int, float)):
+            return float(entry)
+        if hasattr(entry, "logprob"):
+            try:
+                return float(getattr(entry, "logprob"))
+            except Exception:
+                pass
+        if isinstance(entry, dict):
+            # Common case: map token_id -> Logprob object/value.
+            for key in (int(token_id), str(int(token_id))):
+                if key in entry:
+                    val = entry[key]
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    if hasattr(val, "logprob"):
+                        try:
+                            return float(getattr(val, "logprob"))
+                        except Exception:
+                            pass
+                    if isinstance(val, dict) and "logprob" in val:
+                        try:
+                            return float(val["logprob"])
+                        except Exception:
+                            pass
+            # Fallback: if this dict itself is a logprob record.
+            if "logprob" in entry:
+                try:
+                    return float(entry["logprob"])
+                except Exception:
+                    pass
+            return None
+        if isinstance(entry, (list, tuple)):
+            # Fallback for list-style top-k entries with token_id/token attrs.
+            for item in entry:
+                try:
+                    item_tid = getattr(item, "token_id", None)
+                    if item_tid is not None and int(item_tid) == int(token_id):
+                        return float(getattr(item, "logprob"))
+                except Exception:
+                    continue
+            return None
+        return None
 
     def generate_digits(
         self,

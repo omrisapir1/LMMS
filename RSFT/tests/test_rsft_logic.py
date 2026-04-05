@@ -21,12 +21,13 @@ def test_exact_digit_filtering() -> None:
     assert not exact_digit_match([1, 2, 3, 4, 0], [1, 2, 3, 4, 5])
 
 
-def test_shortest_valid_selection_prefers_first_on_tie() -> None:
+def test_selection_prefers_lowest_avg_logprob() -> None:
     candidates = [
         RolloutCandidate(
             prompt_idx=0,
             rollout_idx=0,
             z_token_ids=[10, 11],
+            z_avg_logprob=-1.2,
             digit_token_ids=[101, 102, 103, 104, 105],
             pred_digits=[1, 2, 3, 4, 5],
             true_digits=[1, 2, 3, 4, 5],
@@ -35,6 +36,7 @@ def test_shortest_valid_selection_prefers_first_on_tie() -> None:
             prompt_idx=0,
             rollout_idx=1,
             z_token_ids=[12],
+            z_avg_logprob=-0.8,
             digit_token_ids=[101, 102, 103, 104, 105],
             pred_digits=[1, 2, 3, 4, 5],
             true_digits=[1, 2, 3, 4, 5],
@@ -43,6 +45,7 @@ def test_shortest_valid_selection_prefers_first_on_tie() -> None:
             prompt_idx=0,
             rollout_idx=2,
             z_token_ids=[13],
+            z_avg_logprob=-2.1,
             digit_token_ids=[101, 102, 103, 104, 105],
             pred_digits=[1, 2, 3, 4, 5],
             true_digits=[1, 2, 3, 4, 5],
@@ -50,7 +53,7 @@ def test_shortest_valid_selection_prefers_first_on_tie() -> None:
     ]
     chosen = select_shortest_valid(candidates)
     assert chosen is not None
-    assert chosen.z_token_ids == [12]
+    assert chosen.z_token_ids == [13]
 
 
 def test_acceptance_filtering_requires_exact_match() -> None:
@@ -59,6 +62,7 @@ def test_acceptance_filtering_requires_exact_match() -> None:
             prompt_idx=0,
             rollout_idx=0,
             z_token_ids=[10],
+            z_avg_logprob=-1.0,
             digit_token_ids=[101, 102, 103, 104, 105],
             pred_digits=[1, 2, 3, 4, 0],
             true_digits=[1, 2, 3, 4, 5],

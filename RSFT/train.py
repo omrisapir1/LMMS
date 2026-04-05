@@ -311,6 +311,27 @@ def _next_unique_batch(
     return selected, cur
 
 
+def _mean_prefix_logprob(row: Dict[str, object], prefix_len: int) -> Optional[float]:
+    if prefix_len <= 0:
+        return None
+    vals_raw = row.get("token_logprobs", None)
+    if vals_raw is None:
+        return None
+    vals = list(vals_raw)
+    if len(vals) < int(prefix_len):
+        return None
+    use = vals[: int(prefix_len)]
+    if any(v is None for v in use):
+        return None
+    try:
+        nums = [float(v) for v in use]
+    except Exception:
+        return None
+    if len(nums) == 0:
+        return None
+    return float(sum(nums) / len(nums))
+
+
 def _build_rollout_candidates(
     *,
     prompts: Sequence[PromptExample],
@@ -371,6 +392,7 @@ def _build_rollout_candidates(
             prompt_idx=int(prompt_idx),
             rollout_idx=int(rollout_idx),
             z_token_ids=list(valid_z_ids[local_idx]),
+            z_avg_logprob=_mean_prefix_logprob(z_rows[flat_idx], len(valid_z_ids[local_idx])),
             digit_token_ids=list(dig_tokens),
             pred_digits=list(pred_digits),
             true_digits=list(prompts[prompt_idx].true_digits),
@@ -385,6 +407,7 @@ def _build_rollout_candidates(
                 "rollout_idx": int(rollout_idx),
                 "has_answer": True,
                 "z_len": int(len(cand.z_token_ids)),
+                "z_avg_logprob": cand.z_avg_logprob,
                 "exact_match": is_exact,
                 "selected": False,
             }

@@ -203,6 +203,7 @@ class HFRolloutEngine:
                         rows.append(
                             {
                                 "token_ids": [int(x) for x in gen],
+                                "token_logprobs": None,
                                 "stop_reason": int(self.answer_token_id) if ended_on_answer else None,
                                 "finish_reason": "stop" if ended_on_answer else "length",
                             }
