@@ -32,7 +32,6 @@ from RSFT.logic import (
     decode_digit_tokens,
     extract_z_before_answer_from_row,
     mean_or_zero,
-    select_shortest_valid,
 )
 
 METRICS_FIELDS: List[str] = [
@@ -600,30 +599,39 @@ def train(cfg: Optional[Config] = None) -> str:
                     # Keep only prompts with mixed outcomes (at least one wrong rollout).
                     if not bool(prompt_has_wrong.get(pidx, True)):
                         continue
-                    chosen = select_shortest_valid(cand_by_prompt.get(pidx, []))
-                    if chosen is None:
+                    cands = list(cand_by_prompt.get(pidx, []))
+                    if not cands:
                         continue
-
-                    built = build_training_example(
-                        prompt_ids=prompt_ex.prompt_ids,
-                        z_token_ids=chosen.z_token_ids,
-                        answer_token_id=answer_token_id,
-                        digit_token_ids=chosen.digit_token_ids,
-                        max_length=int(cfg.train.max_length),
-                    )
-                    if built is None:
+                    correct_cands = [c for c in cands if c.pred_digits == c.true_digits]
+                    if len(correct_cands) == 0:
                         continue
-                    accepted_rows.append(built)
-                    accepted_z_lens.append(float(len(chosen.z_token_ids)))
-
-                    # Mark selected row in current rollout chunk.
-                    for row in rollout_log_rows:
-                        if (
-                            int(row.get("prompt_idx", -1)) == int(pidx)
-                            and int(row.get("rollout_idx", -1)) == int(chosen.rollout_idx)
-                        ):
-                            row["selected"] = True
-                            break
+                    built_rows: List[Tuple[int, Dict[str, List[int]]]] = []
+                    for cand in correct_cands:
+                        built = build_training_example(
+                            prompt_ids=prompt_ex.prompt_ids,
+                            z_token_ids=cand.z_token_ids,
+                            answer_token_id=answer_token_id,
+                            digit_token_ids=cand.digit_token_ids,
+                            max_length=int(cfg.train.max_length),
+                        )
+                        if built is None:
+                            continue
+                        built_rows.append((int(cand.rollout_idx), built))
+                    if len(built_rows) == 0:
+                        continue
+                    per_example_weight = 1.0 / float(len(built_rows))
+                    for rollout_idx, built in built_rows:
+                        built["example_weight"] = per_example_weight  # type: ignore[index]
+                        accepted_rows.append(built)
+                        accepted_z_lens.append(float(built["z_len"]))
+                        # Mark selected rows in current rollout chunk.
+                        for row in rollout_log_rows:
+                            if (
+                                int(row.get("prompt_idx", -1)) == int(pidx)
+                                and int(row.get("rollout_idx", -1)) == int(rollout_idx)
+                            ):
+                                row["selected"] = True
+                                break
 
                 step_rollout_logs.extend(rollout_log_rows)
 
@@ -643,13 +651,18 @@ def train(cfg: Optional[Config] = None) -> str:
             else:
                 t_train = time.perf_counter()
                 micro_batches = _chunk_examples(accepted_rows, int(cfg.train.train_batch_size))
-                num_micro = max(1, len(micro_batches))
+                total_example_weight = float(
+                    sum(float(ex.get("example_weight", 1.0)) for ex in accepted_rows)  # type: ignore[call-overload]
+                )
+                if total_example_weight <= 0.0:
+                    total_example_weight = float(len(accepted_rows))
 
                 optimizer.zero_grad(set_to_none=True)
 
-                lz_terms: List[float] = []
-                ld_terms: List[float] = []
-                tl_terms: List[float] = []
+                lz_weighted_sum = 0.0
+                ld_weighted_sum = 0.0
+                tl_weighted_sum = 0.0
+                w_seen_sum = 0.0
 
                 for micro in micro_batches:
                     batch = collate_training_examples(micro, pad_token_id=int(tokenizer.pad_token_id))
@@ -657,6 +670,11 @@ def train(cfg: Optional[Config] = None) -> str:
                     attention_mask = batch["attention_mask"].to(device)
                     labels = batch["labels"].to(device)
                     target_class = batch["target_class"].to(device)
+                    example_weights = torch.tensor(
+                        [float(ex.get("example_weight", 1.0)) for ex in micro],  # type: ignore[call-overload]
+                        dtype=torch.float32,
+                        device=device,
+                    )
 
                     amp_ctx = (
                         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -670,31 +688,45 @@ def train(cfg: Optional[Config] = None) -> str:
                             use_cache=False,
                             return_dict=True,
                         )
-                        losses = compute_rsft_losses(
-                            logits=out.logits,
-                            labels=labels,
-                            target_class=target_class,
-                            z_token_ids=z_token_ids,
-                            answer_token_id=answer_token_id,
-                            digit_token_ids=digit_token_ids,
-                            w_z_ans=float(cfg.loss.w_z_ans),
-                            w_digits=float(cfg.loss.w_digits),
-                        )
-                        loss = losses["loss"] / float(num_micro)
+                        per_lz: List[torch.Tensor] = []
+                        per_ld: List[torch.Tensor] = []
+                        per_tl: List[torch.Tensor] = []
+                        for i in range(out.logits.shape[0]):
+                            losses_i = compute_rsft_losses(
+                                logits=out.logits[i : i + 1],
+                                labels=labels[i : i + 1],
+                                target_class=target_class[i : i + 1],
+                                z_token_ids=z_token_ids,
+                                answer_token_id=answer_token_id,
+                                digit_token_ids=digit_token_ids,
+                                w_z_ans=float(cfg.loss.w_z_ans),
+                                w_digits=float(cfg.loss.w_digits),
+                            )
+                            per_lz.append(losses_i["l_z_ans"])
+                            per_ld.append(losses_i["l_digits"])
+                            per_tl.append(losses_i["loss"])
+                        lz_t = torch.stack(per_lz)
+                        ld_t = torch.stack(per_ld)
+                        tl_t = torch.stack(per_tl)
+                        w_t = example_weights.to(tl_t.dtype)
+                        # Normalize by total step question-weight so each question contributes equally.
+                        loss = (tl_t * w_t).sum() / float(total_example_weight)
 
                     loss.backward()
 
-                    lz_terms.append(float(losses["l_z_ans"].detach().item()))
-                    ld_terms.append(float(losses["l_digits"].detach().item()))
-                    tl_terms.append(float(losses["loss"].detach().item()))
+                    lz_weighted_sum += float((lz_t.detach().float() * example_weights).sum().item())
+                    ld_weighted_sum += float((ld_t.detach().float() * example_weights).sum().item())
+                    tl_weighted_sum += float((tl_t.detach().float() * example_weights).sum().item())
+                    w_seen_sum += float(example_weights.sum().item())
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.train.max_grad_norm))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                l_z_ans_val = mean_or_zero(lz_terms)
-                l_digits_val = mean_or_zero(ld_terms)
-                total_loss_val = mean_or_zero(tl_terms)
+                denom = max(w_seen_sum, 1e-12)
+                l_z_ans_val = float(lz_weighted_sum / denom)
+                l_digits_val = float(ld_weighted_sum / denom)
+                total_loss_val = float(tl_weighted_sum / denom)
                 grad_norm_val = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
                 train_time = time.perf_counter() - t_train
 
