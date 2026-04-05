@@ -589,7 +589,17 @@ def train(cfg: Optional[Config] = None) -> str:
                     rollouts_per_prompt=int(cfg.rollout.rollouts_per_prompt),
                 )
                 exact_rollouts += int(exact_count_chunk)
+                prompt_has_wrong: Dict[int, bool] = {i: False for i in range(len(prompt_batch))}
+                for row in rollout_log_rows:
+                    pidx_row = int(row.get("prompt_idx", -1))
+                    if pidx_row < 0 or pidx_row >= len(prompt_batch):
+                        continue
+                    if not bool(row.get("exact_match", False)):
+                        prompt_has_wrong[pidx_row] = True
                 for pidx, prompt_ex in enumerate(prompt_batch):
+                    # Keep only prompts with mixed outcomes (at least one wrong rollout).
+                    if not bool(prompt_has_wrong.get(pidx, True)):
+                        continue
                     chosen = select_shortest_valid(cand_by_prompt.get(pidx, []))
                     if chosen is None:
                         continue

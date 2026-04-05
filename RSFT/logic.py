@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -102,18 +103,7 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
     valid = [cand for cand in candidates if exact_digit_match(cand.pred_digits, cand.true_digits)]
     if not valid:
         return None
-    scored = [cand for cand in valid if cand.z_avg_logprob is not None]
-    if scored:
-        # Higher average logprob => higher sequence probability.
-        best = max(scored, key=lambda c: (float(c.z_avg_logprob), -int(c.rollout_idx)))
-    else:
-        # Fallback if backend does not provide token logprobs.
-        valid_sorted = sorted(
-            valid,
-            key=lambda c: (len(c.z_token_ids), int(c.rollout_idx)),
-        )
-        mid = len(valid_sorted) // 2  # upper-middle for even counts
-        best = valid_sorted[mid]
+    best = random.choice(valid)
     return AcceptedExample(
         prompt_idx=int(best.prompt_idx),
         rollout_idx=int(best.rollout_idx),
