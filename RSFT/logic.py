@@ -104,8 +104,8 @@ def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[Ac
         return None
     scored = [cand for cand in valid if cand.z_avg_logprob is not None]
     if scored:
-        # Lower average logprob => lower sequence probability.
-        best = min(scored, key=lambda c: (float(c.z_avg_logprob), int(c.rollout_idx)))
+        # Higher average logprob => higher sequence probability.
+        best = max(scored, key=lambda c: (float(c.z_avg_logprob), -int(c.rollout_idx)))
     else:
         # Fallback if backend does not provide token logprobs.
         valid_sorted = sorted(
