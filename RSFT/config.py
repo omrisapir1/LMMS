@@ -60,6 +60,7 @@ class TrainConfig:
 class LossConfig:
     w_z_ans: float = 1.0
     w_digits: float = 1.0
+    use_prompt_weighting: bool = True
 
 
 @dataclass

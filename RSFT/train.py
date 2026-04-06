@@ -43,6 +43,8 @@ METRICS_FIELDS: List[str] = [
     "selected_examples",
     "exact_rollout_rate",
     "selected_example_rate",
+    "k_distribution",
+    "avg_applied_prompt_weight",
     "mean_accepted_z_len",
     "l_z_ans",
     "l_digits",
@@ -60,6 +62,16 @@ METRICS_FIELDS: List[str] = [
     "no_answer_before_kmax_rate",
     "eval_time",
 ]
+
+PROMPT_WEIGHT_BY_K: Dict[int, float] = {
+    1: 0.50,
+    2: 0.80,
+    3: 0.90,
+    4: 1.00,
+    5: 0.80,
+    6: 0.60,
+    7: 0.25,
+}
 
 
 def _log(msg: str, log_path: str) -> None:
@@ -272,6 +284,14 @@ def _chunk_examples(rows: Sequence[Dict[str, List[int]]], chunk_size: int) -> Li
         return []
     k = max(1, int(chunk_size))
     return [list(rows[i : i + k]) for i in range(0, len(rows), k)]
+
+
+def _prompt_weight_multiplier(k_correct: int, *, use_prompt_weighting: bool) -> float:
+    if int(k_correct) <= 0:
+        return 0.0
+    if not bool(use_prompt_weighting):
+        return 1.0
+    return float(PROMPT_WEIGHT_BY_K.get(int(k_correct), 1.0))
 
 
 def _next_unique_batch(
@@ -497,6 +517,8 @@ def train(cfg: Optional[Config] = None) -> str:
             "selected_examples": 0,
             "exact_rollout_rate": 0.0,
             "selected_example_rate": 0.0,
+            "k_distribution": "{}",
+            "avg_applied_prompt_weight": 0.0,
             "mean_accepted_z_len": 0.0,
             "l_z_ans": 0.0,
             "l_digits": 0.0,
@@ -534,6 +556,8 @@ def train(cfg: Optional[Config] = None) -> str:
             step_rollout_logs: List[Dict[str, object]] = []
             accepted_z_lens: List[float] = []
             step_seen_questions: set[str] = set()
+            k_distribution: Dict[int, int] = {}
+            applied_prompt_weights: List[float] = []
             prompts_sampled = 0
             total_rollouts = 0
             exact_rollouts = 0
@@ -588,13 +612,25 @@ def train(cfg: Optional[Config] = None) -> str:
                     rollouts_per_prompt=int(cfg.rollout.rollouts_per_prompt),
                 )
                 exact_rollouts += int(exact_count_chunk)
+                prompt_has_wrong: Dict[int, bool] = {i: False for i in range(len(prompt_batch))}
+                for row in rollout_log_rows:
+                    pidx_row = int(row.get("prompt_idx", -1))
+                    if pidx_row < 0 or pidx_row >= len(prompt_batch):
+                        continue
+                    if not bool(row.get("exact_match", False)):
+                        prompt_has_wrong[pidx_row] = True
                 for pidx, prompt_ex in enumerate(prompt_batch):
+                    # Keep only prompts with mixed outcomes (at least one wrong rollout).
+                    if not bool(prompt_has_wrong.get(pidx, True)):
+                        continue
                     cands = list(cand_by_prompt.get(pidx, []))
                     if not cands:
                         continue
                     correct_cands = [c for c in cands if c.pred_digits == c.true_digits]
-                    if len(correct_cands) == 0:
+                    k_correct = int(len(correct_cands))
+                    if k_correct == 0:
                         continue
+                    k_distribution[k_correct] = int(k_distribution.get(k_correct, 0) + 1)
                     built_rows: List[Tuple[int, Dict[str, List[int]]]] = []
                     for cand in correct_cands:
                         built = build_training_example(
@@ -609,7 +645,13 @@ def train(cfg: Optional[Config] = None) -> str:
                         built_rows.append((int(cand.rollout_idx), built))
                     if len(built_rows) == 0:
                         continue
-                    per_example_weight = 1.0 / float(len(built_rows))
+                    k_trained = int(len(built_rows))
+                    prompt_weight = _prompt_weight_multiplier(
+                        k_trained,
+                        use_prompt_weighting=bool(cfg.loss.use_prompt_weighting),
+                    )
+                    per_example_weight = prompt_weight * (1.0 / float(k_trained))
+                    applied_prompt_weights.append(float(prompt_weight))
                     for rollout_idx, built in built_rows:
                         built["example_weight"] = per_example_weight  # type: ignore[index]
                         accepted_rows.append(built)
@@ -731,6 +773,16 @@ def train(cfg: Optional[Config] = None) -> str:
             selected_examples = int(len(accepted_rows))
             exact_rollout_rate = float(exact_rollouts) / float(total_rollouts) if total_rollouts > 0 else 0.0
             selected_example_rate = float(selected_examples) / float(total_rollouts) if total_rollouts > 0 else 0.0
+            k_distribution_str = json.dumps(
+                {str(k): int(v) for k, v in sorted(k_distribution.items(), key=lambda kv: kv[0])},
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+            avg_applied_prompt_weight = (
+                float(sum(applied_prompt_weights) / float(len(applied_prompt_weights)))
+                if len(applied_prompt_weights) > 0
+                else 0.0
+            )
             row = {
                 "step": int(step),
                 "update_step": int(update_step),
@@ -740,6 +792,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 "selected_examples": selected_examples,
                 "exact_rollout_rate": float(exact_rollout_rate),
                 "selected_example_rate": float(selected_example_rate),
+                "k_distribution": k_distribution_str,
+                "avg_applied_prompt_weight": float(avg_applied_prompt_weight),
                 "mean_accepted_z_len": float(mean_or_zero(accepted_z_lens)),
                 "l_z_ans": float(l_z_ans_val),
                 "l_digits": float(l_digits_val),
@@ -780,6 +834,8 @@ def train(cfg: Optional[Config] = None) -> str:
                             f"selected={row['selected_examples']}",
                             f"exact_rate={row['exact_rollout_rate']:.4f}",
                             f"selected_rate={row['selected_example_rate']:.4f}",
+                            f"k_dist={row['k_distribution']}",
+                            f"avg_prompt_w={row['avg_applied_prompt_weight']:.4f}",
                             f"Lz={row['l_z_ans']:.4f}",
                             f"Ld={row['l_digits']:.4f}",
                             f"L={row['total_loss']:.4f}",
