@@ -258,6 +258,7 @@ def _make_rollout_engine(
     *,
     cfg: Config,
     tokenizer,
+    init_ckpt_ref: str,
     answer_token_id: int,
     z_token_ids: Sequence[int],
     digit_token_ids: Sequence[int],
@@ -274,7 +275,7 @@ def _make_rollout_engine(
         engine_kwargs.setdefault("gpu_memory_utilization", float(cfg.rollout.gpu_memory_utilization))
         engine_kwargs.setdefault("cuda_visible_devices", str(cfg.rollout.vllm_cuda_visible_devices))
         return VLLMRolloutEngine(
-            init_ckpt=str(cfg.model.init_ckpt),
+            init_ckpt=str(init_ckpt_ref),
             tokenizer=tokenizer,
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=list(z_token_ids),
@@ -398,6 +399,16 @@ def train(cfg: Optional[Config] = None) -> str:
     ) = _prepare_tokenizer_and_model(cfg)
     verify_token_ids = [int(finalize_token_id), int(retry_token_id)]
 
+    vllm_init_ckpt_ref = str(cfg.model.init_ckpt)
+    if str(cfg.rollout.backend).strip().lower() == "vllm":
+        # vLLM must see the same vocab size as the torch model after adding special tokens.
+        vllm_bootstrap_dir = os.path.join(run_dir, "tmp_vllm_bootstrap_vocab")
+        os.makedirs(vllm_bootstrap_dir, exist_ok=True)
+        tokenizer.save_pretrained(vllm_bootstrap_dir)
+        model.config.save_pretrained(vllm_bootstrap_dir)
+        vllm_init_ckpt_ref = str(vllm_bootstrap_dir)
+        _log(f"Prepared vLLM bootstrap config/tokenizer at {vllm_bootstrap_dir}", log_path)
+
     device = torch.device(str(cfg.rollout.torch_device))
     model.to(device)
     model.train()
@@ -435,6 +446,7 @@ def train(cfg: Optional[Config] = None) -> str:
     engine = _make_rollout_engine(
         cfg=cfg,
         tokenizer=tokenizer,
+        init_ckpt_ref=vllm_init_ckpt_ref,
         answer_token_id=answer_token_id,
         z_token_ids=z_token_ids,
         digit_token_ids=digit_token_ids,
