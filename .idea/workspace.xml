@@ -16,6 +16,13 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/hf_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/hf_rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/token_contract.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/token_contract.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/vllm_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/vllm_rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/eval_vllm.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/eval_vllm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/logic.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/logic.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/tests/test_rsft_logic.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/tests/test_rsft_logic.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/RSFT/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -83,8 +90,8 @@
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/PPO/RSFT",
+    "git-widget-placeholder": "self-crtique",
+    "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/RSFT",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
@@ -96,6 +103,7 @@
 }]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/RSFT" />
       <recent name="$PROJECT_DIR$/PPO/RSFT" />
       <recent name="$PROJECT_DIR$/thought_embedding" />
       <recent name="$PROJECT_DIR$/z_pipeline" />
@@ -269,6 +277,7 @@
       <workItem from="1770617404265" duration="92254000" />
       <workItem from="1771354565185" duration="9366000" />
       <workItem from="1774536820915" duration="56175000" />
+      <workItem from="1775575161009" duration="4277000" />
     </task>
     <task id="LOCAL-00001" summary="important">
       <option name="closed" value="true" />

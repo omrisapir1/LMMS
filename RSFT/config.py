@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 class ModelConfig:
     init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
+    finalize_token: str = "<FINALIZE>"
+    retry_token: str = "<RETRY>"
     trust_remote_code: bool = True
 
 
@@ -26,6 +28,7 @@ class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     vllm_batch_size: int = 64
     rollouts_per_prompt: int = 8
+    max_rounds: int = 3
     max_new_tokens: int = 512
     temperature: float = 1.2
     top_p: float = 0.95
@@ -39,6 +42,10 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
     sync_every_n_steps: int = 2
+
+    def __post_init__(self) -> None:
+        if int(self.max_rounds) < 1:
+            raise ValueError("rollout.max_rounds must be >= 1")
 
 
 @dataclass
@@ -60,7 +67,15 @@ class TrainConfig:
 class LossConfig:
     w_z_ans: float = 1.0
     w_digits: float = 1.0
-    use_prompt_weighting: bool = True
+    w_verify: float = 1.0
+
+    def __post_init__(self) -> None:
+        if float(self.w_z_ans) < 0.0:
+            raise ValueError("loss.w_z_ans must be >= 0")
+        if float(self.w_digits) < 0.0:
+            raise ValueError("loss.w_digits must be >= 0")
+        if float(self.w_verify) < 0.0:
+            raise ValueError("loss.w_verify must be >= 0")
 
 
 @dataclass

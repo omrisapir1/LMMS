@@ -42,11 +42,24 @@ class HFRolloutEngine:
         digit_allowed_token_ids: Sequence[int],
         sync_every: int,
         logger,
+        verify_allowed_token_ids: Sequence[int] = (),
+        finalize_token_id: Optional[int] = None,
+        retry_token_id: Optional[int] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.answer_token_id = int(answer_token_id)
         self.z_allowed_token_ids = [int(x) for x in z_allowed_token_ids]
         self.digit_allowed_token_ids = [int(x) for x in digit_allowed_token_ids]
+        self.verify_allowed_token_ids = [int(x) for x in verify_allowed_token_ids]
+        self.finalize_token_id = int(finalize_token_id) if finalize_token_id is not None else None
+        self.retry_token_id = int(retry_token_id) if retry_token_id is not None else None
+        if len(self.verify_allowed_token_ids) > 0:
+            if self.finalize_token_id is None or self.retry_token_id is None:
+                raise RuntimeError("HF rollout verify ids are required when verify_allowed_token_ids is set")
+            if sorted(set(self.verify_allowed_token_ids)) != sorted({self.finalize_token_id, self.retry_token_id}):
+                raise RuntimeError("HF rollout verify allowlist must contain exactly <FINALIZE> and <RETRY>")
+        if (self.finalize_token_id is None) != (self.retry_token_id is None):
+            raise RuntimeError("HF rollout finalize/retry ids must be set together")
         self.sync_every = max(1, int(sync_every))
         self._log = logger
         self._lock = threading.RLock()
@@ -250,6 +263,48 @@ class HFRolloutEngine:
                         if len(gen) != 5:
                             raise RuntimeError(f"HF digit generation must return exactly 5 tokens, got {len(gen)}")
                         rows.append([int(x) for x in gen])
+            finally:
+                if was_training:
+                    self._model.train()
+        return rows
+
+    def generate_verify(
+        self,
+        prompts: Optional[Sequence[str]] = None,
+        prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
+        *,
+        temperature: float,
+        top_p: float,
+        greedy: bool,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+    ) -> List[List[int]]:
+        inputs = self._build_inputs(prompts, prompt_token_ids)
+        rows: List[List[int]] = []
+
+        with self._lock:
+            if self._model is None:
+                raise RuntimeError("HF rollout model is not set")
+            was_training = bool(self._model.training)
+            self._model.eval()
+            try:
+                with torch.no_grad():
+                    gens = self._run_generate_batch(
+                        input_ids_rows=inputs,
+                        allowed_token_ids=self.verify_allowed_token_ids,
+                        max_new_tokens=1,
+                        min_new_tokens=1,
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        min_p=float(min_p),
+                        repetition_penalty=float(repetition_penalty),
+                        greedy=bool(greedy),
+                        eos_token_id=None,
+                    )
+                    for gen in gens:
+                        if len(gen) != 1:
+                            raise RuntimeError(f"HF verify generation must return exactly 1 token, got {len(gen)}")
+                        rows.append([int(gen[0])])
             finally:
                 if was_training:
                     self._model.train()

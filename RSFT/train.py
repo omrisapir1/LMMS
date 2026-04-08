@@ -11,6 +11,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -19,13 +20,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from PPO.hf_rollout import HFRolloutEngine
 from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
 from PPO.rollout_logger import RolloutLogger
-from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single
+from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single, validate_single_token
 from PPO.vllm_rollout import VLLMRolloutEngine
 from RSFT.config import Config, DEFAULT_SET_ALLOWED_PREFIXES
 from RSFT.dataset import PromptExample, load_hf_records, make_digit_id_to_value_map, prepare_prompt_examples, sample_unique_prompt_batch
 from RSFT.eval_vllm import evaluate_with_rollout_engine
 from RSFT.logic import (
-    RolloutCandidate,
+    RoundTrace,
     build_training_example,
     collate_training_examples,
     compute_rsft_losses,
@@ -38,16 +39,15 @@ METRICS_FIELDS: List[str] = [
     "step",
     "update_step",
     "prompts_sampled",
-    "total_rollouts",
-    "exact_rollouts",
-    "selected_examples",
-    "exact_rollout_rate",
-    "selected_example_rate",
-    "k_distribution",
-    "avg_applied_prompt_weight",
-    "mean_accepted_z_len",
+    "total_sequences",
+    "accepted_prompts",
+    "accepted_rate",
+    "avg_rounds_per_accepted",
+    "avg_failed_rounds_before_success",
+    "mean_accepted_z_len_per_round",
     "l_z_ans",
     "l_digits",
+    "l_verify",
     "total_loss",
     "grad_norm",
     "rollout_time",
@@ -63,17 +63,6 @@ METRICS_FIELDS: List[str] = [
     "eval_time",
 ]
 
-PROMPT_WEIGHT_BY_K: Dict[int, float] = {
-    1: 1.0,
-    2: 0.95,
-    3: 0.90,
-    4: 0.8,
-    5: 0.6,
-    6: 0.40,
-    7: 0.20,
-}
-
-
 def _log(msg: str, log_path: str) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
     line = f"{ts} | {msg}"
@@ -87,6 +76,17 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _validate_cfg(cfg: Config) -> None:
+    if int(cfg.rollout.max_rounds) < 1:
+        raise ValueError("rollout.max_rounds must be >= 1")
+    if float(cfg.loss.w_z_ans) < 0.0:
+        raise ValueError("loss.w_z_ans must be >= 0")
+    if float(cfg.loss.w_digits) < 0.0:
+        raise ValueError("loss.w_digits must be >= 0")
+    if float(cfg.loss.w_verify) < 0.0:
+        raise ValueError("loss.w_verify must be >= 0")
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -215,8 +215,25 @@ def _prepare_tokenizer_and_model(cfg: Config):
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
             model.resize_token_embeddings(len(tokenizer))
 
+    special_added = tokenizer.add_special_tokens(
+        {"additional_special_tokens": [str(cfg.model.finalize_token), str(cfg.model.retry_token)]}
+    )
+    if int(special_added) > 0:
+        model.resize_token_embeddings(len(tokenizer))
+
     answer_token_id = int(resolve_answer_token_id(tokenizer, answer_token=str(cfg.model.answer_token)))
     validate_answer_token_single(tokenizer, str(cfg.model.answer_token), answer_token_id)
+
+    finalize_ids = tokenizer.encode(str(cfg.model.finalize_token), add_special_tokens=False)
+    retry_ids = tokenizer.encode(str(cfg.model.retry_token), add_special_tokens=False)
+    if len(finalize_ids) != 1 or len(retry_ids) != 1:
+        raise RuntimeError("Verify tokens must tokenize to exactly one token each")
+    finalize_token_id = int(finalize_ids[0])
+    retry_token_id = int(retry_ids[0])
+    validate_single_token(tokenizer, str(cfg.model.finalize_token), finalize_token_id, label="Verify")
+    validate_single_token(tokenizer, str(cfg.model.retry_token), retry_token_id, label="Verify")
+    if finalize_token_id == retry_token_id:
+        raise RuntimeError("<FINALIZE> and <RETRY> must map to distinct token ids")
 
     z_token_ids, _style = introspect_z_token_ids_and_style(tokenizer)
     if not z_token_ids:
@@ -225,7 +242,16 @@ def _prepare_tokenizer_and_model(cfg: Config):
     digit_token_ids = resolve_digit_token_ids(tokenizer)
     digit_id_to_val = make_digit_id_to_value_map(digit_token_ids)
 
-    return tokenizer, model, answer_token_id, z_token_ids, digit_token_ids, digit_id_to_val
+    return (
+        tokenizer,
+        model,
+        answer_token_id,
+        z_token_ids,
+        digit_token_ids,
+        digit_id_to_val,
+        finalize_token_id,
+        retry_token_id,
+    )
 
 
 def _make_rollout_engine(
@@ -235,6 +261,9 @@ def _make_rollout_engine(
     answer_token_id: int,
     z_token_ids: Sequence[int],
     digit_token_ids: Sequence[int],
+    verify_token_ids: Sequence[int],
+    finalize_token_id: int,
+    retry_token_id: int,
     run_dir: str,
     logger,
 ):
@@ -250,6 +279,9 @@ def _make_rollout_engine(
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=list(z_token_ids),
             digit_allowed_token_ids=list(digit_token_ids),
+            verify_allowed_token_ids=list(verify_token_ids),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
             trust_remote_code=bool(cfg.model.trust_remote_code),
             engine_kwargs=engine_kwargs,
             output_dir=run_dir,
@@ -264,34 +296,34 @@ def _make_rollout_engine(
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=list(z_token_ids),
             digit_allowed_token_ids=list(digit_token_ids),
+            verify_allowed_token_ids=list(verify_token_ids),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
             sync_every=int(cfg.rollout.sync_every_n_steps),
             logger=logger,
         )
     raise ValueError(f"Unsupported rollout.backend={cfg.rollout.backend!r}; expected 'vllm' or 'hf'")
 
 
-def _append_metrics_csv(path: str, row: Dict[str, object]) -> None:
+def _append_metrics_csv(path: str, row: Dict[str, object], fieldnames: Sequence[str]) -> None:
     exists = os.path.isfile(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=METRICS_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=list(fieldnames))
         if not exists:
             writer.writeheader()
         writer.writerow(row)
 
 
-def _chunk_examples(rows: Sequence[Dict[str, List[int]]], chunk_size: int) -> List[List[Dict[str, List[int]]]]:
+def _append_metrics_jsonl(path: str, row: Dict[str, object]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def _chunk_examples(rows: Sequence[Dict[str, object]], chunk_size: int) -> List[List[Dict[str, object]]]:
     if len(rows) <= 0:
         return []
     k = max(1, int(chunk_size))
     return [list(rows[i : i + k]) for i in range(0, len(rows), k)]
-
-
-def _prompt_weight_multiplier(k_correct: int, *, use_prompt_weighting: bool) -> float:
-    if int(k_correct) <= 0:
-        return 0.0
-    if not bool(use_prompt_weighting):
-        return 1.0
-    return float(PROMPT_WEIGHT_BY_K.get(int(k_correct), 1.0))
 
 
 def _next_unique_batch(
@@ -330,125 +362,41 @@ def _next_unique_batch(
     return selected, cur
 
 
-def _mean_prefix_logprob(row: Dict[str, object], prefix_len: int) -> Optional[float]:
-    if prefix_len <= 0:
-        return None
-    vals_raw = row.get("token_logprobs", None)
-    if vals_raw is None:
-        return None
-    vals = list(vals_raw)
-    if len(vals) < int(prefix_len):
-        return None
-    use = vals[: int(prefix_len)]
-    if any(v is None for v in use):
-        return None
-    try:
-        nums = [float(v) for v in use]
-    except Exception:
-        return None
-    if len(nums) == 0:
-        return None
-    return float(sum(nums) / len(nums))
-
-
-def _build_rollout_candidates(
-    *,
-    prompts: Sequence[PromptExample],
-    z_rows: Sequence[Dict[str, object]],
-    answer_token_id: int,
-    digit_rows: Sequence[List[int]],
-    digit_id_to_val: Dict[int, int],
-    rollouts_per_prompt: int,
-) -> tuple[Dict[int, List[RolloutCandidate]], List[Dict[str, object]], int]:
-    by_prompt: Dict[int, List[RolloutCandidate]] = {i: [] for i in range(len(prompts))}
-    logs: List[Dict[str, object]] = []
-    exact_rollouts = 0
-
-    valid_indices: List[int] = []
-    valid_z_ids: List[List[int]] = []
-    for flat_idx, row in enumerate(z_rows):
-        prompt_idx = flat_idx // int(rollouts_per_prompt)
-        rollout_idx = flat_idx % int(rollouts_per_prompt)
-        z_ids = extract_z_before_answer_from_row(row, answer_token_id=answer_token_id)
-        if z_ids is None:
-            logs.append(
-                {
-                    "prompt_idx": int(prompt_idx),
-                    "rollout_idx": int(rollout_idx),
-                    "has_answer": False,
-                    "z_len": None,
-                    "exact_match": False,
-                    "selected": False,
-                }
-            )
-            continue
-        valid_indices.append(flat_idx)
-        valid_z_ids.append(z_ids)
-
-    dig_rows = list(digit_rows)
-    if len(dig_rows) != len(valid_indices):
-        raise RuntimeError("digit_rows length mismatch against valid rollout rows")
-
-    for local_idx, flat_idx in enumerate(valid_indices):
-        prompt_idx = flat_idx // int(rollouts_per_prompt)
-        rollout_idx = flat_idx % int(rollouts_per_prompt)
-        dig_tokens = [int(x) for x in dig_rows[local_idx]]
-        pred_digits = decode_digit_tokens(dig_tokens, digit_id_to_val=digit_id_to_val)
-        if pred_digits is None:
-            logs.append(
-                {
-                    "prompt_idx": int(prompt_idx),
-                    "rollout_idx": int(rollout_idx),
-                    "has_answer": True,
-                    "z_len": int(len(valid_z_ids[local_idx])),
-                    "exact_match": False,
-                    "selected": False,
-                }
-            )
-            continue
-
-        cand = RolloutCandidate(
-            prompt_idx=int(prompt_idx),
-            rollout_idx=int(rollout_idx),
-            z_token_ids=list(valid_z_ids[local_idx]),
-            z_avg_logprob=_mean_prefix_logprob(z_rows[flat_idx], len(valid_z_ids[local_idx])),
-            digit_token_ids=list(dig_tokens),
-            pred_digits=list(pred_digits),
-            true_digits=list(prompts[prompt_idx].true_digits),
-        )
-        by_prompt[prompt_idx].append(cand)
-        is_exact = bool(cand.pred_digits == cand.true_digits)
-        if is_exact:
-            exact_rollouts += 1
-        logs.append(
-            {
-                "prompt_idx": int(prompt_idx),
-                "rollout_idx": int(rollout_idx),
-                "has_answer": True,
-                "z_len": int(len(cand.z_token_ids)),
-                "z_avg_logprob": cand.z_avg_logprob,
-                "exact_match": is_exact,
-                "selected": False,
-            }
-        )
-
-    return by_prompt, logs, int(exact_rollouts)
+def _build_round_distribution(accepted_rounds: Sequence[int], max_rounds: int) -> Dict[str, float]:
+    if len(accepted_rounds) == 0:
+        return {f"accepted_round_frac_{r}": 0.0 for r in range(1, int(max_rounds) + 1)}
+    ctr = Counter(int(x) for x in accepted_rounds)
+    denom = float(len(accepted_rounds))
+    return {f"accepted_round_frac_{r}": float(ctr.get(r, 0)) / denom for r in range(1, int(max_rounds) + 1)}
 
 
 def train(cfg: Optional[Config] = None) -> str:
     if cfg is None:
         cfg = Config()
+    _validate_cfg(cfg)
 
     _set_seed(int(cfg.train.seed))
     run_dir = _make_run_dir(str(cfg.logging.output_dir))
     log_path = os.path.join(run_dir, "logs", "run.log")
     metrics_csv = os.path.join(run_dir, "logs", "metrics.csv")
+    metrics_jsonl = os.path.join(run_dir, "logs", "metrics.jsonl")
     rollout_logger = RolloutLogger(os.path.join(run_dir, "logs"))
+    metrics_fields = list(METRICS_FIELDS) + [f"accepted_round_frac_{r}" for r in range(1, int(cfg.rollout.max_rounds) + 1)]
 
     _log(f"Starting RSFT run at {run_dir}", log_path)
     _log(f"Config: {json.dumps(cfg.as_dict(), ensure_ascii=True)}", log_path)
 
-    tokenizer, model, answer_token_id, z_token_ids, digit_token_ids, digit_id_to_val = _prepare_tokenizer_and_model(cfg)
+    (
+        tokenizer,
+        model,
+        answer_token_id,
+        z_token_ids,
+        digit_token_ids,
+        digit_id_to_val,
+        finalize_token_id,
+        retry_token_id,
+    ) = _prepare_tokenizer_and_model(cfg)
+    verify_token_ids = [int(finalize_token_id), int(retry_token_id)]
 
     device = torch.device(str(cfg.rollout.torch_device))
     model.to(device)
@@ -490,6 +438,9 @@ def train(cfg: Optional[Config] = None) -> str:
         answer_token_id=answer_token_id,
         z_token_ids=z_token_ids,
         digit_token_ids=digit_token_ids,
+        verify_token_ids=verify_token_ids,
+        finalize_token_id=finalize_token_id,
+        retry_token_id=retry_token_id,
         run_dir=run_dir,
         logger=lambda msg: _log(msg, log_path),
     )
@@ -512,16 +463,15 @@ def train(cfg: Optional[Config] = None) -> str:
             "step": 0,
             "update_step": int(update_step),
             "prompts_sampled": 0,
-            "total_rollouts": 0,
-            "exact_rollouts": 0,
-            "selected_examples": 0,
-            "exact_rollout_rate": 0.0,
-            "selected_example_rate": 0.0,
-            "k_distribution": "{}",
-            "avg_applied_prompt_weight": 0.0,
-            "mean_accepted_z_len": 0.0,
+            "total_sequences": 0,
+            "accepted_prompts": 0,
+            "accepted_rate": 0.0,
+            "avg_rounds_per_accepted": 0.0,
+            "avg_failed_rounds_before_success": 0.0,
+            "mean_accepted_z_len_per_round": 0.0,
             "l_z_ans": 0.0,
             "l_digits": 0.0,
+            "l_verify": 0.0,
             "total_loss": 0.0,
             "grad_norm": 0.0,
             "rollout_time": 0.0,
@@ -536,7 +486,9 @@ def train(cfg: Optional[Config] = None) -> str:
             "no_answer_before_kmax_rate": eval0.get("no_answer_before_kmax_rate", 0.0),
             "eval_time": eval_time0,
         }
-        _append_metrics_csv(metrics_csv, row0)
+        row0.update(_build_round_distribution([], int(cfg.rollout.max_rounds)))
+        _append_metrics_csv(metrics_csv, row0, metrics_fields)
+        _append_metrics_jsonl(metrics_jsonl, row0)
         _log(
             " | ".join(
                 [
@@ -552,15 +504,15 @@ def train(cfg: Optional[Config] = None) -> str:
     try:
         for step in range(1, int(cfg.train.max_steps) + 1):
             t_step_start = time.perf_counter()
-            accepted_rows: List[Dict[str, List[int]]] = []
+            accepted_rows: List[Dict[str, object]] = []
             step_rollout_logs: List[Dict[str, object]] = []
-            accepted_z_lens: List[float] = []
+            accepted_round_counts: List[int] = []
+            accepted_failed_round_counts: List[int] = []
+            accepted_round_z_lens: List[float] = []
+            accepted_prompt_indices: set[int] = set()
             step_seen_questions: set[str] = set()
-            k_distribution: Dict[int, int] = {}
-            applied_prompt_weights: List[float] = []
             prompts_sampled = 0
-            total_rollouts = 0
-            exact_rollouts = 0
+            total_sequences = 0
 
             prompt_batch, order_cursor = _next_unique_batch(
                 examples=train_examples,
@@ -572,105 +524,203 @@ def train(cfg: Optional[Config] = None) -> str:
             )
             if prompt_batch:
                 prompts_sampled += len(prompt_batch)
-                z_rows = engine.generate_z(
-                    prompt_token_ids=[list(ex.prompt_ids) for ex in prompt_batch],
-                    num_samples_per_prompt=int(cfg.rollout.rollouts_per_prompt),
-                    max_new_tokens=int(cfg.rollout.max_new_tokens),
-                    temperature=float(cfg.rollout.temperature),
-                    top_p=float(cfg.rollout.top_p),
-                    min_p=float(cfg.rollout.min_p),
-                    repetition_penalty=float(cfg.rollout.repetition_penalty),
-                )
-                total_rollouts += len(z_rows)
+                rpp = int(cfg.rollout.rollouts_per_prompt)
+                max_rounds = int(cfg.rollout.max_rounds)
+                flat_prompt_ids: List[List[int]] = []
+                seq_prompt_idx: List[int] = []
+                seq_rollout_idx: List[int] = []
+                for pidx, prompt_ex in enumerate(prompt_batch):
+                    for rollout_idx in range(rpp):
+                        flat_prompt_ids.append(list(prompt_ex.prompt_ids))
+                        seq_prompt_idx.append(int(pidx))
+                        seq_rollout_idx.append(int(rollout_idx))
+                total_sequences = len(flat_prompt_ids)
 
-                valid_prompts_for_digits: List[List[int]] = []
-                for flat_idx, row in enumerate(z_rows):
-                    pidx = flat_idx // int(cfg.rollout.rollouts_per_prompt)
-                    z_ids = extract_z_before_answer_from_row(row, answer_token_id=answer_token_id)
-                    if z_ids is None:
-                        continue
-                    valid_prompts_for_digits.append(list(prompt_batch[pidx].prompt_ids) + list(z_ids) + [int(answer_token_id)])
+                rounds_by_seq: List[List[RoundTrace]] = [[] for _ in range(total_sequences)]
+                status_by_seq: List[str] = ["active"] * total_sequences
+                failure_reason_by_seq: List[Optional[str]] = [None] * total_sequences
+                current_prompts: List[List[int]] = [list(x) for x in flat_prompt_ids]
+                generated_rollout_token_ids_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
 
-                if valid_prompts_for_digits:
+                for round_idx in range(1, max_rounds + 1):
+                    active_indices = [i for i, st in enumerate(status_by_seq) if st == "active"]
+                    if not active_indices:
+                        break
+
+                    z_rows = engine.generate_z(
+                        prompt_token_ids=[current_prompts[i] for i in active_indices],
+                        num_samples_per_prompt=1,
+                        max_new_tokens=int(cfg.rollout.max_new_tokens),
+                        temperature=float(cfg.rollout.temperature),
+                        top_p=float(cfg.rollout.top_p),
+                        min_p=float(cfg.rollout.min_p),
+                        repetition_penalty=float(cfg.rollout.repetition_penalty),
+                    )
+                    if len(z_rows) != len(active_indices):
+                        raise RuntimeError("Z generation row count mismatch for active trajectories")
+
+                    valid_active_indices: List[int] = []
+                    z_ids_by_active: List[List[int]] = []
+                    digit_prompts: List[List[int]] = []
+                    for j, seq_idx in enumerate(active_indices):
+                        z_ids = extract_z_before_answer_from_row(z_rows[j], answer_token_id=answer_token_id)
+                        if z_ids is None:
+                            status_by_seq[seq_idx] = "failed"
+                            failure_reason_by_seq[seq_idx] = "no_answer_before_max_tokens"
+                            step_rollout_logs.append(
+                                {
+                                    "prompt_idx": int(seq_prompt_idx[seq_idx]),
+                                    "rollout_idx": int(seq_rollout_idx[seq_idx]),
+                                    "round_idx": int(round_idx),
+                                    "accepted": False,
+                                    "failure_reason": "no_answer_before_max_tokens",
+                                    "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
+                                }
+                            )
+                            continue
+                        valid_active_indices.append(seq_idx)
+                        z_ids_by_active.append([int(x) for x in z_ids])
+                        digit_prompts.append(list(current_prompts[seq_idx]) + list(z_ids) + [int(answer_token_id)])
+
                     digit_rows = engine.generate_digits(
-                        prompt_token_ids=valid_prompts_for_digits,
+                        prompt_token_ids=digit_prompts,
                         temperature=float(cfg.rollout.temperature),
                         top_p=float(cfg.rollout.top_p),
                         greedy=bool(cfg.rollout.digit_greedy),
                         min_p=float(cfg.rollout.min_p),
                         repetition_penalty=float(cfg.rollout.repetition_penalty),
-                    )
-                else:
-                    digit_rows = []
+                    ) if digit_prompts else []
+                    if len(digit_rows) != len(valid_active_indices):
+                        raise RuntimeError("Digit generation row count mismatch against valid trajectories")
 
-                cand_by_prompt, rollout_log_rows, exact_count_chunk = _build_rollout_candidates(
-                    prompts=prompt_batch,
-                    z_rows=z_rows,
-                    answer_token_id=answer_token_id,
-                    digit_rows=digit_rows,
-                    digit_id_to_val=digit_id_to_val,
-                    rollouts_per_prompt=int(cfg.rollout.rollouts_per_prompt),
-                )
-                exact_rollouts += int(exact_count_chunk)
-                prompt_has_wrong: Dict[int, bool] = {i: False for i in range(len(prompt_batch))}
-                for row in rollout_log_rows:
-                    pidx_row = int(row.get("prompt_idx", -1))
-                    if pidx_row < 0 or pidx_row >= len(prompt_batch):
-                        continue
-                    if not bool(row.get("exact_match", False)):
-                        prompt_has_wrong[pidx_row] = True
-                for pidx, prompt_ex in enumerate(prompt_batch):
-                    # Keep only prompts with mixed outcomes (at least one wrong rollout).
-                    if not bool(prompt_has_wrong.get(pidx, True)):
-                        continue
-                    cands = list(cand_by_prompt.get(pidx, []))
-                    if not cands:
-                        continue
-                    correct_cands = [c for c in cands if c.pred_digits == c.true_digits]
-                    k_correct = int(len(correct_cands))
-                    if k_correct == 0:
-                        continue
-                    k_distribution[k_correct] = int(k_distribution.get(k_correct, 0) + 1)
-                    built_rows: List[Tuple[int, Dict[str, List[int]]]] = []
-                    for cand in correct_cands:
+                    for j, seq_idx in enumerate(valid_active_indices):
+                        z_ids = z_ids_by_active[j]
+                        dig_tokens = [int(x) for x in digit_rows[j]]
+                        if len(dig_tokens) != 5:
+                            raise RuntimeError(f"Digits phase must emit exactly 5 digits per round, got {len(dig_tokens)}")
+                        pred_digits = decode_digit_tokens(dig_tokens, digit_id_to_val=digit_id_to_val)
+                        if pred_digits is None:
+                            raise RuntimeError("Digits decode failed despite restricted digit allowed-token set")
+                        true_digits = list(prompt_batch[seq_prompt_idx[seq_idx]].true_digits)
+                        is_correct = bool(pred_digits == true_digits)
+                        verify_token_id = int(finalize_token_id if is_correct else retry_token_id)
+                        if verify_token_id not in verify_token_ids:
+                            raise RuntimeError("Verify token is outside allowed verify set")
+
+                        rounds_by_seq[seq_idx].append(
+                            RoundTrace(
+                                z_token_ids=list(z_ids),
+                                digit_token_ids=list(dig_tokens),
+                                pred_digits=list(pred_digits),
+                                true_digits=list(true_digits),
+                                verify_token_id=int(verify_token_id),
+                                is_correct=bool(is_correct),
+                            )
+                        )
+
+                        current_prompts[seq_idx].extend(list(z_ids))
+                        current_prompts[seq_idx].append(int(answer_token_id))
+                        current_prompts[seq_idx].extend(list(dig_tokens))
+                        current_prompts[seq_idx].append(int(verify_token_id))
+                        round_generated_ids = list(z_ids) + [int(answer_token_id)] + list(dig_tokens) + [int(verify_token_id)]
+                        generated_rollout_token_ids_by_seq[seq_idx].extend(round_generated_ids)
+
+                        step_rollout_logs.append(
+                            {
+                                "prompt_idx": int(seq_prompt_idx[seq_idx]),
+                                "rollout_idx": int(seq_rollout_idx[seq_idx]),
+                                "round_idx": int(round_idx),
+                                "z_len": int(len(z_ids)),
+                                "z_token_ids": list(z_ids),
+                                "digit_token_ids": list(dig_tokens),
+                                "pred_digits": "".join(str(int(x)) for x in pred_digits),
+                                "true_digits": "".join(str(int(x)) for x in true_digits),
+                                "is_correct": bool(is_correct),
+                                "verify_token_id": int(verify_token_id),
+                                "verify_action": "FINALIZE" if is_correct else "RETRY",
+                                "round_generated_token_ids": list(round_generated_ids),
+                                "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
+                                "accepted": False,
+                                "failure_reason": None,
+                            }
+                        )
+
+                        if is_correct:
+                            status_by_seq[seq_idx] = "success"
+                        elif round_idx >= max_rounds:
+                            status_by_seq[seq_idx] = "failed"
+                            failure_reason_by_seq[seq_idx] = "max_rounds_reached_without_success"
+
+                for seq_idx in range(total_sequences):
+                    rounds = rounds_by_seq[seq_idx]
+                    status = status_by_seq[seq_idx]
+                    reason = failure_reason_by_seq[seq_idx]
+                    include_in_train = bool(status == "success") or bool(
+                        status == "failed" and reason == "max_rounds_reached_without_success"
+                    )
+                    if include_in_train:
                         built = build_training_example(
-                            prompt_ids=prompt_ex.prompt_ids,
-                            z_token_ids=cand.z_token_ids,
+                            prompt_ids=flat_prompt_ids[seq_idx],
+                            rounds=rounds,
                             answer_token_id=answer_token_id,
-                            digit_token_ids=cand.digit_token_ids,
+                            finalize_token_id=finalize_token_id,
+                            retry_token_id=retry_token_id,
                             max_length=int(cfg.train.max_length),
                         )
                         if built is None:
-                            continue
-                        built_rows.append((int(cand.rollout_idx), built))
-                    if len(built_rows) == 0:
-                        continue
-                    k_trained = int(len(built_rows))
-                    prompt_weight = _prompt_weight_multiplier(
-                        k_trained,
-                        use_prompt_weighting=bool(cfg.loss.use_prompt_weighting),
-                    )
-                    per_example_weight = prompt_weight * (1.0 / float(k_trained))
-                    applied_prompt_weights.append(float(prompt_weight))
-                    for rollout_idx, built in built_rows:
-                        built["example_weight"] = per_example_weight  # type: ignore[index]
-                        accepted_rows.append(built)
-                        accepted_z_lens.append(float(built["z_len"]))
-                        # Mark selected rows in current rollout chunk.
-                        for row in rollout_log_rows:
-                            if (
-                                int(row.get("prompt_idx", -1)) == int(pidx)
-                                and int(row.get("rollout_idx", -1)) == int(rollout_idx)
-                            ):
-                                row["selected"] = True
-                                break
+                            status = "failed"
+                            failure_reason_by_seq[seq_idx] = "max_length_exceeded"
+                        else:
+                            built["source_prompt_idx"] = int(seq_prompt_idx[seq_idx])
+                            accepted_rows.append(built)
+                            accepted_prompt_indices.add(int(seq_prompt_idx[seq_idx]))
+                            accepted_round_counts.append(int(built["round_count"]))  # type: ignore[index]
+                            accepted_failed_round_counts.append(int(built["failed_rounds"]))  # type: ignore[index]
+                            for zlen in list(built["round_z_lens"]):  # type: ignore[index]
+                                accepted_round_z_lens.append(float(zlen))
 
-                step_rollout_logs.extend(rollout_log_rows)
+                    if status != "success" and reason is None:
+                        reason = "unknown_failure"
+                    for row in reversed(step_rollout_logs):
+                        if (
+                            int(row.get("prompt_idx", -1)) == int(seq_prompt_idx[seq_idx])
+                            and int(row.get("rollout_idx", -1)) == int(seq_rollout_idx[seq_idx])
+                        ):
+                            row["accepted"] = bool(include_in_train)
+                            row["terminal_status"] = str(status)
+                            row["round_count_observed"] = int(len(rounds))
+                            row["full_rollout_token_ids"] = list(generated_rollout_token_ids_by_seq[seq_idx])
+                            row["full_sequence_token_ids"] = list(flat_prompt_ids[seq_idx]) + list(
+                                generated_rollout_token_ids_by_seq[seq_idx]
+                            )
+                            row["rounds"] = [
+                                {
+                                    "z_token_ids": list(r.z_token_ids),
+                                    "digit_token_ids": list(r.digit_token_ids),
+                                    "verify_token_id": int(r.verify_token_id),
+                                    "is_correct": bool(r.is_correct),
+                                }
+                                for r in rounds
+                            ]
+                            if not bool(include_in_train):
+                                row["failure_reason"] = str(reason)
+                            break
+
+                if accepted_rows:
+                    by_prompt: Dict[int, int] = {}
+                    for ex in accepted_rows:
+                        pidx = int(ex.get("source_prompt_idx", -1))
+                        by_prompt[pidx] = by_prompt.get(pidx, 0) + 1
+                    for ex in accepted_rows:
+                        pidx = int(ex.get("source_prompt_idx", -1))
+                        denom = max(by_prompt.get(pidx, 1), 1)
+                        ex["example_weight"] = 1.0 / float(denom)
 
             rollout_path = rollout_logger.write_step(step, step_rollout_logs)
 
             l_z_ans_val = 0.0
             l_digits_val = 0.0
+            l_verify_val = 0.0
             total_loss_val = 0.0
             grad_norm_val = 0.0
             train_time = 0.0
@@ -693,6 +743,7 @@ def train(cfg: Optional[Config] = None) -> str:
 
                 lz_weighted_sum = 0.0
                 ld_weighted_sum = 0.0
+                lv_weighted_sum = 0.0
                 tl_weighted_sum = 0.0
                 w_seen_sum = 0.0
 
@@ -722,6 +773,7 @@ def train(cfg: Optional[Config] = None) -> str:
                         )
                         per_lz: List[torch.Tensor] = []
                         per_ld: List[torch.Tensor] = []
+                        per_lv: List[torch.Tensor] = []
                         per_tl: List[torch.Tensor] = []
                         for i in range(out.logits.shape[0]):
                             losses_i = compute_rsft_losses(
@@ -731,14 +783,18 @@ def train(cfg: Optional[Config] = None) -> str:
                                 z_token_ids=z_token_ids,
                                 answer_token_id=answer_token_id,
                                 digit_token_ids=digit_token_ids,
+                                verify_token_ids=verify_token_ids,
                                 w_z_ans=float(cfg.loss.w_z_ans),
                                 w_digits=float(cfg.loss.w_digits),
+                                w_verify=float(cfg.loss.w_verify),
                             )
                             per_lz.append(losses_i["l_z_ans"])
                             per_ld.append(losses_i["l_digits"])
+                            per_lv.append(losses_i["l_verify"])
                             per_tl.append(losses_i["loss"])
                         lz_t = torch.stack(per_lz)
                         ld_t = torch.stack(per_ld)
+                        lv_t = torch.stack(per_lv)
                         tl_t = torch.stack(per_tl)
                         w_t = example_weights.to(tl_t.dtype)
                         # Normalize by total step question-weight so each question contributes equally.
@@ -748,6 +804,7 @@ def train(cfg: Optional[Config] = None) -> str:
 
                     lz_weighted_sum += float((lz_t.detach().float() * example_weights).sum().item())
                     ld_weighted_sum += float((ld_t.detach().float() * example_weights).sum().item())
+                    lv_weighted_sum += float((lv_t.detach().float() * example_weights).sum().item())
                     tl_weighted_sum += float((tl_t.detach().float() * example_weights).sum().item())
                     w_seen_sum += float(example_weights.sum().item())
 
@@ -758,6 +815,7 @@ def train(cfg: Optional[Config] = None) -> str:
                 denom = max(w_seen_sum, 1e-12)
                 l_z_ans_val = float(lz_weighted_sum / denom)
                 l_digits_val = float(ld_weighted_sum / denom)
+                l_verify_val = float(lv_weighted_sum / denom)
                 total_loss_val = float(tl_weighted_sum / denom)
                 grad_norm_val = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
                 train_time = time.perf_counter() - t_train
@@ -770,33 +828,21 @@ def train(cfg: Optional[Config] = None) -> str:
 
             rollout_time = (time.perf_counter() - t_step_start) - train_time - sync_time
 
-            selected_examples = int(len(accepted_rows))
-            exact_rollout_rate = float(exact_rollouts) / float(total_rollouts) if total_rollouts > 0 else 0.0
-            selected_example_rate = float(selected_examples) / float(total_rollouts) if total_rollouts > 0 else 0.0
-            k_distribution_str = json.dumps(
-                {str(k): int(v) for k, v in sorted(k_distribution.items(), key=lambda kv: kv[0])},
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            avg_applied_prompt_weight = (
-                float(sum(applied_prompt_weights) / float(len(applied_prompt_weights)))
-                if len(applied_prompt_weights) > 0
-                else 0.0
-            )
+            accepted_prompts = int(len(accepted_prompt_indices))
+            accepted_rate = float(accepted_prompts) / float(prompts_sampled) if prompts_sampled > 0 else 0.0
             row = {
                 "step": int(step),
                 "update_step": int(update_step),
                 "prompts_sampled": int(prompts_sampled),
-                "total_rollouts": int(total_rollouts),
-                "exact_rollouts": int(exact_rollouts),
-                "selected_examples": selected_examples,
-                "exact_rollout_rate": float(exact_rollout_rate),
-                "selected_example_rate": float(selected_example_rate),
-                "k_distribution": k_distribution_str,
-                "avg_applied_prompt_weight": float(avg_applied_prompt_weight),
-                "mean_accepted_z_len": float(mean_or_zero(accepted_z_lens)),
+                "total_sequences": int(total_sequences),
+                "accepted_prompts": int(accepted_prompts),
+                "accepted_rate": float(accepted_rate),
+                "avg_rounds_per_accepted": float(mean_or_zero(accepted_round_counts)),
+                "avg_failed_rounds_before_success": float(mean_or_zero(accepted_failed_round_counts)),
+                "mean_accepted_z_len_per_round": float(mean_or_zero(accepted_round_z_lens)),
                 "l_z_ans": float(l_z_ans_val),
                 "l_digits": float(l_digits_val),
+                "l_verify": float(l_verify_val),
                 "total_loss": float(total_loss_val),
                 "grad_norm": float(grad_norm_val),
                 "rollout_time": float(max(rollout_time, 0.0)),
@@ -811,6 +857,7 @@ def train(cfg: Optional[Config] = None) -> str:
                 "no_answer_before_kmax_rate": None,
                 "eval_time": None,
             }
+            row.update(_build_round_distribution(accepted_round_counts, int(cfg.rollout.max_rounds)))
 
             if step % int(cfg.eval.eval_every_steps) == 0:
                 t_eval = time.perf_counter()
@@ -824,20 +871,20 @@ def train(cfg: Optional[Config] = None) -> str:
                 row.update(eval_metrics)
                 row["eval_time"] = float(time.perf_counter() - t_eval)
 
-            _append_metrics_csv(metrics_csv, row)
+            _append_metrics_csv(metrics_csv, row, metrics_fields)
+            _append_metrics_jsonl(metrics_jsonl, row)
 
             if (step % int(cfg.logging.log_every)) == 0:
                 _log(
                     " | ".join(
                         [
                             f"step={row['step']}",
-                            f"selected={row['selected_examples']}",
-                            f"exact_rate={row['exact_rollout_rate']:.4f}",
-                            f"selected_rate={row['selected_example_rate']:.4f}",
-                            f"k_dist={row['k_distribution']}",
-                            f"avg_prompt_w={row['avg_applied_prompt_weight']:.4f}",
+                            f"accepted={row['accepted_prompts']}",
+                            f"accepted_rate={row['accepted_rate']:.4f}",
+                            f"avg_rounds={row['avg_rounds_per_accepted']:.3f}",
                             f"Lz={row['l_z_ans']:.4f}",
                             f"Ld={row['l_digits']:.4f}",
+                            f"Lv={row['l_verify']:.4f}",
                             f"L={row['total_loss']:.4f}",
                             f"rollout_t={row['rollout_time']:.2f}s",
                             f"train_t={row['train_time']:.2f}s",

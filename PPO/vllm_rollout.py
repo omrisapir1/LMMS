@@ -26,11 +26,24 @@ class VLLMRolloutEngine:
         sync_every: int,
         seed: int,
         logger,
+        verify_allowed_token_ids: Sequence[int] = (),
+        finalize_token_id: Optional[int] = None,
+        retry_token_id: Optional[int] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.answer_token_id = int(answer_token_id)
         self.z_allowed_token_ids = [int(x) for x in z_allowed_token_ids]
         self.digit_allowed_token_ids = [int(x) for x in digit_allowed_token_ids]
+        self.verify_allowed_token_ids = [int(x) for x in verify_allowed_token_ids]
+        self.finalize_token_id = int(finalize_token_id) if finalize_token_id is not None else None
+        self.retry_token_id = int(retry_token_id) if retry_token_id is not None else None
+        if len(self.verify_allowed_token_ids) > 0:
+            if self.finalize_token_id is None or self.retry_token_id is None:
+                raise RuntimeError("vLLM rollout verify ids are required when verify_allowed_token_ids is set")
+            if sorted(set(self.verify_allowed_token_ids)) != sorted({self.finalize_token_id, self.retry_token_id}):
+                raise RuntimeError("vLLM rollout verify allowlist must contain exactly <FINALIZE> and <RETRY>")
+        if (self.finalize_token_id is None) != (self.retry_token_id is None):
+            raise RuntimeError("vLLM rollout finalize/retry ids must be set together")
         self.trust_remote_code = bool(trust_remote_code)
         self.output_dir = output_dir
         self.tmp_ckpt_dir = tmp_ckpt_dir
@@ -675,3 +688,42 @@ class VLLMRolloutEngine:
                 outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
 
         return [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
+
+    def generate_verify(
+        self,
+        prompts: Optional[Sequence[str]] = None,
+        prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
+        *,
+        temperature: float,
+        top_p: float,
+        greedy: bool,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+    ) -> List[List[int]]:
+        if self._llm is None:
+            raise RuntimeError("vLLM engine is not initialized")
+        sp = self._build_sampling_params(
+            allowed_token_ids=self.verify_allowed_token_ids,
+            max_tokens=1,
+            min_tokens=1,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            min_p=float(min_p),
+            repetition_penalty=float(repetition_penalty),
+            greedy=bool(greedy),
+        )
+
+        with self._lock:
+            if prompt_token_ids is not None and self.supports_prompt_token_ids():
+                token_prompts = [{"prompt_token_ids": list(map(int, x))} for x in prompt_token_ids]
+                outs = self._llm.generate(token_prompts, sp, use_tqdm=False)
+            else:
+                if prompts is None:
+                    raise RuntimeError("generate_verify requires text prompts when prompt_token_ids are unsupported")
+                outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
+
+        rows = [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
+        for row in rows:
+            if len(row) != 1:
+                raise RuntimeError(f"vLLM verify generation must return exactly 1 token, got {len(row)}")
+        return rows

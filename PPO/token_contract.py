@@ -13,9 +13,13 @@ def resolve_digit_token_ids(tokenizer) -> List[int]:
     return ids
 
 
-def validate_answer_token_single(tokenizer, answer_token: str, answer_token_id: int) -> None:
-    enc = tokenizer.encode(answer_token, add_special_tokens=False)
-    if enc != [int(answer_token_id)]:
+def validate_single_token(tokenizer, token_text: str, token_id: int, *, label: str) -> None:
+    enc = tokenizer.encode(token_text, add_special_tokens=False)
+    if enc != [int(token_id)]:
         raise RuntimeError(
-            f"Answer tokenization contract violated for {answer_token}: got {enc}, expected [{answer_token_id}]"
+            f"{label} tokenization contract violated for {token_text}: got {enc}, expected [{token_id}]"
         )
+
+
+def validate_answer_token_single(tokenizer, answer_token: str, answer_token_id: int) -> None:
+    validate_single_token(tokenizer, answer_token, answer_token_id, label="Answer")

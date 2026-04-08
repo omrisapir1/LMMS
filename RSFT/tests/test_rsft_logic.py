@@ -4,15 +4,15 @@ import torch
 import torch.nn.functional as F
 
 from RSFT.logic import (
-    RolloutCandidate,
     TARGET_ANSWER,
     TARGET_DIGIT,
+    TARGET_VERIFY,
     TARGET_Z,
+    RoundTrace,
     build_training_example,
     compute_rsft_losses,
     exact_digit_match,
     extract_z_before_answer_from_row,
-    select_shortest_valid,
 )
 
 
@@ -21,79 +21,147 @@ def test_exact_digit_filtering() -> None:
     assert not exact_digit_match([1, 2, 3, 4, 0], [1, 2, 3, 4, 5])
 
 
-def test_selection_picks_any_correct_candidate() -> None:
-    candidates = [
-        RolloutCandidate(
-            prompt_idx=0,
-            rollout_idx=0,
-            z_token_ids=[10, 11],
-            z_avg_logprob=-1.2,
-            digit_token_ids=[101, 102, 103, 104, 105],
-            pred_digits=[1, 2, 3, 4, 5],
-            true_digits=[1, 2, 3, 4, 5],
-        ),
-        RolloutCandidate(
-            prompt_idx=0,
-            rollout_idx=1,
-            z_token_ids=[12],
-            z_avg_logprob=-0.8,
-            digit_token_ids=[101, 102, 103, 104, 105],
-            pred_digits=[1, 2, 3, 4, 5],
-            true_digits=[1, 2, 3, 4, 5],
-        ),
-        RolloutCandidate(
-            prompt_idx=0,
-            rollout_idx=2,
-            z_token_ids=[13],
-            z_avg_logprob=-2.1,
-            digit_token_ids=[101, 102, 103, 104, 105],
-            pred_digits=[1, 2, 3, 4, 5],
-            true_digits=[1, 2, 3, 4, 5],
-        ),
-    ]
-    chosen = select_shortest_valid(candidates)
-    assert chosen is not None
-    assert chosen.z_token_ids in ([10, 11], [12], [13])
-
-
-def test_acceptance_filtering_requires_exact_match() -> None:
-    candidates = [
-        RolloutCandidate(
-            prompt_idx=0,
-            rollout_idx=0,
-            z_token_ids=[10],
-            z_avg_logprob=-1.0,
-            digit_token_ids=[101, 102, 103, 104, 105],
-            pred_digits=[1, 2, 3, 4, 0],
-            true_digits=[1, 2, 3, 4, 5],
+def test_overlength_examples_are_dropped() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[4, 5, 6],
+            digit_token_ids=[8, 9, 10, 11, 12],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=13,
+            is_correct=True,
         )
     ]
-    chosen = select_shortest_valid(candidates)
-    assert chosen is None
-
-
-def test_overlength_examples_are_dropped() -> None:
     ex = build_training_example(
         prompt_ids=[1, 2, 3],
-        z_token_ids=[4, 5, 6],
+        rounds=rounds,
         answer_token_id=7,
-        digit_token_ids=[8, 9, 10, 11, 12],
+        finalize_token_id=13,
+        retry_token_id=14,
         max_length=5,
     )
     assert ex is None
 
 
-def test_masking_contract_for_two_losses() -> None:
-    # 3-token sequence with explicit targets: z, answer, digit.
-    labels = torch.tensor([[5, 6, 7]], dtype=torch.long)
-    target_class = torch.tensor([[TARGET_Z, TARGET_ANSWER, TARGET_DIGIT]], dtype=torch.long)
+def test_masking_contract_failed_then_success() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[10],
+            digit_token_ids=[21, 21, 21, 21, 21],
+            pred_digits=[0, 0, 0, 0, 0],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=14,
+            is_correct=False,
+        ),
+        RoundTrace(
+            z_token_ids=[11],
+            digit_token_ids=[21, 21, 21, 21, 22],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=13,
+            is_correct=True,
+        ),
+    ]
+    ex = build_training_example(
+        prompt_ids=[1, 2],
+        rounds=rounds,
+        answer_token_id=20,
+        finalize_token_id=13,
+        retry_token_id=14,
+        max_length=64,
+    )
+    assert ex is not None
+    tcls = ex["target_class"]
+    assert TARGET_VERIFY in tcls
+    assert tcls.count(TARGET_DIGIT) == 5
+    assert tcls.count(TARGET_VERIFY) == 2
+
+
+def test_verify_always_and_z_digit_only_final_round() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[30, 31],
+            digit_token_ids=[41, 41, 41, 41, 41],
+            pred_digits=[0, 0, 0, 0, 0],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=51,
+            is_correct=False,
+        ),
+        RoundTrace(
+            z_token_ids=[32],
+            digit_token_ids=[41, 41, 41, 41, 42],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=50,
+            is_correct=True,
+        ),
+    ]
+    ex = build_training_example(
+        prompt_ids=[1, 2],
+        rounds=rounds,
+        answer_token_id=40,
+        finalize_token_id=50,
+        retry_token_id=51,
+        max_length=128,
+    )
+    assert ex is not None
+    # With two rounds, we must supervise exactly:
+    # - verify: 2 tokens (every round)
+    # - digits: 5 tokens (final round only)
+    # - z/answer: len(final_z)+1 tokens (final round only)
+    tcls = ex["target_class"]
+    assert tcls.count(TARGET_VERIFY) == 2
+    assert tcls.count(TARGET_DIGIT) == 5
+    assert tcls.count(TARGET_Z) == 1
+    assert tcls.count(TARGET_ANSWER) == 1
+
+
+def test_zero_success_sequence_is_verify_only() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[60],
+            digit_token_ids=[71, 71, 71, 71, 71],
+            pred_digits=[0, 0, 0, 0, 0],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=81,
+            is_correct=False,
+        ),
+        RoundTrace(
+            z_token_ids=[61, 62],
+            digit_token_ids=[71, 71, 71, 71, 71],
+            pred_digits=[0, 0, 0, 0, 0],
+            true_digits=[0, 0, 0, 0, 1],
+            verify_token_id=81,
+            is_correct=False,
+        ),
+    ]
+    ex = build_training_example(
+        prompt_ids=[1, 2],
+        rounds=rounds,
+        answer_token_id=70,
+        finalize_token_id=80,
+        retry_token_id=81,
+        max_length=128,
+    )
+    assert ex is not None
+    tcls = ex["target_class"]
+    assert tcls.count(TARGET_VERIFY) == 2
+    assert tcls.count(TARGET_Z) == 0
+    assert tcls.count(TARGET_ANSWER) == 0
+    assert tcls.count(TARGET_DIGIT) == 0
+
+
+def test_masking_contract_for_three_losses() -> None:
+    labels = torch.tensor([[5, 6, 7, 8]], dtype=torch.long)
+    target_class = torch.tensor([[TARGET_Z, TARGET_ANSWER, TARGET_DIGIT, TARGET_VERIFY]], dtype=torch.long)
 
     logits = torch.tensor(
         [
             [
-                [0.0, 2.0, 3.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 3.0, 2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 2.0, 3.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0],
+                [0.0, 3.0, 2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 5.0, 1.0],
+                [0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 1.0, 5.0],
             ]
         ],
         dtype=torch.float32,
@@ -105,9 +173,11 @@ def test_masking_contract_for_two_losses() -> None:
         target_class=target_class,
         z_token_ids=[5],
         answer_token_id=6,
-        digit_token_ids=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        digit_token_ids=[7, 8],
+        verify_token_ids=[3, 8],
         w_z_ans=1.0,
         w_digits=1.0,
+        w_verify=1.0,
     )
 
     expected_z_ans = F.cross_entropy(
@@ -116,14 +186,20 @@ def test_masking_contract_for_two_losses() -> None:
         reduction="mean",
     )
     expected_digits = F.cross_entropy(
-        torch.tensor([[5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        torch.tensor([[5.0, 1.0]], dtype=torch.float32),
         torch.tensor([0], dtype=torch.long),
+        reduction="mean",
+    )
+    expected_verify = F.cross_entropy(
+        torch.tensor([[3.0, 5.0]], dtype=torch.float32),
+        torch.tensor([1], dtype=torch.long),
         reduction="mean",
     )
 
     assert torch.allclose(losses["l_z_ans"], expected_z_ans, atol=1e-6)
     assert torch.allclose(losses["l_digits"], expected_digits, atol=1e-6)
-    assert torch.allclose(losses["loss"], expected_z_ans + expected_digits, atol=1e-6)
+    assert torch.allclose(losses["l_verify"], expected_verify, atol=1e-6)
+    assert torch.allclose(losses["loss"], expected_z_ans + expected_digits + expected_verify, atol=1e-6)
 
 
 def test_extract_z_before_answer_from_row_handles_implicit_answer_stop() -> None:

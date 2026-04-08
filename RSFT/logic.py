@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import random
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -12,26 +11,25 @@ TARGET_IGNORE = 0
 TARGET_Z = 1
 TARGET_ANSWER = 2
 TARGET_DIGIT = 3
+TARGET_VERIFY = 4
 
 
 @dataclass
-class RolloutCandidate:
-    prompt_idx: int
-    rollout_idx: int
+class RoundTrace:
     z_token_ids: List[int]
-    z_avg_logprob: Optional[float]
     digit_token_ids: List[int]
     pred_digits: List[int]
     true_digits: List[int]
+    verify_token_id: int
+    is_correct: bool
 
 
 @dataclass
-class AcceptedExample:
+class MultiRoundRollout:
     prompt_idx: int
     rollout_idx: int
-    z_token_ids: List[int]
-    digit_token_ids: List[int]
-    pred_digits: List[int]
+    rounds: List[RoundTrace]
+    success: bool
 
 
 def extract_z_before_answer(
@@ -44,7 +42,6 @@ def extract_z_before_answer(
     ids = [int(x) for x in token_ids]
     ans = int(answer_token_id)
 
-    # Case 1: answer token is present in returned token_ids.
     if ids:
         try:
             idx = ids.index(ans)
@@ -52,7 +49,6 @@ def extract_z_before_answer(
         except ValueError:
             pass
 
-    # Case 2: backend indicates stop-on-answer, but omits the answer token from token_ids.
     stop_is_answer = False
     if stop_reason is not None:
         if isinstance(stop_reason, (int, float)) and int(stop_reason) == ans:
@@ -99,34 +95,111 @@ def exact_digit_match(pred_digits: Sequence[int], true_digits: Sequence[int]) ->
     return all(int(a) == int(b) for a, b in zip(pred_digits, true_digits))
 
 
-def select_shortest_valid(candidates: Sequence[RolloutCandidate]) -> Optional[AcceptedExample]:
-    valid = [cand for cand in candidates if exact_digit_match(cand.pred_digits, cand.true_digits)]
-    if not valid:
-        return None
-    best = random.choice(valid)
-    return AcceptedExample(
-        prompt_idx=int(best.prompt_idx),
-        rollout_idx=int(best.rollout_idx),
-        z_token_ids=list(best.z_token_ids),
-        digit_token_ids=list(best.digit_token_ids),
-        pred_digits=list(best.pred_digits),
-    )
+def _validate_accepted_rounds(
+    *,
+    rounds: Sequence[RoundTrace],
+    finalize_token_id: int,
+    retry_token_id: int,
+) -> None:
+    if len(rounds) == 0:
+        raise RuntimeError("Accepted example must include at least one round")
+
+    success_indices = [i for i, r in enumerate(rounds) if bool(r.is_correct)]
+    if len(success_indices) > 1:
+        raise RuntimeError("Accepted example cannot contain more than one successful round")
+    if len(success_indices) == 1 and success_indices[0] != len(rounds) - 1:
+        raise RuntimeError("Successful round must be terminal")
+
+    for idx, rnd in enumerate(rounds):
+        if len(rnd.digit_token_ids) != 5:
+            raise RuntimeError(f"Digits phase must emit exactly 5 tokens per round, got {len(rnd.digit_token_ids)}")
+        if len(rnd.pred_digits) != 5 or len(rnd.true_digits) != 5:
+            raise RuntimeError("Each round must contain exactly 5 predicted digits and 5 true digits")
+        if bool(rnd.is_correct):
+            if int(rnd.verify_token_id) != int(finalize_token_id):
+                raise RuntimeError("Successful round verify token must be <FINALIZE>")
+            if not exact_digit_match(rnd.pred_digits, rnd.true_digits):
+                raise RuntimeError("Successful round must have exact digit match")
+        else:
+            if int(rnd.verify_token_id) != int(retry_token_id):
+                raise RuntimeError("Failed round verify token must be <RETRY>")
+            if exact_digit_match(rnd.pred_digits, rnd.true_digits):
+                raise RuntimeError("Failed round cannot have exact digit match")
+            if len(success_indices) == 1 and idx == len(rounds) - 1:
+                raise RuntimeError("When a successful round exists, final round must be successful")
+    if len(success_indices) == 0:
+        if any(bool(r.is_correct) for r in rounds):
+            raise RuntimeError("Zero-success examples must have all rounds marked failed")
+        if any(int(r.verify_token_id) != int(retry_token_id) for r in rounds):
+            raise RuntimeError("Zero-success examples must use <RETRY> verify token on all rounds")
 
 
 def build_training_example(
     *,
     prompt_ids: Sequence[int],
-    z_token_ids: Sequence[int],
+    rounds: Sequence[RoundTrace],
     answer_token_id: int,
-    digit_token_ids: Sequence[int],
+    finalize_token_id: int,
+    retry_token_id: int,
     max_length: int,
-) -> Optional[Dict[str, List[int]]]:
-    z_ids = [int(x) for x in z_token_ids]
-    d_ids = [int(x) for x in digit_token_ids]
-    if len(d_ids) != 5:
-        return None
+) -> Optional[Dict[str, object]]:
+    _validate_accepted_rounds(
+        rounds=rounds,
+        finalize_token_id=int(finalize_token_id),
+        retry_token_id=int(retry_token_id),
+    )
 
-    suffix = z_ids + [int(answer_token_id)] + d_ids
+    success_indices = [i for i, r in enumerate(rounds) if bool(r.is_correct)]
+    has_success = len(success_indices) == 1
+    success_idx = int(success_indices[0]) if has_success else -1
+
+    suffix: List[int] = []
+    token_class_suffix: List[int] = []
+    round_z_lens: List[int] = []
+    failed_rounds_before_success = 0
+    per_round_supervision: List[Dict[str, int]] = []
+
+    for idx, rnd in enumerate(rounds):
+        is_supervised_final = bool(has_success and idx == success_idx)
+
+        z_ids = [int(x) for x in rnd.z_token_ids]
+        d_ids = [int(x) for x in rnd.digit_token_ids]
+        if len(d_ids) != 5:
+            raise RuntimeError("Digits phase must emit exactly 5 tokens per round")
+
+        suffix.extend(z_ids)
+        suffix.append(int(answer_token_id))
+        suffix.extend(d_ids)
+        suffix.append(int(rnd.verify_token_id))
+
+        round_z_lens.append(len(z_ids))
+
+        if is_supervised_final:
+            token_class_suffix.extend([TARGET_Z] * len(z_ids))
+            token_class_suffix.append(TARGET_ANSWER)
+            token_class_suffix.extend([TARGET_DIGIT] * 5)
+            token_class_suffix.append(TARGET_VERIFY)
+            per_round_supervision.append(
+                {
+                    "z_ans": int(len(z_ids) + 1),
+                    "digits": 5,
+                    "verify": 1,
+                }
+            )
+        else:
+            token_class_suffix.extend([TARGET_IGNORE] * len(z_ids))
+            token_class_suffix.append(TARGET_IGNORE)
+            token_class_suffix.extend([TARGET_IGNORE] * 5)
+            token_class_suffix.append(TARGET_VERIFY)
+            failed_rounds_before_success += 1
+            per_round_supervision.append(
+                {
+                    "z_ans": 0,
+                    "digits": 0,
+                    "verify": 1,
+                }
+            )
+
     input_ids = [int(x) for x in prompt_ids] + suffix
     if len(input_ids) > int(max_length):
         return None
@@ -134,9 +207,7 @@ def build_training_example(
     attention_mask = [1] * len(input_ids)
 
     token_class = [TARGET_IGNORE] * len(prompt_ids)
-    token_class += [TARGET_Z] * len(z_ids)
-    token_class += [TARGET_ANSWER]
-    token_class += [TARGET_DIGIT] * 5
+    token_class.extend(token_class_suffix)
 
     target_class = [TARGET_IGNORE] * len(input_ids)
     for pos in range(len(input_ids) - 1):
@@ -145,33 +216,67 @@ def build_training_example(
     labels = [-100] * len(input_ids)
     for pos in range(len(input_ids) - 1):
         tcls = target_class[pos]
-        if tcls in (TARGET_Z, TARGET_ANSWER, TARGET_DIGIT):
+        if tcls in (TARGET_Z, TARGET_ANSWER, TARGET_DIGIT, TARGET_VERIFY):
             labels[pos] = int(input_ids[pos + 1])
+
+    # Safety contract checks for accepted examples.
+    expected_z_ans = len(rounds[-1].z_token_ids) + 1 if has_success else 0
+    supervised_z_ans = sum(1 for tc in token_class if tc in (TARGET_Z, TARGET_ANSWER))
+    supervised_digits = sum(1 for tc in token_class if tc == TARGET_DIGIT)
+    supervised_verify = sum(1 for tc in token_class if tc == TARGET_VERIFY)
+    if supervised_verify != len(rounds):
+        raise RuntimeError("Each round must contribute exactly one supervised verify token")
+    if has_success:
+        if supervised_z_ans != expected_z_ans or supervised_digits != 5:
+            raise RuntimeError("Final successful round must provide full supervision for Z/<ANSWER>/digits")
+    else:
+        if supervised_z_ans != 0 or supervised_digits != 0:
+            raise RuntimeError("Zero-success sequence must disable Z/<ANSWER>/digit supervision")
+    # Corrected masking rule:
+    # 1) verify supervision is always active for every round
+    # 2) z/answer/digit supervision is active only on the final correct round
+    for idx, stats in enumerate(per_round_supervision):
+        if int(stats["verify"]) != 1:
+            raise RuntimeError("Verification-token loss must be active for every round")
+        if not (has_success and idx == success_idx):
+            if int(stats["z_ans"]) != 0 or int(stats["digits"]) != 0:
+                raise RuntimeError("Non-final rounds must not have Z/<ANSWER>/digit supervision")
+        else:
+            if int(stats["z_ans"]) != expected_z_ans or int(stats["digits"]) != 5:
+                raise RuntimeError("Final correct round must have full Z/<ANSWER>/digit supervision")
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "target_class": target_class,
-        "z_len": len(z_ids),
+        "round_count": int(len(rounds)),
+        "failed_rounds": int(failed_rounds_before_success),
+        "round_z_lens": [int(x) for x in round_z_lens],
     }
 
 
-def collate_training_examples(examples: Sequence[Dict[str, List[int]]], pad_token_id: int) -> Dict[str, torch.Tensor]:
+def collate_training_examples(examples: Sequence[Dict[str, object]], pad_token_id: int) -> Dict[str, torch.Tensor]:
     if not examples:
         raise ValueError("Cannot collate empty examples")
 
-    max_len = max(len(ex["input_ids"]) for ex in examples)
+    max_len = max(len(ex["input_ids"]) for ex in examples)  # type: ignore[index]
 
     def _pad(vals: List[int], pad_value: int) -> List[int]:
         if len(vals) >= max_len:
             return vals
         return vals + [pad_value] * (max_len - len(vals))
 
-    input_ids = torch.tensor([_pad(list(ex["input_ids"]), int(pad_token_id)) for ex in examples], dtype=torch.long)
-    attention_mask = torch.tensor([_pad(list(ex["attention_mask"]), 0) for ex in examples], dtype=torch.long)
-    labels = torch.tensor([_pad(list(ex["labels"]), -100) for ex in examples], dtype=torch.long)
-    target_class = torch.tensor([_pad(list(ex["target_class"]), TARGET_IGNORE) for ex in examples], dtype=torch.long)
+    input_ids = torch.tensor(
+        [_pad(list(ex["input_ids"]), int(pad_token_id)) for ex in examples],  # type: ignore[index]
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor([_pad(list(ex["attention_mask"]), 0) for ex in examples], dtype=torch.long)  # type: ignore[index]
+    labels = torch.tensor([_pad(list(ex["labels"]), -100) for ex in examples], dtype=torch.long)  # type: ignore[index]
+    target_class = torch.tensor(
+        [_pad(list(ex["target_class"]), TARGET_IGNORE) for ex in examples],  # type: ignore[index]
+        dtype=torch.long,
+    )
 
     return {
         "input_ids": input_ids,
@@ -219,13 +324,18 @@ def compute_rsft_losses(
     z_token_ids: Sequence[int],
     answer_token_id: int,
     digit_token_ids: Sequence[int],
+    verify_token_ids: Sequence[int],
     w_z_ans: float,
     w_digits: float,
+    w_verify: float,
 ) -> Dict[str, torch.Tensor]:
     z_ans_mask = (target_class == TARGET_Z) | (target_class == TARGET_ANSWER)
     digits_mask = target_class == TARGET_DIGIT
+    verify_mask = target_class == TARGET_VERIFY
+
     z_ans_allowed = [int(x) for x in z_token_ids] + [int(answer_token_id)]
     digits_allowed = [int(x) for x in digit_token_ids]
+    verify_allowed = [int(x) for x in verify_token_ids]
 
     l_z_ans = _restricted_masked_ce(
         logits=logits,
@@ -239,11 +349,19 @@ def compute_rsft_losses(
         mask=digits_mask,
         allowed_token_ids=digits_allowed,
     )
-    total = float(w_z_ans) * l_z_ans + float(w_digits) * l_digits
+    l_verify = _restricted_masked_ce(
+        logits=logits,
+        labels=labels,
+        mask=verify_mask,
+        allowed_token_ids=verify_allowed,
+    )
+
+    total = float(w_z_ans) * l_z_ans + float(w_digits) * l_digits + float(w_verify) * l_verify
 
     return {
         "l_z_ans": l_z_ans,
         "l_digits": l_digits,
+        "l_verify": l_verify,
         "loss": total,
     }
 
