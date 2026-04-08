@@ -28,7 +28,7 @@ class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     vllm_batch_size: int = 64
     rollouts_per_prompt: int = 8
-    max_rounds: int = 3
+    max_rounds: int = 30
     max_new_tokens: int = 512
     temperature: float = 1.2
     top_p: float = 0.95
@@ -51,7 +51,8 @@ class RolloutConfig:
 @dataclass
 class TrainConfig:
     train_batch_size: int = 2
-    lr: float = 4e-5
+    lr: float = 3e-5
+    warmup_lr: Optional[float] = 1e-4
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -66,6 +67,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if int(self.warmup_steps) < 0:
             raise ValueError("train.warmup_steps must be >= 0")
+        if self.warmup_lr is not None and float(self.warmup_lr) <= 0.0:
+            raise ValueError("train.warmup_lr must be > 0 when provided")
 
 
 @dataclass

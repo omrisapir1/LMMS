@@ -92,6 +92,8 @@ def _validate_cfg(cfg: Config) -> None:
         raise ValueError("loss.w_verify must be >= 0")
     if int(cfg.train.warmup_steps) < 0:
         raise ValueError("train.warmup_steps must be >= 0")
+    if cfg.train.warmup_lr is not None and float(cfg.train.warmup_lr) <= 0.0:
+        raise ValueError("train.warmup_lr must be > 0 when provided")
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -200,6 +202,11 @@ def _build_optimizer(*, model, cfg: Config):
 def _set_optimizer_weight_decay(optimizer, weight_decay: float) -> None:
     for group in optimizer.param_groups:
         group["weight_decay"] = float(weight_decay)
+
+
+def _set_optimizer_lr(optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
 
 
 def _assert_optimizer_weight_decay(optimizer, expected: float) -> None:
@@ -538,6 +545,8 @@ def train(cfg: Optional[Config] = None) -> str:
     model.train()
 
     warmup_steps = int(cfg.train.warmup_steps)
+    normal_lr = float(cfg.train.lr)
+    warmup_lr = float(cfg.train.warmup_lr) if cfg.train.warmup_lr is not None else float(cfg.train.lr)
     current_train_mode = "full_rsft"
     warmup_runtime: Dict[str, object] = {
         "hooks": [],
@@ -557,6 +566,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 [
                     f"train_mode={current_train_mode}",
                     f"warmup_steps={warmup_steps}",
+                    f"warmup_lr={warmup_lr}",
+                    f"full_lr={normal_lr}",
                     f"verify_token_ids={verify_token_ids}",
                     f"emb_lm_head_tied={bool(warmup_runtime.get('tied_weights', False))}",
                     f"trainable_params={effective_trainable_params}",
@@ -573,6 +584,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 [
                     "train_mode=full_rsft",
                     f"warmup_steps={warmup_steps}",
+                    f"warmup_lr={warmup_lr}",
+                    f"full_lr={normal_lr}",
                     f"verify_token_ids={verify_token_ids}",
                     f"trainable_params={_count_trainable_params(model)}",
                 ]
@@ -583,8 +596,10 @@ def train(cfg: Optional[Config] = None) -> str:
     optimizer = _build_optimizer(model=model, cfg=cfg)
     if current_train_mode == "verify_warmup":
         _set_optimizer_weight_decay(optimizer, 0.0)
+        _set_optimizer_lr(optimizer, warmup_lr)
     else:
         _set_optimizer_weight_decay(optimizer, float(cfg.train.weight_decay))
+        _set_optimizer_lr(optimizer, normal_lr)
     optimizer.zero_grad(set_to_none=True)
 
     _log("Loading train records", log_path)
@@ -704,10 +719,12 @@ def train(cfg: Optional[Config] = None) -> str:
                 if desired_mode == "verify_warmup":
                     warmup_runtime = _set_verify_warmup_mode(model=model, verify_token_ids=verify_token_ids)
                     _set_optimizer_weight_decay(optimizer, 0.0)
+                    _set_optimizer_lr(optimizer, warmup_lr)
                 else:
                     _set_full_train_mode(model)
                     _assert_full_train_mode_restored(model)
                     _set_optimizer_weight_decay(optimizer, float(cfg.train.weight_decay))
+                    _set_optimizer_lr(optimizer, normal_lr)
                 current_train_mode = desired_mode
                 optimizer.zero_grad(set_to_none=True)
                 effective_trainable_params = (
@@ -724,6 +741,8 @@ def train(cfg: Optional[Config] = None) -> str:
                             f"step={step}",
                             f"train_mode={current_train_mode}",
                             f"warmup_steps={warmup_steps}",
+                            f"warmup_lr={warmup_lr}",
+                            f"full_lr={normal_lr}",
                             f"verify_token_ids={verify_token_ids}",
                             f"emb_lm_head_tied={bool(warmup_runtime.get('tied_weights', False))}",
                             f"trainable_params={effective_trainable_params}",
@@ -1001,20 +1020,6 @@ def train(cfg: Optional[Config] = None) -> str:
                         for zlen in list(built["round_z_lens"]):  # type: ignore[index]
                             accepted_round_z_lens.append(float(zlen))
                     seq_row.pop("_candidate_built_example", None)
-
-                _log(
-                    " | ".join(
-                        [
-                            f"step={step}",
-                            f"excluded_prompts_all_r1_correct={int(len(excluded_prompt_idxs))}",
-                            f"correct_examples_before={correct_before}",
-                            f"correct_examples_after={int(len(eligible_correct_seq_idxs))}",
-                            f"full_failures_before_sampling={full_failure_before}",
-                            f"full_failures_kept={int(len(kept_full_failure_seq_idxs))}",
-                        ]
-                    ),
-                    log_path,
-                )
 
                 step_rollout_logs.extend(sequence_logs_by_seq_idx)
 
