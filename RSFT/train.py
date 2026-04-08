@@ -906,6 +906,8 @@ def train(cfg: Optional[Config] = None) -> str:
                         status == "failed" and reason == "max_rounds_reached_without_success"
                     )
                     accepted_for_train = False
+                    example_type: Optional[str] = None
+                    built_example: Optional[Dict[str, object]] = None
                     if candidate_for_train:
                         built = build_training_example(
                             prompt_ids=flat_prompt_ids[seq_idx],
@@ -920,14 +922,11 @@ def train(cfg: Optional[Config] = None) -> str:
                             reason = "max_length_exceeded"
                             failure_reason_by_seq[seq_idx] = str(reason)
                         else:
-                            accepted_for_train = True
-                            built["source_prompt_idx"] = int(seq_prompt_idx[seq_idx])
-                            accepted_rows.append(built)
-                            accepted_prompt_indices.add(int(seq_prompt_idx[seq_idx]))
-                            accepted_round_counts.append(int(built["round_count"]))  # type: ignore[index]
-                            accepted_failed_round_counts.append(int(built["failed_rounds"]))  # type: ignore[index]
-                            for zlen in list(built["round_z_lens"]):  # type: ignore[index]
-                                accepted_round_z_lens.append(float(zlen))
+                            built_example = built
+                            if str(status) == "success":
+                                example_type = "correct_answer"
+                            elif str(status) == "failed" and str(reason) == "max_rounds_reached_without_success":
+                                example_type = "full_failure"
 
                     if status != "success" and reason is None:
                         reason = "unknown_failure"
@@ -940,6 +939,82 @@ def train(cfg: Optional[Config] = None) -> str:
                     seq_row["full_sequence_token_ids"] = list(flat_prompt_ids[seq_idx]) + list(
                         generated_rollout_token_ids_by_seq[seq_idx]
                     )
+                    seq_row["example_type"] = example_type
+
+                    # Store candidate artifacts for two-stage filtering.
+                    seq_row["_candidate_built_example"] = built_example
+
+                # Stage A: exclude only prompts where all rollouts are successful on round 1.
+                excluded_prompt_idxs: set[int] = set()
+                by_prompt_seq_indices: Dict[int, List[int]] = {}
+                for seq_idx in range(total_sequences):
+                    pidx = int(seq_prompt_idx[seq_idx])
+                    by_prompt_seq_indices.setdefault(pidx, []).append(seq_idx)
+                for pidx, seq_ids in by_prompt_seq_indices.items():
+                    if len(seq_ids) == 0:
+                        continue
+                    all_success_round1 = all(
+                        str(status_by_seq[i]) == "success" and int(len(rounds_by_seq[i])) == 1 for i in seq_ids
+                    )
+                    if all_success_round1:
+                        excluded_prompt_idxs.add(int(pidx))
+
+                # Stage B: among eligible examples, keep all correct and sample failures up to half.
+                eligible_correct_seq_idxs: List[int] = []
+                eligible_full_failure_seq_idxs: List[int] = []
+                for seq_idx in range(total_sequences):
+                    pidx = int(seq_prompt_idx[seq_idx])
+                    if pidx in excluded_prompt_idxs:
+                        continue
+                    seq_row = sequence_logs_by_seq_idx[seq_idx]
+                    built_example = seq_row.get("_candidate_built_example", None)
+                    if not isinstance(built_example, dict):
+                        continue
+                    et = str(seq_row.get("example_type", ""))
+                    if et == "correct_answer":
+                        eligible_correct_seq_idxs.append(seq_idx)
+                    elif et == "full_failure":
+                        eligible_full_failure_seq_idxs.append(seq_idx)
+
+                correct_before = int(len(eligible_correct_seq_idxs))
+                full_failure_before = int(len(eligible_full_failure_seq_idxs))
+                full_failure_cap = int(correct_before * 0.5)
+                if full_failure_before <= full_failure_cap:
+                    kept_full_failure_seq_idxs = list(eligible_full_failure_seq_idxs)
+                else:
+                    kept_full_failure_seq_idxs = list(rng.sample(eligible_full_failure_seq_idxs, full_failure_cap))
+                kept_seq_idxs: set[int] = set(eligible_correct_seq_idxs) | set(kept_full_failure_seq_idxs)
+
+                # Finalize accepted_rows and per-sequence accepted flags.
+                for seq_idx in range(total_sequences):
+                    seq_row = sequence_logs_by_seq_idx[seq_idx]
+                    built_example = seq_row.get("_candidate_built_example", None)
+                    accepted_for_train = bool(seq_idx in kept_seq_idxs and isinstance(built_example, dict))
+                    seq_row["accepted"] = bool(accepted_for_train)
+                    if accepted_for_train:
+                        built = dict(built_example)
+                        built["source_prompt_idx"] = int(seq_prompt_idx[seq_idx])
+                        accepted_rows.append(built)
+                        accepted_prompt_indices.add(int(seq_prompt_idx[seq_idx]))
+                        accepted_round_counts.append(int(built["round_count"]))  # type: ignore[index]
+                        accepted_failed_round_counts.append(int(built["failed_rounds"]))  # type: ignore[index]
+                        for zlen in list(built["round_z_lens"]):  # type: ignore[index]
+                            accepted_round_z_lens.append(float(zlen))
+                    seq_row.pop("_candidate_built_example", None)
+
+                _log(
+                    " | ".join(
+                        [
+                            f"step={step}",
+                            f"excluded_prompts_all_r1_correct={int(len(excluded_prompt_idxs))}",
+                            f"correct_examples_before={correct_before}",
+                            f"correct_examples_after={int(len(eligible_correct_seq_idxs))}",
+                            f"full_failures_before_sampling={full_failure_before}",
+                            f"full_failures_kept={int(len(kept_full_failure_seq_idxs))}",
+                        ]
+                    ),
+                    log_path,
+                )
 
                 step_rollout_logs.extend(sequence_logs_by_seq_idx)
 

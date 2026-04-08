@@ -61,7 +61,7 @@ class TrainConfig:
     seed: int = 42
     use_bf16: bool = True
     optimizer_8bit: bool = True
-    warmup_steps: int = 50
+    warmup_steps: int = 30
 
     def __post_init__(self) -> None:
         if int(self.warmup_steps) < 0:
@@ -72,7 +72,7 @@ class TrainConfig:
 class LossConfig:
     w_z_ans: float = 1.0
     w_digits: float = 1.0
-    w_verify: float = 1.0
+    w_verify: float = 2.0
 
     def __post_init__(self) -> None:
         if float(self.w_z_ans) < 0.0:
