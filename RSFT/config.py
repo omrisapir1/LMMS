@@ -61,6 +61,11 @@ class TrainConfig:
     seed: int = 42
     use_bf16: bool = True
     optimizer_8bit: bool = True
+    warmup_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if int(self.warmup_steps) < 0:
+            raise ValueError("train.warmup_steps must be >= 0")
 
 
 @dataclass

@@ -53,6 +53,9 @@ METRICS_FIELDS: List[str] = [
     "rollout_time",
     "train_time",
     "sync_time",
+    "train_mode",
+    "warmup_steps",
+    "trainable_params",
     "skipped_optimizer",
     "rollout_log_path",
     "evaluated_questions",
@@ -87,6 +90,8 @@ def _validate_cfg(cfg: Config) -> None:
         raise ValueError("loss.w_digits must be >= 0")
     if float(cfg.loss.w_verify) < 0.0:
         raise ValueError("loss.w_verify must be >= 0")
+    if int(cfg.train.warmup_steps) < 0:
+        raise ValueError("train.warmup_steps must be >= 0")
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -190,6 +195,19 @@ def _build_optimizer(*, model, cfg: Config):
         eps=float(cfg.train.eps),
         weight_decay=float(cfg.train.weight_decay),
     )
+
+
+def _set_optimizer_weight_decay(optimizer, weight_decay: float) -> None:
+    for group in optimizer.param_groups:
+        group["weight_decay"] = float(weight_decay)
+
+
+def _assert_optimizer_weight_decay(optimizer, expected: float) -> None:
+    exp = float(expected)
+    for i, group in enumerate(optimizer.param_groups):
+        got = float(group.get("weight_decay", 0.0))
+        if abs(got - exp) > 1e-12:
+            raise RuntimeError(f"Optimizer weight_decay mismatch in group {i}: got {got}, expected {exp}")
 
 
 def _prepare_tokenizer_and_model(cfg: Config):
@@ -371,6 +389,112 @@ def _build_round_distribution(accepted_rounds: Sequence[int], max_rounds: int) -
     return {f"accepted_round_frac_{r}": float(ctr.get(r, 0)) / denom for r in range(1, int(max_rounds) + 1)}
 
 
+def _resolve_lm_head_weight(model) -> torch.nn.Parameter:
+    out_emb = model.get_output_embeddings()
+    if out_emb is not None and hasattr(out_emb, "weight"):
+        return out_emb.weight
+    if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+        return model.lm_head.weight
+    raise RuntimeError("Could not resolve lm_head/output embedding weight")
+
+
+def _count_trainable_params(model) -> int:
+    return int(sum(int(p.numel()) for p in model.parameters() if bool(p.requires_grad)))
+
+
+def _count_effective_warmup_trainable_params(
+    *,
+    warmup_runtime: Dict[str, object],
+    verify_token_ids: Sequence[int],
+) -> int:
+    inp_p = warmup_runtime.get("inp_param", None)
+    if not isinstance(inp_p, torch.nn.Parameter):
+        return 0
+    row_count = int(len([int(x) for x in verify_token_ids]))
+    inp_dim = int(inp_p.shape[1]) if inp_p.ndim >= 2 else 0
+    total = row_count * inp_dim
+    tied = bool(warmup_runtime.get("tied_weights", False))
+    if not tied:
+        lm_p = warmup_runtime.get("lm_param", None)
+        if isinstance(lm_p, torch.nn.Parameter) and lm_p.ndim >= 2:
+            total += row_count * int(lm_p.shape[1])
+    return int(total)
+
+
+def _mask_non_verify_rows(grad: torch.Tensor, verify_token_ids: Sequence[int]) -> torch.Tensor:
+    if grad is None:
+        return grad
+    if grad.ndim < 2:
+        raise RuntimeError("Expected row-wise parameter grad tensor with ndim >= 2")
+    out = grad.clone()
+    out.zero_()
+    row_ids = [int(x) for x in verify_token_ids]
+    out[row_ids] = grad[row_ids]
+    return out
+
+
+def _set_full_train_mode(model) -> None:
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+
+def _assert_full_train_mode_restored(model) -> None:
+    for name, p in model.named_parameters():
+        if not bool(p.requires_grad):
+            raise RuntimeError(f"Full RSFT mode restore failed: parameter remained frozen: {name}")
+
+
+def _set_verify_warmup_mode(
+    *,
+    model,
+    verify_token_ids: Sequence[int],
+) -> Dict[str, object]:
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    inp_w = model.get_input_embeddings().weight
+    lm_w = _resolve_lm_head_weight(model)
+    tied_weights = bool(inp_w.data_ptr() == lm_w.data_ptr())
+
+    inp_w.requires_grad_(True)
+    hooks: List[object] = []
+    hooks.append(inp_w.register_hook(lambda g: _mask_non_verify_rows(g, verify_token_ids)))
+    if not tied_weights:
+        lm_w.requires_grad_(True)
+        hooks.append(lm_w.register_hook(lambda g: _mask_non_verify_rows(g, verify_token_ids)))
+
+    return {
+        "tied_weights": bool(tied_weights),
+        "hooks": hooks,
+        "inp_param": inp_w,
+        "lm_param": lm_w,
+    }
+
+
+def _remove_hooks(hooks: Sequence[object]) -> None:
+    for h in hooks:
+        try:
+            h.remove()
+        except Exception:
+            pass
+
+
+def _assert_verify_row_grads_only(*, param: torch.nn.Parameter, verify_token_ids: Sequence[int], name: str) -> None:
+    g = param.grad
+    if g is None:
+        return
+    if g.ndim < 2:
+        raise RuntimeError(f"{name} grad tensor expected ndim>=2, got {g.ndim}")
+    ids = [int(x) for x in verify_token_ids]
+    with torch.no_grad():
+        row_abs = g.abs().sum(dim=tuple(range(1, g.ndim)))
+        allowed = torch.zeros_like(row_abs, dtype=torch.bool)
+        allowed[ids] = True
+        bad = row_abs[(~allowed)] > 0
+        if bool(bad.any()):
+            raise RuntimeError(f"Warmup safety check failed: non-verify rows received gradient in {name}")
+
+
 def train(cfg: Optional[Config] = None) -> str:
     if cfg is None:
         cfg = Config()
@@ -413,7 +537,54 @@ def train(cfg: Optional[Config] = None) -> str:
     model.to(device)
     model.train()
 
+    warmup_steps = int(cfg.train.warmup_steps)
+    current_train_mode = "full_rsft"
+    warmup_runtime: Dict[str, object] = {
+        "hooks": [],
+        "tied_weights": False,
+        "inp_param": None,
+        "lm_param": None,
+    }
+    if warmup_steps > 0:
+        warmup_runtime = _set_verify_warmup_mode(model=model, verify_token_ids=verify_token_ids)
+        current_train_mode = "verify_warmup"
+        effective_trainable_params = _count_effective_warmup_trainable_params(
+            warmup_runtime=warmup_runtime,
+            verify_token_ids=verify_token_ids,
+        )
+        _log(
+            " | ".join(
+                [
+                    f"train_mode={current_train_mode}",
+                    f"warmup_steps={warmup_steps}",
+                    f"verify_token_ids={verify_token_ids}",
+                    f"emb_lm_head_tied={bool(warmup_runtime.get('tied_weights', False))}",
+                    f"trainable_params={effective_trainable_params}",
+                    "trainable_rows=input_embeddings+lm_head verify rows only",
+                ]
+            ),
+            log_path,
+        )
+    else:
+        _set_full_train_mode(model)
+        _assert_full_train_mode_restored(model)
+        _log(
+            " | ".join(
+                [
+                    "train_mode=full_rsft",
+                    f"warmup_steps={warmup_steps}",
+                    f"verify_token_ids={verify_token_ids}",
+                    f"trainable_params={_count_trainable_params(model)}",
+                ]
+            ),
+            log_path,
+        )
+
     optimizer = _build_optimizer(model=model, cfg=cfg)
+    if current_train_mode == "verify_warmup":
+        _set_optimizer_weight_decay(optimizer, 0.0)
+    else:
+        _set_optimizer_weight_decay(optimizer, float(cfg.train.weight_decay))
     optimizer.zero_grad(set_to_none=True)
 
     _log("Loading train records", log_path)
@@ -489,6 +660,16 @@ def train(cfg: Optional[Config] = None) -> str:
             "rollout_time": 0.0,
             "train_time": 0.0,
             "sync_time": 0.0,
+            "train_mode": ("verify_warmup" if warmup_steps > 0 else "full_rsft"),
+            "warmup_steps": int(cfg.train.warmup_steps),
+            "trainable_params": float(
+                _count_effective_warmup_trainable_params(
+                    warmup_runtime=warmup_runtime,
+                    verify_token_ids=verify_token_ids,
+                )
+                if warmup_steps > 0
+                else _count_trainable_params(model)
+            ),
             "skipped_optimizer": True,
             "rollout_log_path": "",
             "evaluated_questions": eval0.get("evaluated_questions", 0.0),
@@ -515,6 +696,42 @@ def train(cfg: Optional[Config] = None) -> str:
 
     try:
         for step in range(1, int(cfg.train.max_steps) + 1):
+            should_be_warmup = bool(step <= warmup_steps and warmup_steps > 0)
+            desired_mode = "verify_warmup" if should_be_warmup else "full_rsft"
+            if desired_mode != current_train_mode:
+                if current_train_mode == "verify_warmup":
+                    _remove_hooks(warmup_runtime.get("hooks", []))  # type: ignore[arg-type]
+                if desired_mode == "verify_warmup":
+                    warmup_runtime = _set_verify_warmup_mode(model=model, verify_token_ids=verify_token_ids)
+                    _set_optimizer_weight_decay(optimizer, 0.0)
+                else:
+                    _set_full_train_mode(model)
+                    _assert_full_train_mode_restored(model)
+                    _set_optimizer_weight_decay(optimizer, float(cfg.train.weight_decay))
+                current_train_mode = desired_mode
+                optimizer.zero_grad(set_to_none=True)
+                effective_trainable_params = (
+                    _count_effective_warmup_trainable_params(
+                        warmup_runtime=warmup_runtime,
+                        verify_token_ids=verify_token_ids,
+                    )
+                    if current_train_mode == "verify_warmup"
+                    else _count_trainable_params(model)
+                )
+                _log(
+                    " | ".join(
+                        [
+                            f"step={step}",
+                            f"train_mode={current_train_mode}",
+                            f"warmup_steps={warmup_steps}",
+                            f"verify_token_ids={verify_token_ids}",
+                            f"emb_lm_head_tied={bool(warmup_runtime.get('tied_weights', False))}",
+                            f"trainable_params={effective_trainable_params}",
+                        ]
+                    ),
+                    log_path,
+                )
+
             t_step_start = time.perf_counter()
             accepted_rows: List[Dict[str, object]] = []
             step_rollout_logs: List[Dict[str, object]] = []
@@ -808,10 +1025,15 @@ def train(cfg: Optional[Config] = None) -> str:
                                 w_digits=float(cfg.loss.w_digits),
                                 w_verify=float(cfg.loss.w_verify),
                             )
-                            per_lz.append(losses_i["l_z_ans"])
-                            per_ld.append(losses_i["l_digits"])
                             per_lv.append(losses_i["l_verify"])
-                            per_tl.append(losses_i["loss"])
+                            if current_train_mode == "verify_warmup":
+                                per_lz.append(losses_i["l_verify"].new_zeros(()))
+                                per_ld.append(losses_i["l_verify"].new_zeros(()))
+                                per_tl.append(float(cfg.loss.w_verify) * losses_i["l_verify"])
+                            else:
+                                per_lz.append(losses_i["l_z_ans"])
+                                per_ld.append(losses_i["l_digits"])
+                                per_tl.append(losses_i["loss"])
                         lz_t = torch.stack(per_lz)
                         ld_t = torch.stack(per_ld)
                         lv_t = torch.stack(per_lv)
@@ -821,6 +1043,21 @@ def train(cfg: Optional[Config] = None) -> str:
                         loss = (tl_t * w_t).sum() / float(total_example_weight)
 
                     loss.backward()
+                    if current_train_mode == "verify_warmup":
+                        inp_p = warmup_runtime.get("inp_param", None)
+                        if isinstance(inp_p, torch.nn.Parameter):
+                            _assert_verify_row_grads_only(
+                                param=inp_p,
+                                verify_token_ids=verify_token_ids,
+                                name="input_embeddings.weight",
+                            )
+                        lm_p = warmup_runtime.get("lm_param", None)
+                        if isinstance(lm_p, torch.nn.Parameter) and (lm_p is not inp_p):
+                            _assert_verify_row_grads_only(
+                                param=lm_p,
+                                verify_token_ids=verify_token_ids,
+                                name="lm_head.weight",
+                            )
 
                     lz_weighted_sum += float((lz_t.detach().float() * example_weights).sum().item())
                     ld_weighted_sum += float((ld_t.detach().float() * example_weights).sum().item())
@@ -829,6 +1066,8 @@ def train(cfg: Optional[Config] = None) -> str:
                     w_seen_sum += float(example_weights.sum().item())
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.train.max_grad_norm))
+                if current_train_mode == "verify_warmup":
+                    _assert_optimizer_weight_decay(optimizer, 0.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -868,6 +1107,16 @@ def train(cfg: Optional[Config] = None) -> str:
                 "rollout_time": float(max(rollout_time, 0.0)),
                 "train_time": float(train_time),
                 "sync_time": float(sync_time),
+                "train_mode": str(current_train_mode),
+                "warmup_steps": int(warmup_steps),
+                "trainable_params": float(
+                    _count_effective_warmup_trainable_params(
+                        warmup_runtime=warmup_runtime,
+                        verify_token_ids=verify_token_ids,
+                    )
+                    if current_train_mode == "verify_warmup"
+                    else _count_trainable_params(model)
+                ),
                 "skipped_optimizer": bool(skipped_optimizer),
                 "rollout_log_path": str(rollout_path),
                 "evaluated_questions": None,
@@ -899,6 +1148,7 @@ def train(cfg: Optional[Config] = None) -> str:
                     " | ".join(
                         [
                             f"step={row['step']}",
+                            f"mode={row['train_mode']}",
                             f"accepted={row['accepted_prompts']}",
                             f"accepted_rate={row['accepted_rate']:.4f}",
                             f"avg_rounds={row['avg_rounds_per_accepted']:.3f}",
@@ -927,6 +1177,8 @@ def train(cfg: Optional[Config] = None) -> str:
 
         _save_last(run_dir=run_dir, model=model, tokenizer=tokenizer, cfg=cfg, step=int(cfg.train.max_steps))
     finally:
+        _remove_hooks(warmup_runtime.get("hooks", []))  # type: ignore[arg-type]
+        _set_full_train_mode(model)
         try:
             engine.close()
         except Exception:
