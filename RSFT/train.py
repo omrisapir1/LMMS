@@ -553,6 +553,21 @@ def train(cfg: Optional[Config] = None) -> str:
                 failure_reason_by_seq: List[Optional[str]] = [None] * total_sequences
                 current_prompts: List[List[int]] = [list(x) for x in flat_prompt_ids]
                 generated_rollout_token_ids_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+                sequence_logs_by_seq_idx: List[Dict[str, object]] = [
+                    {
+                        "prompt_idx": int(seq_prompt_idx[i]),
+                        "rollout_idx": int(seq_rollout_idx[i]),
+                        "question": str(prompt_batch[seq_prompt_idx[i]].question),
+                        "accepted": False,
+                        "terminal_status": "active",
+                        "failure_reason": None,
+                        "round_count_observed": 0,
+                        "full_rollout_token_ids": [],
+                        "full_sequence_token_ids": [],
+                        "rounds": [],
+                    }
+                    for i in range(total_sequences)
+                ]
 
                 for round_idx in range(1, max_rounds + 1):
                     active_indices = [i for i, st in enumerate(status_by_seq) if st == "active"]
@@ -579,14 +594,21 @@ def train(cfg: Optional[Config] = None) -> str:
                         if z_ids is None:
                             status_by_seq[seq_idx] = "failed"
                             failure_reason_by_seq[seq_idx] = "no_answer_before_max_tokens"
-                            step_rollout_logs.append(
+                            true_digits = list(prompt_batch[seq_prompt_idx[seq_idx]].true_digits)
+                            sequence_logs_by_seq_idx[seq_idx]["rounds"].append(  # type: ignore[index]
                                 {
-                                    "prompt_idx": int(seq_prompt_idx[seq_idx]),
-                                    "rollout_idx": int(seq_rollout_idx[seq_idx]),
                                     "round_idx": int(round_idx),
-                                    "accepted": False,
-                                    "failure_reason": "no_answer_before_max_tokens",
+                                    "z_len": 0,
+                                    "z_token_ids": [],
+                                    "digit_token_ids": [],
+                                    "pred_digits": "",
+                                    "true_digits": "".join(str(int(x)) for x in true_digits),
+                                    "is_correct": False,
+                                    "verify_token_id": -1,
+                                    "verify_action": "NONE",
+                                    "round_generated_token_ids": [],
                                     "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
+                                    "round_event": "no_answer_before_max_tokens",
                                 }
                             )
                             continue
@@ -637,10 +659,8 @@ def train(cfg: Optional[Config] = None) -> str:
                         round_generated_ids = list(z_ids) + [int(answer_token_id)] + list(dig_tokens) + [int(verify_token_id)]
                         generated_rollout_token_ids_by_seq[seq_idx].extend(round_generated_ids)
 
-                        step_rollout_logs.append(
+                        sequence_logs_by_seq_idx[seq_idx]["rounds"].append(  # type: ignore[index]
                             {
-                                "prompt_idx": int(seq_prompt_idx[seq_idx]),
-                                "rollout_idx": int(seq_rollout_idx[seq_idx]),
                                 "round_idx": int(round_idx),
                                 "z_len": int(len(z_ids)),
                                 "z_token_ids": list(z_ids),
@@ -652,8 +672,6 @@ def train(cfg: Optional[Config] = None) -> str:
                                 "verify_action": "FINALIZE" if is_correct else "RETRY",
                                 "round_generated_token_ids": list(round_generated_ids),
                                 "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
-                                "accepted": False,
-                                "failure_reason": None,
                             }
                         )
 
@@ -667,10 +685,11 @@ def train(cfg: Optional[Config] = None) -> str:
                     rounds = rounds_by_seq[seq_idx]
                     status = status_by_seq[seq_idx]
                     reason = failure_reason_by_seq[seq_idx]
-                    include_in_train = bool(status == "success") or bool(
+                    candidate_for_train = bool(status == "success") or bool(
                         status == "failed" and reason == "max_rounds_reached_without_success"
                     )
-                    if include_in_train:
+                    accepted_for_train = False
+                    if candidate_for_train:
                         built = build_training_example(
                             prompt_ids=flat_prompt_ids[seq_idx],
                             rounds=rounds,
@@ -681,8 +700,10 @@ def train(cfg: Optional[Config] = None) -> str:
                         )
                         if built is None:
                             status = "failed"
-                            failure_reason_by_seq[seq_idx] = "max_length_exceeded"
+                            reason = "max_length_exceeded"
+                            failure_reason_by_seq[seq_idx] = str(reason)
                         else:
+                            accepted_for_train = True
                             built["source_prompt_idx"] = int(seq_prompt_idx[seq_idx])
                             accepted_rows.append(built)
                             accepted_prompt_indices.add(int(seq_prompt_idx[seq_idx]))
@@ -693,30 +714,17 @@ def train(cfg: Optional[Config] = None) -> str:
 
                     if status != "success" and reason is None:
                         reason = "unknown_failure"
-                    for row in reversed(step_rollout_logs):
-                        if (
-                            int(row.get("prompt_idx", -1)) == int(seq_prompt_idx[seq_idx])
-                            and int(row.get("rollout_idx", -1)) == int(seq_rollout_idx[seq_idx])
-                        ):
-                            row["accepted"] = bool(include_in_train)
-                            row["terminal_status"] = str(status)
-                            row["round_count_observed"] = int(len(rounds))
-                            row["full_rollout_token_ids"] = list(generated_rollout_token_ids_by_seq[seq_idx])
-                            row["full_sequence_token_ids"] = list(flat_prompt_ids[seq_idx]) + list(
-                                generated_rollout_token_ids_by_seq[seq_idx]
-                            )
-                            row["rounds"] = [
-                                {
-                                    "z_token_ids": list(r.z_token_ids),
-                                    "digit_token_ids": list(r.digit_token_ids),
-                                    "verify_token_id": int(r.verify_token_id),
-                                    "is_correct": bool(r.is_correct),
-                                }
-                                for r in rounds
-                            ]
-                            if not bool(include_in_train):
-                                row["failure_reason"] = str(reason)
-                            break
+                    seq_row = sequence_logs_by_seq_idx[seq_idx]
+                    seq_row["accepted"] = bool(accepted_for_train)
+                    seq_row["terminal_status"] = str(status)
+                    seq_row["failure_reason"] = (None if str(status) == "success" else str(reason))
+                    seq_row["round_count_observed"] = int(len(seq_row["rounds"]))  # type: ignore[arg-type]
+                    seq_row["full_rollout_token_ids"] = list(generated_rollout_token_ids_by_seq[seq_idx])
+                    seq_row["full_sequence_token_ids"] = list(flat_prompt_ids[seq_idx]) + list(
+                        generated_rollout_token_ids_by_seq[seq_idx]
+                    )
+
+                step_rollout_logs.extend(sequence_logs_by_seq_idx)
 
                 if accepted_rows:
                     by_prompt: Dict[int, int] = {}
