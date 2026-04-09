@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from RSFT.config import Config
 from RSFT.dataset import PromptExample
 from RSFT.logic import decode_digit_tokens, exact_digit_match, extract_z_before_answer_from_row, mean_or_zero
+from RSFT.sample_questions_for_eval import sample_questions
 
 
 def _stable_example_key(ex: PromptExample) -> Tuple[str, int]:
@@ -23,6 +24,32 @@ def _select_eval_examples(examples: Sequence[PromptExample], max_q: int) -> List
     rows = [( _stable_example_key(ex), int(i), ex) for i, ex in enumerate(examples)]
     rows.sort(key=lambda x: (x[0][0], x[0][1], x[1]))
     return [x[2] for x in rows[: int(max_q)]]
+
+
+def _select_eval_examples_from_sample_questions(examples: Sequence[PromptExample], max_q: int) -> List[PromptExample]:
+    if max_q <= 0:
+        return []
+    if not sample_questions:
+        return _select_eval_examples(examples, max_q)
+
+    by_question: Dict[str, PromptExample] = {}
+    for ex in examples:
+        q = str(ex.question)
+        if q not in by_question:
+            by_question[q] = ex
+
+    selected: List[PromptExample] = []
+    for q in sample_questions:
+        ex = by_question.get(str(q))
+        if ex is None:
+            continue
+        selected.append(ex)
+        if len(selected) >= int(max_q):
+            break
+
+    if selected:
+        return selected
+    return _select_eval_examples(examples, max_q)
 
 
 def _write_jsonl(path: str, rows: Sequence[Dict[str, object]]) -> None:
@@ -436,7 +463,7 @@ def evaluate_with_rollout_engine(
 ) -> Dict[str, object]:
     mode_file_keys = ("standard", "retry_bias", "oracle_retry")
     max_q = min(len(examples), int(cfg.eval.max_eval_questions))
-    selected_examples = _select_eval_examples(examples, int(max_q))
+    selected_examples = _select_eval_examples_from_sample_questions(examples, int(max_q))
     max_q = int(len(selected_examples))
     if max_q <= 0:
         out = {
