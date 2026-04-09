@@ -11,6 +11,8 @@ BACH_SIZE = 64
 class ModelConfig:
     init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
+    finalize_token: str = "<FINALIZE>"
+    retry_token: str = "<RETRY>"
     trust_remote_code: bool = True
 
 
@@ -31,7 +33,7 @@ class RolloutConfig:
     temperature: float = 1.0
     top_p: float = 0.95
     digit_greedy: bool = True
-    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full"
+    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
@@ -54,6 +56,7 @@ class RewardConfig:
     length_penalty: float = 0.0001
     reward_if_max_len: float = -0.1
     correct_length_discount: float = 0.1
+    rounds_penalty_coef: float = 0.0
 
 
 @dataclass
