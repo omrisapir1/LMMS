@@ -1,10 +1,29 @@
 import json
 import os
+import hashlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from RSFT.config import Config
 from RSFT.dataset import PromptExample
 from RSFT.logic import decode_digit_tokens, exact_digit_match, extract_z_before_answer_from_row, mean_or_zero
+
+
+def _stable_example_key(ex: PromptExample) -> Tuple[str, int]:
+    # Stable key across runs/resume even if upstream dataset iteration order changes.
+    payload = f"{ex.question}\n{','.join(str(int(x)) for x in ex.true_digits)}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return digest, int(len(ex.prompt_ids))
+
+
+def _select_eval_examples(examples: Sequence[PromptExample], max_q: int) -> List[PromptExample]:
+    if max_q <= 0:
+        return []
+    if len(examples) <= max_q:
+        return list(examples)
+    rows = [( _stable_example_key(ex), int(i), ex) for i, ex in enumerate(examples)]
+    rows.sort(key=lambda x: (x[0][0], x[0][1], x[1]))
+    return [x[2] for x in rows[: int(max_q)]]
+
 
 def _write_jsonl(path: str, rows: Sequence[Dict[str, object]]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -417,6 +436,8 @@ def evaluate_with_rollout_engine(
 ) -> Dict[str, object]:
     mode_file_keys = ("standard", "retry_bias", "oracle_retry")
     max_q = min(len(examples), int(cfg.eval.max_eval_questions))
+    selected_examples = _select_eval_examples(examples, int(max_q))
+    max_q = int(len(selected_examples))
     if max_q <= 0:
         out = {
             "evaluated_questions": 0.0,
@@ -452,7 +473,7 @@ def evaluate_with_rollout_engine(
         mode_name="standard",
         policy_mode="standard",
         engine=engine,
-        examples=examples,
+        examples=selected_examples,
         cfg=cfg,
         answer_token_id=answer_token_id,
         digit_id_to_val=digit_id_to_val,
@@ -480,7 +501,7 @@ def evaluate_with_rollout_engine(
             mode_name="retry_bias",
             policy_mode="retry_bias",
             engine=engine,
-            examples=examples,
+            examples=selected_examples,
             cfg=cfg,
             answer_token_id=answer_token_id,
             digit_id_to_val=digit_id_to_val,
@@ -500,7 +521,7 @@ def evaluate_with_rollout_engine(
             mode_name="oracle_retry",
             policy_mode="oracle_auto_retry",
             engine=engine,
-            examples=examples,
+            examples=selected_examples,
             cfg=cfg,
             answer_token_id=answer_token_id,
             digit_id_to_val=digit_id_to_val,
