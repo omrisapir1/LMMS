@@ -1248,7 +1248,7 @@ def train(cfg: Optional[Config] = None) -> str:
                     if len(seq_ids) == 0:
                         continue
                     wrong_count = sum(1 for i in seq_ids if str(status_by_seq[i]) != "success")
-                    if wrong_count <= 3:
+                    if wrong_count <= 1:
                         excluded_prompt_idxs.add(int(pidx))
 
                 # Stage B: among eligible examples, keep all correct and sample failures up to half.
