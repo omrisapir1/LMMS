@@ -9,10 +9,10 @@ import random
 import shutil
 import time
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -131,6 +131,160 @@ def _make_run_dir(output_root: str) -> str:
     return run_dir
 
 
+@dataclass
+class _ResumeArtifacts:
+    run_dir: str
+    model_dir: str
+    state_path: str
+
+
+def _resolve_resume_artifacts(resume_from: str) -> _ResumeArtifacts:
+    p = os.path.abspath(str(resume_from))
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"resume_from path does not exist: {p}")
+
+    if os.path.isfile(p):
+        if os.path.basename(p) == "trainer_state.pt":
+            ckpt_dir = os.path.dirname(p)
+        else:
+            raise ValueError(
+                "resume_from file path must be trainer_state.pt or a directory containing checkpoints"
+            )
+    else:
+        ckpt_dir = p
+        if os.path.basename(ckpt_dir) == "checkpoints":
+            raise ValueError("resume_from cannot point to checkpoints root; use a step_* dir, last, or run dir")
+        if os.path.isdir(os.path.join(ckpt_dir, "last")) and os.path.isdir(os.path.join(ckpt_dir, "checkpoints")):
+            ckpt_dir = os.path.join(ckpt_dir, "last")
+
+    state_path = os.path.join(ckpt_dir, "trainer_state.pt")
+    if not os.path.isfile(state_path):
+        raise FileNotFoundError(f"Missing trainer_state.pt in resume checkpoint dir: {ckpt_dir}")
+
+    parent = os.path.dirname(ckpt_dir)
+    if os.path.basename(ckpt_dir) == "last":
+        run_dir = parent
+    elif os.path.basename(parent) == "checkpoints":
+        run_dir = os.path.dirname(parent)
+    else:
+        raise ValueError(
+            "Could not infer run directory from resume path. Expected run_dir, run_dir/last, run_dir/checkpoints/step_*, or trainer_state.pt within one of those."
+        )
+
+    if not os.path.isdir(run_dir):
+        raise FileNotFoundError(f"Inferred run directory does not exist: {run_dir}")
+
+    return _ResumeArtifacts(
+        run_dir=run_dir,
+        model_dir=ckpt_dir,
+        state_path=state_path,
+    )
+
+
+def _save_trainer_state(*, out_dir: str, payload: Dict[str, Any]) -> str:
+    path = os.path.join(out_dir, "trainer_state.pt")
+    torch.save(payload, path)
+    return path
+
+
+def _move_optimizer_state_to_device(optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
+def _serialize_trainer_state(
+    *,
+    cfg: Config,
+    step: int,
+    update_step: int,
+    order_cursor: int,
+    ordered_indices: Sequence[int],
+    sampler_rng: random.Random,
+    optimizer,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "step": int(step),
+        "update_step": int(update_step),
+        "order_cursor": int(order_cursor),
+        "ordered_indices": [int(x) for x in ordered_indices],
+        "sampler_rng_state": sampler_rng.getstate(),
+        "python_random_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": asdict(cfg),
+    }
+    if torch.cuda.is_available():
+        payload["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    else:
+        payload["torch_cuda_rng_state_all"] = None
+    return payload
+
+
+def _load_trainer_state(
+    *,
+    state_path: str,
+    train_example_count: int,
+    optimizer,
+    sampler_rng: random.Random,
+    ordered_indices: List[int],
+    device: torch.device,
+) -> Tuple[int, int, int]:
+    state = torch.load(state_path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Invalid trainer_state payload type at {state_path}: {type(state).__name__}")
+
+    if "optimizer_state" not in state:
+        raise RuntimeError(f"trainer_state missing optimizer_state at {state_path}")
+    optimizer.load_state_dict(state["optimizer_state"])
+    _move_optimizer_state_to_device(optimizer, device)
+
+    saved_indices = state.get("ordered_indices", None)
+    if not isinstance(saved_indices, list) or len(saved_indices) != int(train_example_count):
+        raise RuntimeError(
+            "Resume failed: saved ordered_indices are missing or dataset length changed "
+            f"(saved={len(saved_indices) if isinstance(saved_indices, list) else 'n/a'} current={train_example_count})"
+        )
+    ordered_indices[:] = [int(x) for x in saved_indices]
+
+    order_cursor = int(state.get("order_cursor", 0))
+    if order_cursor < 0 or order_cursor > len(ordered_indices):
+        raise RuntimeError(
+            f"Resume failed: saved order_cursor={order_cursor} is outside [0, {len(ordered_indices)}]"
+        )
+
+    sampler_rng_state = state.get("sampler_rng_state", None)
+    if sampler_rng_state is None:
+        raise RuntimeError("Resume failed: sampler_rng_state is missing in trainer_state")
+    sampler_rng.setstate(sampler_rng_state)
+
+    py_rng_state = state.get("python_random_state", None)
+    if py_rng_state is None:
+        raise RuntimeError("Resume failed: python_random_state is missing in trainer_state")
+    random.setstate(py_rng_state)
+
+    torch_rng_state = state.get("torch_rng_state", None)
+    if torch_rng_state is None:
+        raise RuntimeError("Resume failed: torch_rng_state is missing in trainer_state")
+    torch.set_rng_state(torch_rng_state)
+
+    cuda_rng_state = state.get("torch_cuda_rng_state_all", None)
+    if torch.cuda.is_available() and cuda_rng_state is not None:
+        torch.cuda.set_rng_state_all(cuda_rng_state)
+
+    saved_step = int(state.get("step", 0))
+    update_step = int(state.get("update_step", 0))
+    if saved_step < 0:
+        raise RuntimeError(f"Resume failed: invalid saved step {saved_step}")
+    if update_step < 0:
+        raise RuntimeError(f"Resume failed: invalid saved update_step {update_step}")
+
+    return saved_step, update_step, order_cursor
+
+
 def _save_model_dir(model, tokenizer, out_dir: str) -> None:
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
@@ -217,11 +371,12 @@ def _assert_optimizer_weight_decay(optimizer, expected: float) -> None:
             raise RuntimeError(f"Optimizer weight_decay mismatch in group {i}: got {got}, expected {exp}")
 
 
-def _prepare_tokenizer_and_model(cfg: Config):
-    if not str(cfg.model.init_ckpt).strip():
+def _prepare_tokenizer_and_model(cfg: Config, init_ckpt_override: Optional[str] = None):
+    init_ckpt = str(init_ckpt_override) if init_ckpt_override is not None else str(cfg.model.init_ckpt)
+    if not str(init_ckpt).strip():
         raise ValueError("model.init_ckpt must be set (no auto-guessing)")
 
-    tokenizer = AutoTokenizer.from_pretrained(str(cfg.model.init_ckpt), trust_remote_code=bool(cfg.model.trust_remote_code))
+    tokenizer = AutoTokenizer.from_pretrained(str(init_ckpt), trust_remote_code=bool(cfg.model.trust_remote_code))
     model_kwargs = {
         "trust_remote_code": bool(cfg.model.trust_remote_code),
     }
@@ -229,7 +384,7 @@ def _prepare_tokenizer_and_model(cfg: Config):
         model_kwargs["torch_dtype"] = torch.bfloat16
 
     model = AutoModelForCausalLM.from_pretrained(
-        str(cfg.model.init_ckpt),
+        str(init_ckpt),
         **model_kwargs,
     )
 
@@ -508,14 +663,25 @@ def train(cfg: Optional[Config] = None) -> str:
     _validate_cfg(cfg)
 
     _set_seed(int(cfg.train.seed))
-    run_dir = _make_run_dir(str(cfg.logging.output_dir))
+    resume_artifacts: Optional[_ResumeArtifacts] = None
+    if cfg.train.resume_from is not None and str(cfg.train.resume_from).strip():
+        resume_artifacts = _resolve_resume_artifacts(str(cfg.train.resume_from))
+        run_dir = str(resume_artifacts.run_dir)
+    else:
+        run_dir = _make_run_dir(str(cfg.logging.output_dir))
     log_path = os.path.join(run_dir, "logs", "run.log")
     metrics_csv = os.path.join(run_dir, "logs", "metrics.csv")
     metrics_jsonl = os.path.join(run_dir, "logs", "metrics.jsonl")
     rollout_logger = RolloutLogger(os.path.join(run_dir, "logs"))
     metrics_fields = list(METRICS_FIELDS) + [f"accepted_round_frac_{r}" for r in range(1, int(cfg.rollout.max_rounds) + 1)]
 
-    _log(f"Starting RSFT run at {run_dir}", log_path)
+    if resume_artifacts is None:
+        _log(f"Starting RSFT run at {run_dir}", log_path)
+    else:
+        _log(
+            f"Resuming RSFT run from {resume_artifacts.model_dir} (state: {resume_artifacts.state_path}) into {run_dir}",
+            log_path,
+        )
     _log(f"Config: {json.dumps(cfg.as_dict(), ensure_ascii=True)}", log_path)
 
     (
@@ -527,7 +693,10 @@ def train(cfg: Optional[Config] = None) -> str:
         digit_id_to_val,
         finalize_token_id,
         retry_token_id,
-    ) = _prepare_tokenizer_and_model(cfg)
+    ) = _prepare_tokenizer_and_model(
+        cfg,
+        init_ckpt_override=(resume_artifacts.model_dir if resume_artifacts is not None else None),
+    )
     verify_token_ids = [int(finalize_token_id), int(retry_token_id)]
 
     vllm_init_ckpt_ref = str(cfg.model.init_ckpt)
@@ -628,6 +797,31 @@ def train(cfg: Optional[Config] = None) -> str:
     ordered_indices = list(range(len(train_examples)))
     rng.shuffle(ordered_indices)
     order_cursor = 0
+    start_step = 1
+    update_step = 0
+
+    if resume_artifacts is not None:
+        saved_step, saved_update_step, saved_order_cursor = _load_trainer_state(
+            state_path=resume_artifacts.state_path,
+            train_example_count=len(train_examples),
+            optimizer=optimizer,
+            sampler_rng=rng,
+            ordered_indices=ordered_indices,
+            device=device,
+        )
+        start_step = int(saved_step) + 1
+        update_step = int(saved_update_step)
+        order_cursor = int(saved_order_cursor)
+        if start_step > int(cfg.train.max_steps):
+            _log(
+                f"Resume checkpoint already at/after max_steps (saved_step={saved_step}, max_steps={cfg.train.max_steps}); exiting.",
+                log_path,
+            )
+            return run_dir
+        _log(
+            f"Loaded trainer_state: saved_step={saved_step}, next_step={start_step}, update_step={update_step}, order_cursor={order_cursor}",
+            log_path,
+        )
 
     engine = _make_rollout_engine(
         cfg=cfg,
@@ -643,11 +837,10 @@ def train(cfg: Optional[Config] = None) -> str:
         logger=lambda msg: _log(msg, log_path),
     )
 
-    update_step = 0
     with torch.no_grad():
         engine.maybe_sync_from_torch(model, tokenizer, update_idx=1)
 
-    if bool(cfg.eval.eval_at_start):
+    if bool(cfg.eval.eval_at_start) and int(start_step) == 1:
         t_eval0 = time.perf_counter()
         eval0 = evaluate_with_rollout_engine(
             engine=engine,
@@ -710,7 +903,7 @@ def train(cfg: Optional[Config] = None) -> str:
         )
 
     try:
-        for step in range(1, int(cfg.train.max_steps) + 1):
+        for step in range(int(start_step), int(cfg.train.max_steps) + 1):
             should_be_warmup = bool(step <= warmup_steps and warmup_steps > 0)
             desired_mode = "verify_warmup" if should_be_warmup else "full_rsft"
             if desired_mode != current_train_mode:
@@ -1245,6 +1438,15 @@ def train(cfg: Optional[Config] = None) -> str:
                 )
 
             if (step % int(cfg.logging.save_every)) == 0:
+                trainer_state_payload = _serialize_trainer_state(
+                    cfg=cfg,
+                    step=int(step),
+                    update_step=int(update_step),
+                    order_cursor=int(order_cursor),
+                    ordered_indices=ordered_indices,
+                    sampler_rng=rng,
+                    optimizer=optimizer,
+                )
                 ckpt = _save_periodic(
                     run_dir=run_dir,
                     model=model,
@@ -1252,10 +1454,22 @@ def train(cfg: Optional[Config] = None) -> str:
                     step=step,
                     keep_last=int(cfg.logging.keep_last),
                 )
-                _save_last(run_dir=run_dir, model=model, tokenizer=tokenizer, cfg=cfg, step=step)
+                _save_trainer_state(out_dir=ckpt, payload=trainer_state_payload)
+                last_dir = _save_last(run_dir=run_dir, model=model, tokenizer=tokenizer, cfg=cfg, step=step)
+                _save_trainer_state(out_dir=last_dir, payload=trainer_state_payload)
                 _log(f"Saved checkpoint: {ckpt}", log_path)
 
-        _save_last(run_dir=run_dir, model=model, tokenizer=tokenizer, cfg=cfg, step=int(cfg.train.max_steps))
+        final_state_payload = _serialize_trainer_state(
+            cfg=cfg,
+            step=int(cfg.train.max_steps),
+            update_step=int(update_step),
+            order_cursor=int(order_cursor),
+            ordered_indices=ordered_indices,
+            sampler_rng=rng,
+            optimizer=optimizer,
+        )
+        final_last = _save_last(run_dir=run_dir, model=model, tokenizer=tokenizer, cfg=cfg, step=int(cfg.train.max_steps))
+        _save_trainer_state(out_dir=final_last, payload=final_state_payload)
     finally:
         _remove_hooks(warmup_runtime.get("hooks", []))  # type: ignore[arg-type]
         _set_full_train_mode(model)

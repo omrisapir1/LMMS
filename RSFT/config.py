@@ -63,6 +63,7 @@ class TrainConfig:
     use_bf16: bool = True
     optimizer_8bit: bool = True
     warmup_steps: int = 30
+    resume_from: Optional[str] = None
 
     def __post_init__(self) -> None:
         if int(self.warmup_steps) < 0:
