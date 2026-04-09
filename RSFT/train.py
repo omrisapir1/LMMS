@@ -859,6 +859,8 @@ def train(cfg: Optional[Config] = None) -> str:
     with torch.no_grad():
         engine.maybe_sync_from_torch(model, tokenizer, update_idx=1)
 
+    eval_modes_log_dir = os.path.join(run_dir, "logs", "eval_modes")
+
     if bool(cfg.eval.eval_at_start) and int(start_step) == 1:
         t_eval0 = time.perf_counter()
         eval0 = evaluate_with_rollout_engine(
@@ -867,6 +869,8 @@ def train(cfg: Optional[Config] = None) -> str:
             cfg=cfg,
             answer_token_id=answer_token_id,
             digit_id_to_val=digit_id_to_val,
+            eval_log_dir=eval_modes_log_dir,
+            eval_step=0,
         )
         eval_time0 = float(time.perf_counter() - t_eval0)
         row0 = {
@@ -1502,6 +1506,8 @@ def train(cfg: Optional[Config] = None) -> str:
                     cfg=cfg,
                     answer_token_id=answer_token_id,
                     digit_id_to_val=digit_id_to_val,
+                    eval_log_dir=eval_modes_log_dir,
+                    eval_step=int(step),
                 )
                 row.update(eval_metrics)
                 row["eval_time"] = float(time.perf_counter() - t_eval)
