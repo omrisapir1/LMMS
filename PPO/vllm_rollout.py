@@ -347,6 +347,7 @@ class VLLMRolloutEngine:
         logprobs: Optional[int] = None,
         min_tokens: Optional[int] = None,
         stop_on_answer: bool = False,
+        logit_bias: Optional[Dict[int, float]] = None,
     ):
         if self._sampling_params_cls is None:
             raise RuntimeError("vLLM SamplingParams class is not initialized")
@@ -365,6 +366,8 @@ class VLLMRolloutEngine:
             kwargs["stop_token_ids"] = [int(self.answer_token_id)]
         if logprobs is not None:
             kwargs["logprobs"] = int(logprobs)
+        if logit_bias is not None and len(logit_bias) > 0:
+            kwargs["logit_bias"] = {int(k): float(v) for k, v in dict(logit_bias).items()}
 
         try:
             return self._sampling_params_cls(
@@ -699,6 +702,7 @@ class VLLMRolloutEngine:
         greedy: bool,
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        logit_bias: Optional[Dict[int, float]] = None,
     ) -> List[List[int]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
@@ -711,6 +715,7 @@ class VLLMRolloutEngine:
             min_p=float(min_p),
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
+            logit_bias=logit_bias,
         )
 
         with self._lock:

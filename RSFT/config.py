@@ -29,7 +29,9 @@ class RolloutConfig:
     vllm_batch_size: int = 64
     rollouts_per_prompt: int = 8
     max_rounds: int = 30
-    max_new_tokens: int = 512
+    retry_on_correct_prob: float = 0.0
+    retry_on_correct_only_first_round: bool = True
+    max_new_tokens: int = 1024
     temperature: float = 1.2
     top_p: float = 0.95
     min_p: float = 0.03
@@ -46,13 +48,15 @@ class RolloutConfig:
     def __post_init__(self) -> None:
         if int(self.max_rounds) < 1:
             raise ValueError("rollout.max_rounds must be >= 1")
+        if float(self.retry_on_correct_prob) < 0.0 or float(self.retry_on_correct_prob) > 1.0:
+            raise ValueError("rollout.retry_on_correct_prob must be in [0.0, 1.0]")
 
 
 @dataclass
 class TrainConfig:
     train_batch_size: int = 2
     lr: float = 3e-5
-    warmup_lr: Optional[float] = 1e-4
+    warmup_lr: Optional[float] = 2e-4
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -62,7 +66,7 @@ class TrainConfig:
     seed: int = 42
     use_bf16: bool = True
     optimizer_8bit: bool = True
-    warmup_steps: int = 30
+    warmup_steps: int = 50
     resume_from: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -89,19 +93,27 @@ class LossConfig:
 
 @dataclass
 class EvalConfig:
-    eval_every_steps: int = 500
-    eval_at_start: bool = False
-    vllm_batch_size: int = 256
+    eval_every_steps: int = 100
+    eval_at_start: bool = True
+    vllm_batch_size: int = 512
     pass_at_n: int = 16
-    k_max: int = 512
+    k_max: int = 2048
     max_eval_questions: int = 1024
+    verify_retry_logit_bias: float = 1.0
+    oracle_auto_retry_max_rounds: int = 30
+    eval_retry_bias_enabled: bool = True
+    eval_oracle_auto_retry_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if int(self.oracle_auto_retry_max_rounds) < 1:
+            raise ValueError("eval.oracle_auto_retry_max_rounds must be >= 1")
 
 
 @dataclass
 class LoggingConfig:
     output_dir: str = "./runs/rsft"
     log_every: int = 1
-    save_every: int = 5000
+    save_every: int = 50
     keep_last: int = 3
 
 

@@ -32,6 +32,20 @@ class _AllowedTokenLogitsProcessor(LogitsProcessor):
         return scores + self._mask
 
 
+class _AdditiveLogitBiasProcessor(LogitsProcessor):
+    def __init__(self, logit_bias: Dict[int, float]) -> None:
+        self.logit_bias = {int(k): float(v) for k, v in dict(logit_bias).items()}
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        del input_ids
+        if not self.logit_bias:
+            return scores
+        for tok_id, bias in self.logit_bias.items():
+            if 0 <= int(tok_id) < int(scores.shape[-1]):
+                scores[:, int(tok_id)] = scores[:, int(tok_id)] + float(bias)
+        return scores
+
+
 class HFRolloutEngine:
     def __init__(
         self,
@@ -108,6 +122,7 @@ class HFRolloutEngine:
         greedy: bool,
         eos_token_id: Optional[int],
         num_return_sequences: int = 1,
+        logit_bias: Optional[Dict[int, float]] = None,
     ) -> List[List[int]]:
         if self._model is None:
             raise RuntimeError("HF rollout model is not set; call maybe_sync_from_torch first")
@@ -121,7 +136,10 @@ class HFRolloutEngine:
         if pad_token_id is None:
             pad_token_id = int(self.answer_token_id)
 
-        logits_processor = LogitsProcessorList([_AllowedTokenLogitsProcessor(allowed_token_ids)])
+        logits_processors: List[LogitsProcessor] = [_AllowedTokenLogitsProcessor(allowed_token_ids)]
+        if logit_bias is not None and len(logit_bias) > 0:
+            logits_processors.append(_AdditiveLogitBiasProcessor(logit_bias))
+        logits_processor = LogitsProcessorList(logits_processors)
         lengths = [len(x) for x in input_ids_rows]
         max_len = max(lengths)
         batch_size = len(input_ids_rows)
@@ -278,6 +296,7 @@ class HFRolloutEngine:
         greedy: bool,
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
+        logit_bias: Optional[Dict[int, float]] = None,
     ) -> List[List[int]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[List[int]] = []
@@ -300,6 +319,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
+                        logit_bias=logit_bias,
                     )
                     for gen in gens:
                         if len(gen) != 1:

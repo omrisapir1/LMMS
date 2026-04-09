@@ -16,6 +16,12 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/hf_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/hf_rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PPO/vllm_rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/PPO/vllm_rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/logic.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/logic.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/tests/test_rsft_logic.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/tests/test_rsft_logic.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/RSFT/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/RSFT/train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -269,7 +275,7 @@
       <workItem from="1770617404265" duration="92254000" />
       <workItem from="1771354565185" duration="9366000" />
       <workItem from="1774536820915" duration="56175000" />
-      <workItem from="1775575161009" duration="12192000" />
+      <workItem from="1775575161009" duration="13541000" />
     </task>
     <task id="LOCAL-00001" summary="important">
       <option name="closed" value="true" />

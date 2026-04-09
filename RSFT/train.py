@@ -61,8 +61,23 @@ METRICS_FIELDS: List[str] = [
     "evaluated_questions",
     "greedy_exact",
     "pass_at_n",
+    "greedy_exact_standard",
+    "pass_at_n_standard",
+    "greedy_exact_retry_bias",
+    "pass_at_n_retry_bias",
+    "greedy_exact_oracle_retry",
+    "pass_at_n_oracle_retry",
     "mean_z_length",
+    "mean_z_length_standard",
+    "mean_z_length_retry_bias",
+    "mean_z_length_oracle_retry",
     "no_answer_before_kmax_rate",
+    "no_answer_before_kmax_rate_standard",
+    "no_answer_before_kmax_rate_retry_bias",
+    "no_answer_before_kmax_rate_oracle_retry",
+    "verify_retry_logit_bias",
+    "oracle_auto_retry_max_rounds",
+    "eval_modes_ran",
     "eval_time",
 ]
 
@@ -94,6 +109,10 @@ def _validate_cfg(cfg: Config) -> None:
         raise ValueError("train.warmup_steps must be >= 0")
     if cfg.train.warmup_lr is not None and float(cfg.train.warmup_lr) <= 0.0:
         raise ValueError("train.warmup_lr must be > 0 when provided")
+    if float(cfg.rollout.retry_on_correct_prob) < 0.0 or float(cfg.rollout.retry_on_correct_prob) > 1.0:
+        raise ValueError("rollout.retry_on_correct_prob must be in [0.0, 1.0]")
+    if int(cfg.eval.oracle_auto_retry_max_rounds) < 1:
+        raise ValueError("eval.oracle_auto_retry_max_rounds must be >= 1")
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -883,8 +902,26 @@ def train(cfg: Optional[Config] = None) -> str:
             "evaluated_questions": eval0.get("evaluated_questions", 0.0),
             "greedy_exact": eval0.get("greedy_exact", 0.0),
             "pass_at_n": eval0.get("pass_at_n", 0.0),
+            "greedy_exact_standard": eval0.get("greedy_exact_standard", eval0.get("greedy_exact", 0.0)),
+            "pass_at_n_standard": eval0.get("pass_at_n_standard", eval0.get("pass_at_n", 0.0)),
+            "greedy_exact_retry_bias": eval0.get("greedy_exact_retry_bias", None),
+            "pass_at_n_retry_bias": eval0.get("pass_at_n_retry_bias", None),
+            "greedy_exact_oracle_retry": eval0.get("greedy_exact_oracle_retry", None),
+            "pass_at_n_oracle_retry": eval0.get("pass_at_n_oracle_retry", None),
             "mean_z_length": eval0.get("mean_z_length", 0.0),
+            "mean_z_length_standard": eval0.get("mean_z_length_standard", eval0.get("mean_z_length", 0.0)),
+            "mean_z_length_retry_bias": eval0.get("mean_z_length_retry_bias", None),
+            "mean_z_length_oracle_retry": eval0.get("mean_z_length_oracle_retry", None),
             "no_answer_before_kmax_rate": eval0.get("no_answer_before_kmax_rate", 0.0),
+            "no_answer_before_kmax_rate_standard": eval0.get(
+                "no_answer_before_kmax_rate_standard",
+                eval0.get("no_answer_before_kmax_rate", 0.0),
+            ),
+            "no_answer_before_kmax_rate_retry_bias": eval0.get("no_answer_before_kmax_rate_retry_bias", None),
+            "no_answer_before_kmax_rate_oracle_retry": eval0.get("no_answer_before_kmax_rate_oracle_retry", None),
+            "verify_retry_logit_bias": eval0.get("verify_retry_logit_bias", None),
+            "oracle_auto_retry_max_rounds": eval0.get("oracle_auto_retry_max_rounds", None),
+            "eval_modes_ran": eval0.get("eval_modes_ran", None),
             "eval_time": eval_time0,
         }
         row0.update(_build_round_distribution([], int(cfg.rollout.max_rounds)))
@@ -897,6 +934,16 @@ def train(cfg: Optional[Config] = None) -> str:
                     f"greedy_exact={float(row0['greedy_exact']):.4f}",
                     f"pass@N={float(row0['pass_at_n']):.4f}",
                     f"no_answer_rate={float(row0['no_answer_before_kmax_rate']):.4f}",
+                ]
+            ),
+            log_path,
+        )
+        _log(
+            " | ".join(
+                [
+                    f"eval_modes={row0.get('eval_modes_ran', 'standard')}",
+                    f"verify_retry_logit_bias={cfg.eval.verify_retry_logit_bias}",
+                    f"oracle_auto_retry_max_rounds={cfg.eval.oracle_auto_retry_max_rounds}",
                 ]
             ),
             log_path,
@@ -1034,7 +1081,10 @@ def train(cfg: Optional[Config] = None) -> str:
                                     "true_digits": "".join(str(int(x)) for x in true_digits),
                                     "is_correct": False,
                                     "verify_token_id": -1,
+                                    "executed_verify_token_id": -1,
+                                    "verify_target_token_id": -1,
                                     "verify_action": "NONE",
+                                    "forced_retry_on_correct": False,
                                     "round_generated_token_ids": [],
                                     "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
                                     "round_event": "no_answer_before_max_tokens",
@@ -1066,9 +1116,27 @@ def train(cfg: Optional[Config] = None) -> str:
                             raise RuntimeError("Digits decode failed despite restricted digit allowed-token set")
                         true_digits = list(prompt_batch[seq_prompt_idx[seq_idx]].true_digits)
                         is_correct = bool(pred_digits == true_digits)
-                        verify_token_id = int(finalize_token_id if is_correct else retry_token_id)
-                        if verify_token_id not in verify_token_ids:
-                            raise RuntimeError("Verify token is outside allowed verify set")
+                        verify_target_token_id = int(finalize_token_id if is_correct else retry_token_id)
+                        execute_forced_retry = False
+                        if bool(is_correct):
+                            can_force_retry = bool(round_idx < max_rounds)
+                            if bool(cfg.rollout.retry_on_correct_only_first_round):
+                                can_force_retry = bool(can_force_retry and round_idx == 1)
+                            if can_force_retry and float(cfg.rollout.retry_on_correct_prob) > 0.0:
+                                execute_forced_retry = bool(rng.random() < float(cfg.rollout.retry_on_correct_prob))
+                        executed_verify_token_id = int(retry_token_id if execute_forced_retry else verify_target_token_id)
+                        if executed_verify_token_id not in verify_token_ids:
+                            raise RuntimeError("Executed verify token is outside allowed verify set")
+                        if verify_target_token_id not in verify_token_ids:
+                            raise RuntimeError("Verify target token is outside allowed verify set")
+                        if bool(is_correct) and int(executed_verify_token_id) == int(retry_token_id):
+                            if int(verify_target_token_id) != int(finalize_token_id):
+                                raise RuntimeError("Correct round with executed <RETRY> must target <FINALIZE>")
+                        if (not bool(is_correct)) and (
+                            int(executed_verify_token_id) != int(retry_token_id)
+                            or int(verify_target_token_id) != int(retry_token_id)
+                        ):
+                            raise RuntimeError("Wrong round must execute and target <RETRY>")
 
                         rounds_by_seq[seq_idx].append(
                             RoundTrace(
@@ -1076,7 +1144,8 @@ def train(cfg: Optional[Config] = None) -> str:
                                 digit_token_ids=list(dig_tokens),
                                 pred_digits=list(pred_digits),
                                 true_digits=list(true_digits),
-                                verify_token_id=int(verify_token_id),
+                                executed_verify_token_id=int(executed_verify_token_id),
+                                verify_target_token_id=int(verify_target_token_id),
                                 is_correct=bool(is_correct),
                             )
                         )
@@ -1084,8 +1153,10 @@ def train(cfg: Optional[Config] = None) -> str:
                         current_prompts[seq_idx].extend(list(z_ids))
                         current_prompts[seq_idx].append(int(answer_token_id))
                         current_prompts[seq_idx].extend(list(dig_tokens))
-                        current_prompts[seq_idx].append(int(verify_token_id))
-                        round_generated_ids = list(z_ids) + [int(answer_token_id)] + list(dig_tokens) + [int(verify_token_id)]
+                        current_prompts[seq_idx].append(int(executed_verify_token_id))
+                        round_generated_ids = (
+                            list(z_ids) + [int(answer_token_id)] + list(dig_tokens) + [int(executed_verify_token_id)]
+                        )
                         generated_rollout_token_ids_by_seq[seq_idx].extend(round_generated_ids)
 
                         sequence_logs_by_seq_idx[seq_idx]["rounds"].append(  # type: ignore[index]
@@ -1097,14 +1168,21 @@ def train(cfg: Optional[Config] = None) -> str:
                                 "pred_digits": "".join(str(int(x)) for x in pred_digits),
                                 "true_digits": "".join(str(int(x)) for x in true_digits),
                                 "is_correct": bool(is_correct),
-                                "verify_token_id": int(verify_token_id),
-                                "verify_action": "FINALIZE" if is_correct else "RETRY",
+                                "verify_token_id": int(executed_verify_token_id),
+                                "executed_verify_token_id": int(executed_verify_token_id),
+                                "verify_target_token_id": int(verify_target_token_id),
+                                "verify_action": (
+                                    "FINALIZE" if int(executed_verify_token_id) == int(finalize_token_id) else "RETRY"
+                                ),
+                                "forced_retry_on_correct": bool(execute_forced_retry),
                                 "round_generated_token_ids": list(round_generated_ids),
                                 "full_rollout_token_ids_so_far": list(generated_rollout_token_ids_by_seq[seq_idx]),
                             }
                         )
 
-                        if is_correct:
+                        if int(executed_verify_token_id) == int(finalize_token_id):
+                            if not bool(is_correct):
+                                raise RuntimeError("Executed <FINALIZE> is only valid on correct rounds")
                             status_by_seq[seq_idx] = "success"
                         elif round_idx >= max_rounds:
                             status_by_seq[seq_idx] = "failed"
@@ -1395,8 +1473,23 @@ def train(cfg: Optional[Config] = None) -> str:
                 "evaluated_questions": None,
                 "greedy_exact": None,
                 "pass_at_n": None,
+                "greedy_exact_standard": None,
+                "pass_at_n_standard": None,
+                "greedy_exact_retry_bias": None,
+                "pass_at_n_retry_bias": None,
+                "greedy_exact_oracle_retry": None,
+                "pass_at_n_oracle_retry": None,
                 "mean_z_length": None,
+                "mean_z_length_standard": None,
+                "mean_z_length_retry_bias": None,
+                "mean_z_length_oracle_retry": None,
                 "no_answer_before_kmax_rate": None,
+                "no_answer_before_kmax_rate_standard": None,
+                "no_answer_before_kmax_rate_retry_bias": None,
+                "no_answer_before_kmax_rate_oracle_retry": None,
+                "verify_retry_logit_bias": None,
+                "oracle_auto_retry_max_rounds": None,
+                "eval_modes_ran": None,
                 "eval_time": None,
             }
             row.update(_build_round_distribution(accepted_round_counts, int(cfg.rollout.max_rounds)))
@@ -1412,6 +1505,17 @@ def train(cfg: Optional[Config] = None) -> str:
                 )
                 row.update(eval_metrics)
                 row["eval_time"] = float(time.perf_counter() - t_eval)
+                _log(
+                    " | ".join(
+                        [
+                            f"step={step}",
+                            f"eval_modes={row.get('eval_modes_ran', 'standard')}",
+                            f"verify_retry_logit_bias={cfg.eval.verify_retry_logit_bias}",
+                            f"oracle_auto_retry_max_rounds={cfg.eval.oracle_auto_retry_max_rounds}",
+                        ]
+                    ),
+                    log_path,
+                )
 
             _append_metrics_csv(metrics_csv, row, metrics_fields)
             _append_metrics_jsonl(metrics_jsonl, row)

@@ -28,7 +28,8 @@ def test_overlength_examples_are_dropped() -> None:
             digit_token_ids=[8, 9, 10, 11, 12],
             pred_digits=[0, 0, 0, 0, 1],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=13,
+            executed_verify_token_id=13,
+            verify_target_token_id=13,
             is_correct=True,
         )
     ]
@@ -50,7 +51,8 @@ def test_masking_contract_failed_then_success() -> None:
             digit_token_ids=[21, 21, 21, 21, 21],
             pred_digits=[0, 0, 0, 0, 0],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=14,
+            executed_verify_token_id=14,
+            verify_target_token_id=14,
             is_correct=False,
         ),
         RoundTrace(
@@ -58,7 +60,8 @@ def test_masking_contract_failed_then_success() -> None:
             digit_token_ids=[21, 21, 21, 21, 22],
             pred_digits=[0, 0, 0, 0, 1],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=13,
+            executed_verify_token_id=13,
+            verify_target_token_id=13,
             is_correct=True,
         ),
     ]
@@ -84,7 +87,8 @@ def test_verify_always_and_z_digit_only_final_round() -> None:
             digit_token_ids=[41, 41, 41, 41, 41],
             pred_digits=[0, 0, 0, 0, 0],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=51,
+            executed_verify_token_id=51,
+            verify_target_token_id=51,
             is_correct=False,
         ),
         RoundTrace(
@@ -92,7 +96,8 @@ def test_verify_always_and_z_digit_only_final_round() -> None:
             digit_token_ids=[41, 41, 41, 41, 42],
             pred_digits=[0, 0, 0, 0, 1],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=50,
+            executed_verify_token_id=50,
+            verify_target_token_id=50,
             is_correct=True,
         ),
     ]
@@ -123,7 +128,8 @@ def test_zero_success_sequence_is_verify_only() -> None:
             digit_token_ids=[71, 71, 71, 71, 71],
             pred_digits=[0, 0, 0, 0, 0],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=81,
+            executed_verify_token_id=81,
+            verify_target_token_id=81,
             is_correct=False,
         ),
         RoundTrace(
@@ -131,7 +137,45 @@ def test_zero_success_sequence_is_verify_only() -> None:
             digit_token_ids=[71, 71, 71, 71, 71],
             pred_digits=[0, 0, 0, 0, 0],
             true_digits=[0, 0, 0, 0, 1],
-            verify_token_id=81,
+            executed_verify_token_id=81,
+            verify_target_token_id=81,
+            is_correct=False,
+        ),
+    ]
+    ex = build_training_example(
+        prompt_ids=[1, 2],
+        rounds=rounds,
+        answer_token_id=70,
+        finalize_token_id=80,
+        retry_token_id=81,
+        max_length=128,
+    )
+    assert ex is not None
+    tcls = ex["target_class"]
+    assert tcls.count(TARGET_VERIFY) == 2
+    assert tcls.count(TARGET_Z) == 0
+    assert tcls.count(TARGET_ANSWER) == 0
+    assert tcls.count(TARGET_DIGIT) == 0
+
+
+def test_zero_success_with_correct_but_retry_round_is_allowed_verify_only() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[90],
+            digit_token_ids=[71, 71, 71, 71, 72],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            executed_verify_token_id=81,  # executed retry even though correct
+            verify_target_token_id=80,    # target finalize
+            is_correct=True,
+        ),
+        RoundTrace(
+            z_token_ids=[91],
+            digit_token_ids=[71, 71, 71, 71, 71],
+            pred_digits=[0, 0, 0, 0, 0],
+            true_digits=[0, 0, 0, 0, 1],
+            executed_verify_token_id=81,
+            verify_target_token_id=81,
             is_correct=False,
         ),
     ]
@@ -210,3 +254,39 @@ def test_extract_z_before_answer_from_row_handles_implicit_answer_stop() -> None
     }
     z = extract_z_before_answer_from_row(row, answer_token_id=999)
     assert z == [101, 102, 103]
+
+
+def test_correct_but_executed_retry_uses_finalize_verify_target_label() -> None:
+    rounds = [
+        RoundTrace(
+            z_token_ids=[10],
+            digit_token_ids=[21, 21, 21, 21, 22],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            executed_verify_token_id=14,  # executed <RETRY> to continue
+            verify_target_token_id=13,    # supervise <FINALIZE>
+            is_correct=True,
+        ),
+        RoundTrace(
+            z_token_ids=[11],
+            digit_token_ids=[21, 21, 21, 21, 22],
+            pred_digits=[0, 0, 0, 0, 1],
+            true_digits=[0, 0, 0, 0, 1],
+            executed_verify_token_id=13,
+            verify_target_token_id=13,
+            is_correct=True,
+        ),
+    ]
+    ex = build_training_example(
+        prompt_ids=[1, 2],
+        rounds=rounds,
+        answer_token_id=20,
+        finalize_token_id=13,
+        retry_token_id=14,
+        max_length=128,
+    )
+    assert ex is not None
+    labels = ex["labels"]
+    target_class = ex["target_class"]
+    verify_labels = [labels[i] for i in range(len(labels)) if target_class[i] == TARGET_VERIFY]
+    assert verify_labels == [13, 13]

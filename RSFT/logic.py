@@ -20,7 +20,8 @@ class RoundTrace:
     digit_token_ids: List[int]
     pred_digits: List[int]
     true_digits: List[int]
-    verify_token_id: int
+    executed_verify_token_id: int
+    verify_target_token_id: int
     is_correct: bool
 
 
@@ -104,7 +105,11 @@ def _validate_accepted_rounds(
     if len(rounds) == 0:
         raise RuntimeError("Accepted example must include at least one round")
 
-    success_indices = [i for i, r in enumerate(rounds) if bool(r.is_correct)]
+    success_indices = [
+        i
+        for i, r in enumerate(rounds)
+        if bool(r.is_correct) and int(r.executed_verify_token_id) == int(finalize_token_id)
+    ]
     if len(success_indices) > 1:
         raise RuntimeError("Accepted example cannot contain more than one successful round")
     if len(success_indices) == 1 and success_indices[0] != len(rounds) - 1:
@@ -115,23 +120,28 @@ def _validate_accepted_rounds(
             raise RuntimeError(f"Digits phase must emit exactly 5 tokens per round, got {len(rnd.digit_token_ids)}")
         if len(rnd.pred_digits) != 5 or len(rnd.true_digits) != 5:
             raise RuntimeError("Each round must contain exactly 5 predicted digits and 5 true digits")
+        if int(rnd.executed_verify_token_id) not in (int(finalize_token_id), int(retry_token_id)):
+            raise RuntimeError("Executed verify token must be exactly one of <FINALIZE>/<RETRY>")
+        if int(rnd.verify_target_token_id) not in (int(finalize_token_id), int(retry_token_id)):
+            raise RuntimeError("Verify target token must be exactly one of <FINALIZE>/<RETRY>")
         if bool(rnd.is_correct):
-            if int(rnd.verify_token_id) != int(finalize_token_id):
-                raise RuntimeError("Successful round verify token must be <FINALIZE>")
             if not exact_digit_match(rnd.pred_digits, rnd.true_digits):
                 raise RuntimeError("Successful round must have exact digit match")
+            if int(rnd.verify_target_token_id) != int(finalize_token_id):
+                raise RuntimeError("Correct round verify target must be <FINALIZE>")
+            if int(rnd.executed_verify_token_id) == int(retry_token_id):
+                if int(rnd.verify_target_token_id) != int(finalize_token_id):
+                    raise RuntimeError("Correct round with executed <RETRY> must still target <FINALIZE>")
         else:
-            if int(rnd.verify_token_id) != int(retry_token_id):
-                raise RuntimeError("Failed round verify token must be <RETRY>")
             if exact_digit_match(rnd.pred_digits, rnd.true_digits):
                 raise RuntimeError("Failed round cannot have exact digit match")
+            if int(rnd.executed_verify_token_id) != int(retry_token_id):
+                raise RuntimeError("Wrong round executed verify token must be <RETRY>")
+            if int(rnd.verify_target_token_id) != int(retry_token_id):
+                raise RuntimeError("Wrong round verify target must be <RETRY>")
             if len(success_indices) == 1 and idx == len(rounds) - 1:
                 raise RuntimeError("When a successful round exists, final round must be successful")
-    if len(success_indices) == 0:
-        if any(bool(r.is_correct) for r in rounds):
-            raise RuntimeError("Zero-success examples must have all rounds marked failed")
-        if any(int(r.verify_token_id) != int(retry_token_id) for r in rounds):
-            raise RuntimeError("Zero-success examples must use <RETRY> verify token on all rounds")
+    # Zero-success trajectories are allowed; they may include correct-but-retry rounds.
 
 
 def build_training_example(
@@ -149,12 +159,17 @@ def build_training_example(
         retry_token_id=int(retry_token_id),
     )
 
-    success_indices = [i for i, r in enumerate(rounds) if bool(r.is_correct)]
+    success_indices = [
+        i
+        for i, r in enumerate(rounds)
+        if bool(r.is_correct) and int(r.executed_verify_token_id) == int(finalize_token_id)
+    ]
     has_success = len(success_indices) == 1
     success_idx = int(success_indices[0]) if has_success else -1
 
     suffix: List[int] = []
     token_class_suffix: List[int] = []
+    verify_target_suffix: List[int] = []
     round_z_lens: List[int] = []
     failed_rounds_before_success = 0
     per_round_supervision: List[Dict[str, int]] = []
@@ -170,7 +185,10 @@ def build_training_example(
         suffix.extend(z_ids)
         suffix.append(int(answer_token_id))
         suffix.extend(d_ids)
-        suffix.append(int(rnd.verify_token_id))
+        suffix.append(int(rnd.executed_verify_token_id))
+        verify_target_suffix.extend(
+            [TARGET_IGNORE] * len(z_ids) + [TARGET_IGNORE] + [TARGET_IGNORE] * 5 + [int(rnd.verify_target_token_id)]
+        )
 
         round_z_lens.append(len(z_ids))
 
@@ -208,16 +226,25 @@ def build_training_example(
 
     token_class = [TARGET_IGNORE] * len(prompt_ids)
     token_class.extend(token_class_suffix)
+    verify_target_by_token_pos = [TARGET_IGNORE] * len(prompt_ids)
+    verify_target_by_token_pos.extend(verify_target_suffix)
 
     target_class = [TARGET_IGNORE] * len(input_ids)
+    verify_target_by_label_pos = [TARGET_IGNORE] * len(input_ids)
     for pos in range(len(input_ids) - 1):
         target_class[pos] = token_class[pos + 1]
+        verify_target_by_label_pos[pos] = int(verify_target_by_token_pos[pos + 1])
 
     labels = [-100] * len(input_ids)
     for pos in range(len(input_ids) - 1):
         tcls = target_class[pos]
-        if tcls in (TARGET_Z, TARGET_ANSWER, TARGET_DIGIT, TARGET_VERIFY):
+        if tcls in (TARGET_Z, TARGET_ANSWER, TARGET_DIGIT):
             labels[pos] = int(input_ids[pos + 1])
+        elif tcls == TARGET_VERIFY:
+            tgt = int(verify_target_by_label_pos[pos])
+            if tgt not in (int(finalize_token_id), int(retry_token_id)):
+                raise RuntimeError("Verify position missing valid verify target label")
+            labels[pos] = int(tgt)
 
     # Safety contract checks for accepted examples.
     expected_z_ans = len(rounds[-1].z_token_ids) + 1 if has_success else 0
@@ -244,6 +271,10 @@ def build_training_example(
         else:
             if int(stats["z_ans"]) != expected_z_ans or int(stats["digits"]) != 5:
                 raise RuntimeError("Final correct round must have full Z/<ANSWER>/digit supervision")
+    # If executed verify is <FINALIZE> the sequence must terminate at that round.
+    for idx, rnd in enumerate(rounds):
+        if int(rnd.executed_verify_token_id) == int(finalize_token_id) and idx != (len(rounds) - 1):
+            raise RuntimeError("Sequence must terminate immediately after executed <FINALIZE>")
 
     return {
         "input_ids": input_ids,
