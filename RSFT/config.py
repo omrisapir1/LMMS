@@ -98,7 +98,7 @@ class EvalConfig:
     vllm_batch_size: int = 512
     pass_at_n: int = 16
     k_max: int = 2048
-    max_eval_questions: int = 1024
+    max_eval_questions: int = 20
     verify_retry_logit_bias: float = 1.0
     oracle_auto_retry_max_rounds: int = 30
     eval_retry_bias_enabled: bool = True
