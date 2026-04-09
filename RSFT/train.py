@@ -1238,7 +1238,7 @@ def train(cfg: Optional[Config] = None) -> str:
                     # Store candidate artifacts for two-stage filtering.
                     seq_row["_candidate_built_example"] = built_example
 
-                # Stage A: exclude only prompts where all rollouts are successful on round 1.
+                # Stage A: exclude prompts where all rollouts are successful.
                 excluded_prompt_idxs: set[int] = set()
                 by_prompt_seq_indices: Dict[int, List[int]] = {}
                 for seq_idx in range(total_sequences):
@@ -1247,10 +1247,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 for pidx, seq_ids in by_prompt_seq_indices.items():
                     if len(seq_ids) == 0:
                         continue
-                    all_success_round1 = all(
-                        str(status_by_seq[i]) == "success" and int(len(rounds_by_seq[i])) == 1 for i in seq_ids
-                    )
-                    if all_success_round1:
+                    all_success = all(str(status_by_seq[i]) == "success" for i in seq_ids)
+                    if all_success:
                         excluded_prompt_idxs.add(int(pidx))
 
                 # Stage B: among eligible examples, keep all correct and sample failures up to half.

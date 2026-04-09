@@ -93,7 +93,7 @@ class LossConfig:
 
 @dataclass
 class EvalConfig:
-    eval_every_steps: int = 100
+    eval_every_steps: int = 100000
     eval_at_start: bool = True
     vllm_batch_size: int = 256
     pass_at_n: int = 16
