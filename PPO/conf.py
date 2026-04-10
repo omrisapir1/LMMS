@@ -9,7 +9,7 @@ BACH_SIZE = 64
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/nemotron-7B-12K"
+    init_ckpt: str = "omrisap/RSFT_250_8"
     answer_token: str = "<ANSWER>"
     finalize_token: str = "<FINALIZE>"
     retry_token: str = "<RETRY>"
