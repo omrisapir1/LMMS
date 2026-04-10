@@ -67,7 +67,7 @@ class TrainConfig:
     use_bf16: bool = True
     optimizer_8bit: bool = True
     warmup_steps: int = 50
-    resume_from: Optional[str] = None
+    resume_from: Optional[str] = "20260410_091737/checkpoints/step_00050"
 
     def __post_init__(self) -> None:
         if int(self.warmup_steps) < 0:
