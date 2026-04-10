@@ -226,13 +226,13 @@ def test_masking_contract_for_three_losses() -> None:
     )
 
     expected_z = F.cross_entropy(
-        torch.tensor([[0.0, 2.0, 3.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
-        torch.tensor([5], dtype=torch.long),
+        torch.tensor([[4.0, 0.0]], dtype=torch.float32),
+        torch.tensor([0], dtype=torch.long),
         reduction="mean",
     )
     expected_answer = F.cross_entropy(
-        torch.tensor([[0.0, 3.0, 2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0]], dtype=torch.float32),
-        torch.tensor([6], dtype=torch.long),
+        torch.tensor([[0.0, 4.0]], dtype=torch.float32),
+        torch.tensor([1], dtype=torch.long),
         reduction="mean",
     )
     expected_digits = F.cross_entropy(

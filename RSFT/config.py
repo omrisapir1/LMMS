@@ -79,7 +79,7 @@ class TrainConfig:
 @dataclass
 class LossConfig:
     w_z: float = 1.0
-    w_answer: float = 0.1
+    w_answer: float = 0.05
     w_digits: float = 1.0
     w_verify: float = 2.0
 
