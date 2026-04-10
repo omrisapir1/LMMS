@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
-MAX_TOKENS = 4096
+MAX_TOKENS = 512
 BACH_SIZE = 64
 
 @dataclass
@@ -95,7 +95,7 @@ class TrainConfig:
     grad_accum_steps: int = 4
     seed: int = 42
     output_dir: str = "./runs/ppo"
-    save_every: int = 1000
+    save_every: int = 25
     keep_last: int = 3
     resume_from: str = ""
     resume_auto_latest: bool = False
