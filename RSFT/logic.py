@@ -347,6 +347,24 @@ def _restricted_masked_ce(
     return F.cross_entropy(restricted_logits, local_labels, reduction="mean")
 
 
+def _full_vocab_masked_ce(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    active = mask & (labels != -100)
+    if not bool(active.any()):
+        return logits.new_zeros(())
+
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_labels = labels.reshape(-1)
+    flat_active = active.reshape(-1)
+    sel_logits = flat_logits[flat_active]
+    sel_labels = flat_labels[flat_active]
+    return F.cross_entropy(sel_logits, sel_labels, reduction="mean")
+
+
 def compute_rsft_losses(
     *,
     logits: torch.Tensor,
@@ -361,27 +379,28 @@ def compute_rsft_losses(
     w_digits: float,
     w_verify: float,
 ) -> Dict[str, torch.Tensor]:
+    # Kept for API/config compatibility; not used by full-vocab Z/<ANSWER> losses.
+    _ = z_token_ids
+    _ = answer_token_id
+
     z_mask = target_class == TARGET_Z
     answer_mask = target_class == TARGET_ANSWER
     digits_mask = target_class == TARGET_DIGIT
     verify_mask = target_class == TARGET_VERIFY
 
-    z_allowed = [int(x) for x in z_token_ids]
-    answer_allowed = [int(answer_token_id)]
     digits_allowed = [int(x) for x in digit_token_ids]
     verify_allowed = [int(x) for x in verify_token_ids]
 
-    l_z = _restricted_masked_ce(
+    # Z and <ANSWER> are trained with full-vocab CE on disjoint masks.
+    l_z = _full_vocab_masked_ce(
         logits=logits,
         labels=labels,
         mask=z_mask,
-        allowed_token_ids=z_allowed,
     )
-    l_answer = _restricted_masked_ce(
+    l_answer = _full_vocab_masked_ce(
         logits=logits,
         labels=labels,
         mask=answer_mask,
-        allowed_token_ids=answer_allowed,
     )
     l_digits = _restricted_masked_ce(
         logits=logits,
