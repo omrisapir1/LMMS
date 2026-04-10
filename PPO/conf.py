@@ -47,7 +47,7 @@ class RolloutConfig:
     vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 512
     rollouts_per_prompt: int = 8  # number of sampled completions per prompt
-    max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
+    max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE * rollouts_per_prompt
     verify_finalize_logit_bias: float = 0.5
     verify_retry_logit_bias: float = 0
 
