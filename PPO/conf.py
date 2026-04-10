@@ -18,7 +18,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "omrisap/RSFT_250_8"
+    dataset_name: str = "omrisap/numina_openmath"
     train_split: str = "train"
     question_field: str = "problem"
     answer_digits_field: str = "answer_digits"
