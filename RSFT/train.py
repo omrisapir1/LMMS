@@ -45,7 +45,8 @@ METRICS_FIELDS: List[str] = [
     "avg_rounds_per_accepted",
     "avg_failed_rounds_before_success",
     "mean_accepted_z_len_per_round",
-    "l_z_ans",
+    "l_z",
+    "l_answer",
     "l_digits",
     "l_verify",
     "total_loss",
@@ -99,8 +100,10 @@ def _set_seed(seed: int) -> None:
 def _validate_cfg(cfg: Config) -> None:
     if int(cfg.rollout.max_rounds) < 1:
         raise ValueError("rollout.max_rounds must be >= 1")
-    if float(cfg.loss.w_z_ans) < 0.0:
-        raise ValueError("loss.w_z_ans must be >= 0")
+    if float(cfg.loss.w_z) < 0.0:
+        raise ValueError("loss.w_z must be >= 0")
+    if float(cfg.loss.w_answer) < 0.0:
+        raise ValueError("loss.w_answer must be >= 0")
     if float(cfg.loss.w_digits) < 0.0:
         raise ValueError("loss.w_digits must be >= 0")
     if float(cfg.loss.w_verify) < 0.0:
@@ -883,7 +886,8 @@ def train(cfg: Optional[Config] = None) -> str:
             "avg_rounds_per_accepted": 0.0,
             "avg_failed_rounds_before_success": 0.0,
             "mean_accepted_z_len_per_round": 0.0,
-            "l_z_ans": 0.0,
+            "l_z": 0.0,
+            "l_answer": 0.0,
             "l_digits": 0.0,
             "l_verify": 0.0,
             "total_loss": 0.0,
@@ -1308,7 +1312,8 @@ def train(cfg: Optional[Config] = None) -> str:
 
             rollout_path = rollout_logger.write_step(step, step_rollout_logs)
 
-            l_z_ans_val = 0.0
+            l_z_val = 0.0
+            l_answer_val = 0.0
             l_digits_val = 0.0
             l_verify_val = 0.0
             total_loss_val = 0.0
@@ -1332,6 +1337,7 @@ def train(cfg: Optional[Config] = None) -> str:
                 optimizer.zero_grad(set_to_none=True)
 
                 lz_weighted_sum = 0.0
+                la_weighted_sum = 0.0
                 ld_weighted_sum = 0.0
                 lv_weighted_sum = 0.0
                 tl_weighted_sum = 0.0
@@ -1362,6 +1368,7 @@ def train(cfg: Optional[Config] = None) -> str:
                             return_dict=True,
                         )
                         per_lz: List[torch.Tensor] = []
+                        per_la: List[torch.Tensor] = []
                         per_ld: List[torch.Tensor] = []
                         per_lv: List[torch.Tensor] = []
                         per_tl: List[torch.Tensor] = []
@@ -1374,20 +1381,24 @@ def train(cfg: Optional[Config] = None) -> str:
                                 answer_token_id=answer_token_id,
                                 digit_token_ids=digit_token_ids,
                                 verify_token_ids=verify_token_ids,
-                                w_z_ans=float(cfg.loss.w_z_ans),
+                                w_z=float(cfg.loss.w_z),
+                                w_answer=float(cfg.loss.w_answer),
                                 w_digits=float(cfg.loss.w_digits),
                                 w_verify=float(cfg.loss.w_verify),
                             )
                             per_lv.append(losses_i["l_verify"])
                             if current_train_mode == "verify_warmup":
                                 per_lz.append(losses_i["l_verify"].new_zeros(()))
+                                per_la.append(losses_i["l_verify"].new_zeros(()))
                                 per_ld.append(losses_i["l_verify"].new_zeros(()))
                                 per_tl.append(float(cfg.loss.w_verify) * losses_i["l_verify"])
                             else:
-                                per_lz.append(losses_i["l_z_ans"])
+                                per_lz.append(losses_i["l_z"])
+                                per_la.append(losses_i["l_answer"])
                                 per_ld.append(losses_i["l_digits"])
                                 per_tl.append(losses_i["loss"])
                         lz_t = torch.stack(per_lz)
+                        la_t = torch.stack(per_la)
                         ld_t = torch.stack(per_ld)
                         lv_t = torch.stack(per_lv)
                         tl_t = torch.stack(per_tl)
@@ -1413,6 +1424,7 @@ def train(cfg: Optional[Config] = None) -> str:
                             )
 
                     lz_weighted_sum += float((lz_t.detach().float() * example_weights).sum().item())
+                    la_weighted_sum += float((la_t.detach().float() * example_weights).sum().item())
                     ld_weighted_sum += float((ld_t.detach().float() * example_weights).sum().item())
                     lv_weighted_sum += float((lv_t.detach().float() * example_weights).sum().item())
                     tl_weighted_sum += float((tl_t.detach().float() * example_weights).sum().item())
@@ -1425,7 +1437,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 optimizer.zero_grad(set_to_none=True)
 
                 denom = max(w_seen_sum, 1e-12)
-                l_z_ans_val = float(lz_weighted_sum / denom)
+                l_z_val = float(lz_weighted_sum / denom)
+                l_answer_val = float(la_weighted_sum / denom)
                 l_digits_val = float(ld_weighted_sum / denom)
                 l_verify_val = float(lv_weighted_sum / denom)
                 total_loss_val = float(tl_weighted_sum / denom)
@@ -1452,7 +1465,8 @@ def train(cfg: Optional[Config] = None) -> str:
                 "avg_rounds_per_accepted": float(mean_or_zero(accepted_round_counts)),
                 "avg_failed_rounds_before_success": float(mean_or_zero(accepted_failed_round_counts)),
                 "mean_accepted_z_len_per_round": float(mean_or_zero(accepted_round_z_lens)),
-                "l_z_ans": float(l_z_ans_val),
+                "l_z": float(l_z_val),
+                "l_answer": float(l_answer_val),
                 "l_digits": float(l_digits_val),
                 "l_verify": float(l_verify_val),
                 "total_loss": float(total_loss_val),
@@ -1533,7 +1547,8 @@ def train(cfg: Optional[Config] = None) -> str:
                             f"accepted={row['accepted_prompts']}",
                             f"accepted_rate={row['accepted_rate']:.4f}",
                             f"avg_rounds={row['avg_rounds_per_accepted']:.3f}",
-                            f"Lz={row['l_z_ans']:.4f}",
+                            f"Lz={row['l_z']:.4f}",
+                            f"La={row['l_answer']:.4f}",
                             f"Ld={row['l_digits']:.4f}",
                             f"Lv={row['l_verify']:.4f}",
                             f"L={row['total_loss']:.4f}",

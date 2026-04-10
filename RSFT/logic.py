@@ -356,23 +356,32 @@ def compute_rsft_losses(
     answer_token_id: int,
     digit_token_ids: Sequence[int],
     verify_token_ids: Sequence[int],
-    w_z_ans: float,
+    w_z: float,
+    w_answer: float,
     w_digits: float,
     w_verify: float,
 ) -> Dict[str, torch.Tensor]:
-    z_ans_mask = (target_class == TARGET_Z) | (target_class == TARGET_ANSWER)
+    z_mask = target_class == TARGET_Z
+    answer_mask = target_class == TARGET_ANSWER
     digits_mask = target_class == TARGET_DIGIT
     verify_mask = target_class == TARGET_VERIFY
 
-    z_ans_allowed = [int(x) for x in z_token_ids] + [int(answer_token_id)]
+    z_allowed = [int(x) for x in z_token_ids]
+    answer_allowed = [int(answer_token_id)]
     digits_allowed = [int(x) for x in digit_token_ids]
     verify_allowed = [int(x) for x in verify_token_ids]
 
-    l_z_ans = _restricted_masked_ce(
+    l_z = _restricted_masked_ce(
         logits=logits,
         labels=labels,
-        mask=z_ans_mask,
-        allowed_token_ids=z_ans_allowed,
+        mask=z_mask,
+        allowed_token_ids=z_allowed,
+    )
+    l_answer = _restricted_masked_ce(
+        logits=logits,
+        labels=labels,
+        mask=answer_mask,
+        allowed_token_ids=answer_allowed,
     )
     l_digits = _restricted_masked_ce(
         logits=logits,
@@ -387,10 +396,16 @@ def compute_rsft_losses(
         allowed_token_ids=verify_allowed,
     )
 
-    total = float(w_z_ans) * l_z_ans + float(w_digits) * l_digits + float(w_verify) * l_verify
+    total = (
+        float(w_z) * l_z
+        + float(w_answer) * l_answer
+        + float(w_digits) * l_digits
+        + float(w_verify) * l_verify
+    )
 
     return {
-        "l_z_ans": l_z_ans,
+        "l_z": l_z,
+        "l_answer": l_answer,
         "l_digits": l_digits,
         "l_verify": l_verify,
         "loss": total,

@@ -78,13 +78,16 @@ class TrainConfig:
 
 @dataclass
 class LossConfig:
-    w_z_ans: float = 1.0
+    w_z: float = 1.0
+    w_answer: float = 0.1
     w_digits: float = 1.0
     w_verify: float = 2.0
 
     def __post_init__(self) -> None:
-        if float(self.w_z_ans) < 0.0:
-            raise ValueError("loss.w_z_ans must be >= 0")
+        if float(self.w_z) < 0.0:
+            raise ValueError("loss.w_z must be >= 0")
+        if float(self.w_answer) < 0.0:
+            raise ValueError("loss.w_answer must be >= 0")
         if float(self.w_digits) < 0.0:
             raise ValueError("loss.w_digits must be >= 0")
         if float(self.w_verify) < 0.0:

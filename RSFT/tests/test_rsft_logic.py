@@ -219,14 +219,20 @@ def test_masking_contract_for_three_losses() -> None:
         answer_token_id=6,
         digit_token_ids=[7, 8],
         verify_token_ids=[3, 8],
-        w_z_ans=1.0,
+        w_z=1.0,
+        w_answer=1.0,
         w_digits=1.0,
         w_verify=1.0,
     )
 
-    expected_z_ans = F.cross_entropy(
-        torch.tensor([[4.0, 0.0], [0.0, 4.0]], dtype=torch.float32),
-        torch.tensor([0, 1], dtype=torch.long),
+    expected_z = F.cross_entropy(
+        torch.tensor([[4.0]], dtype=torch.float32),
+        torch.tensor([0], dtype=torch.long),
+        reduction="mean",
+    )
+    expected_answer = F.cross_entropy(
+        torch.tensor([[4.0]], dtype=torch.float32),
+        torch.tensor([0], dtype=torch.long),
         reduction="mean",
     )
     expected_digits = F.cross_entropy(
@@ -240,10 +246,11 @@ def test_masking_contract_for_three_losses() -> None:
         reduction="mean",
     )
 
-    assert torch.allclose(losses["l_z_ans"], expected_z_ans, atol=1e-6)
+    assert torch.allclose(losses["l_z"], expected_z, atol=1e-6)
+    assert torch.allclose(losses["l_answer"], expected_answer, atol=1e-6)
     assert torch.allclose(losses["l_digits"], expected_digits, atol=1e-6)
     assert torch.allclose(losses["l_verify"], expected_verify, atol=1e-6)
-    assert torch.allclose(losses["loss"], expected_z_ans + expected_digits + expected_verify, atol=1e-6)
+    assert torch.allclose(losses["loss"], expected_z + expected_answer + expected_digits + expected_verify, atol=1e-6)
 
 
 def test_extract_z_before_answer_from_row_handles_implicit_answer_stop() -> None:
