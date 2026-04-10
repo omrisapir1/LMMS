@@ -1466,6 +1466,14 @@ def _collect_rollouts_vllm_batch_multiround(
         raise RuntimeError("rollout.max_new_tokens must be > 0")
     digit_allowed_set = set(int(x) for x in digit_token_ids)
     id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
+    verify_logit_bias: Optional[Dict[int, float]] = None
+    finalize_bias = float(cfg.rollout.verify_finalize_logit_bias)
+    retry_bias = float(cfg.rollout.verify_retry_logit_bias)
+    if finalize_bias != 0.0 or retry_bias != 0.0:
+        verify_logit_bias = {
+            int(finalize_token_id): float(finalize_bias),
+            int(retry_token_id): float(retry_bias),
+        }
 
     prompt_ids_by_seq: List[List[int]] = []
     prompt_attn_by_seq: List[List[int]] = []
@@ -1655,6 +1663,7 @@ def _collect_rollouts_vllm_batch_multiround(
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
                             greedy=True,
+                            logit_bias=verify_logit_bias,
                         )
                     else:
                         verify_texts = [
@@ -1666,6 +1675,7 @@ def _collect_rollouts_vllm_batch_multiround(
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
                             greedy=True,
+                            logit_bias=verify_logit_bias,
                         )
                     if len(verify_rows) != len(verify_owner):
                         raise RuntimeError("vLLM verify-phase row count mismatch in multi-round rollout")
@@ -2263,6 +2273,10 @@ def train(cfg: Config) -> None:
             raise ValueError("ppo_only_z_tokens_and_verify requires rollout.vllm_enabled=True")
         if not bool(cfg.rollout.digit_greedy):
             raise ValueError("ppo_only_z_tokens_and_verify requires rollout.digit_greedy=True")
+    if not math.isfinite(float(cfg.rollout.verify_finalize_logit_bias)):
+        raise ValueError("rollout.verify_finalize_logit_bias must be finite")
+    if not math.isfinite(float(cfg.rollout.verify_retry_logit_bias)):
+        raise ValueError("rollout.verify_retry_logit_bias must be finite")
     if float(cfg.reward.rounds_penalty_coef) < 0.0:
         raise ValueError("reward.rounds_penalty_coef must be >= 0")
     if float(cfg.reward.early_success) < 0.0 or float(cfg.reward.early_success) > 1.0:
@@ -2311,7 +2325,9 @@ def train(cfg: Config) -> None:
 
     _log(
         f"Action scope={action_scope} | Z tokens={len(z_token_ids)} ({z_style}) | "
-        f"answer_token_id={answer_token_id} | finalize_token_id={finalize_token_id} | retry_token_id={retry_token_id}"
+        f"answer_token_id={answer_token_id} | finalize_token_id={finalize_token_id} | retry_token_id={retry_token_id} | "
+        f"verify_finalize_logit_bias={float(cfg.rollout.verify_finalize_logit_bias):.4f} | "
+        f"verify_retry_logit_bias={float(cfg.rollout.verify_retry_logit_bias):.4f}"
     )
 
     hidden_size = int(model.config.hidden_size)
