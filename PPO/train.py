@@ -391,6 +391,62 @@ def _extract_true_digits(sample: Dict[str, object], answer_digits_field: str, an
     return parse_final_answer_to_digits(sample.get(answer_field))
 
 
+def _question_text(raw: object) -> str:
+    return str(raw).strip()
+
+
+def _extract_questions_from_json_payload(payload: object) -> List[str]:
+    rows: List[str] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                txt = _question_text(item)
+                if txt:
+                    rows.append(txt)
+            elif isinstance(item, dict):
+                if "question" in item:
+                    txt = _question_text(item.get("question"))
+                    if txt:
+                        rows.append(txt)
+                elif "problem" in item:
+                    txt = _question_text(item.get("problem"))
+                    if txt:
+                        rows.append(txt)
+    elif isinstance(payload, dict):
+        if "questions" in payload:
+            rows.extend(_extract_questions_from_json_payload(payload.get("questions")))
+        elif "trained_questions" in payload:
+            rows.extend(_extract_questions_from_json_payload(payload.get("trained_questions")))
+        elif "items" in payload:
+            rows.extend(_extract_questions_from_json_payload(payload.get("items")))
+        elif "data" in payload:
+            rows.extend(_extract_questions_from_json_payload(payload.get("data")))
+        elif "question" in payload:
+            txt = _question_text(payload.get("question"))
+            if txt:
+                rows.append(txt)
+        elif "problem" in payload:
+            txt = _question_text(payload.get("problem"))
+            if txt:
+                rows.append(txt)
+    return rows
+
+
+def _load_rsft_trained_questions(path: str) -> Tuple[set[str], str]:
+    p = str(path).strip()
+    if not p:
+        return set(), ""
+    abs_path = os.path.abspath(os.path.expanduser(p))
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(
+            f"Configured data.rsft_trained_questions_path does not exist or is not a file: {abs_path}"
+        )
+    with open(abs_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    questions = [q for q in _extract_questions_from_json_payload(payload) if q]
+    return set(questions), abs_path
+
+
 def _resolve_strict_vocab_token_id(tokenizer, token_text: str, *, label: str) -> int:
     vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
     if token_text not in vocab:
@@ -2272,6 +2328,34 @@ def train(cfg: Config) -> None:
     ds = load_dataset(cfg.data.dataset_name, split=cfg.data.train_split)
     if len(ds) == 0:
         raise RuntimeError("Training dataset is empty")
+    excluded_questions, excluded_questions_path = _load_rsft_trained_questions(
+        str(getattr(cfg.data, "rsft_trained_questions_path", ""))
+    )
+    if excluded_questions_path:
+        _log(
+            f"Loaded {len(excluded_questions)} unique questions to exclude from "
+            f"{excluded_questions_path}"
+        )
+
+    train_row_indices: List[int] = []
+    removed_count = 0
+    q_field = str(cfg.data.question_field)
+    for row_idx in range(len(ds)):
+        sample = ds[int(row_idx)]
+        q_text = _question_text(sample.get(q_field, ""))
+        if q_text in excluded_questions:
+            removed_count += 1
+            continue
+        train_row_indices.append(int(row_idx))
+
+    if excluded_questions_path:
+        _log(
+            f"Dataset filter by question text: before={len(ds)} after={len(train_row_indices)} "
+            f"removed={removed_count}"
+        )
+
+    if len(train_row_indices) == 0:
+        raise RuntimeError("No training rows remain after applying rsft_trained_questions filter")
 
     reward_rng = _make_rng(cfg.train.seed + 17)
     rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
@@ -2328,7 +2412,7 @@ def train(cfg: Config) -> None:
 
                 prepared: List[Dict[str, object]] = []
                 while len(prepared) < this_batch:
-                    sample = ds[int(ds_index % len(ds))]
+                    sample = ds[int(train_row_indices[ds_index % len(train_row_indices)])]
                     ds_index += 1
 
                     question = str(sample[cfg.data.question_field])

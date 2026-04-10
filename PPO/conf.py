@@ -18,11 +18,12 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "omrisap/LMMS_PPO_200K"
+    dataset_name: str = "omrisap/RSFT_250_8"
     train_split: str = "train"
     question_field: str = "problem"
     answer_digits_field: str = "answer_digits"
     answer_field: str = "final_answer"
+    rsft_trained_questions_path: str = "rsft_trained_questions.json"
 
 
 
