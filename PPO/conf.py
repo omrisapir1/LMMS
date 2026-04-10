@@ -48,19 +48,19 @@ class RolloutConfig:
     episodes_per_batch: int = 512
     rollouts_per_prompt: int = 8  # number of sampled completions per prompt
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
-    verify_finalize_logit_bias: float = 100
-    verify_retry_logit_bias: float = -100
+    verify_finalize_logit_bias: float = 5
+    verify_retry_logit_bias: float = 0
 
 
 @dataclass
 class RewardConfig:
     partial_scale: float = 0.25
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.0001
+    length_penalty: float = 0.00005
     reward_if_max_len: float = -0.1
     correct_length_discount: float = 0.1
     early_success: float = 0.4
-    rounds_penalty_coef: float = 0.0
+    rounds_penalty_coef: float = 0.0005
 
 
 @dataclass
