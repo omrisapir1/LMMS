@@ -97,7 +97,7 @@ class TrainConfig:
     output_dir: str = "./runs/ppo"
     save_every: int = 25
     keep_last: int = 3
-    resume_from: str = "ppo/rollouts/step_0025"
+    resume_from: str = "runs/ppo/rollouts/step_0025"
     resume_auto_latest: bool = True
 
 
