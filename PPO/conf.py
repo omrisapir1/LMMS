@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
-MAX_TOKENS = 512
+MAX_TOKENS = 4096
 BACH_SIZE = 64
 
 @dataclass
@@ -57,6 +57,7 @@ class RewardConfig:
     length_penalty: float = 0.0001
     reward_if_max_len: float = -0.1
     correct_length_discount: float = 0.1
+    early_success: float = 0.4
     rounds_penalty_coef: float = 0.0
 
 
@@ -76,7 +77,7 @@ class PPOConfig:
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
     adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
-    adv_norm_hybrid_alpha: float = 0.7
+    adv_norm_hybrid_alpha: float = 0.3
     adv_norm_use_global_for_homogeneous_prompts: bool = True
     value_warmup_steps: int = 25
     value_warmup_lr: float = 1e-4
@@ -84,7 +85,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 5e-5
+    lr: float = 2e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -94,6 +95,8 @@ class TrainConfig:
     output_dir: str = "./runs/ppo"
     save_every: int = 1000
     keep_last: int = 3
+    resume_from: str = ""
+    resume_auto_latest: bool = False
 
 
 @dataclass

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -1738,6 +1739,7 @@ def _collect_rollouts_vllm_batch_multiround(
             keep_prob=cfg.reward.keep_prob,
             length_penalty=cfg.reward.length_penalty,
             correct_length_discount=cfg.reward.correct_length_discount,
+            early_success=cfg.reward.early_success,
             reward_if_max_len=cfg.reward.reward_if_max_len,
             rounds_penalty_coef=cfg.reward.rounds_penalty_coef,
             num_generated_tokens=len(generated_all_by_seq[idx]),
@@ -2097,6 +2099,11 @@ def _save_checkpoint(
     model,
     value_head: ValueHead,
     tokenizer,
+    ppo_optimizer: torch.optim.Optimizer,
+    warmup_optimizer: Optional[torch.optim.Optimizer],
+    ds_index: int,
+    prev_train_mode: Optional[str],
+    reward_rng: torch.Generator,
     cfg: Config,
 ) -> None:
     ckpt_dir = os.path.join(output_dir, "checkpoints", f"step_{step:04d}")
@@ -2109,10 +2116,80 @@ def _save_checkpoint(
 
     torch.save(
         {
+            "checkpoint_format_version": 1,
+            "step": int(step),
             "value_head_state_dict": value_head.state_dict(),
+            "ppo_optimizer_state_dict": ppo_optimizer.state_dict(),
+            "warmup_optimizer_state_dict": (warmup_optimizer.state_dict() if warmup_optimizer is not None else None),
+            "ds_index": int(ds_index),
+            "prev_train_mode": prev_train_mode,
+            "python_random_state": random.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "torch_cuda_rng_state_all": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+            "reward_rng_state": reward_rng.get_state(),
         },
         os.path.join(ckpt_dir, "ppo_state.pt"),
     )
+
+
+def _checkpoint_step_from_dirname(path: str) -> Optional[int]:
+    base = os.path.basename(os.path.normpath(path))
+    m = re.fullmatch(r"step_(\d+)", base)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
+def _find_latest_checkpoint_in_dir(root_dir: str) -> Optional[str]:
+    if not os.path.isdir(root_dir):
+        return None
+    candidates: List[Tuple[int, str]] = []
+    for p in glob(os.path.join(root_dir, "step_*")):
+        if not os.path.isdir(p):
+            continue
+        step = _checkpoint_step_from_dirname(p)
+        if step is None:
+            continue
+        if not os.path.isfile(os.path.join(p, "ppo_state.pt")):
+            continue
+        if not os.path.isdir(os.path.join(p, "model")):
+            continue
+        candidates.append((int(step), str(p)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return str(candidates[-1][1])
+
+
+def _resolve_resume_checkpoint_dir(cfg: Config) -> Optional[str]:
+    resume_from_raw = str(getattr(cfg.train, "resume_from", "")).strip()
+    if resume_from_raw:
+        p = os.path.abspath(os.path.expanduser(resume_from_raw))
+        if not os.path.isdir(p):
+            raise FileNotFoundError(f"train.resume_from is not a directory: {p}")
+
+        # Direct step directory.
+        step = _checkpoint_step_from_dirname(p)
+        if step is not None:
+            return p
+
+        # output_dir or checkpoints dir.
+        search_roots: List[str] = [p]
+        if os.path.basename(os.path.normpath(p)) != "checkpoints":
+            search_roots.append(os.path.join(p, "checkpoints"))
+        for root in search_roots:
+            latest = _find_latest_checkpoint_in_dir(root)
+            if latest is not None:
+                return latest
+        raise FileNotFoundError(
+            f"Could not find any checkpoint step_* directory under resume_from={p}"
+        )
+
+    if bool(getattr(cfg.train, "resume_auto_latest", False)):
+        latest = _find_latest_checkpoint_in_dir(os.path.join(cfg.train.output_dir, "checkpoints"))
+        if latest is not None:
+            return latest
+    return None
 
 
 def _rotate_checkpoints(output_dir: str, keep_last: int) -> None:
@@ -2135,13 +2212,27 @@ def train(cfg: Config) -> None:
     device = torch.device(torch_device_cfg if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
+    resume_ckpt_dir = _resolve_resume_checkpoint_dir(cfg)
+    model_init_path = (
+        os.path.join(resume_ckpt_dir, "model")
+        if resume_ckpt_dir is not None
+        else cfg.model.init_ckpt
+    )
+    tokenizer_init_path = (
+        os.path.join(resume_ckpt_dir, "tokenizer")
+        if resume_ckpt_dir is not None
+        else cfg.model.init_ckpt
+    )
+    if resume_ckpt_dir is not None:
+        _log(f"Resuming from checkpoint: {resume_ckpt_dir}")
+
     tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model.init_ckpt,
+        tokenizer_init_path,
         use_fast=True,
         trust_remote_code=bool(cfg.model.trust_remote_code),
     )
     model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.init_ckpt,
+        model_init_path,
         torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         trust_remote_code=bool(cfg.model.trust_remote_code),
     )
@@ -2174,6 +2265,8 @@ def train(cfg: Config) -> None:
             raise ValueError("ppo_only_z_tokens_and_verify requires rollout.digit_greedy=True")
     if float(cfg.reward.rounds_penalty_coef) < 0.0:
         raise ValueError("reward.rounds_penalty_coef must be >= 0")
+    if float(cfg.reward.early_success) < 0.0 or float(cfg.reward.early_success) > 1.0:
+        raise ValueError("reward.early_success must be in [0.0, 1.0]")
     ce_mode = str(cfg.ppo.ce_mode).strip().lower()
     if ce_mode not in ("successful_traces", "random"):
         raise ValueError(
@@ -2278,6 +2371,27 @@ def train(cfg: Config) -> None:
         _assert_optimizer_matches_params(warmup_optimizer, value_head_params)
     _assert_optimizer_matches_params(ppo_optimizer, ppo_params)
 
+    resume_state: Optional[Dict[str, object]] = None
+    resume_step = 0
+    if resume_ckpt_dir is not None:
+        ppo_state_path = os.path.join(resume_ckpt_dir, "ppo_state.pt")
+        if not os.path.isfile(ppo_state_path):
+            raise FileNotFoundError(f"Resume checkpoint missing ppo_state.pt: {ppo_state_path}")
+        resume_state = torch.load(ppo_state_path, map_location="cpu")
+        if "value_head_state_dict" not in resume_state:
+            raise RuntimeError(f"Resume checkpoint missing value_head_state_dict: {ppo_state_path}")
+        value_head.load_state_dict(resume_state["value_head_state_dict"])
+        if "ppo_optimizer_state_dict" in resume_state and resume_state["ppo_optimizer_state_dict"] is not None:
+            ppo_optimizer.load_state_dict(resume_state["ppo_optimizer_state_dict"])
+        if warmup_optimizer is not None and resume_state.get("warmup_optimizer_state_dict") is not None:
+            warmup_optimizer.load_state_dict(resume_state["warmup_optimizer_state_dict"])
+        if "step" in resume_state:
+            resume_step = int(resume_state["step"])
+        else:
+            parsed = _checkpoint_step_from_dirname(resume_ckpt_dir)
+            resume_step = int(parsed) if parsed is not None else 0
+        _log(f"Loaded optimizer/value state from checkpoint step={resume_step}")
+
     rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
     vllm_engine: Optional[Any] = None
     if rollout_backend == "hf":
@@ -2304,7 +2418,7 @@ def train(cfg: Config) -> None:
                 _log(f"vLLM CUDA_VISIBLE_DEVICES={vllm_kwargs['cuda_visible_devices']}")
         vllm_seed = int(cfg.rollout.vllm_seed) if cfg.rollout.vllm_seed is not None else int(cfg.train.seed)
         vllm_engine = VLLMRolloutEngine(
-            init_ckpt=cfg.model.init_ckpt,
+            init_ckpt=model_init_path,
             tokenizer=tokenizer,
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=z_allowed_t.tolist(),
@@ -2362,8 +2476,37 @@ def train(cfg: Config) -> None:
 
     ds_index = 0
     prev_train_mode: Optional[str] = None
+    start_update = 1
+    if resume_state is not None:
+        ds_index = int(resume_state.get("ds_index", 0))
+        prev_train_mode_raw = resume_state.get("prev_train_mode", None)
+        prev_train_mode = str(prev_train_mode_raw) if prev_train_mode_raw is not None else None
+        if "reward_rng_state" in resume_state and resume_state["reward_rng_state"] is not None:
+            reward_rng.set_state(resume_state["reward_rng_state"])
+        if "python_random_state" in resume_state and resume_state["python_random_state"] is not None:
+            random.setstate(resume_state["python_random_state"])
+        if "torch_rng_state" in resume_state and resume_state["torch_rng_state"] is not None:
+            torch.set_rng_state(resume_state["torch_rng_state"])
+        if torch.cuda.is_available():
+            cuda_state = resume_state.get("torch_cuda_rng_state_all")
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+        start_update = int(resume_step) + 1
+        _log(
+            f"Resume state restored: next_update={start_update}, ds_index={ds_index}, "
+            f"prev_train_mode={prev_train_mode}"
+        )
+    if start_update > int(cfg.train.updates):
+        _log(
+            f"Resume checkpoint is already at/after target updates "
+            f"(next_update={start_update}, train.updates={int(cfg.train.updates)}). Nothing to do."
+        )
+        if vllm_engine is not None:
+            vllm_engine.close()
+        return
+
     try:
-        for update in range(1, cfg.train.updates + 1):
+        for update in range(start_update, cfg.train.updates + 1):
             _t_update0 = time.perf_counter()
             _reset_reward_timing_acc()
             value_warmup_active = (update - 1) < int(cfg.ppo.value_warmup_steps)
@@ -2538,17 +2681,6 @@ def train(cfg: Config) -> None:
             avg_rollouts_per_prompt_actual = float(len(trajectories)) / float(max(unique_prompt_ids, 1))
             homogeneous_prompt_frac, mixed_prompt_frac = _prompt_reward_homogeneity_stats(prompt_groups)
             _prepare_normalized_advantages(trajectories=trajectories, cfg=cfg)
-            adv_var_per_prompt: List[float] = []
-            for group in prompt_groups.values():
-                group_adv: List[float] = []
-                for traj in group:
-                    group_adv.extend(traj.advantages_norm)
-                if group_adv:
-                    x = torch.tensor(group_adv, dtype=torch.float32)
-                    adv_var_per_prompt.append(float(x.var(unbiased=False).item()))
-            avg_adv_var_per_prompt = (
-                float(sum(adv_var_per_prompt) / len(adv_var_per_prompt)) if adv_var_per_prompt else 0.0
-            )
             adv_norm_mode_effective = (
                 str(cfg.ppo.adv_norm_mode).strip().lower() if bool(cfg.ppo.normalize_advantages) else "none"
             )
@@ -2780,19 +2912,57 @@ def train(cfg: Config) -> None:
                     p.requires_grad_(False)
 
             rewards = torch.tensor([float(t.reward_info["reward_final"]) for t in trajectories], dtype=torch.float32)
-            exact_rate = float(
-                sum(1 for t in trajectories if bool(t.reward_info.get("exact_match", False)))
-            ) / float(len(trajectories))
-            if action_scope == "ppo_only_z_tokens_and_verify":
-                answered = sum(1 for t in trajectories if t.terminated_by == "finalize")
-            else:
-                answered = sum(1 for t in trajectories if t.terminated_by == "answer_with_5_digits")
-            answer_rate = float(answered) / float(len(trajectories))
-            avg_len = float(sum(t.num_generated_total for t in trajectories)) / float(len(trajectories))
 
             old_values = torch.tensor([v for t in trajectories for v in t.values_old], dtype=torch.float32)
             old_returns = torch.tensor([r for t in trajectories for r in t.returns], dtype=torch.float32)
             ev = explained_variance(y_pred=old_values, y_true=old_returns)
+
+            num_traj = float(len(trajectories))
+            finalize_exact_rate = float(
+                sum(1 for t in trajectories if str(t.reward_info.get("reward_selection_mode", "")) == "finalize_exact")
+            ) / num_traj
+            early_success_discount_rate = float(
+                sum(
+                    1
+                    for t in trajectories
+                    if str(t.reward_info.get("reward_selection_mode", "")) == "early_success_discounted"
+                )
+            ) / num_traj
+            finalize_partial_rate = float(
+                sum(
+                    1
+                    for t in trajectories
+                    if str(t.reward_info.get("reward_selection_mode", "")) == "finalize_partial_or_zero"
+                )
+            ) / num_traj
+            non_finalize_no_credit_rate = float(
+                sum(
+                    1
+                    for t in trajectories
+                    if str(t.reward_info.get("reward_selection_mode", "")) == "non_finalize_no_credit"
+                )
+            ) / num_traj
+            avg_rounds = float(
+                sum(float(t.reward_info.get("round_count", 0.0)) for t in trajectories)
+            ) / num_traj
+            avg_verify_tokens = float(sum(len(t.generated_verify_ids) for t in trajectories)) / num_traj
+            any_exact_rate = float(
+                sum(
+                    1
+                    for t in trajectories
+                    if bool(t.reward_info.get("any_exact_match", t.reward_info.get("exact_match", False)))
+                )
+            ) / num_traj
+            reward_base_mean = float(
+                sum(float(t.reward_info.get("reward", 0.0)) for t in trajectories)
+            ) / num_traj
+            token_penalty_mean = float(
+                sum(float(t.reward_info.get("token_penalty", 0.0)) for t in trajectories)
+            ) / num_traj
+            rounds_penalty_mean = float(
+                sum(float(t.reward_info.get("rounds_penalty", 0.0)) for t in trajectories)
+            ) / num_traj
+            reward_final_mean = float(rewards.mean().item())
 
             denom = max(minibatch_count, 1)
             t_reward_sec = _get_reward_timing_acc()
@@ -2801,33 +2971,22 @@ def train(cfg: Config) -> None:
                 " | ".join(
                     [
                         f"update={update}",
-                        f"tokens={sum(len(t.actions) for t in trajectories)}",
-                        f"generated_tokens={full_generated_token_budget}",
-                        f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
-                        f"reward_mean={float(rewards.mean().item()):.4f}",
-                        f"exact={exact_rate:.4f}",
-                        f"answer_rate={answer_rate:.4f}",
-                        f"avg_len={avg_len:.2f}",
+                        f"finalize_exact_rate={finalize_exact_rate:.4f}",
+                        f"early_success_discount_rate={early_success_discount_rate:.4f}",
+                        f"finalize_partial_rate={finalize_partial_rate:.4f}",
+                        f"non_finalize_no_credit_rate={non_finalize_no_credit_rate:.4f}",
+                        f"avg_rounds={avg_rounds:.3f}",
+                        f"avg_verify_tokens={avg_verify_tokens:.3f}",
+                        f"any_exact_rate={any_exact_rate:.4f}",
+                        f"reward_base_mean={reward_base_mean:.4f}",
+                        f"token_penalty_mean={token_penalty_mean:.4f}",
+                        f"rounds_penalty_mean={rounds_penalty_mean:.4f}",
+                        f"reward_final_mean={reward_final_mean:.4f}",
                         f"entropy={ent_acc / denom:.4f}",
-                        *(
-                            [f"kl={kl_acc / denom:.4f}", f"kl_penalty={kl_pen_acc / denom:.4f}"]
-                            if float(cfg.ppo.kl_coef) > 0.0
-                            else []
-                        ),
-                        *([f"entropy_loss={ent_loss_acc / denom:.4f}"] if float(cfg.ppo.c_ent) != 0.0 else []),
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"value_loss={val_acc / denom:.4f}",
-                        *(
-                            [f"ce_loss={ce_acc / denom:.4f}", f"ce_examples={ce_examples_acc}"]
-                            if bool(ce_enabled)
-                            else []
-                        ),
                         f"explained_var={ev:.4f}",
-                        f"t_sync={t_sync_sec:.3f}s",
-                        f"t_rollout={t_rollout_sec:.3f}s",
-                        f"t_reward={t_reward_sec:.3f}s",
-                        f"t_backprop={t_backprop_sec:.3f}s",
                         f"t_update={t_total_sec:.3f}s",
                     ]
                 )
@@ -2840,6 +2999,11 @@ def train(cfg: Config) -> None:
                     model=model,
                     value_head=value_head,
                     tokenizer=tokenizer,
+                    ppo_optimizer=ppo_optimizer,
+                    warmup_optimizer=warmup_optimizer,
+                    ds_index=ds_index,
+                    prev_train_mode=prev_train_mode,
+                    reward_rng=reward_rng,
                     cfg=cfg,
                 )
                 _rotate_checkpoints(output_dir=cfg.train.output_dir, keep_last=int(cfg.train.keep_last))

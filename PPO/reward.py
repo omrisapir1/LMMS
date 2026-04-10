@@ -154,6 +154,7 @@ def compute_multi_round_reward(
     keep_prob: Sequence[float],
     length_penalty: float,
     correct_length_discount: float,
+    early_success: float,
     reward_if_max_len: float,
     rounds_penalty_coef: float,
     num_generated_tokens: int,
@@ -166,6 +167,8 @@ def compute_multi_round_reward(
         raise ValueError("round_count must be >= 0")
     if float(rounds_penalty_coef) < 0.0:
         raise ValueError("rounds_penalty_coef must be >= 0")
+    if float(early_success) < 0.0 or float(early_success) > 1.0:
+        raise ValueError("early_success must be in [0.0, 1.0]")
 
     episode_mask = _sample_episode_zero_zero_mask(
         true_digits=true_digits,
@@ -204,22 +207,41 @@ def compute_multi_round_reward(
         round_applied_counts.append(int(rr["applied_count"]))
         round_correct_counts.append(int(rr["correct_count"]))
 
-    if has_complete_round:
-        best_round_index = -1
-        best_round_answer_reward = float("-inf")
-        for idx, (pred, rew) in enumerate(zip(round_pred_digits, round_answer_rewards)):
-            if pred is None:
-                continue
-            if float(rew) > best_round_answer_reward:
-                best_round_answer_reward = float(rew)
-                best_round_index = int(idx)
-        if best_round_index < 0:
-            best_round_answer_reward = 0.0
-    else:
-        best_round_index = -1
-        best_round_answer_reward = 0.0
+    is_finalize_terminated = str(terminated_reason) == "finalize"
+    finalize_round_index = int(len(round_pred_digits) - 1) if is_finalize_terminated and len(round_pred_digits) > 0 else -1
+    finalize_round_has_complete_answer = bool(
+        finalize_round_index >= 0
+        and finalize_round_index < len(round_pred_digits)
+        and round_pred_digits[finalize_round_index] is not None
+    )
+    finalize_round_exact_match = bool(
+        finalize_round_has_complete_answer and bool(round_exact_flags[finalize_round_index])
+    )
+    any_exact_indices = [idx for idx, is_exact in enumerate(round_exact_flags) if bool(is_exact)]
+    any_exact_match = bool(any_exact_indices)
+    first_exact_round_index = int(any_exact_indices[0]) if any_exact_match else -1
 
-    best_exact_match = bool(best_round_index >= 0 and round_exact_flags[best_round_index])
+    selected_round_index = -1
+    selected_round_answer_reward = 0.0
+    reward_mode = "no_complete_round"
+    if finalize_round_exact_match:
+        selected_round_index = int(finalize_round_index)
+        selected_round_answer_reward = 1.0
+        reward_mode = "finalize_exact"
+    elif is_finalize_terminated and any_exact_match:
+        selected_round_index = int(first_exact_round_index)
+        selected_round_answer_reward = float(early_success)
+        reward_mode = "early_success_discounted"
+    elif is_finalize_terminated and finalize_round_has_complete_answer:
+        selected_round_index = int(finalize_round_index)
+        selected_round_answer_reward = float(round_answer_rewards[finalize_round_index])
+        reward_mode = "finalize_partial_or_zero"
+    elif has_complete_round:
+        reward_mode = "non_finalize_no_credit"
+
+    best_round_index = int(selected_round_index)
+    best_round_answer_reward = float(selected_round_answer_reward)
+    best_exact_match = bool(finalize_round_exact_match)
 
     token_penalty = float(length_penalty) * float(num_generated_tokens)
     if best_exact_match:
@@ -229,10 +251,10 @@ def compute_multi_round_reward(
     max_len_term = float(reward_if_max_len) if str(terminated_reason) == "max_new_tokens" else 0.0
     reward_final = float(best_round_answer_reward) - float(token_penalty) - float(rounds_penalty) + float(max_len_term)
 
-    if best_round_index >= 0:
-        best_applied_mask = [int(x) for x in round_applied_masks[best_round_index]]
-        best_applied_count = int(round_applied_counts[best_round_index])
-        best_correct_count = int(round_correct_counts[best_round_index])
+    if selected_round_index >= 0:
+        best_applied_mask = [int(x) for x in round_applied_masks[selected_round_index]]
+        best_applied_count = int(round_applied_counts[selected_round_index])
+        best_correct_count = int(round_correct_counts[selected_round_index])
     else:
         best_applied_mask = [0, 0, 0, 0, 0]
         best_applied_count = 0
@@ -248,6 +270,7 @@ def compute_multi_round_reward(
         "reward_partial": float(best_round_answer_reward),
         "length_penalty": float(length_penalty),
         "correct_length_discount": float(correct_length_discount),
+        "early_success": float(early_success),
         "rounds_penalty_coef": float(rounds_penalty_coef),
         "reward_if_max_len": float(max_len_term),
         "reward": float(best_round_answer_reward),
@@ -257,6 +280,11 @@ def compute_multi_round_reward(
         "round_answer_rewards": [float(x) for x in round_answer_rewards],
         "best_round_answer_reward": float(best_round_answer_reward),
         "best_round_index": int(best_round_index),
+        "reward_selection_mode": str(reward_mode),
+        "finalize_round_index": int(finalize_round_index),
+        "finalize_round_exact_match": bool(finalize_round_exact_match),
+        "any_exact_match": bool(any_exact_match),
+        "first_exact_round_index": int(first_exact_round_index),
         "token_penalty": float(token_penalty),
         "rounds_penalty": float(rounds_penalty),
         "reached_max_length": bool(str(terminated_reason) == "max_new_tokens"),
