@@ -34,7 +34,7 @@ class RolloutConfig:
     temperature: float = 1.0
     top_p: float = 0.95
     digit_greedy: bool = True
-    action_scope: str = "ppo_only_z_tokens"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
+    action_scope: str = "ppo_only_z_tokens_and_verify"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
