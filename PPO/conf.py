@@ -48,7 +48,7 @@ class RolloutConfig:
     episodes_per_batch: int = 512
     rollouts_per_prompt: int = 8  # number of sampled completions per prompt
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE
-    verify_finalize_logit_bias: float = 5
+    verify_finalize_logit_bias: float = 1
     verify_retry_logit_bias: float = 0
 
 
