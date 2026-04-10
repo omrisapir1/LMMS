@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from RSFT.logic import (
     TARGET_ANSWER,
     TARGET_DIGIT,
+    TARGET_IGNORE,
     TARGET_VERIFY,
     TARGET_Z,
     RoundTrace,
@@ -219,6 +220,8 @@ def test_masking_contract_for_three_losses() -> None:
         answer_token_id=6,
         digit_token_ids=[7, 8],
         verify_token_ids=[3, 8],
+        finalize_token_id=3,
+        retry_token_id=8,
         w_z=1.0,
         w_answer=1.0,
         w_digits=1.0,
@@ -297,3 +300,151 @@ def test_correct_but_executed_retry_uses_finalize_verify_target_label() -> None:
     target_class = ex["target_class"]
     verify_labels = [labels[i] for i in range(len(labels)) if target_class[i] == TARGET_VERIFY]
     assert verify_labels == [13, 13]
+
+
+def test_verify_weighting_alpha_zero_matches_unweighted_mean_per_example() -> None:
+    # verify labels: [retry, retry, finalize]
+    labels = torch.tensor([[-100, -100, 20, 20, 10]], dtype=torch.long)
+    target_class = torch.tensor([[TARGET_IGNORE, TARGET_IGNORE, TARGET_VERIFY, TARGET_VERIFY, TARGET_VERIFY]], dtype=torch.long)
+
+    logits = torch.zeros((1, 5, 32), dtype=torch.float32)
+    # retry token id=20, finalize token id=10
+    logits[0, 2, 10] = 1.0
+    logits[0, 2, 20] = 3.0
+    logits[0, 3, 10] = 1.0
+    logits[0, 3, 20] = 3.0
+    logits[0, 4, 10] = 1.5
+    logits[0, 4, 20] = 2.5
+
+    losses = compute_rsft_losses(
+        logits=logits,
+        labels=labels,
+        target_class=target_class,
+        z_token_ids=[1],
+        answer_token_id=2,
+        digit_token_ids=[3, 4],
+        verify_token_ids=[10, 20],
+        finalize_token_id=10,
+        retry_token_id=20,
+        w_z=0.0,
+        w_answer=0.0,
+        w_digits=0.0,
+        w_verify=1.0,
+        verify_finalize_alpha=0.0,
+    )
+
+    restricted = torch.tensor(
+        [
+            [3.0, 1.0],
+            [3.0, 1.0],
+            [2.5, 1.5],
+        ],
+        dtype=torch.float32,
+    )
+    expected = F.cross_entropy(
+        restricted,
+        torch.tensor([0, 0, 1], dtype=torch.long),
+        reduction="mean",
+    )
+    assert torch.allclose(losses["l_verify"], expected, atol=1e-6)
+
+
+def test_verify_weighting_boosts_finalize_for_retry_heavy_success() -> None:
+    # success-like verify labels with many retries then one finalize: [R, R, R, F]
+    labels = torch.tensor([[20, 20, 20, 10]], dtype=torch.long)
+    target_class = torch.tensor([[TARGET_VERIFY, TARGET_VERIFY, TARGET_VERIFY, TARGET_VERIFY]], dtype=torch.long)
+
+    logits = torch.zeros((1, 4, 32), dtype=torch.float32)
+    # retries are easy, finalize is hard
+    logits[0, 0, 20] = 5.0
+    logits[0, 0, 10] = 1.0
+    logits[0, 1, 20] = 5.0
+    logits[0, 1, 10] = 1.0
+    logits[0, 2, 20] = 5.0
+    logits[0, 2, 10] = 1.0
+    logits[0, 3, 10] = 1.1
+    logits[0, 3, 20] = 4.9
+
+    losses_alpha0 = compute_rsft_losses(
+        logits=logits,
+        labels=labels,
+        target_class=target_class,
+        z_token_ids=[1],
+        answer_token_id=2,
+        digit_token_ids=[3, 4],
+        verify_token_ids=[10, 20],
+        finalize_token_id=10,
+        retry_token_id=20,
+        w_z=0.0,
+        w_answer=0.0,
+        w_digits=0.0,
+        w_verify=1.0,
+        verify_finalize_alpha=0.0,
+    )
+    losses_alpha1 = compute_rsft_losses(
+        logits=logits,
+        labels=labels,
+        target_class=target_class,
+        z_token_ids=[1],
+        answer_token_id=2,
+        digit_token_ids=[3, 4],
+        verify_token_ids=[10, 20],
+        finalize_token_id=10,
+        retry_token_id=20,
+        w_z=0.0,
+        w_answer=0.0,
+        w_digits=0.0,
+        w_verify=1.0,
+        verify_finalize_alpha=1.0,
+    )
+
+    assert float(losses_alpha1["l_verify"].item()) > float(losses_alpha0["l_verify"].item())
+
+
+def test_verify_weighting_failure_only_is_normalized() -> None:
+    # failure-only labels: [R, R, R], no finalize present.
+    labels = torch.tensor([[20, 20, 20]], dtype=torch.long)
+    target_class = torch.tensor([[TARGET_VERIFY, TARGET_VERIFY, TARGET_VERIFY]], dtype=torch.long)
+
+    logits = torch.zeros((1, 3, 32), dtype=torch.float32)
+    logits[0, 0, 20] = 3.0
+    logits[0, 0, 10] = 1.0
+    logits[0, 1, 20] = 2.0
+    logits[0, 1, 10] = 1.2
+    logits[0, 2, 20] = 1.5
+    logits[0, 2, 10] = 1.0
+
+    losses_alpha0 = compute_rsft_losses(
+        logits=logits,
+        labels=labels,
+        target_class=target_class,
+        z_token_ids=[1],
+        answer_token_id=2,
+        digit_token_ids=[3, 4],
+        verify_token_ids=[10, 20],
+        finalize_token_id=10,
+        retry_token_id=20,
+        w_z=0.0,
+        w_answer=0.0,
+        w_digits=0.0,
+        w_verify=1.0,
+        verify_finalize_alpha=0.0,
+    )
+    losses_alpha2 = compute_rsft_losses(
+        logits=logits,
+        labels=labels,
+        target_class=target_class,
+        z_token_ids=[1],
+        answer_token_id=2,
+        digit_token_ids=[3, 4],
+        verify_token_ids=[10, 20],
+        finalize_token_id=10,
+        retry_token_id=20,
+        w_z=0.0,
+        w_answer=0.0,
+        w_digits=0.0,
+        w_verify=1.0,
+        verify_finalize_alpha=2.0,
+    )
+
+    assert torch.allclose(losses_alpha0["l_verify"], losses_alpha2["l_verify"], atol=1e-6)

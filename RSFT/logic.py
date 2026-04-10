@@ -347,6 +347,70 @@ def _restricted_masked_ce(
     return F.cross_entropy(restricted_logits, local_labels, reduction="mean")
 
 
+def _restricted_weighted_verify_ce(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    allowed_token_ids: Sequence[int],
+    finalize_token_id: int,
+    retry_token_id: int,
+    verify_finalize_alpha: float,
+) -> torch.Tensor:
+    active = mask & (labels != -100)
+    if not bool(active.any()):
+        return logits.new_zeros(())
+
+    allowed_t = torch.tensor([int(x) for x in allowed_token_ids], dtype=torch.long, device=logits.device)
+    vocab_size = int(logits.shape[-1])
+    id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=logits.device)
+    id_to_local[allowed_t] = torch.arange(allowed_t.numel(), dtype=torch.long, device=logits.device)
+
+    finalize_t = int(finalize_token_id)
+    retry_t = int(retry_token_id)
+    alpha = float(verify_finalize_alpha)
+    per_example_losses: List[torch.Tensor] = []
+
+    for b in range(int(logits.shape[0])):
+        ex_active = active[b]
+        if not bool(ex_active.any()):
+            continue
+
+        ex_logits = logits[b][ex_active]
+        ex_labels = labels[b][ex_active]
+
+        local_labels = id_to_local[ex_labels]
+        if bool((local_labels < 0).any()):
+            raise RuntimeError("Restricted CE received labels outside allowed token set")
+
+        is_retry = ex_labels == retry_t
+        is_finalize = ex_labels == finalize_t
+        if bool((~(is_retry | is_finalize)).any()):
+            raise RuntimeError("Verify labels must be exactly one of <FINALIZE>/<RETRY>")
+
+        retries = is_retry.sum().to(dtype=ex_logits.dtype)
+        finalizes = is_finalize.sum().to(dtype=ex_logits.dtype)
+        boost = torch.pow(retries + 1.0, alpha)
+        denom = retries + boost * finalizes
+        if bool(denom <= 0):
+            raise RuntimeError("Verify weighting denominator must be strictly positive")
+
+        retry_w = 1.0 / denom
+        finalize_w = boost / denom
+        weights = torch.where(is_retry, retry_w, finalize_w).to(dtype=ex_logits.dtype)
+
+        token_loss = F.cross_entropy(
+            ex_logits.index_select(1, allowed_t),
+            local_labels,
+            reduction="none",
+        ).to(dtype=ex_logits.dtype)
+        per_example_losses.append((token_loss * weights).sum())
+
+    if not per_example_losses:
+        return logits.new_zeros(())
+    return torch.stack(per_example_losses).mean()
+
+
 def compute_rsft_losses(
     *,
     logits: torch.Tensor,
@@ -356,11 +420,17 @@ def compute_rsft_losses(
     answer_token_id: int,
     digit_token_ids: Sequence[int],
     verify_token_ids: Sequence[int],
+    finalize_token_id: int,
+    retry_token_id: int,
     w_z: float,
     w_answer: float,
     w_digits: float,
     w_verify: float,
+    verify_finalize_alpha: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
+    if float(verify_finalize_alpha) < 0.0:
+        raise ValueError("verify_finalize_alpha must be >= 0")
+
     z_mask = target_class == TARGET_Z
     answer_mask = target_class == TARGET_ANSWER
     digits_mask = target_class == TARGET_DIGIT
@@ -396,11 +466,14 @@ def compute_rsft_losses(
         mask=digits_mask,
         allowed_token_ids=digits_allowed,
     )
-    l_verify = _restricted_masked_ce(
+    l_verify = _restricted_weighted_verify_ce(
         logits=logits,
         labels=labels,
         mask=verify_mask,
         allowed_token_ids=verify_allowed,
+        finalize_token_id=int(finalize_token_id),
+        retry_token_id=int(retry_token_id),
+        verify_finalize_alpha=float(verify_finalize_alpha),
     )
 
     total = (

@@ -82,6 +82,7 @@ class LossConfig:
     w_answer: float = 0.05
     w_digits: float = 1.0
     w_verify: float = 2.0
+    verify_finalize_alpha: float = 0.5
 
     def __post_init__(self) -> None:
         if float(self.w_z) < 0.0:
@@ -92,6 +93,8 @@ class LossConfig:
             raise ValueError("loss.w_digits must be >= 0")
         if float(self.w_verify) < 0.0:
             raise ValueError("loss.w_verify must be >= 0")
+        if float(self.verify_finalize_alpha) < 0.0:
+            raise ValueError("loss.verify_finalize_alpha must be >= 0")
 
 
 @dataclass

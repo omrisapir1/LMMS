@@ -26,6 +26,7 @@ from RSFT.config import Config, DEFAULT_SET_ALLOWED_PREFIXES
 from RSFT.dataset import PromptExample, load_hf_records, make_digit_id_to_value_map, prepare_prompt_examples, sample_unique_prompt_batch
 from RSFT.eval_vllm import evaluate_with_rollout_engine
 from RSFT.logic import (
+    TARGET_VERIFY,
     RoundTrace,
     build_training_example,
     collate_training_examples,
@@ -45,6 +46,10 @@ METRICS_FIELDS: List[str] = [
     "avg_rounds_per_accepted",
     "avg_failed_rounds_before_success",
     "mean_accepted_z_len_per_round",
+    "verify_finalize_alpha",
+    "avg_retry_targets_per_accepted",
+    "avg_finalize_targets_per_accepted",
+    "avg_effective_finalize_boost",
     "l_z",
     "l_answer",
     "l_digits",
@@ -108,6 +113,8 @@ def _validate_cfg(cfg: Config) -> None:
         raise ValueError("loss.w_digits must be >= 0")
     if float(cfg.loss.w_verify) < 0.0:
         raise ValueError("loss.w_verify must be >= 0")
+    if float(cfg.loss.verify_finalize_alpha) < 0.0:
+        raise ValueError("loss.verify_finalize_alpha must be >= 0")
     if int(cfg.train.warmup_steps) < 0:
         raise ValueError("train.warmup_steps must be >= 0")
     if cfg.train.warmup_lr is not None and float(cfg.train.warmup_lr) <= 0.0:
@@ -720,6 +727,18 @@ def train(cfg: Optional[Config] = None) -> str:
         init_ckpt_override=(resume_artifacts.model_dir if resume_artifacts is not None else None),
     )
     verify_token_ids = [int(finalize_token_id), int(retry_token_id)]
+    _log(
+        " | ".join(
+            [
+                f"loss.w_z={cfg.loss.w_z}",
+                f"loss.w_answer={cfg.loss.w_answer}",
+                f"loss.w_digits={cfg.loss.w_digits}",
+                f"loss.w_verify={cfg.loss.w_verify}",
+                f"loss.verify_finalize_alpha={cfg.loss.verify_finalize_alpha}",
+            ]
+        ),
+        log_path,
+    )
 
     vllm_init_ckpt_ref = str(cfg.model.init_ckpt)
     if str(cfg.rollout.backend).strip().lower() == "vllm":
@@ -886,6 +905,10 @@ def train(cfg: Optional[Config] = None) -> str:
             "avg_rounds_per_accepted": 0.0,
             "avg_failed_rounds_before_success": 0.0,
             "mean_accepted_z_len_per_round": 0.0,
+            "verify_finalize_alpha": float(cfg.loss.verify_finalize_alpha),
+            "avg_retry_targets_per_accepted": 0.0,
+            "avg_finalize_targets_per_accepted": 0.0,
+            "avg_effective_finalize_boost": 0.0,
             "l_z": 0.0,
             "l_answer": 0.0,
             "l_digits": 0.0,
@@ -1381,10 +1404,13 @@ def train(cfg: Optional[Config] = None) -> str:
                                 answer_token_id=answer_token_id,
                                 digit_token_ids=digit_token_ids,
                                 verify_token_ids=verify_token_ids,
+                                finalize_token_id=int(finalize_token_id),
+                                retry_token_id=int(retry_token_id),
                                 w_z=float(cfg.loss.w_z),
                                 w_answer=float(cfg.loss.w_answer),
                                 w_digits=float(cfg.loss.w_digits),
                                 w_verify=float(cfg.loss.w_verify),
+                                verify_finalize_alpha=float(cfg.loss.verify_finalize_alpha),
                             )
                             per_lv.append(losses_i["l_verify"])
                             if current_train_mode == "verify_warmup":
@@ -1455,6 +1481,31 @@ def train(cfg: Optional[Config] = None) -> str:
 
             accepted_prompts = int(len(accepted_prompt_indices))
             accepted_rate = float(accepted_prompts) / float(prompts_sampled) if prompts_sampled > 0 else 0.0
+            accepted_retry_targets: List[float] = []
+            accepted_finalize_targets: List[float] = []
+            accepted_effective_finalize_boosts: List[float] = []
+            for ex in accepted_rows:
+                ex_labels = ex.get("labels", None)
+                ex_target_class = ex.get("target_class", None)
+                if not isinstance(ex_labels, list) or not isinstance(ex_target_class, list):
+                    continue
+                retry_count = 0
+                finalize_count = 0
+                n = min(len(ex_labels), len(ex_target_class))
+                for pos in range(n):
+                    if int(ex_target_class[pos]) != int(TARGET_VERIFY):
+                        continue
+                    lbl = int(ex_labels[pos])
+                    if lbl == int(retry_token_id):
+                        retry_count += 1
+                    elif lbl == int(finalize_token_id):
+                        finalize_count += 1
+                accepted_retry_targets.append(float(retry_count))
+                accepted_finalize_targets.append(float(finalize_count))
+                if finalize_count > 0:
+                    accepted_effective_finalize_boosts.append(
+                        float((float(retry_count) + 1.0) ** float(cfg.loss.verify_finalize_alpha))
+                    )
             row = {
                 "step": int(step),
                 "update_step": int(update_step),
@@ -1465,6 +1516,10 @@ def train(cfg: Optional[Config] = None) -> str:
                 "avg_rounds_per_accepted": float(mean_or_zero(accepted_round_counts)),
                 "avg_failed_rounds_before_success": float(mean_or_zero(accepted_failed_round_counts)),
                 "mean_accepted_z_len_per_round": float(mean_or_zero(accepted_round_z_lens)),
+                "verify_finalize_alpha": float(cfg.loss.verify_finalize_alpha),
+                "avg_retry_targets_per_accepted": float(mean_or_zero(accepted_retry_targets)),
+                "avg_finalize_targets_per_accepted": float(mean_or_zero(accepted_finalize_targets)),
+                "avg_effective_finalize_boost": float(mean_or_zero(accepted_effective_finalize_boosts)),
                 "l_z": float(l_z_val),
                 "l_answer": float(l_answer_val),
                 "l_digits": float(l_digits_val),
@@ -1547,6 +1602,8 @@ def train(cfg: Optional[Config] = None) -> str:
                             f"accepted={row['accepted_prompts']}",
                             f"accepted_rate={row['accepted_rate']:.4f}",
                             f"avg_rounds={row['avg_rounds_per_accepted']:.3f}",
+                            f"avg_retry_targets={row['avg_retry_targets_per_accepted']:.3f}",
+                            f"alpha={row['verify_finalize_alpha']:.3f}",
                             f"Lz={row['l_z']:.4f}",
                             f"La={row['l_answer']:.4f}",
                             f"Ld={row['l_digits']:.4f}",
