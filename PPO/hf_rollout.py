@@ -249,6 +249,7 @@ class HFRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_digits: int = 5,
         temperature: float,
         top_p: float,
         greedy: bool,
@@ -257,6 +258,9 @@ class HFRolloutEngine:
     ) -> List[List[int]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[List[int]] = []
+        k = int(num_digits)
+        if k < 1 or k > 5:
+            raise RuntimeError(f"num_digits must be in [1, 5], got {k}")
 
         with self._lock:
             if self._model is None:
@@ -268,8 +272,8 @@ class HFRolloutEngine:
                     gens = self._run_generate_batch(
                         input_ids_rows=inputs,
                         allowed_token_ids=self.digit_allowed_token_ids,
-                        max_new_tokens=5,
-                        min_new_tokens=5,
+                        max_new_tokens=k,
+                        min_new_tokens=k,
                         temperature=float(temperature),
                         top_p=float(top_p),
                         min_p=float(min_p),
@@ -278,8 +282,8 @@ class HFRolloutEngine:
                         eos_token_id=None,
                     )
                     for gen in gens:
-                        if len(gen) != 5:
-                            raise RuntimeError(f"HF digit generation must return exactly 5 tokens, got {len(gen)}")
+                        if len(gen) != k:
+                            raise RuntimeError(f"HF digit generation must return exactly {k} tokens, got {len(gen)}")
                         rows.append([int(x) for x in gen])
             finally:
                 if was_training:

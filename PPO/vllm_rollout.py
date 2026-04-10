@@ -662,6 +662,7 @@ class VLLMRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_digits: int = 5,
         temperature: float,
         top_p: float,
         greedy: bool,
@@ -670,10 +671,13 @@ class VLLMRolloutEngine:
     ) -> List[List[int]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
+        k = int(num_digits)
+        if k < 1 or k > 5:
+            raise RuntimeError(f"num_digits must be in [1, 5], got {k}")
         sp = self._build_sampling_params(
             allowed_token_ids=self.digit_allowed_token_ids,
-            max_tokens=5,
-            min_tokens=5,
+            max_tokens=k,
+            min_tokens=k,
             temperature=float(temperature),
             top_p=float(top_p),
             min_p=float(min_p),

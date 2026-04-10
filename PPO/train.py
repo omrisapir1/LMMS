@@ -27,10 +27,10 @@ from PPO.conf import Config, DEFAULT_SET_ALLOWED_PREFIXES
 from PPO.hf_rollout import HFRolloutEngine
 from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
 from PPO.ppo_math import explained_variance
-from PPO.reward import compute_reward, parse_answer_digits, parse_final_answer_to_digits
+from PPO.reward import compute_multi_round_reward, compute_reward, parse_answer_digits, parse_final_answer_to_digits
 from PPO.rollout_contract import is_ppo_action, validate_action_scope
 from PPO.rollout_logger import RolloutLogger
-from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single
+from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single, validate_single_token
 from PPO.vllm_rollout import VLLMRolloutEngine
 from phase1.dataset import SYSTEM_PROMPT
 
@@ -97,6 +97,10 @@ class Trajectory:
         reward_info: Dict[str, object],
         num_generated_total: int,
         num_digits_generated: int,
+        generated_verify_ids: Optional[List[int]] = None,
+        rounds_meta: Optional[List[Dict[str, object]]] = None,
+        full_generated_ids: Optional[List[int]] = None,
+        termination_reason: Optional[str] = None,
     ) -> None:
         self.prompt_id = int(prompt_id)
         self.sample_id = sample_id
@@ -118,6 +122,10 @@ class Trajectory:
         self.reward_info = reward_info
         self.num_generated_total = int(num_generated_total)
         self.num_digits_generated = int(num_digits_generated)
+        self.generated_verify_ids = list(generated_verify_ids or [])
+        self.rounds_meta = list(rounds_meta or [])
+        self.full_generated_ids = list(full_generated_ids or [])
+        self.termination_reason = str(termination_reason) if termination_reason is not None else str(terminated_by)
 
         self.returns = [float(self.reward_info["reward_final"])] * len(actions)
         self.advantages = [float(self.reward_info["reward_final"]) - float(v) for v in values_old]
@@ -131,7 +139,7 @@ class TrajectoryDeviceCache:
     seq_ids: torch.Tensor
     attention_mask: torch.Tensor
     action_ids: torch.Tensor
-    is_digit: torch.Tensor
+    action_phase: torch.Tensor
     state_positions: torch.Tensor
     prompt_len: int
     seq_len: int
@@ -139,6 +147,17 @@ class TrajectoryDeviceCache:
     logp_old: torch.Tensor
     advantages_norm: torch.Tensor
     returns: torch.Tensor
+
+
+def _action_type_to_phase_id(action_type: str) -> int:
+    t = str(action_type)
+    if t in ("z", "answer"):
+        return 0
+    if t == "digit":
+        return 1
+    if t == "verify":
+        return 2
+    raise RuntimeError(f"Unsupported action_type {action_type!r}")
 
 
 def _build_trajectory_device_cache(
@@ -176,7 +195,11 @@ def _build_trajectory_device_cache(
                 seq_ids=seq_ids,
                 attention_mask=attn,
                 action_ids=torch.tensor(traj.actions, dtype=torch.long, device=device),
-                is_digit=torch.tensor([t == "digit" for t in traj.action_types], dtype=torch.bool, device=device),
+                action_phase=torch.tensor(
+                    [_action_type_to_phase_id(t) for t in traj.action_types],
+                    dtype=torch.long,
+                    device=device,
+                ),
                 state_positions=state_positions,
                 prompt_len=prompt_len,
                 seq_len=int(seq_ids.numel()),
@@ -368,6 +391,15 @@ def _extract_true_digits(sample: Dict[str, object], answer_digits_field: str, an
     return parse_final_answer_to_digits(sample.get(answer_field))
 
 
+def _resolve_strict_vocab_token_id(tokenizer, token_text: str, *, label: str) -> int:
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    if token_text not in vocab:
+        raise RuntimeError(f"{label} token {token_text!r} is missing from tokenizer vocabulary")
+    tok_id = int(vocab[token_text])
+    validate_single_token(tokenizer, token_text, tok_id, label=label)
+    return int(tok_id)
+
+
 def _should_run_debug_restricted_logits_check(cfg: Config) -> bool:
     env = os.getenv("PPO_DEBUG_RESTRICTED_LOGITS_CHECK", "").strip().lower()
     env_on = env in ("1", "true", "yes", "y", "on")
@@ -516,6 +548,7 @@ def _action_stats_tensors(
     action_types: Sequence[str],
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
     temperature: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
@@ -554,7 +587,12 @@ def _action_stats_tensors(
         pos = int(state_positions[i].item())
         action_id = int(actions[i])
         action_type = str(action_types[i])
-        allowed_t = digit_allowed_t if action_type == "digit" else z_allowed_t
+        if action_type == "digit":
+            allowed_t = digit_allowed_t
+        elif action_type == "verify":
+            allowed_t = verify_allowed_t
+        else:
+            allowed_t = z_allowed_t
 
         allowed_logits = logits_all[pos].index_select(0, allowed_t) / float(temperature)
         log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
@@ -578,40 +616,55 @@ def _action_stats_tensors(
 def _token_stats_from_hidden(
     hidden_states: torch.Tensor,
     action_ids: torch.Tensor,
-    is_digit: torch.Tensor,
+    action_phase: torch.Tensor,
     z_w: torch.Tensor,
     z_b: Optional[torch.Tensor],
     d_w: torch.Tensor,
     d_b: Optional[torch.Tensor],
+    v_w: torch.Tensor,
+    v_b: Optional[torch.Tensor],
     z_id_to_local: torch.Tensor,
     d_id_to_local: torch.Tensor,
+    v_id_to_local: torch.Tensor,
     temperature: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     local_z = z_id_to_local[action_ids]
     local_d = d_id_to_local[action_ids]
-    invalid = torch.where(is_digit, local_d < 0, local_z < 0)
+    local_v = v_id_to_local[action_ids]
+    is_z = action_phase == 0
+    is_d = action_phase == 1
+    is_v = action_phase == 2
+    invalid = (is_z & (local_z < 0)) | (is_d & (local_d < 0)) | (is_v & (local_v < 0))
 
     z_logits = (hidden_states @ z_w.t()) / float(temperature)
     d_logits = (hidden_states @ d_w.t()) / float(temperature)
+    v_logits = (hidden_states @ v_w.t()) / float(temperature)
     if z_b is not None:
         z_logits = z_logits + z_b
     if d_b is not None:
         d_logits = d_logits + d_b
+    if v_b is not None:
+        v_logits = v_logits + v_b
 
     z_logp = torch.log_softmax(z_logits, dim=-1)
     d_logp = torch.log_softmax(d_logits, dim=-1)
+    v_logp = torch.log_softmax(v_logits, dim=-1)
     z_probs = z_logp.exp()
     d_probs = d_logp.exp()
+    v_probs = v_logp.exp()
 
     local_z_safe = local_z.clamp_min(0)
     local_d_safe = local_d.clamp_min(0)
+    local_v_safe = local_v.clamp_min(0)
     z_chosen = z_logp.gather(1, local_z_safe.view(-1, 1)).squeeze(1)
     d_chosen = d_logp.gather(1, local_d_safe.view(-1, 1)).squeeze(1)
+    v_chosen = v_logp.gather(1, local_v_safe.view(-1, 1)).squeeze(1)
     z_ent = -(z_probs * z_logp).sum(dim=-1)
     d_ent = -(d_probs * d_logp).sum(dim=-1)
+    v_ent = -(v_probs * v_logp).sum(dim=-1)
 
-    logp_vec = torch.where(is_digit, d_chosen, z_chosen)
-    entropy_vec = torch.where(is_digit, d_ent, z_ent)
+    logp_vec = torch.where(is_z, z_chosen, torch.where(is_d, d_chosen, v_chosen))
+    entropy_vec = torch.where(is_z, z_ent, torch.where(is_d, d_ent, v_ent))
     return logp_vec, entropy_vec, invalid
 
 
@@ -652,8 +705,10 @@ def _action_stats_tensors_batched(
     traj_cache: Optional[Sequence[TrajectoryDeviceCache]],
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
     z_id_to_local: torch.Tensor,
     d_id_to_local: torch.Tensor,
+    v_id_to_local: torch.Tensor,
     temperature: float,
     pad_token_id: int,
     token_stats_kernel,
@@ -706,15 +761,19 @@ def _action_stats_tensors_batched(
     weight = lm_head.weight
     z_w = weight.index_select(0, z_allowed_t)  # [|Z|,H]
     d_w = weight.index_select(0, digit_allowed_t)  # [|D|,H]
+    v_w = weight.index_select(0, verify_allowed_t)  # [|V|,H]
     bias = getattr(lm_head, "bias", None)
     z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
     d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
+    v_b = bias.index_select(0, verify_allowed_t) if bias is not None else None
 
     ref_hidden_all: Optional[torch.Tensor] = None
     ref_z_w: Optional[torch.Tensor] = None
     ref_d_w: Optional[torch.Tensor] = None
+    ref_v_w: Optional[torch.Tensor] = None
     ref_z_b: Optional[torch.Tensor] = None
     ref_d_b: Optional[torch.Tensor] = None
+    ref_v_b: Optional[torch.Tensor] = None
     if ref_model is not None:
         ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
         with torch.no_grad():
@@ -732,9 +791,11 @@ def _action_stats_tensors_batched(
         ref_weight = ref_lm_head.weight
         ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
         ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
+        ref_v_w = ref_weight.index_select(0, verify_allowed_t)  # [|V|,H]
         ref_bias = getattr(ref_lm_head, "bias", None)
         ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
         ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
+        ref_v_b = ref_bias.index_select(0, verify_allowed_t) if ref_bias is not None else None
 
     lengths_all = torch.tensor([c.action_len for c in cache], dtype=torch.long, device=device)
     nonzero_rows = torch.nonzero(lengths_all > 0, as_tuple=False).squeeze(-1)
@@ -752,7 +813,7 @@ def _action_stats_tensors_batched(
     )
     state_positions = torch.cat([cache[int(i)].state_positions for i in nonzero_rows.tolist()], dim=0)
     action_ids = torch.cat([cache[int(i)].action_ids for i in nonzero_rows.tolist()], dim=0)
-    is_digit = torch.cat([cache[int(i)].is_digit for i in nonzero_rows.tolist()], dim=0)
+    action_phase = torch.cat([cache[int(i)].action_phase for i in nonzero_rows.tolist()], dim=0)
     logp_old = torch.cat([cache[int(i)].logp_old for i in nonzero_rows.tolist()], dim=0)
     advantages = torch.cat([cache[int(i)].advantages_norm for i in nonzero_rows.tolist()], dim=0)
     returns = torch.cat([cache[int(i)].returns for i in nonzero_rows.tolist()], dim=0)
@@ -761,36 +822,49 @@ def _action_stats_tensors_batched(
     logp_new, entropy_new, invalid = token_stats_kernel(
         h_states,
         action_ids,
-        is_digit,
+        action_phase,
         z_w,
         z_b,
         d_w,
         d_b,
+        v_w,
+        v_b,
         z_id_to_local,
         d_id_to_local,
+        v_id_to_local,
         float(temperature),
     )
     if bool(invalid.any()):
         bad_idx = torch.nonzero(invalid, as_tuple=False).squeeze(-1)[:8]
         bad_ids = action_ids.index_select(0, bad_idx).tolist()
-        bad_types = ["digit" if bool(x) else "z_or_answer" for x in is_digit.index_select(0, bad_idx).tolist()]
+        bad_types = []
+        for x in action_phase.index_select(0, bad_idx).tolist():
+            if int(x) == 1:
+                bad_types.append("digit")
+            elif int(x) == 2:
+                bad_types.append("verify")
+            else:
+                bad_types.append("z_or_answer")
         raise RuntimeError(f"Found actions not in allowed set: ids={bad_ids}, types={bad_types}")
 
     if ref_model is not None:
-        assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None
+        assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None and ref_v_w is not None
         ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows)
         ref_h_states = ref_hidden_nz[batch_ids, state_positions]
         with torch.no_grad():
             logp_ref, _ref_entropy, ref_invalid = token_stats_kernel(
                 ref_h_states,
                 action_ids,
-                is_digit,
+                action_phase,
                 ref_z_w,
                 ref_z_b,
                 ref_d_w,
                 ref_d_b,
+                ref_v_w,
+                ref_v_b,
                 z_id_to_local,
                 d_id_to_local,
+                v_id_to_local,
                 float(temperature),
             )
         if bool(ref_invalid.any()):
@@ -818,6 +892,7 @@ def _validate_actions_in_allowed(
     action_types: Sequence[str],
     z_allowed_set: set[int],
     digit_allowed_set: set[int],
+    verify_allowed_set: set[int],
 ) -> None:
     if len(actions) != len(action_types):
         raise RuntimeError("actions/action_types length mismatch")
@@ -826,9 +901,14 @@ def _validate_actions_in_allowed(
         if t == "digit":
             if aid not in digit_allowed_set:
                 raise RuntimeError(f"Digit action id {aid} not in digit allowed set")
-        else:
+        elif t == "verify":
+            if aid not in verify_allowed_set:
+                raise RuntimeError(f"Verify action id {aid} not in verify allowed set")
+        elif t in ("z", "answer"):
             if aid not in z_allowed_set:
                 raise RuntimeError(f"Z/answer action id {aid} not in Z allowed set")
+        else:
+            raise RuntimeError(f"Unsupported action type {t!r}")
 
 
 def _rollout_one_torch(
@@ -852,6 +932,7 @@ def _rollout_one_torch(
     sample_id: str,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
 ) -> Trajectory:
     prompt_text = _build_prompt_text(tokenizer, question)
     prompt_pack = tokenizer(prompt_text, add_special_tokens=False, return_attention_mask=True)
@@ -943,11 +1024,13 @@ def _rollout_one_torch(
 
     z_allowed_set = set(int(x) for x in z_token_ids + [answer_token_id])
     digit_allowed_set = set(int(x) for x in digit_token_ids)
+    verify_allowed_set = set(int(x) for x in verify_allowed_t.tolist())
     _validate_actions_in_allowed(
         actions=actions,
         action_types=action_types,
         z_allowed_set=z_allowed_set,
         digit_allowed_set=digit_allowed_set,
+        verify_allowed_set=verify_allowed_set,
     )
 
     logp_t, values_t, entropy_t = _action_stats_tensors(
@@ -959,6 +1042,7 @@ def _rollout_one_torch(
         action_types=action_types,
         z_allowed_t=z_allowed_t,
         digit_allowed_t=digit_allowed_t,
+        verify_allowed_t=verify_allowed_t,
         temperature=temperature,
     )
 
@@ -1022,6 +1106,7 @@ def _build_trajectory_from_vllm_tokens(
     sample_id: str,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
     temperature: float,
     terminated_by: str,
 ) -> Trajectory:
@@ -1040,11 +1125,13 @@ def _build_trajectory_from_vllm_tokens(
 
     z_allowed_set = set(int(x) for x in z_allowed_t.tolist())
     digit_allowed_set = set(int(x) for x in digit_allowed_t.tolist())
+    verify_allowed_set = set(int(x) for x in verify_allowed_t.tolist())
     _validate_actions_in_allowed(
         actions=actions,
         action_types=action_types,
         z_allowed_set=z_allowed_set,
         digit_allowed_set=digit_allowed_set,
+        verify_allowed_set=verify_allowed_set,
     )
 
     logp_t, values_t, entropy_t = _action_stats_tensors(
@@ -1056,6 +1143,7 @@ def _build_trajectory_from_vllm_tokens(
         action_types=action_types,
         z_allowed_t=z_allowed_t,
         digit_allowed_t=digit_allowed_t,
+        verify_allowed_t=verify_allowed_t,
         temperature=temperature,
     )
 
@@ -1116,6 +1204,7 @@ def _collect_rollouts_vllm_batch(
     cfg: Config,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
     answer_token_id: int,
     digit_token_ids: Sequence[int],
     reward_rng: torch.Generator,
@@ -1254,10 +1343,390 @@ def _collect_rollouts_vllm_batch(
             sample_id=f"{str(item['sample_id_base'])}_r{rollout_idx}",
             z_allowed_t=z_allowed_t,
             digit_allowed_t=digit_allowed_t,
+            verify_allowed_t=verify_allowed_t,
             temperature=cfg.rollout.temperature,
             terminated_by=terminated_by,
         )
         trajectories.append(traj)
+
+    return trajectories
+
+
+def _extract_z_phase_from_vllm_row_with_budget(
+    *,
+    row: Dict[str, object],
+    answer_token_id: int,
+    budget: int,
+) -> Tuple[List[int], bool]:
+    if int(budget) <= 0:
+        return [], False
+    token_ids_full = [int(x) for x in list(row.get("token_ids", []))]
+    token_ids = token_ids_full[: int(budget)]
+    was_truncated_by_budget = len(token_ids_full) > int(budget)
+    if int(answer_token_id) in token_ids:
+        pos = token_ids.index(int(answer_token_id))
+        return token_ids[:pos], True
+
+    has_answer = False
+    if (not was_truncated_by_budget) and row.get("stop_reason") is not None:
+        try:
+            has_answer = int(row.get("stop_reason")) == int(answer_token_id)
+        except Exception:
+            has_answer = False
+    return token_ids, bool(has_answer)
+
+
+def _collect_rollouts_vllm_batch_multiround(
+    *,
+    model,
+    value_head: ValueHead,
+    tokenizer,
+    vllm_engine: Any,
+    prepared: Sequence[Dict[str, object]],
+    rollouts_per_prompt: int,
+    cfg: Config,
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
+    answer_token_id: int,
+    finalize_token_id: int,
+    retry_token_id: int,
+    digit_token_ids: Sequence[int],
+    reward_rng: torch.Generator,
+    logger,
+) -> List[Trajectory]:
+    del logger
+    if len(prepared) == 0:
+        return []
+    if str(cfg.rollout.action_scope) != "ppo_only_z_tokens_and_verify":
+        raise RuntimeError("_collect_rollouts_vllm_batch_multiround requires action_scope=ppo_only_z_tokens_and_verify")
+
+    num_samples_per_prompt = max(1, int(rollouts_per_prompt))
+    supports_token_prompts = bool(vllm_engine.supports_prompt_token_ids())
+    total_sequences = len(prepared) * int(num_samples_per_prompt)
+    max_tokens_global = int(cfg.rollout.max_new_tokens)
+    if max_tokens_global <= 0:
+        raise RuntimeError("rollout.max_new_tokens must be > 0")
+    digit_allowed_set = set(int(x) for x in digit_token_ids)
+    id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
+
+    prompt_ids_by_seq: List[List[int]] = []
+    prompt_attn_by_seq: List[List[int]] = []
+    prompt_id_by_seq: List[int] = []
+    question_by_seq: List[str] = []
+    true_digits_by_seq: List[List[int]] = []
+    sample_id_by_seq: List[str] = []
+
+    for base_idx, item in enumerate(prepared):
+        for rollout_idx in range(num_samples_per_prompt):
+            prompt_ids_by_seq.append(list(map(int, item["prompt_ids"])))
+            prompt_attn_by_seq.append(list(map(int, item["prompt_attention_mask"])))
+            prompt_id_by_seq.append(int(item["prompt_id"]))
+            question_by_seq.append(str(item["question"]))
+            true_digits_by_seq.append([int(x) for x in list(item["true_digits"])])
+            sample_id_by_seq.append(f"{str(item['sample_id_base'])}_r{rollout_idx}")
+
+    current_prompts: List[List[int]] = [list(x) for x in prompt_ids_by_seq]
+    terminated_by: List[Optional[str]] = [None for _ in range(total_sequences)]
+    generated_all_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+    generated_z_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+    generated_digit_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+    generated_verify_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+    actions_by_seq: List[List[int]] = [[] for _ in range(total_sequences)]
+    action_types_by_seq: List[List[str]] = [[] for _ in range(total_sequences)]
+    rounds_meta_by_seq: List[List[Dict[str, object]]] = [[] for _ in range(total_sequences)]
+
+    while True:
+        active = [i for i in range(total_sequences) if terminated_by[i] is None]
+        if not active:
+            break
+
+        start_active: List[int] = []
+        remaining_before_round: Dict[int, int] = {}
+        for idx in active:
+            rem = int(max_tokens_global - len(generated_all_by_seq[idx]))
+            if rem <= 0:
+                terminated_by[idx] = "max_new_tokens"
+                continue
+            remaining_before_round[idx] = rem
+            rounds_meta_by_seq[idx].append(
+                {
+                    "round_index": int(len(rounds_meta_by_seq[idx]) + 1),
+                    "action_start": int(len(actions_by_seq[idx])),
+                    "action_end": None,
+                    "z_token_ids": [],
+                    "digit_token_ids": [],
+                    "pred_digits": None,
+                    "verify_token_id": None,
+                    "completed_answer": False,
+                }
+            )
+            start_active.append(idx)
+
+        if not start_active:
+            continue
+
+        max_z_budget = max(remaining_before_round[idx] for idx in start_active)
+        z_prompt_ids = [current_prompts[idx] for idx in start_active]
+        if supports_token_prompts:
+            z_rows = vllm_engine.generate_z(
+                prompt_token_ids=z_prompt_ids,
+                num_samples_per_prompt=1,
+                max_new_tokens=max_z_budget,
+                temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+            )
+        else:
+            z_texts = [
+                tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                for p in z_prompt_ids
+            ]
+            z_rows = vllm_engine.generate_z(
+                prompts=z_texts,
+                num_samples_per_prompt=1,
+                max_new_tokens=max_z_budget,
+                temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+            )
+        if len(z_rows) != len(start_active):
+            raise RuntimeError("vLLM Z-phase row count mismatch in multi-round rollout")
+
+        need_digits: List[int] = []
+        for j, idx in enumerate(start_active):
+            row = z_rows[j]
+            rem = int(remaining_before_round[idx])
+            z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
+                row=row,
+                answer_token_id=int(answer_token_id),
+                budget=rem,
+            )
+            round_meta = rounds_meta_by_seq[idx][-1]
+            round_meta["z_token_ids"] = [int(x) for x in z_prefix]
+            if z_prefix:
+                actions_by_seq[idx].extend([int(x) for x in z_prefix])
+                action_types_by_seq[idx].extend(["z"] * len(z_prefix))
+                generated_z_by_seq[idx].extend([int(x) for x in z_prefix])
+                generated_all_by_seq[idx].extend([int(x) for x in z_prefix])
+                current_prompts[idx].extend([int(x) for x in z_prefix])
+
+            if not has_answer:
+                terminated_by[idx] = "max_new_tokens"
+                continue
+
+            if len(generated_all_by_seq[idx]) >= max_tokens_global:
+                terminated_by[idx] = "max_new_tokens"
+                continue
+
+            actions_by_seq[idx].append(int(answer_token_id))
+            action_types_by_seq[idx].append("answer")
+            generated_all_by_seq[idx].append(int(answer_token_id))
+            current_prompts[idx].append(int(answer_token_id))
+            round_meta["has_answer"] = True
+            need_digits.append(idx)
+
+        if need_digits:
+            need_verify: List[int] = []
+            digits_group: Dict[int, List[int]] = defaultdict(list)
+            for idx in need_digits:
+                rem = int(max_tokens_global - len(generated_all_by_seq[idx]))
+                if rem <= 0:
+                    terminated_by[idx] = "max_new_tokens"
+                    continue
+                k = min(5, rem)
+                digits_group[int(k)].append(idx)
+
+            for k, idxs in digits_group.items():
+                prompt_ids_batch = [current_prompts[idx] for idx in idxs]
+                if supports_token_prompts:
+                    digit_rows = vllm_engine.generate_digits(
+                        prompt_token_ids=prompt_ids_batch,
+                        num_digits=int(k),
+                        temperature=cfg.rollout.temperature,
+                        top_p=cfg.rollout.top_p,
+                        greedy=bool(cfg.rollout.digit_greedy),
+                    )
+                else:
+                    digit_texts = [
+                        tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                        for p in prompt_ids_batch
+                    ]
+                    digit_rows = vllm_engine.generate_digits(
+                        prompts=digit_texts,
+                        num_digits=int(k),
+                        temperature=cfg.rollout.temperature,
+                        top_p=cfg.rollout.top_p,
+                        greedy=bool(cfg.rollout.digit_greedy),
+                    )
+                if len(digit_rows) != len(idxs):
+                    raise RuntimeError("vLLM digit-phase row count mismatch in multi-round rollout")
+
+                for row_i, idx in enumerate(idxs):
+                    digits = [int(x) for x in list(digit_rows[row_i])]
+                    if len(digits) != int(k):
+                        raise RuntimeError(f"Digit phase must return exactly {k} tokens, got {len(digits)}")
+                    bad = [d for d in digits if d not in digit_allowed_set]
+                    if bad:
+                        raise RuntimeError(f"Digit rollout contains tokens outside digit set: {bad}")
+                    round_meta = rounds_meta_by_seq[idx][-1]
+                    round_meta["digit_token_ids"] = list(digits)
+                    generated_digit_by_seq[idx].extend(list(digits))
+                    generated_all_by_seq[idx].extend(list(digits))
+                    current_prompts[idx].extend(list(digits))
+                    if int(k) < 5:
+                        terminated_by[idx] = "max_new_tokens"
+                        continue
+                    pred_digits = [int(id2d[x]) for x in digits]
+                    round_meta["pred_digits"] = list(pred_digits)
+                    round_meta["completed_answer"] = True
+                    need_verify.append(idx)
+
+            if need_verify:
+                verify_prompt_ids = []
+                verify_owner: List[int] = []
+                for idx in need_verify:
+                    rem = int(max_tokens_global - len(generated_all_by_seq[idx]))
+                    if rem <= 0:
+                        terminated_by[idx] = "max_new_tokens"
+                        continue
+                    verify_prompt_ids.append(current_prompts[idx])
+                    verify_owner.append(idx)
+
+                if verify_owner:
+                    if supports_token_prompts:
+                        verify_rows = vllm_engine.generate_verify(
+                            prompt_token_ids=verify_prompt_ids,
+                            temperature=cfg.rollout.temperature,
+                            top_p=cfg.rollout.top_p,
+                            greedy=True,
+                        )
+                    else:
+                        verify_texts = [
+                            tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                            for p in verify_prompt_ids
+                        ]
+                        verify_rows = vllm_engine.generate_verify(
+                            prompts=verify_texts,
+                            temperature=cfg.rollout.temperature,
+                            top_p=cfg.rollout.top_p,
+                            greedy=True,
+                        )
+                    if len(verify_rows) != len(verify_owner):
+                        raise RuntimeError("vLLM verify-phase row count mismatch in multi-round rollout")
+                    for row_i, idx in enumerate(verify_owner):
+                        row = [int(x) for x in list(verify_rows[row_i])]
+                        if len(row) != 1:
+                            raise RuntimeError(f"Verify phase must return exactly 1 token, got {len(row)}")
+                        tok = int(row[0])
+                        if tok not in (int(finalize_token_id), int(retry_token_id)):
+                            raise RuntimeError("Verify phase emitted token outside {<FINALIZE>, <RETRY>}")
+                        round_meta = rounds_meta_by_seq[idx][-1]
+                        round_meta["verify_token_id"] = int(tok)
+                        generated_verify_by_seq[idx].append(int(tok))
+                        generated_all_by_seq[idx].append(int(tok))
+                        current_prompts[idx].append(int(tok))
+                        actions_by_seq[idx].append(int(tok))
+                        action_types_by_seq[idx].append("verify")
+                        if tok == int(finalize_token_id):
+                            terminated_by[idx] = "finalize"
+                        elif tok == int(retry_token_id):
+                            pass
+                        else:
+                            raise RuntimeError("Invalid verify token emitted")
+
+        for idx in start_active:
+            rounds_meta_by_seq[idx][-1]["action_end"] = int(len(actions_by_seq[idx]))
+            if terminated_by[idx] is None and len(generated_all_by_seq[idx]) >= max_tokens_global:
+                terminated_by[idx] = "max_new_tokens"
+
+    trajectories: List[Trajectory] = []
+    z_allowed_set = set(int(x) for x in z_allowed_t.tolist())
+    digit_allowed_set_t = set(int(x) for x in digit_allowed_t.tolist())
+    verify_allowed_set = set(int(x) for x in verify_allowed_t.tolist())
+    for idx in range(total_sequences):
+        term = str(terminated_by[idx] or "max_new_tokens")
+        rounds_meta = rounds_meta_by_seq[idx]
+        round_pred_digits: List[Optional[List[int]]] = []
+        for rnd in rounds_meta:
+            pred = rnd.get("pred_digits")
+            if isinstance(pred, list) and len(pred) == 5:
+                round_pred_digits.append([int(x) for x in pred])
+            else:
+                round_pred_digits.append(None)
+
+        _validate_actions_in_allowed(
+            actions=actions_by_seq[idx],
+            action_types=action_types_by_seq[idx],
+            z_allowed_set=z_allowed_set,
+            digit_allowed_set=digit_allowed_set_t,
+            verify_allowed_set=verify_allowed_set,
+        )
+        logp_t, values_t, entropy_t = _action_stats_tensors(
+            model=model,
+            value_head=value_head,
+            prompt_ids=prompt_ids_by_seq[idx],
+            prompt_attention_mask=prompt_attn_by_seq[idx],
+            actions=actions_by_seq[idx],
+            action_types=action_types_by_seq[idx],
+            z_allowed_t=z_allowed_t,
+            digit_allowed_t=digit_allowed_t,
+            verify_allowed_t=verify_allowed_t,
+            temperature=cfg.rollout.temperature,
+        )
+
+        _t_reward0 = time.perf_counter()
+        reward_info = compute_multi_round_reward(
+            round_pred_digits=round_pred_digits,
+            true_digits=true_digits_by_seq[idx],
+            terminated_reason=term,
+            partial_scale=cfg.reward.partial_scale,
+            keep_prob=cfg.reward.keep_prob,
+            length_penalty=cfg.reward.length_penalty,
+            correct_length_discount=cfg.reward.correct_length_discount,
+            reward_if_max_len=cfg.reward.reward_if_max_len,
+            rounds_penalty_coef=cfg.reward.rounds_penalty_coef,
+            num_generated_tokens=len(generated_all_by_seq[idx]),
+            round_count=len(rounds_meta),
+            generator=reward_rng,
+        )
+        reward_info["verify_tokens_per_round"] = [rnd.get("verify_token_id", None) for rnd in rounds_meta]
+        reward_info["termination_reason"] = str(term)
+        _add_reward_timing_acc(time.perf_counter() - _t_reward0)
+
+        best_idx = int(reward_info.get("best_round_index", -1))
+        digit_pred: Optional[List[int]] = None
+        if best_idx >= 0 and best_idx < len(round_pred_digits):
+            best_pred = round_pred_digits[best_idx]
+            if best_pred is not None:
+                digit_pred = [int(x) for x in best_pred]
+
+        trajectories.append(
+            Trajectory(
+                prompt_id=prompt_id_by_seq[idx],
+                sample_id=sample_id_by_seq[idx],
+                question=question_by_seq[idx],
+                prompt_ids=prompt_ids_by_seq[idx],
+                prompt_attention_mask=prompt_attn_by_seq[idx],
+                actions=actions_by_seq[idx],
+                action_types=action_types_by_seq[idx],
+                logp_old=logp_t.float().cpu().tolist(),
+                values_old=values_t.float().cpu().tolist(),
+                entropy_old=entropy_t.float().cpu().tolist(),
+                terminated_by=str(term),
+                generated_z_ids=generated_z_by_seq[idx],
+                generated_digit_ids=generated_digit_by_seq[idx],
+                digit_logits=None,
+                digit_probs=None,
+                digit_pred=digit_pred,
+                digit_true=[int(x) for x in true_digits_by_seq[idx]],
+                reward_info=reward_info,
+                num_generated_total=len(generated_all_by_seq[idx]),
+                num_digits_generated=len(generated_digit_by_seq[idx]),
+                generated_verify_ids=generated_verify_by_seq[idx],
+                rounds_meta=rounds_meta,
+                full_generated_ids=generated_all_by_seq[idx],
+                termination_reason=str(term),
+            )
+        )
 
     return trajectories
 
@@ -1548,6 +2017,7 @@ def _recompute_trajectory(
     traj: Trajectory,
     z_allowed_t: torch.Tensor,
     digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
     temperature: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _action_stats_tensors(
@@ -1559,6 +2029,7 @@ def _recompute_trajectory(
         action_types=traj.action_types,
         z_allowed_t=z_allowed_t,
         digit_allowed_t=digit_allowed_t,
+        verify_allowed_t=verify_allowed_t,
         temperature=temperature,
     )
 
@@ -1637,6 +2108,16 @@ def train(cfg: Config) -> None:
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
         raise ValueError("digit_greedy=True is incompatible with ppo_full")
+    rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
+    if action_scope == "ppo_only_z_tokens_and_verify":
+        if rollout_backend != "vllm":
+            raise ValueError("ppo_only_z_tokens_and_verify currently requires rollout.backend='vllm'")
+        if not bool(cfg.rollout.vllm_enabled):
+            raise ValueError("ppo_only_z_tokens_and_verify requires rollout.vllm_enabled=True")
+        if not bool(cfg.rollout.digit_greedy):
+            raise ValueError("ppo_only_z_tokens_and_verify requires rollout.digit_greedy=True")
+    if float(cfg.reward.rounds_penalty_coef) < 0.0:
+        raise ValueError("reward.rounds_penalty_coef must be >= 0")
     ce_mode = str(cfg.ppo.ce_mode).strip().lower()
     if ce_mode not in ("successful_traces", "random"):
         raise ValueError(
@@ -1669,14 +2150,19 @@ def train(cfg: Config) -> None:
 
     answer_token_id = resolve_answer_token_id(tokenizer, answer_token=cfg.model.answer_token)
     validate_answer_token_single(tokenizer, cfg.model.answer_token, answer_token_id)
+    finalize_token_id = _resolve_strict_vocab_token_id(tokenizer, str(cfg.model.finalize_token), label="Verify")
+    retry_token_id = _resolve_strict_vocab_token_id(tokenizer, str(cfg.model.retry_token), label="Verify")
+    if int(finalize_token_id) == int(retry_token_id):
+        raise RuntimeError("<FINALIZE> and <RETRY> must map to distinct token ids")
     digit_token_ids = resolve_digit_token_ids(tokenizer)
 
     z_allowed_t = torch.tensor(list(z_token_ids) + [int(answer_token_id)], dtype=torch.long, device=device)
     digit_allowed_t = torch.tensor(list(digit_token_ids), dtype=torch.long, device=device)
+    verify_allowed_t = torch.tensor([int(finalize_token_id), int(retry_token_id)], dtype=torch.long, device=device)
 
     _log(
         f"Action scope={action_scope} | Z tokens={len(z_token_ids)} ({z_style}) | "
-        f"answer_token_id={answer_token_id}"
+        f"answer_token_id={answer_token_id} | finalize_token_id={finalize_token_id} | retry_token_id={retry_token_id}"
     )
 
     hidden_size = int(model.config.hidden_size)
@@ -1687,8 +2173,10 @@ def train(cfg: Config) -> None:
     vocab_size = int(lm_head.weight.size(0))
     z_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
     d_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+    v_id_to_local = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
     z_id_to_local[z_allowed_t] = torch.arange(z_allowed_t.numel(), device=device, dtype=torch.long)
     d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
+    v_id_to_local[verify_allowed_t] = torch.arange(verify_allowed_t.numel(), device=device, dtype=torch.long)
     if _should_run_debug_restricted_logits_check(cfg):
         with torch.no_grad():
             weight = lm_head.weight
@@ -1707,6 +2195,11 @@ def train(cfg: Config) -> None:
             z_b=z_b_dbg,
             d_b=d_b_dbg,
         )
+
+    ce_enabled = bool(cfg.ppo.apply_ce)
+    if action_scope == "ppo_only_z_tokens_and_verify" and ce_enabled:
+        _log("Disabling CE auxiliary for ppo_only_z_tokens_and_verify path (no round-aware CE semantics implemented)")
+        ce_enabled = False
 
     ppo_params = list(model.parameters()) + list(value_head.parameters())
     value_head_params = list(value_head.parameters())
@@ -1737,6 +2230,9 @@ def train(cfg: Config) -> None:
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=z_allowed_t.tolist(),
             digit_allowed_token_ids=digit_allowed_t.tolist(),
+            verify_allowed_token_ids=verify_allowed_t.tolist(),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
             sync_every=int(cfg.rollout.vllm_sync_every),
             logger=_log,
         )
@@ -1757,6 +2253,9 @@ def train(cfg: Config) -> None:
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=z_allowed_t.tolist(),
             digit_allowed_token_ids=digit_allowed_t.tolist(),
+            verify_allowed_token_ids=verify_allowed_t.tolist(),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
             trust_remote_code=bool(cfg.model.trust_remote_code),
             engine_kwargs=vllm_kwargs,
             output_dir=cfg.train.output_dir,
@@ -1817,6 +2316,7 @@ def train(cfg: Config) -> None:
 
             trajectories: List[Trajectory] = []
             token_budget = 0
+            full_generated_token_budget = 0
             prompt_counter = 0
             _t_rollout0 = time.perf_counter()
 
@@ -1862,22 +2362,45 @@ def train(cfg: Config) -> None:
                     continue
 
                 if vllm_engine is not None:
-                    batch_trajs = _collect_rollouts_vllm_batch(
-                        model=model,
-                        value_head=value_head,
-                        tokenizer=tokenizer,
-                        vllm_engine=vllm_engine,
-                        prepared=prepared,
-                        rollouts_per_prompt=rollouts_per_prompt,
-                        cfg=cfg,
-                        z_allowed_t=z_allowed_t,
-                        digit_allowed_t=digit_allowed_t,
-                        answer_token_id=int(answer_token_id),
-                        digit_token_ids=digit_token_ids,
-                        reward_rng=reward_rng,
-                        logger=_log,
-                    )
+                    if action_scope == "ppo_only_z_tokens_and_verify":
+                        batch_trajs = _collect_rollouts_vllm_batch_multiround(
+                            model=model,
+                            value_head=value_head,
+                            tokenizer=tokenizer,
+                            vllm_engine=vllm_engine,
+                            prepared=prepared,
+                            rollouts_per_prompt=rollouts_per_prompt,
+                            cfg=cfg,
+                            z_allowed_t=z_allowed_t,
+                            digit_allowed_t=digit_allowed_t,
+                            verify_allowed_t=verify_allowed_t,
+                            answer_token_id=int(answer_token_id),
+                            finalize_token_id=int(finalize_token_id),
+                            retry_token_id=int(retry_token_id),
+                            digit_token_ids=digit_token_ids,
+                            reward_rng=reward_rng,
+                            logger=_log,
+                        )
+                    else:
+                        batch_trajs = _collect_rollouts_vllm_batch(
+                            model=model,
+                            value_head=value_head,
+                            tokenizer=tokenizer,
+                            vllm_engine=vllm_engine,
+                            prepared=prepared,
+                            rollouts_per_prompt=rollouts_per_prompt,
+                            cfg=cfg,
+                            z_allowed_t=z_allowed_t,
+                            digit_allowed_t=digit_allowed_t,
+                            verify_allowed_t=verify_allowed_t,
+                            answer_token_id=int(answer_token_id),
+                            digit_token_ids=digit_token_ids,
+                            reward_rng=reward_rng,
+                            logger=_log,
+                        )
                 else:
+                    if action_scope == "ppo_only_z_tokens_and_verify":
+                        raise RuntimeError("ppo_only_z_tokens_and_verify currently requires vLLM rollout backend")
                     prepared_rollouts: List[Dict[str, object]] = []
                     for item in prepared:
                         sample_id_base = str(item["sample_id_base"])
@@ -1906,6 +2429,7 @@ def train(cfg: Config) -> None:
                             sample_id=str(item["sample_id"]),
                             z_allowed_t=z_allowed_t,
                             digit_allowed_t=digit_allowed_t,
+                            verify_allowed_t=verify_allowed_t,
                         )
                         for item in prepared_rollouts
                     ]
@@ -1915,6 +2439,7 @@ def train(cfg: Config) -> None:
                         continue
                     trajectories.append(traj)
                     token_budget += len(traj.actions)
+                    full_generated_token_budget += int(traj.num_generated_total)
                     if token_budget >= int(cfg.rollout.max_tokens_per_batch):
                         break
                 if token_budget >= int(cfg.rollout.max_tokens_per_batch):
@@ -1956,13 +2481,18 @@ def train(cfg: Config) -> None:
                     "generated_z_tokens": tokenizer.convert_ids_to_tokens(traj.generated_z_ids),
                     "generated_digit_ids": traj.generated_digit_ids,
                     "generated_digit_tokens": tokenizer.convert_ids_to_tokens(traj.generated_digit_ids),
+                    "generated_verify_ids": traj.generated_verify_ids,
+                    "generated_verify_tokens": tokenizer.convert_ids_to_tokens(traj.generated_verify_ids),
                     "terminated_by": traj.terminated_by,
+                    "termination_reason": traj.termination_reason,
                     "num_generated": traj.num_generated_total,
                     "num_digits_generated": traj.num_digits_generated,
                     "digit_logits": traj.digit_logits,
                     "digit_probs": traj.digit_probs,
                     "digit_pred": traj.digit_pred,
                     "digit_true": traj.digit_true,
+                    "full_generated_ids": traj.full_generated_ids,
+                    "rounds_meta": traj.rounds_meta,
                     "reward_full": traj.reward_info["reward_full"],
                     "partial_scale": traj.reward_info["partial_scale"],
                     "keep_prob": traj.reward_info["keep_prob"],
@@ -1972,6 +2502,13 @@ def train(cfg: Config) -> None:
                     "reward_partial": traj.reward_info["reward_partial"],
                     "length_penalty": traj.reward_info["length_penalty"],
                     "reward_if_max_len": traj.reward_info["reward_if_max_len"],
+                    "round_count": traj.reward_info.get("round_count", None),
+                    "round_answer_rewards": traj.reward_info.get("round_answer_rewards", None),
+                    "best_round_answer_reward": traj.reward_info.get("best_round_answer_reward", None),
+                    "best_round_index": traj.reward_info.get("best_round_index", None),
+                    "token_penalty": traj.reward_info.get("token_penalty", None),
+                    "rounds_penalty": traj.reward_info.get("rounds_penalty", None),
+                    "verify_tokens_per_round": traj.reward_info.get("verify_tokens_per_round", None),
                     "reward_final": traj.reward_info["reward_final"],
                     "actions": traj.actions,
                     "action_types": traj.action_types,
@@ -2005,7 +2542,7 @@ def train(cfg: Config) -> None:
                 compile_update_stats=bool(getattr(cfg.runtime, "compile_update_stats", False))
             )
             ce_selected_global: set[int] = set()
-            if (not value_warmup_active) and bool(cfg.ppo.apply_ce):
+            if (not value_warmup_active) and bool(ce_enabled):
                 ce_selected_global = set(
                     _select_ce_trajectory_indices(
                         batch_trajs=trajectories,
@@ -2048,8 +2585,10 @@ def train(cfg: Config) -> None:
                             traj_cache=batch_cache,
                             z_allowed_t=z_allowed_t,
                             digit_allowed_t=digit_allowed_t,
+                            verify_allowed_t=verify_allowed_t,
                             z_id_to_local=z_id_to_local,
                             d_id_to_local=d_id_to_local,
+                            v_id_to_local=v_id_to_local,
                             temperature=cfg.rollout.temperature,
                             pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                             token_stats_kernel=token_stats_kernel,
@@ -2093,7 +2632,7 @@ def train(cfg: Config) -> None:
 
                         ce_loss = torch.zeros((), dtype=torch.float32, device=logp_new_f.device)
                         ce_used = 0
-                        if (not value_warmup_active) and bool(cfg.ppo.apply_ce) and ce_selected_global:
+                        if (not value_warmup_active) and bool(ce_enabled) and ce_selected_global:
                             ce_selected_global_in_batch = [int(i) for i in batch_idx if int(i) in ce_selected_global]
                             batch_local_pos = {int(global_i): local_i for local_i, global_i in enumerate(batch_idx)}
                             ce_selected = [
@@ -2160,7 +2699,10 @@ def train(cfg: Config) -> None:
             exact_rate = float(
                 sum(1 for t in trajectories if bool(t.reward_info.get("exact_match", False)))
             ) / float(len(trajectories))
-            answered = sum(1 for t in trajectories if t.terminated_by == "answer_with_5_digits")
+            if action_scope == "ppo_only_z_tokens_and_verify":
+                answered = sum(1 for t in trajectories if t.terminated_by == "finalize")
+            else:
+                answered = sum(1 for t in trajectories if t.terminated_by == "answer_with_5_digits")
             answer_rate = float(answered) / float(len(trajectories))
             avg_len = float(sum(t.num_generated_total for t in trajectories)) / float(len(trajectories))
 
@@ -2176,6 +2718,7 @@ def train(cfg: Config) -> None:
                     [
                         f"update={update}",
                         f"tokens={sum(len(t.actions) for t in trajectories)}",
+                        f"generated_tokens={full_generated_token_budget}",
                         f"adv_var_per_prompt={avg_adv_var_per_prompt:.6f}",
                         f"reward_mean={float(rewards.mean().item()):.4f}",
                         f"exact={exact_rate:.4f}",
@@ -2193,7 +2736,7 @@ def train(cfg: Config) -> None:
                         f"value_loss={val_acc / denom:.4f}",
                         *(
                             [f"ce_loss={ce_acc / denom:.4f}", f"ce_examples={ce_examples_acc}"]
-                            if bool(cfg.ppo.apply_ce)
+                            if bool(ce_enabled)
                             else []
                         ),
                         f"explained_var={ev:.4f}",
