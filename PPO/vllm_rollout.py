@@ -583,10 +583,14 @@ class VLLMRolloutEngine:
         for o in outs:
             for out_j in list(getattr(o, "outputs", []) or []):
                 token_ids = [int(x) for x in list(getattr(out_j, "token_ids", []) or [])]
-                token_logprobs = self._extract_token_logprobs_for_sample(
-                    token_ids=token_ids,
-                    logprobs_payload=getattr(out_j, "logprobs", None),
-                )
+                logprobs_payload = getattr(out_j, "logprobs", None)
+                if logprobs_payload is None:
+                    token_logprobs = None
+                else:
+                    token_logprobs = self._extract_token_logprobs_for_sample(
+                        token_ids=token_ids,
+                        logprobs_payload=logprobs_payload,
+                    )
                 rows.append(
                     {
                         "token_ids": token_ids,

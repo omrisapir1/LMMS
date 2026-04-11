@@ -1271,6 +1271,21 @@ def _collect_rollouts_vllm_batch(
         return []
     num_samples_per_prompt = max(1, int(rollouts_per_prompt))
     supports_token_prompts = vllm_engine.supports_prompt_token_ids()
+    decode_cache: Dict[Tuple[int, ...], str] = {}
+
+    def _decode_cached(ids: Sequence[int]) -> str:
+        key = tuple(int(x) for x in ids)
+        cached = decode_cache.get(key)
+        if cached is not None:
+            return cached
+        txt = tokenizer.decode(
+            list(key),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        decode_cache[key] = str(txt)
+        return str(txt)
+
     prompt_texts = [str(x["prompt_text"]) for x in prepared]
     prompt_ids_batch = [list(map(int, x["prompt_ids"])) for x in prepared]
     z_gen_rows = vllm_engine.generate_z(
@@ -1332,13 +1347,7 @@ def _collect_rollouts_vllm_batch(
                 assert int(answer_token_id) not in digit_prompt_ids[:-1]
             digit_prompt_ids_batch.append(digit_prompt_ids)
             if not supports_token_prompts:
-                digit_prompt_texts.append(
-                    tokenizer.decode(
-                        digit_prompt_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                )
+                digit_prompt_texts.append(_decode_cached(digit_prompt_ids))
         else:
             z_prefix_by_idx[i] = z_prefix
 
@@ -1460,6 +1469,21 @@ def _collect_rollouts_vllm_batch_multiround(
 
     num_samples_per_prompt = max(1, int(rollouts_per_prompt))
     supports_token_prompts = bool(vllm_engine.supports_prompt_token_ids())
+    decode_cache: Dict[Tuple[int, ...], str] = {}
+
+    def _decode_cached(ids: Sequence[int]) -> str:
+        key = tuple(int(x) for x in ids)
+        cached = decode_cache.get(key)
+        if cached is not None:
+            return cached
+        txt = tokenizer.decode(
+            list(key),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        decode_cache[key] = str(txt)
+        return str(txt)
+
     total_sequences = len(prepared) * int(num_samples_per_prompt)
     max_tokens_global = int(cfg.rollout.max_new_tokens)
     if max_tokens_global <= 0:
@@ -1543,7 +1567,7 @@ def _collect_rollouts_vllm_batch_multiround(
             )
         else:
             z_texts = [
-                tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                _decode_cached(p)
                 for p in z_prompt_ids
             ]
             z_rows = vllm_engine.generate_z(
@@ -1612,7 +1636,7 @@ def _collect_rollouts_vllm_batch_multiround(
                     )
                 else:
                     digit_texts = [
-                        tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                        _decode_cached(p)
                         for p in prompt_ids_batch
                     ]
                     digit_rows = vllm_engine.generate_digits(
@@ -1667,7 +1691,7 @@ def _collect_rollouts_vllm_batch_multiround(
                         )
                     else:
                         verify_texts = [
-                            tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                            _decode_cached(p)
                             for p in verify_prompt_ids
                         ]
                         verify_rows = vllm_engine.generate_verify(
