@@ -1531,42 +1531,34 @@ def _collect_rollouts_vllm_batch_multiround(
         if not start_active:
             continue
 
-        z_rows_by_idx: Dict[int, Dict[str, object]] = {}
-        z_budget_buckets: Dict[int, List[int]] = defaultdict(list)
-        for idx in start_active:
-            z_budget_buckets[int(remaining_before_round[idx])].append(int(idx))
-        for z_budget, idxs in z_budget_buckets.items():
-            z_prompt_ids = [current_prompts[idx] for idx in idxs]
-            if supports_token_prompts:
-                z_rows = vllm_engine.generate_z(
-                    prompt_token_ids=z_prompt_ids,
-                    num_samples_per_prompt=1,
-                    max_new_tokens=int(z_budget),
-                    temperature=cfg.rollout.temperature,
-                    top_p=cfg.rollout.top_p,
-                )
-            else:
-                z_texts = [
-                    tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-                    for p in z_prompt_ids
-                ]
-                z_rows = vllm_engine.generate_z(
-                    prompts=z_texts,
-                    num_samples_per_prompt=1,
-                    max_new_tokens=int(z_budget),
-                    temperature=cfg.rollout.temperature,
-                    top_p=cfg.rollout.top_p,
-                )
-            if len(z_rows) != len(idxs):
-                raise RuntimeError("vLLM Z-phase row count mismatch in multi-round rollout")
-            for row_i, idx in enumerate(idxs):
-                z_rows_by_idx[int(idx)] = dict(z_rows[row_i])
+        max_z_budget = max(remaining_before_round[idx] for idx in start_active)
+        z_prompt_ids = [current_prompts[idx] for idx in start_active]
+        if supports_token_prompts:
+            z_rows = vllm_engine.generate_z(
+                prompt_token_ids=z_prompt_ids,
+                num_samples_per_prompt=1,
+                max_new_tokens=max_z_budget,
+                temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+            )
+        else:
+            z_texts = [
+                tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                for p in z_prompt_ids
+            ]
+            z_rows = vllm_engine.generate_z(
+                prompts=z_texts,
+                num_samples_per_prompt=1,
+                max_new_tokens=max_z_budget,
+                temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+            )
+        if len(z_rows) != len(start_active):
+            raise RuntimeError("vLLM Z-phase row count mismatch in multi-round rollout")
 
         need_digits: List[int] = []
-        for idx in start_active:
-            row = z_rows_by_idx.get(int(idx))
-            if row is None:
-                raise RuntimeError("Missing Z-phase row for active sequence in multi-round rollout")
+        for j, idx in enumerate(start_active):
+            row = z_rows[j]
             rem = int(remaining_before_round[idx])
             z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
                 row=row,
