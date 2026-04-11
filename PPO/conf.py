@@ -71,7 +71,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.25
     c_ent: float = 0.003
-    kl_coef: float = 0.01
+    kl_coef: float = 0.02
     apply_ce: bool = False
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
@@ -90,7 +90,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 2e-5
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
