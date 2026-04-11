@@ -836,6 +836,9 @@ def _action_stats_tensors_batched(
         ref_device = next(ref_model.parameters()).device
         ref_input_ids = input_ids if ref_device == device else input_ids.to(ref_device)
         ref_attention_mask = attention_mask if ref_device == device else attention_mask.to(ref_device)
+        z_allowed_ref = z_allowed_t if ref_device == device else z_allowed_t.to(ref_device)
+        digit_allowed_ref = digit_allowed_t if ref_device == device else digit_allowed_t.to(ref_device)
+        verify_allowed_ref = verify_allowed_t if ref_device == device else verify_allowed_t.to(ref_device)
         ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
         with torch.no_grad():
             ref_out = ref_base_model(
@@ -850,13 +853,13 @@ def _action_stats_tensors_batched(
         if ref_lm_head is None:
             raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
         ref_weight = ref_lm_head.weight
-        ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
-        ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
-        ref_v_w = ref_weight.index_select(0, verify_allowed_t)  # [|V|,H]
+        ref_z_w = ref_weight.index_select(0, z_allowed_ref)  # [|Z|,H]
+        ref_d_w = ref_weight.index_select(0, digit_allowed_ref)  # [|D|,H]
+        ref_v_w = ref_weight.index_select(0, verify_allowed_ref)  # [|V|,H]
         ref_bias = getattr(ref_lm_head, "bias", None)
-        ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
-        ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
-        ref_v_b = ref_bias.index_select(0, verify_allowed_t) if ref_bias is not None else None
+        ref_z_b = ref_bias.index_select(0, z_allowed_ref) if ref_bias is not None else None
+        ref_d_b = ref_bias.index_select(0, digit_allowed_ref) if ref_bias is not None else None
+        ref_v_b = ref_bias.index_select(0, verify_allowed_ref) if ref_bias is not None else None
 
     lengths_all = torch.tensor([c.action_len for c in cache], dtype=torch.long, device=device)
     nonzero_rows = torch.nonzero(lengths_all > 0, as_tuple=False).squeeze(-1)
