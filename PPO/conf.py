@@ -39,12 +39,12 @@ class RolloutConfig:
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
     vllm_tp_size: int = 1
-    gpu_memory_utilization: float = 0.75
+    gpu_memory_utilization: float = 0.95
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
-    ref_model_device: str = "cuda:1"
+    ref_model_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 512
     rollouts_per_prompt: int = 8  # number of sampled completions per prompt
@@ -76,7 +76,7 @@ class PPOConfig:
     ce_mode: str = "random"  # "successful_traces" | "random"
     update_ref_model_each_steps: int = 500
     ppo_epochs: int = 1
-    minibatch_size: int = 32
+    minibatch_size: int = 16
     max_grad_norm: float = 1.0
     normalize_advantages: bool = True
     adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
