@@ -566,7 +566,7 @@ class VLLMRolloutEngine:
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
             n=n,
-            logprobs=1,
+            logprobs=None,
             stop_on_answer=True,
         )
 
