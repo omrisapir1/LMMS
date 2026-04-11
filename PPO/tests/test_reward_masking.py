@@ -113,7 +113,7 @@ def test_multi_round_early_success_discount_applies_when_finalize_not_exact() ->
     assert abs(float(out["reward_final"]) - 0.7) < 1e-8
 
 
-def test_multi_round_no_finalize_no_credit_and_max_len_term() -> None:
+def test_multi_round_max_len_with_early_exact_gets_early_success_credit() -> None:
     out = compute_multi_round_reward(
         round_pred_digits=[[1, 2, 3, 4, 5], None],
         true_digits=[1, 2, 3, 4, 5],
@@ -129,8 +129,31 @@ def test_multi_round_no_finalize_no_credit_and_max_len_term() -> None:
         round_count=2,
         generator=torch.Generator().manual_seed(0),
     )
+    assert abs(float(out["best_round_answer_reward"]) - 0.7) < 1e-8
+    assert out["best_round_index"] == 0
+    assert out["reward_selection_mode"] == "early_success_discounted"
+    # 0.7 - 0.2 + (-0.1)
+    assert abs(float(out["reward_final"]) - 0.4) < 1e-8
+
+
+def test_multi_round_max_len_without_any_exact_has_no_credit() -> None:
+    out = compute_multi_round_reward(
+        round_pred_digits=[None, None],
+        true_digits=[1, 2, 3, 4, 5],
+        terminated_reason="max_new_tokens",
+        partial_scale=0.5,
+        keep_prob=(0.02, 0.05, 0.1, 0.5, 1.0),
+        length_penalty=0.01,
+        correct_length_discount=0.1,
+        early_success=0.7,
+        reward_if_max_len=-0.1,
+        rounds_penalty_coef=0.0,
+        num_generated_tokens=20,
+        round_count=2,
+        generator=torch.Generator().manual_seed(0),
+    )
     assert out["best_round_answer_reward"] == 0.0
     assert out["best_round_index"] == -1
-    assert out["reward_selection_mode"] == "non_finalize_no_credit"
+    assert out["reward_selection_mode"] == "no_complete_round"
     # 0 - 0.2 + (-0.1)
     assert abs(float(out["reward_final"]) + 0.3) < 1e-8
