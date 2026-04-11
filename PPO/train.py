@@ -831,12 +831,16 @@ def _action_stats_tensors_batched(
     ref_z_b: Optional[torch.Tensor] = None
     ref_d_b: Optional[torch.Tensor] = None
     ref_v_b: Optional[torch.Tensor] = None
+    ref_device: Optional[torch.device] = None
     if ref_model is not None:
+        ref_device = next(ref_model.parameters()).device
+        ref_input_ids = input_ids if ref_device == device else input_ids.to(ref_device)
+        ref_attention_mask = attention_mask if ref_device == device else attention_mask.to(ref_device)
         ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
         with torch.no_grad():
             ref_out = ref_base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=ref_input_ids,
+                attention_mask=ref_attention_mask,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
@@ -906,26 +910,47 @@ def _action_stats_tensors_batched(
 
     if ref_model is not None:
         assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None and ref_v_w is not None
-        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows)
-        ref_h_states = ref_hidden_nz[batch_ids, state_positions]
+        assert ref_device is not None
+        if ref_device == device:
+            nonzero_rows_ref = nonzero_rows
+            batch_ids_ref = batch_ids
+            state_positions_ref = state_positions
+            action_ids_ref = action_ids
+            action_phase_ref = action_phase
+            z_id_to_local_ref = z_id_to_local
+            d_id_to_local_ref = d_id_to_local
+            v_id_to_local_ref = v_id_to_local
+        else:
+            nonzero_rows_ref = nonzero_rows.to(ref_device)
+            batch_ids_ref = batch_ids.to(ref_device)
+            state_positions_ref = state_positions.to(ref_device)
+            action_ids_ref = action_ids.to(ref_device)
+            action_phase_ref = action_phase.to(ref_device)
+            z_id_to_local_ref = z_id_to_local.to(ref_device)
+            d_id_to_local_ref = d_id_to_local.to(ref_device)
+            v_id_to_local_ref = v_id_to_local.to(ref_device)
+        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows_ref)
+        ref_h_states = ref_hidden_nz[batch_ids_ref, state_positions_ref]
         with torch.no_grad():
             logp_ref, _ref_entropy, ref_invalid = token_stats_kernel(
                 ref_h_states,
-                action_ids,
-                action_phase,
+                action_ids_ref,
+                action_phase_ref,
                 ref_z_w,
                 ref_z_b,
                 ref_d_w,
                 ref_d_b,
                 ref_v_w,
                 ref_v_b,
-                z_id_to_local,
-                d_id_to_local,
-                v_id_to_local,
+                z_id_to_local_ref,
+                d_id_to_local_ref,
+                v_id_to_local_ref,
                 float(temperature),
             )
         if bool(ref_invalid.any()):
             raise RuntimeError("Reference model found actions not in allowed set")
+        if logp_ref.device != device:
+            logp_ref = logp_ref.to(device)
     else:
         logp_ref = logp_new.detach()
 
@@ -2252,6 +2277,20 @@ def train(cfg: Config) -> None:
     device = torch.device(torch_device_cfg if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
+    ref_device_cfg = str(getattr(cfg.rollout, "ref_model_device", "cuda:1")).strip()
+    if torch.cuda.is_available():
+        ref_device = torch.device(ref_device_cfg)
+        if ref_device.type == "cuda":
+            ref_idx = int(ref_device.index) if ref_device.index is not None else 0
+            if ref_idx >= int(torch.cuda.device_count()):
+                _log(
+                    f"WARNING: rollout.ref_model_device={ref_device_cfg!r} is unavailable "
+                    f"(cuda device_count={torch.cuda.device_count()}); falling back to {device}"
+                )
+                ref_device = device
+    else:
+        ref_device = torch.device("cpu")
+
     resume_ckpt_dir = _resolve_resume_checkpoint_dir(cfg)
     model_init_path = (
         os.path.join(resume_ckpt_dir, "model")
@@ -2284,11 +2323,11 @@ def train(cfg: Config) -> None:
     ref_model: Optional[Any] = None
     if use_ref_model:
         ref_model = copy.deepcopy(model)
-        ref_model.to(device)
+        ref_model.to(ref_device)
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad_(False)
-        _log("Reference model enabled (kl_coef > 0)")
+        _log(f"Reference model enabled (kl_coef > 0) on device={ref_device}")
     else:
         _log("Reference model disabled (kl_coef <= 0); skipping ref model allocation")
 

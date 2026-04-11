@@ -39,16 +39,17 @@ class RolloutConfig:
     vllm_sync_every: int = 2
     vllm_batch_size: int = BACH_SIZE
     vllm_tp_size: int = 1
-    gpu_memory_utilization: float = 0.95
+    gpu_memory_utilization: float = 0.75
     vllm_seed: Optional[int] = None
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
+    ref_model_device: str = "cuda:1"
     vllm_cuda_visible_devices: str = "1"
     episodes_per_batch: int = 512
     rollouts_per_prompt: int = 8  # number of sampled completions per prompt
     max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE * rollouts_per_prompt
-    verify_finalize_logit_bias: float = 0.5
+    verify_finalize_logit_bias: float = 0
     verify_retry_logit_bias: float = 0
 
 
@@ -67,8 +68,8 @@ class RewardConfig:
 class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.25
-    c_ent: float = 0.000
-    kl_coef: float = 0.00
+    c_ent: float = 0.003
+    kl_coef: float = 0.01
     apply_ce: bool = False
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
