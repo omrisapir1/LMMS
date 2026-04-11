@@ -31,9 +31,11 @@ class DataConfig:
 class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     max_new_tokens: int = MAX_TOKENS
-    temperature: float = 1.0
+    temperature: float = 1.2
     top_p: float = 0.95
-    digit_greedy: bool = True
+    min_p: float = 0.03
+    repetition_penalty: float = 1.05
+    digit_greedy: bool = False
     action_scope: str = "ppo_only_z_tokens_and_verify"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2

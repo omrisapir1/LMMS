@@ -355,12 +355,15 @@ def _sample_action_from_allowed_logits(
     *,
     temperature: float,
     top_p: float,
+    min_p: float,
     greedy: bool,
 ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
     if temperature <= 0:
         raise ValueError("rollout.temperature must be > 0")
     if top_p <= 0 or top_p > 1:
         raise ValueError("rollout.top_p must be in (0, 1]")
+    if min_p < 0 or min_p >= 1:
+        raise ValueError("rollout.min_p must be in [0, 1)")
 
     logits = allowed_logits / float(temperature)
     logp = torch.log_softmax(logits, dim=-1)
@@ -369,8 +372,33 @@ def _sample_action_from_allowed_logits(
     if greedy:
         local_idx = int(torch.argmax(logits, dim=-1).item())
     else:
+        if float(min_p) > 0.0:
+            p_max = float(torch.max(probs).item())
+            threshold = float(min_p) * p_max
+            keep = probs >= threshold
+            if bool(keep.any()):
+                probs = probs * keep.to(dtype=probs.dtype)
+                probs = probs / probs.sum()
         local_idx = _nucleus_sample_from_probs(probs, top_p=top_p)
     return local_idx, logp, probs, entropy
+
+
+def _apply_repetition_penalty_to_allowed_logits(
+    *,
+    allowed_logits: torch.Tensor,
+    allowed_token_ids: torch.Tensor,
+    seen_token_ids: set[int],
+    repetition_penalty: float,
+) -> torch.Tensor:
+    if float(repetition_penalty) == 1.0 or len(seen_token_ids) == 0:
+        return allowed_logits
+    out = allowed_logits.clone()
+    for local_idx, tok_id in enumerate(allowed_token_ids.tolist()):
+        if int(tok_id) not in seen_token_ids:
+            continue
+        val = out[local_idx]
+        out[local_idx] = val * float(repetition_penalty) if float(val.item()) < 0.0 else val / float(repetition_penalty)
+    return out
 
 
 def _forward_last_with_cache(core, input_ids, attention_mask, past_key_values):
@@ -1010,6 +1038,8 @@ def _rollout_one_torch(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    min_p: float,
+    repetition_penalty: float,
     action_scope: str,
     digit_greedy: bool,
     reward_cfg,
@@ -1049,11 +1079,19 @@ def _rollout_one_torch(
         last_logits = out0.logits[:, -1, :].squeeze(0)
 
         for _ in range(max_new_tokens):
+            seen_token_ids = set(int(x) for x in actions)
             if phase == "z":
+                z_logits_allowed = _apply_repetition_penalty_to_allowed_logits(
+                    allowed_logits=last_logits.index_select(0, z_allowed_t),
+                    allowed_token_ids=z_allowed_t,
+                    seen_token_ids=seen_token_ids,
+                    repetition_penalty=float(repetition_penalty),
+                )
                 local_idx, _logp_allowed, _probs_allowed, _entropy = _sample_action_from_allowed_logits(
-                    last_logits.index_select(0, z_allowed_t),
+                    z_logits_allowed,
                     temperature=temperature,
                     top_p=top_p,
+                    min_p=min_p,
                     greedy=False,
                 )
                 action = int(z_allowed_t[local_idx].item())
@@ -1064,10 +1102,17 @@ def _rollout_one_torch(
                 else:
                     generated_z_ids.append(action)
             else:
+                d_logits_allowed = _apply_repetition_penalty_to_allowed_logits(
+                    allowed_logits=last_logits.index_select(0, digit_allowed_t),
+                    allowed_token_ids=digit_allowed_t,
+                    seen_token_ids=seen_token_ids,
+                    repetition_penalty=float(repetition_penalty),
+                )
                 local_idx, _logp_allowed, probs_allowed, _entropy = _sample_action_from_allowed_logits(
-                    last_logits.index_select(0, digit_allowed_t),
+                    d_logits_allowed,
                     temperature=temperature,
                     top_p=top_p,
+                    min_p=min_p,
                     greedy=bool(digit_greedy),
                 )
                 action = int(digit_allowed_t[local_idx].item())
@@ -1323,6 +1368,8 @@ def _collect_rollouts_vllm_batch(
         max_new_tokens=cfg.rollout.max_new_tokens,
         temperature=cfg.rollout.temperature,
         top_p=cfg.rollout.top_p,
+        min_p=cfg.rollout.min_p,
+        repetition_penalty=cfg.rollout.repetition_penalty,
     )
     expected_rows = len(prepared) * int(num_samples_per_prompt)
     if len(z_gen_rows) != expected_rows:
@@ -1388,6 +1435,8 @@ def _collect_rollouts_vllm_batch(
             temperature=cfg.rollout.temperature,
             top_p=cfg.rollout.top_p,
             greedy=bool(cfg.rollout.digit_greedy),
+            min_p=cfg.rollout.min_p,
+            repetition_penalty=cfg.rollout.repetition_penalty,
         )
         for j, idx in enumerate(with_answer_idx):
             digits = [int(x) for x in digit_gens[j]]
@@ -1592,6 +1641,8 @@ def _collect_rollouts_vllm_batch_multiround(
                 max_new_tokens=max_z_budget,
                 temperature=cfg.rollout.temperature,
                 top_p=cfg.rollout.top_p,
+                min_p=cfg.rollout.min_p,
+                repetition_penalty=cfg.rollout.repetition_penalty,
             )
         else:
             z_texts = [
@@ -1604,6 +1655,8 @@ def _collect_rollouts_vllm_batch_multiround(
                 max_new_tokens=max_z_budget,
                 temperature=cfg.rollout.temperature,
                 top_p=cfg.rollout.top_p,
+                min_p=cfg.rollout.min_p,
+                repetition_penalty=cfg.rollout.repetition_penalty,
             )
         if len(z_rows) != len(start_active):
             raise RuntimeError("vLLM Z-phase row count mismatch in multi-round rollout")
@@ -1661,6 +1714,8 @@ def _collect_rollouts_vllm_batch_multiround(
                         temperature=cfg.rollout.temperature,
                         top_p=cfg.rollout.top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
+                        min_p=cfg.rollout.min_p,
+                        repetition_penalty=cfg.rollout.repetition_penalty,
                     )
                 else:
                     digit_texts = [
@@ -1673,6 +1728,8 @@ def _collect_rollouts_vllm_batch_multiround(
                         temperature=cfg.rollout.temperature,
                         top_p=cfg.rollout.top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
+                        min_p=cfg.rollout.min_p,
+                        repetition_penalty=cfg.rollout.repetition_penalty,
                     )
                 if len(digit_rows) != len(idxs):
                     raise RuntimeError("vLLM digit-phase row count mismatch in multi-round rollout")
@@ -1715,6 +1772,8 @@ def _collect_rollouts_vllm_batch_multiround(
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
                             greedy=True,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
                         )
                     else:
@@ -1727,6 +1786,8 @@ def _collect_rollouts_vllm_batch_multiround(
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
                             greedy=True,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
                         )
                     if len(verify_rows) != len(verify_owner):
@@ -2337,14 +2398,20 @@ def train(cfg: Config) -> None:
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
         raise ValueError("digit_greedy=True is incompatible with ppo_full")
+    if float(cfg.rollout.temperature) <= 0.0:
+        raise ValueError("rollout.temperature must be > 0")
+    if float(cfg.rollout.top_p) <= 0.0 or float(cfg.rollout.top_p) > 1.0:
+        raise ValueError("rollout.top_p must be in (0, 1]")
+    if float(cfg.rollout.min_p) < 0.0 or float(cfg.rollout.min_p) >= 1.0:
+        raise ValueError("rollout.min_p must be in [0, 1)")
+    if float(cfg.rollout.repetition_penalty) <= 0.0:
+        raise ValueError("rollout.repetition_penalty must be > 0")
     rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
     if action_scope == "ppo_only_z_tokens_and_verify":
         if rollout_backend != "vllm":
             raise ValueError("ppo_only_z_tokens_and_verify currently requires rollout.backend='vllm'")
         if not bool(cfg.rollout.vllm_enabled):
             raise ValueError("ppo_only_z_tokens_and_verify requires rollout.vllm_enabled=True")
-        if not bool(cfg.rollout.digit_greedy):
-            raise ValueError("ppo_only_z_tokens_and_verify requires rollout.digit_greedy=True")
     if not math.isfinite(float(cfg.rollout.verify_finalize_logit_bias)):
         raise ValueError("rollout.verify_finalize_logit_bias must be finite")
     if not math.isfinite(float(cfg.rollout.verify_retry_logit_bias)):
@@ -2737,6 +2804,8 @@ def train(cfg: Config) -> None:
                             max_new_tokens=cfg.rollout.max_new_tokens,
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             action_scope=action_scope,
                             digit_greedy=cfg.rollout.digit_greedy,
                             reward_cfg=cfg.reward,
