@@ -2172,7 +2172,13 @@ def _find_latest_checkpoint_in_dir(root_dir: str) -> Optional[str]:
 
 
 def _resolve_resume_checkpoint_dir(cfg: Config) -> Optional[str]:
-    resume_from_raw = str(getattr(cfg.train, "resume_from", "")).strip()
+    resume_from_val = getattr(cfg.train, "resume_from", None)
+    if resume_from_val is None:
+        resume_from_raw = ""
+    else:
+        resume_from_raw = str(resume_from_val).strip()
+        if resume_from_raw.lower() in {"none", "null"}:
+            resume_from_raw = ""
     if resume_from_raw:
         p = os.path.abspath(os.path.expanduser(resume_from_raw))
         if not os.path.isdir(p):
