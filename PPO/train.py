@@ -1038,6 +1038,8 @@ def _rollout_one_torch(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    digit_temperature: float,
+    digit_top_p: float,
     min_p: float,
     repetition_penalty: float,
     action_scope: str,
@@ -1106,13 +1108,13 @@ def _rollout_one_torch(
                     allowed_logits=last_logits.index_select(0, digit_allowed_t),
                     allowed_token_ids=digit_allowed_t,
                     seen_token_ids=seen_token_ids,
-                    repetition_penalty=float(repetition_penalty),
+                    repetition_penalty=1.0,
                 )
                 local_idx, _logp_allowed, probs_allowed, _entropy = _sample_action_from_allowed_logits(
                     d_logits_allowed,
-                    temperature=temperature,
-                    top_p=top_p,
-                    min_p=min_p,
+                    temperature=digit_temperature,
+                    top_p=digit_top_p,
+                    min_p=0.0,
                     greedy=bool(digit_greedy),
                 )
                 action = int(digit_allowed_t[local_idx].item())
@@ -1432,11 +1434,11 @@ def _collect_rollouts_vllm_batch(
         digit_gens = vllm_engine.generate_digits(
             prompts=digit_prompt_texts if not supports_token_prompts else None,
             prompt_token_ids=digit_prompt_ids_batch if supports_token_prompts else None,
-            temperature=cfg.rollout.temperature,
-            top_p=cfg.rollout.top_p,
+            temperature=cfg.rollout.digit_temperature,
+            top_p=cfg.rollout.digit_top_p,
             greedy=bool(cfg.rollout.digit_greedy),
-            min_p=cfg.rollout.min_p,
-            repetition_penalty=cfg.rollout.repetition_penalty,
+            min_p=0.0,
+            repetition_penalty=1.0,
         )
         for j, idx in enumerate(with_answer_idx):
             digits = [int(x) for x in digit_gens[j]]
@@ -1711,11 +1713,11 @@ def _collect_rollouts_vllm_batch_multiround(
                     digit_rows = vllm_engine.generate_digits(
                         prompt_token_ids=prompt_ids_batch,
                         num_digits=int(k),
-                        temperature=cfg.rollout.temperature,
-                        top_p=cfg.rollout.top_p,
+                        temperature=cfg.rollout.digit_temperature,
+                        top_p=cfg.rollout.digit_top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
-                        min_p=cfg.rollout.min_p,
-                        repetition_penalty=cfg.rollout.repetition_penalty,
+                        min_p=0.0,
+                        repetition_penalty=1.0,
                     )
                 else:
                     digit_texts = [
@@ -1725,11 +1727,11 @@ def _collect_rollouts_vllm_batch_multiround(
                     digit_rows = vllm_engine.generate_digits(
                         prompts=digit_texts,
                         num_digits=int(k),
-                        temperature=cfg.rollout.temperature,
-                        top_p=cfg.rollout.top_p,
+                        temperature=cfg.rollout.digit_temperature,
+                        top_p=cfg.rollout.digit_top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
-                        min_p=cfg.rollout.min_p,
-                        repetition_penalty=cfg.rollout.repetition_penalty,
+                        min_p=0.0,
+                        repetition_penalty=1.0,
                     )
                 if len(digit_rows) != len(idxs):
                     raise RuntimeError("vLLM digit-phase row count mismatch in multi-round rollout")
@@ -2402,6 +2404,10 @@ def train(cfg: Config) -> None:
         raise ValueError("rollout.temperature must be > 0")
     if float(cfg.rollout.top_p) <= 0.0 or float(cfg.rollout.top_p) > 1.0:
         raise ValueError("rollout.top_p must be in (0, 1]")
+    if float(cfg.rollout.digit_temperature) <= 0.0:
+        raise ValueError("rollout.digit_temperature must be > 0")
+    if float(cfg.rollout.digit_top_p) <= 0.0 or float(cfg.rollout.digit_top_p) > 1.0:
+        raise ValueError("rollout.digit_top_p must be in (0, 1]")
     if float(cfg.rollout.min_p) < 0.0 or float(cfg.rollout.min_p) >= 1.0:
         raise ValueError("rollout.min_p must be in [0, 1)")
     if float(cfg.rollout.repetition_penalty) <= 0.0:
@@ -2804,6 +2810,8 @@ def train(cfg: Config) -> None:
                             max_new_tokens=cfg.rollout.max_new_tokens,
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
+                            digit_temperature=cfg.rollout.digit_temperature,
+                            digit_top_p=cfg.rollout.digit_top_p,
                             min_p=cfg.rollout.min_p,
                             repetition_penalty=cfg.rollout.repetition_penalty,
                             action_scope=action_scope,

@@ -34,7 +34,9 @@ class RolloutConfig:
     temperature: float = 1.2
     top_p: float = 0.95
     min_p: float = 0.03
-    repetition_penalty: float = 1.05
+    repetition_penalty: float = 1.1
+    digit_temperature: float = 1.0
+    digit_top_p: float = 0.90
     digit_greedy: bool = False
     action_scope: str = "ppo_only_z_tokens_and_verify"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
     vllm_enabled: bool = True
@@ -70,13 +72,13 @@ class RewardConfig:
 class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.25
-    c_ent: float = 0.003
-    kl_coef: float = 0.02
+    c_ent: float = 0.002
+    kl_coef: float = 0.03
     apply_ce: bool = False
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
     ce_mode: str = "random"  # "successful_traces" | "random"
-    update_ref_model_each_steps: int = 500
+    update_ref_model_each_steps: int = 100
     ppo_epochs: int = 1
     minibatch_size: int = 16
     max_grad_norm: float = 1.0
