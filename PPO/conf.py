@@ -64,7 +64,7 @@ class RewardConfig:
     length_penalty: float = 0.00005
     reward_if_max_len: float = -0.1
     correct_length_discount: float = 0.1
-    early_success: float = 0.7
+    early_success: float = 0.85
     rounds_penalty_coef: float = 0.0005
 
 
@@ -73,7 +73,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.25
     c_ent: float = 0.002
-    kl_coef: float = 0.03
+    kl_coef: float = 0.01
     apply_ce: bool = False
     alpha_sft: float = 0.5
     batch_frac_to_apply_ce: float = 0.25
@@ -92,7 +92,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-5
+    lr: float = 5e-6
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
