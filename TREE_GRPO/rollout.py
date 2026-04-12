@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from PPO.train import Trajectory, _action_stats_tensors, _extract_z_phase_from_vllm_row_with_budget
+from PPO.train import Trajectory, _extract_z_phase_from_vllm_row_with_budget
 from TREE_GRPO.conf import Config
 from TREE_GRPO.credit import assign_tree_values_and_advantages, tree_summary
 from TREE_GRPO.tree_structs import ExpandRequest, SegmentResult, TreeGroup, TreeNode
@@ -24,6 +24,72 @@ class _WaveState:
         self.action_types: List[str] = []
         self.full_generated_ids: List[int] = []
         self.terminated_reason: str = "max_new_tokens"
+
+
+def _action_logp_entropy_tensors(
+    *,
+    model,
+    prompt_ids: Sequence[int],
+    prompt_attention_mask: Sequence[int],
+    actions: Sequence[int],
+    action_types: Sequence[str],
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = next(model.parameters()).device
+    if len(actions) == 0:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        return empty, empty
+
+    seq_ids = torch.tensor(list(prompt_ids) + list(actions), dtype=torch.long, device=device).unsqueeze(0)
+    full_attn = list(prompt_attention_mask) + [1] * len(actions)
+    attn = torch.tensor(full_attn, dtype=torch.long, device=device).unsqueeze(0)
+
+    out = model(
+        input_ids=seq_ids,
+        attention_mask=attn,
+        use_cache=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+
+    p_len = len(prompt_ids)
+    t_steps = len(actions)
+    state_positions = torch.arange(
+        p_len - 1,
+        p_len - 1 + t_steps,
+        device=device,
+        dtype=torch.long,
+    )
+    logits_all = out.logits[0]
+
+    logp_list: List[torch.Tensor] = []
+    entropy_list: List[torch.Tensor] = []
+    for i in range(t_steps):
+        pos = int(state_positions[i].item())
+        aid = int(actions[i])
+        t = str(action_types[i])
+        if t == "digit":
+            allowed_t = digit_allowed_t
+        elif t == "verify":
+            allowed_t = verify_allowed_t
+        else:
+            allowed_t = z_allowed_t
+
+        allowed_logits = logits_all[pos].index_select(0, allowed_t) / float(temperature)
+        log_probs_allowed = torch.log_softmax(allowed_logits, dim=-1)
+        probs_allowed = log_probs_allowed.exp()
+
+        local_matches = torch.nonzero(allowed_t == aid, as_tuple=False)
+        if local_matches.numel() == 0:
+            raise RuntimeError(f"Action id {aid} not in allowed set for type={t}")
+        local_idx = int(local_matches[0].item())
+        logp_list.append(log_probs_allowed[local_idx])
+        entropy_list.append((-(probs_allowed * log_probs_allowed).sum()))
+
+    return torch.stack(logp_list, dim=0), torch.stack(entropy_list, dim=0)
 
 
 def _run_segment_wave(
@@ -280,7 +346,6 @@ def _run_segment_wave(
 def collect_tree_grpo_v1_batch(
     *,
     model,
-    value_head,
     tokenizer,
     vllm_engine: Any,
     prepared: Sequence[Dict[str, object]],
@@ -521,9 +586,8 @@ def collect_tree_grpo_v1_batch(
         if len(n.actions) == 0:
             continue
 
-        logp_t, values_t, entropy_t = _action_stats_tensors(
+        logp_t, entropy_t = _action_logp_entropy_tensors(
             model=model,
-            value_head=value_head,
             prompt_ids=n.prompt_ids,
             prompt_attention_mask=n.prompt_attention_mask,
             actions=n.actions,
@@ -582,7 +646,7 @@ def collect_tree_grpo_v1_batch(
             actions=list(n.actions),
             action_types=list(n.action_types),
             logp_old=logp_t.float().cpu().tolist(),
-            values_old=values_t.float().cpu().tolist(),
+            values_old=[0.0] * len(n.actions),
             entropy_old=entropy_t.float().cpu().tolist(),
             terminated_by=str(n.terminated_reason),
             generated_z_ids=list(n.z_token_ids),

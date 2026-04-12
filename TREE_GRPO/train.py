@@ -10,7 +10,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import bitsandbytes as bnb
 import torch
@@ -19,12 +19,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from PPO.hf_rollout import HFRolloutEngine
 from PPO.masking import introspect_z_token_ids_and_style, resolve_answer_token_id
-from PPO.ppo_math import explained_variance
 from PPO.rollout_logger import RolloutLogger
 from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single, validate_single_token
 from PPO.train import (
-    ValueHead,
-    _action_stats_tensors_batched,
     _build_minibatch_order,
     _build_prompt_text,
     _build_trajectory_device_cache,
@@ -101,7 +98,6 @@ def _save_checkpoint(
     output_dir: str,
     step: int,
     model,
-    value_head: ValueHead,
     tokenizer,
     optimizer: torch.optim.Optimizer,
     cfg: Config,
@@ -115,11 +111,199 @@ def _save_checkpoint(
     torch.save(
         {
             "step": int(step),
-            "value_head_state_dict": value_head.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
         os.path.join(ckpt_dir, "tree_grpo_state.pt"),
     )
+
+
+def _action_stats_tensors_batched_policy_only(
+    *,
+    model,
+    ref_model,
+    trajs: Sequence,
+    traj_cache: Sequence,
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
+    z_id_to_local: torch.Tensor,
+    d_id_to_local: torch.Tensor,
+    v_id_to_local: torch.Tensor,
+    temperature: float,
+    pad_token_id: int,
+    token_stats_kernel,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    device = next(model.parameters()).device
+    if not trajs:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        empty_l = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty, empty, empty, empty, empty_l
+
+    cache = list(traj_cache)
+    if len(cache) != len(trajs):
+        raise RuntimeError("traj_cache length must match trajs length")
+
+    max_len = max(c.seq_len for c in cache)
+    bsz = len(cache)
+    input_ids = torch.full((bsz, max_len), int(pad_token_id), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
+    for i, c in enumerate(cache):
+        L = c.seq_len
+        input_ids[i, :L] = c.seq_ids
+        attention_mask[i, :L] = c.attention_mask
+
+    base_model = model.get_submodule(model.base_model_prefix)
+    out = base_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    hidden_all = out.last_hidden_state
+
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("Model output embeddings (LM head) are unavailable")
+    weight = lm_head.weight
+    z_w = weight.index_select(0, z_allowed_t)
+    d_w = weight.index_select(0, digit_allowed_t)
+    v_w = weight.index_select(0, verify_allowed_t)
+    bias = getattr(lm_head, "bias", None)
+    z_b = bias.index_select(0, z_allowed_t) if bias is not None else None
+    d_b = bias.index_select(0, digit_allowed_t) if bias is not None else None
+    v_b = bias.index_select(0, verify_allowed_t) if bias is not None else None
+
+    ref_hidden_all: Optional[torch.Tensor] = None
+    ref_z_w: Optional[torch.Tensor] = None
+    ref_d_w: Optional[torch.Tensor] = None
+    ref_v_w: Optional[torch.Tensor] = None
+    ref_z_b: Optional[torch.Tensor] = None
+    ref_d_b: Optional[torch.Tensor] = None
+    ref_v_b: Optional[torch.Tensor] = None
+    ref_device: Optional[torch.device] = None
+    if ref_model is not None:
+        ref_device = next(ref_model.parameters()).device
+        ref_input_ids = input_ids if ref_device == device else input_ids.to(ref_device)
+        ref_attention_mask = attention_mask if ref_device == device else attention_mask.to(ref_device)
+        z_allowed_ref = z_allowed_t if ref_device == device else z_allowed_t.to(ref_device)
+        digit_allowed_ref = digit_allowed_t if ref_device == device else digit_allowed_t.to(ref_device)
+        verify_allowed_ref = verify_allowed_t if ref_device == device else verify_allowed_t.to(ref_device)
+        ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
+        with torch.no_grad():
+            ref_out = ref_base_model(
+                input_ids=ref_input_ids,
+                attention_mask=ref_attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        ref_hidden_all = ref_out.last_hidden_state
+        ref_lm_head = ref_model.get_output_embeddings()
+        if ref_lm_head is None:
+            raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
+        ref_weight = ref_lm_head.weight
+        ref_z_w = ref_weight.index_select(0, z_allowed_ref)
+        ref_d_w = ref_weight.index_select(0, digit_allowed_ref)
+        ref_v_w = ref_weight.index_select(0, verify_allowed_ref)
+        ref_bias = getattr(ref_lm_head, "bias", None)
+        ref_z_b = ref_bias.index_select(0, z_allowed_ref) if ref_bias is not None else None
+        ref_d_b = ref_bias.index_select(0, digit_allowed_ref) if ref_bias is not None else None
+        ref_v_b = ref_bias.index_select(0, verify_allowed_ref) if ref_bias is not None else None
+
+    lengths_all = torch.tensor([c.action_len for c in cache], dtype=torch.long, device=device)
+    nonzero_rows = torch.nonzero(lengths_all > 0, as_tuple=False).squeeze(-1)
+    if nonzero_rows.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        empty_l = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty, empty, empty, empty, empty_l
+
+    lengths = lengths_all.index_select(0, nonzero_rows)
+    hidden_nz = hidden_all.index_select(0, nonzero_rows)
+
+    batch_ids = torch.repeat_interleave(
+        torch.arange(nonzero_rows.numel(), device=device, dtype=torch.long),
+        lengths,
+    )
+    state_positions = torch.cat([cache[int(i)].state_positions for i in nonzero_rows.tolist()], dim=0)
+    action_ids = torch.cat([cache[int(i)].action_ids for i in nonzero_rows.tolist()], dim=0)
+    action_phase = torch.cat([cache[int(i)].action_phase for i in nonzero_rows.tolist()], dim=0)
+    logp_old = torch.cat([cache[int(i)].logp_old for i in nonzero_rows.tolist()], dim=0)
+    advantages = torch.cat([cache[int(i)].advantages_norm for i in nonzero_rows.tolist()], dim=0)
+
+    h_states = hidden_nz[batch_ids, state_positions]
+    logp_new, entropy_new, invalid = token_stats_kernel(
+        h_states,
+        action_ids,
+        action_phase,
+        z_w,
+        z_b,
+        d_w,
+        d_b,
+        v_w,
+        v_b,
+        z_id_to_local,
+        d_id_to_local,
+        v_id_to_local,
+        float(temperature),
+    )
+    if bool(invalid.any()):
+        raise RuntimeError("Found actions not in allowed set")
+
+    if ref_model is not None:
+        assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None and ref_v_w is not None
+        assert ref_device is not None
+        if ref_device == device:
+            nonzero_rows_ref = nonzero_rows
+            batch_ids_ref = batch_ids
+            state_positions_ref = state_positions
+            action_ids_ref = action_ids
+            action_phase_ref = action_phase
+            z_id_to_local_ref = z_id_to_local
+            d_id_to_local_ref = d_id_to_local
+            v_id_to_local_ref = v_id_to_local
+        else:
+            nonzero_rows_ref = nonzero_rows.to(ref_device)
+            batch_ids_ref = batch_ids.to(ref_device)
+            state_positions_ref = state_positions.to(ref_device)
+            action_ids_ref = action_ids.to(ref_device)
+            action_phase_ref = action_phase.to(ref_device)
+            z_id_to_local_ref = z_id_to_local.to(ref_device)
+            d_id_to_local_ref = d_id_to_local.to(ref_device)
+            v_id_to_local_ref = v_id_to_local.to(ref_device)
+        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows_ref)
+        ref_h_states = ref_hidden_nz[batch_ids_ref, state_positions_ref]
+        with torch.no_grad():
+            logp_ref, _ref_entropy, ref_invalid = token_stats_kernel(
+                ref_h_states,
+                action_ids_ref,
+                action_phase_ref,
+                ref_z_w,
+                ref_z_b,
+                ref_d_w,
+                ref_d_b,
+                ref_v_w,
+                ref_v_b,
+                z_id_to_local_ref,
+                d_id_to_local_ref,
+                v_id_to_local_ref,
+                float(temperature),
+            )
+        if bool(ref_invalid.any()):
+            raise RuntimeError("Reference model found actions not in allowed set")
+        if logp_ref.device != device:
+            logp_ref = logp_ref.to(device)
+    else:
+        logp_ref = logp_new.detach()
+
+    return logp_new, logp_ref, entropy_new, logp_old, advantages, lengths
 
 
 def train(cfg: Config) -> None:
@@ -195,9 +379,6 @@ def train(cfg: Config) -> None:
         f"c_retry={cfg.tree.c_retry:.4f} c_trunc={cfg.tree.c_trunc:.4f} gamma={cfg.tree.gamma:.4f}"
     )
 
-    hidden_size = int(model.config.hidden_size)
-    value_head = ValueHead(hidden_size=hidden_size).to(device)
-
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise RuntimeError("Model output embeddings (LM head) are unavailable")
@@ -209,7 +390,7 @@ def train(cfg: Config) -> None:
     d_id_to_local[digit_allowed_t] = torch.arange(digit_allowed_t.numel(), device=device, dtype=torch.long)
     v_id_to_local[verify_allowed_t] = torch.arange(verify_allowed_t.numel(), device=device, dtype=torch.long)
 
-    ppo_params = list(model.parameters()) + list(value_head.parameters())
+    ppo_params = list(model.parameters())
     optimizer = bnb.optim.AdamW8bit(
         ppo_params,
         lr=cfg.train.lr,
@@ -342,7 +523,6 @@ def train(cfg: Config) -> None:
 
             trajectories, tree_stats = collect_tree_grpo_v1_batch(
                 model=model,
-                value_head=value_head,
                 tokenizer=tokenizer,
                 vllm_engine=vllm_engine,
                 prepared=prepared,
@@ -419,7 +599,6 @@ def train(cfg: Config) -> None:
 
             minibatch_count = 0
             pol_acc = 0.0
-            val_acc = 0.0
             ent_acc = 0.0
             clip_acc = 0.0
             kl_acc = 0.0
@@ -444,16 +623,13 @@ def train(cfg: Config) -> None:
                         (
                             logp_new,
                             logp_ref,
-                            values_new,
                             entropy_new,
                             logp_old,
                             advantages,
-                            returns,
                             lengths,
-                        ) = _action_stats_tensors_batched(
+                        ) = _action_stats_tensors_batched_policy_only(
                             model=model,
                             ref_model=ref_model,
-                            value_head=value_head,
                             trajs=batch_trajs,
                             traj_cache=batch_cache,
                             z_allowed_t=z_allowed_t,
@@ -474,8 +650,6 @@ def train(cfg: Config) -> None:
                         logp_old_f = logp_old.float()
                         logp_ref_f = logp_ref.float()
                         advantages_f = advantages.float()
-                        values_new_f = values_new.float()
-                        returns_f = returns.float()
                         entropy_new_f = entropy_new.float()
 
                         log_ratio = logp_new_f - logp_old_f
@@ -492,7 +666,6 @@ def train(cfg: Config) -> None:
                         lo = 1.0 - float(cfg.ppo.clip_range)
                         hi = 1.0 + float(cfg.ppo.clip_range)
                         clipped_tok = ((ratio < lo) | (ratio > hi)).float()
-                        value_loss_tok = (values_new_f - returns_f).pow(2)
 
                         def _segment_means(values: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
                             if int(lens.numel()) == 0:
@@ -508,7 +681,6 @@ def train(cfg: Config) -> None:
 
                         policy_loss = _segment_means(policy_loss_tok, lengths).mean()
                         clipfrac = _segment_means(clipped_tok, lengths).mean()
-                        v_loss = _segment_means(value_loss_tok, lengths).mean()
                         entropy_mean = _segment_means(entropy_new_f, lengths).mean()
                         kl_mean = _segment_means(kl_tok, lengths).mean()
                         entropy_loss = -entropy_mean
@@ -517,7 +689,6 @@ def train(cfg: Config) -> None:
                         loss = (
                             policy_loss
                             + kl_penalty
-                            + float(cfg.ppo.c_v) * v_loss
                             + float(cfg.ppo.c_ent) * entropy_loss
                         ) / float(cfg.train.grad_accum_steps)
 
@@ -525,7 +696,6 @@ def train(cfg: Config) -> None:
                     minibatch_count += 1
 
                     pol_acc += float(policy_loss.detach().item())
-                    val_acc += float(v_loss.detach().item())
                     ent_acc += float(entropy_mean.detach().item())
                     clip_acc += float(clipfrac.detach().item())
                     kl_acc += float(kl_mean.detach().item())
@@ -547,10 +717,6 @@ def train(cfg: Config) -> None:
                 for p in ref_model.parameters():
                     p.requires_grad_(False)
 
-            old_values = torch.tensor([v for t in trajectories for v in t.values_old], dtype=torch.float32)
-            old_returns = torch.tensor([r for t in trajectories for r in t.returns], dtype=torch.float32)
-            ev = explained_variance(y_pred=old_values, y_true=old_returns)
-
             denom = float(max(minibatch_count, 1))
             t_total = time.perf_counter() - _t_update0
             _log(
@@ -565,11 +731,9 @@ def train(cfg: Config) -> None:
                         f"mean_az={tree_stats.get('mean_az', 0.0):.4f}",
                         f"mean_av={tree_stats.get('mean_av', 0.0):.4f}",
                         f"policy_loss={pol_acc / denom:.4f}",
-                        f"value_loss={val_acc / denom:.4f}",
                         f"entropy={ent_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"kl={kl_acc / denom:.4f}",
-                        f"explained_var={ev:.4f}",
                         f"t_update={t_total:.3f}s",
                     ]
                 )
@@ -580,7 +744,6 @@ def train(cfg: Config) -> None:
                     output_dir=cfg.train.output_dir,
                     step=update,
                     model=model,
-                    value_head=value_head,
                     tokenizer=tokenizer,
                     optimizer=optimizer,
                     cfg=cfg,
