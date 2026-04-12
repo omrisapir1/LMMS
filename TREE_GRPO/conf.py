@@ -34,8 +34,8 @@ class TreeConfig:
     root_siblings: int = 4
     max_retry_parents_from_root: int = 2
     retry_children_per_parent: int = 2
+    max_retry_depth: int = 1
     c_retry: float = 0.05
-    c_trunc: float = 0.10
     gamma: float = 0.95
     c_branch: float = 0.0
     advantage_clip: float = 3.0

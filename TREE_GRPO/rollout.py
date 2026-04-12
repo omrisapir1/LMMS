@@ -12,9 +12,8 @@ from TREE_GRPO.tree_structs import ExpandRequest, SegmentResult, TreeGroup, Tree
 
 
 class _WaveState:
-    def __init__(self, req: ExpandRequest, remaining_budget: int) -> None:
+    def __init__(self, req: ExpandRequest) -> None:
         self.req = req
-        self.remaining_budget = int(max(0, remaining_budget))
         self.z_ids: List[int] = []
         self.has_answer: bool = False
         self.digit_ids: List[int] = []
@@ -23,7 +22,10 @@ class _WaveState:
         self.actions: List[int] = []
         self.action_types: List[str] = []
         self.full_generated_ids: List[int] = []
-        self.terminated_reason: str = "max_new_tokens"
+        self.terminated_reason: str = "non_terminal_retry"
+        self.was_forced_finalize: bool = False
+        self.verify_action_present: bool = False
+        self.leaf_end_type: str = "non_terminal_retry"
 
 
 def _action_logp_entropy_tensors(
@@ -97,7 +99,8 @@ def _run_segment_wave(
     requests: Sequence[ExpandRequest],
     tokenizer,
     vllm_engine: Any,
-    max_new_tokens_global: int,
+    max_new_tokens_round: int,
+    max_retry_depth: int,
     answer_token_id: int,
     finalize_token_id: int,
     retry_token_id: int,
@@ -130,195 +133,171 @@ def _run_segment_wave(
         decode_cache[key] = str(txt)
         return str(txt)
 
-    states: List[_WaveState] = []
-    active_idx: List[int] = []
-    for i, req in enumerate(requests):
-        rem = int(max_new_tokens_global - int(req.path_generated_len))
-        st = _WaveState(req=req, remaining_budget=rem)
-        if rem > 0:
-            active_idx.append(i)
-        states.append(st)
+    states: List[_WaveState] = [_WaveState(req=req) for req in requests]
+    active_idx = list(range(len(requests)))
 
-    if active_idx:
-        max_z_budget = max(states[i].remaining_budget for i in active_idx)
-        row_by_req_idx: Dict[int, Dict[str, object]] = {}
+    max_z_budget = max(int(max_new_tokens_round), 1)
+    row_by_req_idx: Dict[int, Dict[str, object]] = {}
 
-        # Group by identical prefix to reuse prefill and request sibling samples
-        # via num_samples_per_prompt=k (important for retry-child efficiency).
-        prefix_to_req_idxs: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
-        for req_idx in active_idx:
-            key = tuple(int(x) for x in requests[req_idx].prefix_ids)
-            prefix_to_req_idxs[key].append(int(req_idx))
+    # Group by identical prefix to reuse prefill and request sibling samples
+    # via num_samples_per_prompt=k (important for retry-child efficiency).
+    prefix_to_req_idxs: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+    for req_idx in active_idx:
+        key = tuple(int(x) for x in requests[req_idx].prefix_ids)
+        prefix_to_req_idxs[key].append(int(req_idx))
 
-        for key, req_idxs in prefix_to_req_idxs.items():
-            ordered_req_idxs = sorted(req_idxs, key=lambda i: int(requests[i].branch_slot))
-            k = int(len(ordered_req_idxs))
-            if k <= 0:
-                continue
-            if supports_token_prompts:
-                z_rows_group = vllm_engine.generate_z(
-                    prompt_token_ids=[list(key)],
-                    num_samples_per_prompt=k,
-                    max_new_tokens=max_z_budget,
-                    temperature=float(temperature),
-                    top_p=float(top_p),
-                    min_p=float(min_p),
-                    repetition_penalty=float(repetition_penalty),
-                )
-            else:
-                z_rows_group = vllm_engine.generate_z(
-                    prompts=[_decode_cached(key)],
-                    num_samples_per_prompt=k,
-                    max_new_tokens=max_z_budget,
-                    temperature=float(temperature),
-                    top_p=float(top_p),
-                    min_p=float(min_p),
-                    repetition_penalty=float(repetition_penalty),
-                )
-            if len(z_rows_group) != k:
-                raise RuntimeError(
-                    f"Tree wave grouped Z-phase row count mismatch: got={len(z_rows_group)} expected={k}"
-                )
-            for local_i, req_idx in enumerate(ordered_req_idxs):
-                row_by_req_idx[int(req_idx)] = dict(z_rows_group[local_i])
-
-        need_digits: List[int] = []
-        for req_idx in active_idx:
-            st = states[req_idx]
-            row = row_by_req_idx.get(int(req_idx))
-            if row is None:
-                raise RuntimeError(f"Missing grouped Z-phase row for request index {req_idx}")
-            z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
-                row=row,
-                answer_token_id=int(answer_token_id),
-                budget=int(st.remaining_budget),
+    for key, req_idxs in prefix_to_req_idxs.items():
+        ordered_req_idxs = sorted(req_idxs, key=lambda i: int(requests[i].branch_slot))
+        k = int(len(ordered_req_idxs))
+        if k <= 0:
+            continue
+        if supports_token_prompts:
+            z_rows_group = vllm_engine.generate_z(
+                prompt_token_ids=[list(key)],
+                num_samples_per_prompt=k,
+                max_new_tokens=max_z_budget,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                min_p=float(min_p),
+                repetition_penalty=float(repetition_penalty),
             )
-            st.z_ids = [int(x) for x in z_prefix]
-            st.actions.extend(st.z_ids)
-            st.action_types.extend(["z"] * len(st.z_ids))
-            st.full_generated_ids.extend(st.z_ids)
-            st.has_answer = bool(has_answer)
+        else:
+            z_rows_group = vllm_engine.generate_z(
+                prompts=[_decode_cached(key)],
+                num_samples_per_prompt=k,
+                max_new_tokens=max_z_budget,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                min_p=float(min_p),
+                repetition_penalty=float(repetition_penalty),
+            )
+        if len(z_rows_group) != k:
+            raise RuntimeError(
+                f"Tree wave grouped Z-phase row count mismatch: got={len(z_rows_group)} expected={k}"
+            )
+        for local_i, req_idx in enumerate(ordered_req_idxs):
+            row_by_req_idx[int(req_idx)] = dict(z_rows_group[local_i])
 
-            if not st.has_answer:
-                st.terminated_reason = "max_new_tokens"
-                continue
+    # Z + <ANSWER> (strict: each round must reach an answer token).
+    for req_idx in active_idx:
+        st = states[req_idx]
+        row = row_by_req_idx.get(int(req_idx))
+        if row is None:
+            raise RuntimeError(f"Missing grouped Z-phase row for request index {req_idx}")
+        z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
+            row=row,
+            answer_token_id=int(answer_token_id),
+            budget=max_z_budget,
+        )
+        st.z_ids = [int(x) for x in z_prefix]
+        st.actions.extend(st.z_ids)
+        st.action_types.extend(["z"] * len(st.z_ids))
+        st.full_generated_ids.extend(st.z_ids)
+        st.has_answer = bool(has_answer)
+        if not st.has_answer:
+            raise RuntimeError(
+                f"Round failed to emit <ANSWER> within max_new_tokens={max_z_budget}; "
+                "this violates terminal-leaf semantics."
+            )
+        st.actions.append(int(answer_token_id))
+        st.action_types.append("answer")
+        st.full_generated_ids.append(int(answer_token_id))
 
-            if len(st.full_generated_ids) >= st.remaining_budget:
-                st.has_answer = False
-                st.terminated_reason = "max_new_tokens"
-                continue
+    # Always generate exactly 5 digits.
+    digit_allowed_set = set(int(x) for x in digit_token_ids)
+    id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
+    digit_prompt_ids = [requests[idx].prefix_ids + states[idx].full_generated_ids for idx in active_idx]
+    if supports_token_prompts:
+        digit_rows = vllm_engine.generate_digits(
+            prompt_token_ids=digit_prompt_ids,
+            num_digits=5,
+            temperature=float(digit_temperature),
+            top_p=float(digit_top_p),
+            greedy=bool(digit_greedy),
+            min_p=0.0,
+            repetition_penalty=1.0,
+        )
+    else:
+        digit_rows = vllm_engine.generate_digits(
+            prompts=[_decode_cached(x) for x in digit_prompt_ids],
+            num_digits=5,
+            temperature=float(digit_temperature),
+            top_p=float(digit_top_p),
+            greedy=bool(digit_greedy),
+            min_p=0.0,
+            repetition_penalty=1.0,
+        )
+    if len(digit_rows) != len(active_idx):
+        raise RuntimeError("Tree wave digit-phase row count mismatch")
+    for j, req_idx in enumerate(active_idx):
+        st = states[req_idx]
+        digits = [int(x) for x in list(digit_rows[j])]
+        if len(digits) != 5:
+            raise RuntimeError(f"Digit phase must return exactly 5 tokens, got {len(digits)}")
+        bad = [d for d in digits if d not in digit_allowed_set]
+        if bad:
+            raise RuntimeError(f"Digit rollout contains tokens outside digit set: {bad}")
+        st.digit_ids = list(digits)
+        st.pred_digits = [int(id2d[x]) for x in st.digit_ids]
+        st.full_generated_ids.extend(st.digit_ids)
 
-            st.actions.append(int(answer_token_id))
-            st.action_types.append("answer")
-            st.full_generated_ids.append(int(answer_token_id))
-            need_digits.append(req_idx)
+    # Verify only when retry is legal at this depth.
+    need_verify: List[int] = []
+    verify_prompt_ids: List[List[int]] = []
+    for req_idx in active_idx:
+        st = states[req_idx]
+        req = requests[req_idx]
+        force_finalize = int(req.retry_depth) >= int(max_retry_depth)
+        if force_finalize:
+            st.was_forced_finalize = True
+            st.verify_action_present = False
+            st.verify_token_id = None
+            st.terminated_reason = "forced_finalize_max_retry"
+            st.leaf_end_type = "forced_finalize_max_retry"
+            continue
+        need_verify.append(int(req_idx))
+        verify_prompt_ids.append(list(req.prefix_ids) + list(st.full_generated_ids))
 
-        if need_digits:
-            digits_group: Dict[int, List[int]] = defaultdict(list)
-            for req_idx in need_digits:
-                st = states[req_idx]
-                rem_after_answer = int(st.remaining_budget - len(st.full_generated_ids))
-                if rem_after_answer <= 0:
-                    st.terminated_reason = "max_new_tokens"
-                    continue
-                k = min(5, rem_after_answer)
-                digits_group[int(k)].append(req_idx)
-
-            digit_allowed_set = set(int(x) for x in digit_token_ids)
-            id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
-            need_verify: List[int] = []
-
-            for k, idxs in digits_group.items():
-                prompt_ids_batch = [requests[idx].prefix_ids + states[idx].full_generated_ids for idx in idxs]
-                if supports_token_prompts:
-                    digit_rows = vllm_engine.generate_digits(
-                        prompt_token_ids=prompt_ids_batch,
-                        num_digits=int(k),
-                        temperature=float(digit_temperature),
-                        top_p=float(digit_top_p),
-                        greedy=bool(digit_greedy),
-                        min_p=0.0,
-                        repetition_penalty=1.0,
-                    )
-                else:
-                    digit_texts = [_decode_cached(x) for x in prompt_ids_batch]
-                    digit_rows = vllm_engine.generate_digits(
-                        prompts=digit_texts,
-                        num_digits=int(k),
-                        temperature=float(digit_temperature),
-                        top_p=float(digit_top_p),
-                        greedy=bool(digit_greedy),
-                        min_p=0.0,
-                        repetition_penalty=1.0,
-                    )
-                if len(digit_rows) != len(idxs):
-                    raise RuntimeError("Tree wave digit-phase row count mismatch")
-
-                for row_i, req_idx in enumerate(idxs):
-                    st = states[req_idx]
-                    digits = [int(x) for x in list(digit_rows[row_i])]
-                    if len(digits) != int(k):
-                        raise RuntimeError(f"Digit phase must return exactly {k} tokens, got {len(digits)}")
-                    bad = [d for d in digits if d not in digit_allowed_set]
-                    if bad:
-                        raise RuntimeError(f"Digit rollout contains tokens outside digit set: {bad}")
-                    st.digit_ids = list(digits)
-                    st.full_generated_ids.extend(st.digit_ids)
-
-                    if int(k) < 5:
-                        st.terminated_reason = "max_new_tokens"
-                        continue
-                    st.pred_digits = [int(id2d[x]) for x in st.digit_ids]
-                    need_verify.append(req_idx)
-
-            if need_verify:
-                verify_prompt_ids = []
-                verify_owner: List[int] = []
-                for req_idx in need_verify:
-                    st = states[req_idx]
-                    rem_after_digits = int(st.remaining_budget - len(st.full_generated_ids))
-                    if rem_after_digits <= 0:
-                        st.terminated_reason = "max_new_tokens"
-                        continue
-                    verify_prompt_ids.append(requests[req_idx].prefix_ids + st.full_generated_ids)
-                    verify_owner.append(req_idx)
-
-                if verify_owner:
-                    if supports_token_prompts:
-                        verify_rows = vllm_engine.generate_verify(
-                            prompt_token_ids=verify_prompt_ids,
-                            temperature=float(verify_temperature),
-                            top_p=float(verify_p),
-                            greedy=False,
-                            min_p=float(min_p),
-                            repetition_penalty=float(repetition_penalty),
-                        )
-                    else:
-                        verify_texts = [_decode_cached(x) for x in verify_prompt_ids]
-                        verify_rows = vllm_engine.generate_verify(
-                            prompts=verify_texts,
-                            temperature=float(verify_temperature),
-                            top_p=float(verify_p),
-                            greedy=False,
-                            min_p=float(min_p),
-                            repetition_penalty=float(repetition_penalty),
-                        )
-                    if len(verify_rows) != len(verify_owner):
-                        raise RuntimeError("Tree wave verify-phase row count mismatch")
-
-                    for row_i, req_idx in enumerate(verify_owner):
-                        st = states[req_idx]
-                        row = [int(x) for x in list(verify_rows[row_i])]
-                        if len(row) != 1:
-                            raise RuntimeError(f"Verify phase must return exactly 1 token, got {len(row)}")
-                        tok = int(row[0])
-                        if tok not in (int(finalize_token_id), int(retry_token_id)):
-                            raise RuntimeError("Verify phase emitted token outside {<FINALIZE>, <RETRY>}")
-                        st.verify_token_id = int(tok)
-                        st.actions.append(int(tok))
-                        st.action_types.append("verify")
-                        st.full_generated_ids.append(int(tok))
-                        st.terminated_reason = "finalize" if tok == int(finalize_token_id) else "retry"
+    if need_verify:
+        if supports_token_prompts:
+            verify_rows = vllm_engine.generate_verify(
+                prompt_token_ids=verify_prompt_ids,
+                temperature=float(verify_temperature),
+                top_p=float(verify_p),
+                greedy=False,
+                min_p=float(min_p),
+                repetition_penalty=float(repetition_penalty),
+            )
+        else:
+            verify_rows = vllm_engine.generate_verify(
+                prompts=[_decode_cached(x) for x in verify_prompt_ids],
+                temperature=float(verify_temperature),
+                top_p=float(verify_p),
+                greedy=False,
+                min_p=float(min_p),
+                repetition_penalty=float(repetition_penalty),
+            )
+        if len(verify_rows) != len(need_verify):
+            raise RuntimeError("Tree wave verify-phase row count mismatch")
+        for row_i, req_idx in enumerate(need_verify):
+            st = states[req_idx]
+            row = [int(x) for x in list(verify_rows[row_i])]
+            if len(row) != 1:
+                raise RuntimeError(f"Verify phase must return exactly 1 token, got {len(row)}")
+            tok = int(row[0])
+            if tok not in (int(finalize_token_id), int(retry_token_id)):
+                raise RuntimeError("Verify phase emitted token outside {<FINALIZE>, <RETRY>}")
+            st.verify_action_present = True
+            st.verify_token_id = int(tok)
+            st.actions.append(int(tok))
+            st.action_types.append("verify")
+            st.full_generated_ids.append(int(tok))
+            if tok == int(finalize_token_id):
+                st.terminated_reason = "model_finalize"
+                st.leaf_end_type = "model_finalize"
+            else:
+                st.terminated_reason = "retry"
+                st.leaf_end_type = "non_terminal_retry"
 
     out: List[SegmentResult] = []
     for st in states:
@@ -338,6 +317,9 @@ def _run_segment_wave(
                 next_prefix_attention_mask=next_attn,
                 next_path_generated_len=int(st.req.path_generated_len + len(st.full_generated_ids)),
                 terminated_reason=str(st.terminated_reason),
+                was_forced_finalize=bool(st.was_forced_finalize),
+                verify_action_present=bool(st.verify_action_present),
+                leaf_end_type=str(st.leaf_end_type),
             )
         )
     return out
@@ -361,7 +343,7 @@ def collect_tree_grpo_v1_batch(
     if len(prepared) == 0:
         return [], {}
 
-    # v1 is intentionally shallow and fixed-shape.
+    # v1 split policy is intentionally shallow and fixed-shape.
     root_k = int(cfg.tree.root_siblings)
     if root_k != 4:
         raise RuntimeError(f"This v1 implementation expects tree.root_siblings=4, got {root_k}")
@@ -375,6 +357,7 @@ def collect_tree_grpo_v1_batch(
     prompt_meta: Dict[int, Dict[str, object]] = {}
 
     root_requests: List[ExpandRequest] = []
+    nonroot_request_count = 0
 
     for item in prepared:
         prompt_id = int(item["prompt_id"])
@@ -412,7 +395,8 @@ def collect_tree_grpo_v1_batch(
         requests=root_requests,
         tokenizer=tokenizer,
         vllm_engine=vllm_engine,
-        max_new_tokens_global=int(cfg.rollout.max_new_tokens),
+        max_new_tokens_round=int(cfg.rollout.max_new_tokens),
+        max_retry_depth=int(cfg.tree.max_retry_depth),
         answer_token_id=int(answer_token_id),
         finalize_token_id=int(finalize_token_id),
         retry_token_id=int(retry_token_id),
@@ -428,8 +412,8 @@ def collect_tree_grpo_v1_batch(
         digit_greedy=bool(cfg.rollout.digit_greedy),
     )
 
-    root_nodes_by_prompt: Dict[int, List[int]] = defaultdict(list)
-    for req, seg in zip(root_requests, root_segments):
+    def _append_node(req: ExpandRequest, seg: SegmentResult, *, group_type: str) -> int:
+        nonlocal node_id_next
         nid = int(node_id_next)
         node_id_next += 1
         q = 0.0
@@ -438,10 +422,10 @@ def collect_tree_grpo_v1_batch(
         n = TreeNode(
             node_id=nid,
             prompt_id=int(req.prompt_id),
-            parent_node_id=None,
-            retry_depth=0,
+            parent_node_id=(None if req.parent_node_id is None else int(req.parent_node_id)),
+            retry_depth=int(req.retry_depth),
             group_id=int(req.group_id),
-            group_type="root_siblings",
+            group_type=str(group_type),
             branch_slot=int(req.branch_slot),
             path_generated_len_before=int(req.path_generated_len),
             path_generated_len_after=int(seg.next_path_generated_len),
@@ -456,31 +440,40 @@ def collect_tree_grpo_v1_batch(
             full_generated_ids=list(seg.full_generated_ids),
             q=float(q),
             terminated_reason=str(seg.terminated_reason),
+            was_forced_finalize=bool(seg.was_forced_finalize),
+            verify_action_present=bool(seg.verify_action_present),
+            leaf_end_type=str(seg.leaf_end_type),
         )
         nodes.append(n)
         node_by_id[int(nid)] = n
         groups[int(req.group_id)].member_node_ids.append(int(nid))
+        if req.parent_node_id is not None:
+            parent = node_by_id.get(int(req.parent_node_id))
+            if parent is None:
+                raise RuntimeError(f"Missing parent node_id={int(req.parent_node_id)} for child node_id={nid}")
+            parent.child_node_ids.append(int(nid))
+        return int(nid)
+
+    root_nodes_by_prompt: Dict[int, List[int]] = defaultdict(list)
+    for req, seg in zip(root_requests, root_segments):
+        nid = _append_node(req=req, seg=seg, group_type="root_siblings")
         root_nodes_by_prompt[int(req.prompt_id)].append(int(nid))
 
-    # Expand only retry nodes from root, up to 2 parents per prompt, each with k=2 children.
-    # No deeper expansion in v1.
-    child_requests: List[ExpandRequest] = []
-    selected_retry_parents: set[int] = set()
+    # Root split policy:
+    # - Expand up to K retry parents with k=2 children.
+    # - Remaining retry roots continue as k=1 (no unresolved retry leaves).
+    pending_requests: List[ExpandRequest] = []
 
     for prompt_id, node_ids in root_nodes_by_prompt.items():
         retry_roots = [
             nid
             for nid in node_ids
-            if int(node_by_id[int(nid)].verify_token_id or -1) == int(retry_token_id)
+            if bool(node_by_id[int(nid)].verify_action_present)
+            and int(node_by_id[int(nid)].verify_token_id or -1) == int(retry_token_id)
         ]
         retry_roots.sort(key=lambda nid: int(node_by_id[int(nid)].branch_slot))
         keep = retry_roots[: int(cfg.tree.max_retry_parents_from_root)]
-        selected_retry_parents.update(int(x) for x in keep)
         dropped = retry_roots[int(cfg.tree.max_retry_parents_from_root):]
-        for nid in dropped:
-            # Intentionally pessimistic: parent-cap dropped retries are treated
-            # as truncated retry for Q_R fallback.
-            node_by_id[int(nid)].retry_block_reason = "root_retry_parent_cap"
 
         for parent_nid in keep:
             parent = node_by_id[int(parent_nid)]
@@ -494,88 +487,116 @@ def collect_tree_grpo_v1_batch(
                 member_node_ids=[],
             )
             for branch_slot in range(int(cfg.tree.retry_children_per_parent)):
-                child_requests.append(
+                pending_requests.append(
                     ExpandRequest(
                         prompt_id=int(prompt_id),
                         true_digits=list(prompt_meta[int(prompt_id)]["true_digits"]),
                         prefix_ids=list(parent.prompt_ids) + list(parent.full_generated_ids),
                         prefix_attention_mask=list(parent.prompt_attention_mask) + [1] * len(parent.full_generated_ids),
                         path_generated_len=int(parent.path_generated_len_after),
-                        retry_depth=1,
+                        retry_depth=int(parent.retry_depth + 1),
                         parent_node_id=int(parent_nid),
                         group_id=int(gid),
                         branch_slot=int(branch_slot),
                     )
                 )
+                nonroot_request_count += 1
 
-    child_segments = _run_segment_wave(
-        requests=child_requests,
-        tokenizer=tokenizer,
-        vllm_engine=vllm_engine,
-        max_new_tokens_global=int(cfg.rollout.max_new_tokens),
-        answer_token_id=int(answer_token_id),
-        finalize_token_id=int(finalize_token_id),
-        retry_token_id=int(retry_token_id),
-        digit_token_ids=digit_token_ids,
-        temperature=float(cfg.rollout.temperature),
-        top_p=float(cfg.rollout.top_p),
-        verify_temperature=float(cfg.rollout.verify_temperature),
-        verify_p=float(cfg.rollout.verify_p),
-        min_p=float(cfg.rollout.min_p),
-        repetition_penalty=float(cfg.rollout.repetition_penalty),
-        digit_temperature=float(cfg.rollout.digit_temperature),
-        digit_top_p=float(cfg.rollout.digit_top_p),
-        digit_greedy=bool(cfg.rollout.digit_greedy),
-    )
+        # Not split because of parent cap: continue with a single route.
+        for parent_nid in dropped:
+            parent = node_by_id[int(parent_nid)]
+            parent.retry_block_reason = "continued_single_after_parent_cap"
+            gid = int(group_id_next)
+            group_id_next += 1
+            groups[gid] = TreeGroup(
+                group_id=gid,
+                prompt_id=int(prompt_id),
+                group_type="retry_single_continue",
+                parent_node_id=int(parent_nid),
+                member_node_ids=[],
+            )
+            pending_requests.append(
+                ExpandRequest(
+                    prompt_id=int(prompt_id),
+                    true_digits=list(prompt_meta[int(prompt_id)]["true_digits"]),
+                    prefix_ids=list(parent.prompt_ids) + list(parent.full_generated_ids),
+                    prefix_attention_mask=list(parent.prompt_attention_mask) + [1] * len(parent.full_generated_ids),
+                    path_generated_len=int(parent.path_generated_len_after),
+                    retry_depth=int(parent.retry_depth + 1),
+                    parent_node_id=int(parent_nid),
+                    group_id=int(gid),
+                    branch_slot=0,
+                )
+            )
+            nonroot_request_count += 1
 
-    for req, seg in zip(child_requests, child_segments):
-        nid = int(node_id_next)
-        node_id_next += 1
-        q = 0.0
-        if seg.pred_digits is not None:
-            q = 1.0 if list(seg.pred_digits) == list(req.true_digits) else 0.0
-        n = TreeNode(
-            node_id=nid,
-            prompt_id=int(req.prompt_id),
-            parent_node_id=(None if req.parent_node_id is None else int(req.parent_node_id)),
-            retry_depth=1,
-            group_id=int(req.group_id),
-            group_type="retry_children",
-            branch_slot=int(req.branch_slot),
-            path_generated_len_before=int(req.path_generated_len),
-            path_generated_len_after=int(seg.next_path_generated_len),
-            prompt_ids=list(req.prefix_ids),
-            prompt_attention_mask=list(req.prefix_attention_mask),
-            z_token_ids=list(seg.z_token_ids),
-            digit_token_ids=list(seg.digit_token_ids),
-            pred_digits=(None if seg.pred_digits is None else list(seg.pred_digits)),
-            verify_token_id=(None if seg.verify_token_id is None else int(seg.verify_token_id)),
-            actions=list(seg.actions),
-            action_types=list(seg.action_types),
-            full_generated_ids=list(seg.full_generated_ids),
-            q=float(q),
-            terminated_reason=str(seg.terminated_reason),
+    # After root split phase, all retry continuations are k=1 until terminal.
+    while pending_requests:
+        segs = _run_segment_wave(
+            requests=pending_requests,
+            tokenizer=tokenizer,
+            vllm_engine=vllm_engine,
+            max_new_tokens_round=int(cfg.rollout.max_new_tokens),
+            max_retry_depth=int(cfg.tree.max_retry_depth),
+            answer_token_id=int(answer_token_id),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
+            digit_token_ids=digit_token_ids,
+            temperature=float(cfg.rollout.temperature),
+            top_p=float(cfg.rollout.top_p),
+            verify_temperature=float(cfg.rollout.verify_temperature),
+            verify_p=float(cfg.rollout.verify_p),
+            min_p=float(cfg.rollout.min_p),
+            repetition_penalty=float(cfg.rollout.repetition_penalty),
+            digit_temperature=float(cfg.rollout.digit_temperature),
+            digit_top_p=float(cfg.rollout.digit_top_p),
+            digit_greedy=bool(cfg.rollout.digit_greedy),
         )
-        nodes.append(n)
-        node_by_id[int(nid)] = n
-        groups[int(req.group_id)].member_node_ids.append(int(nid))
-        if req.parent_node_id is not None:
-            parent = node_by_id.get(int(req.parent_node_id))
-            if parent is None:
-                raise RuntimeError(f"Missing parent node_id={int(req.parent_node_id)} for child node_id={nid}")
-            parent.child_node_ids.append(int(nid))
+        next_pending: List[ExpandRequest] = []
+        for req, seg in zip(pending_requests, segs):
+            gid = groups[int(req.group_id)].group_type
+            nid = _append_node(req=req, seg=seg, group_type=str(gid))
+            node = node_by_id[int(nid)]
+            if bool(node.verify_action_present) and int(node.verify_token_id or -1) == int(retry_token_id):
+                cgid = int(group_id_next)
+                group_id_next += 1
+                groups[cgid] = TreeGroup(
+                    group_id=cgid,
+                    prompt_id=int(node.prompt_id),
+                    group_type="retry_single_continue",
+                    parent_node_id=int(nid),
+                    member_node_ids=[],
+                )
+                next_pending.append(
+                    ExpandRequest(
+                        prompt_id=int(node.prompt_id),
+                        true_digits=list(prompt_meta[int(node.prompt_id)]["true_digits"]),
+                        prefix_ids=list(node.prompt_ids) + list(node.full_generated_ids),
+                        prefix_attention_mask=list(node.prompt_attention_mask) + [1] * len(node.full_generated_ids),
+                        path_generated_len=int(node.path_generated_len_after),
+                        retry_depth=int(node.retry_depth + 1),
+                        parent_node_id=int(nid),
+                        group_id=int(cgid),
+                        branch_slot=0,
+                    )
+                )
+                nonroot_request_count += 1
+        pending_requests = next_pending
 
-    for root_nid in selected_retry_parents:
-        root_node = node_by_id[int(root_nid)]
-        if len(root_node.child_node_ids) == 0:
-            root_node.retry_block_reason = "budget_truncated"
+    # Strict invariant: no unresolved retry leaves in normal algorithm.
+    for n in nodes:
+        if bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id):
+            if len(n.child_node_ids) == 0:
+                n.retry_block_reason = "exception_missing_retry_child"
+                raise RuntimeError(
+                    f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
+                )
 
     assign_tree_values_and_advantages(
         nodes=nodes,
         groups=groups,
         retry_token_id=int(retry_token_id),
         c_retry=float(cfg.tree.c_retry),
-        c_trunc=float(cfg.tree.c_trunc),
         gamma=float(cfg.tree.gamma),
         c_branch=float(cfg.tree.c_branch),
         advantage_clip=float(cfg.tree.advantage_clip),
@@ -634,6 +655,14 @@ def collect_tree_grpo_v1_batch(
             "child_node_ids": [int(x) for x in n.child_node_ids],
             "retry_block_reason": str(n.retry_block_reason),
             "terminated_reason": str(n.terminated_reason),
+            "leaf_end_type": str(n.leaf_end_type),
+            "was_forced_finalize": bool(n.was_forced_finalize),
+            "retry_depth_at_leaf": (
+                int(n.retry_depth)
+                if str(n.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
+                else None
+            ),
+            "verify_action_present": bool(n.verify_action_present),
             "tree_mode": "shallow_v1",
         }
 
@@ -670,6 +699,14 @@ def collect_tree_grpo_v1_batch(
                     "digit_token_ids": list(n.digit_token_ids),
                     "pred_digits": (None if n.pred_digits is None else list(n.pred_digits)),
                     "verify_token_id": (None if n.verify_token_id is None else int(n.verify_token_id)),
+                    "verify_action_present": bool(n.verify_action_present),
+                    "leaf_end_type": str(n.leaf_end_type),
+                    "was_forced_finalize": bool(n.was_forced_finalize),
+                    "retry_depth_at_leaf": (
+                        int(n.retry_depth)
+                        if str(n.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
+                        else None
+                    ),
                     "q": float(n.q),
                     "Q_F": float(n.Q_F),
                     "Q_R": float(n.Q_R),
@@ -694,6 +731,6 @@ def collect_tree_grpo_v1_batch(
     stats = tree_summary(nodes=nodes, retry_token_id=int(retry_token_id))
     stats["num_groups"] = float(len(groups))
     stats["num_root_requests"] = float(len(root_requests))
-    stats["num_child_requests"] = float(len(child_requests))
+    stats["num_child_requests"] = float(nonroot_request_count)
     stats["num_trajectories"] = float(len(trajectories))
     return trajectories, stats

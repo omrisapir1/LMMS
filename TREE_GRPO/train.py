@@ -374,9 +374,10 @@ def train(cfg: Config) -> None:
         f"Tree-GRPO v1 | root_siblings={cfg.tree.root_siblings} | "
         f"max_retry_parents_from_root={cfg.tree.max_retry_parents_from_root} | "
         f"retry_children_per_parent={cfg.tree.retry_children_per_parent} | "
+        f"max_retry_depth={cfg.tree.max_retry_depth} | "
         f"verify_temperature={cfg.rollout.verify_temperature:.4f} | "
         f"verify_p={cfg.rollout.verify_p:.4f} | "
-        f"c_retry={cfg.tree.c_retry:.4f} c_trunc={cfg.tree.c_trunc:.4f} gamma={cfg.tree.gamma:.4f}"
+        f"c_retry={cfg.tree.c_retry:.4f} gamma={cfg.tree.gamma:.4f}"
     )
 
     lm_head = model.get_output_embeddings()
@@ -577,6 +578,10 @@ def train(cfg: Config) -> None:
                     "parent_node_id": traj.reward_info.get("parent_node_id", None),
                     "child_node_ids": traj.reward_info.get("child_node_ids", None),
                     "retry_block_reason": traj.reward_info.get("retry_block_reason", None),
+                    "leaf_end_type": traj.reward_info.get("leaf_end_type", None),
+                    "was_forced_finalize": traj.reward_info.get("was_forced_finalize", None),
+                    "retry_depth_at_leaf": traj.reward_info.get("retry_depth_at_leaf", None),
+                    "verify_action_present": traj.reward_info.get("verify_action_present", None),
                     "actions": traj.actions,
                     "action_types": traj.action_types,
                     "logp_old": traj.logp_old,

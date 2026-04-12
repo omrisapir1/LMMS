@@ -40,6 +40,9 @@ class SegmentResult:
     next_prefix_attention_mask: List[int]
     next_path_generated_len: int
     terminated_reason: str
+    was_forced_finalize: bool
+    verify_action_present: bool
+    leaf_end_type: str
 
 
 @dataclass
@@ -76,3 +79,6 @@ class TreeNode:
     A_Z: float = 0.0
     A_V: float = 0.0
     terminated_reason: str = "max_new_tokens"
+    was_forced_finalize: bool = False
+    verify_action_present: bool = False
+    leaf_end_type: str = "model_finalize"

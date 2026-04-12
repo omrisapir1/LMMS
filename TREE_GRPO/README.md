@@ -8,6 +8,11 @@ Current rollout shape:
 - Expand at most 2 retry parents from root
 - Each expanded parent gets 2 children
 - No deeper expansion (intentional v1 constraint)
+- Non-split retry paths continue as single-route until terminal
+
+Terminal semantics:
+- Every leaf ends with a real terminal 5-digit answer
+- At `tree.max_retry_depth`, verify is skipped and finalize is forced
 
 Credit semantics:
 - `Q_F`, `Q_R`, `U=max(Q_F,Q_R)`, `V`
