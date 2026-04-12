@@ -20,7 +20,6 @@ def assign_tree_values_and_advantages(
     *,
     nodes: List[TreeNode],
     groups: Dict[int, TreeGroup],
-    finalize_token_id: int,
     retry_token_id: int,
     c_retry: float,
     c_trunc: float,
@@ -68,6 +67,9 @@ def assign_tree_values_and_advantages(
                     backup = float(sum(best) / float(len(best)))
                 n.Q_R = -float(c_retry) - float(c_branch) + float(gamma) * float(backup)
             else:
+                # Intentional pessimistic fallback:
+                # retry nodes that were not expanded (including parent-cap drops /
+                # budget truncation in shallow v1) are treated as truncated retry.
                 n.Q_R = -float(c_retry) - float(c_trunc)
 
             n.U = float(max(n.Q_F, n.Q_R))

@@ -1771,9 +1771,9 @@ def _collect_rollouts_vllm_batch_multiround(
                     if supports_token_prompts:
                         verify_rows = vllm_engine.generate_verify(
                             prompt_token_ids=verify_prompt_ids,
-                            temperature=cfg.rollout.temperature,
-                            top_p=cfg.rollout.top_p,
-                            greedy=True,
+                            temperature=cfg.rollout.verify_temperature,
+                            top_p=cfg.rollout.verify_p,
+                            greedy=False,
                             min_p=cfg.rollout.min_p,
                             repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
@@ -1785,9 +1785,9 @@ def _collect_rollouts_vllm_batch_multiround(
                         ]
                         verify_rows = vllm_engine.generate_verify(
                             prompts=verify_texts,
-                            temperature=cfg.rollout.temperature,
-                            top_p=cfg.rollout.top_p,
-                            greedy=True,
+                            temperature=cfg.rollout.verify_temperature,
+                            top_p=cfg.rollout.verify_p,
+                            greedy=False,
                             min_p=cfg.rollout.min_p,
                             repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
@@ -2404,6 +2404,10 @@ def train(cfg: Config) -> None:
         raise ValueError("rollout.temperature must be > 0")
     if float(cfg.rollout.top_p) <= 0.0 or float(cfg.rollout.top_p) > 1.0:
         raise ValueError("rollout.top_p must be in (0, 1]")
+    if float(cfg.rollout.verify_temperature) <= 0.0:
+        raise ValueError("rollout.verify_temperature must be > 0")
+    if float(cfg.rollout.verify_p) <= 0.0 or float(cfg.rollout.verify_p) > 1.0:
+        raise ValueError("rollout.verify_p must be in (0, 1]")
     if float(cfg.rollout.digit_temperature) <= 0.0:
         raise ValueError("rollout.digit_temperature must be > 0")
     if float(cfg.rollout.digit_top_p) <= 0.0 or float(cfg.rollout.digit_top_p) > 1.0:
@@ -2471,6 +2475,8 @@ def train(cfg: Config) -> None:
     _log(
         f"Action scope={action_scope} | Z tokens={len(z_token_ids)} ({z_style}) | "
         f"answer_token_id={answer_token_id} | finalize_token_id={finalize_token_id} | retry_token_id={retry_token_id} | "
+        f"verify_temperature={float(cfg.rollout.verify_temperature):.4f} | "
+        f"verify_p={float(cfg.rollout.verify_p):.4f} | "
         f"verify_finalize_logit_bias={float(cfg.rollout.verify_finalize_logit_bias):.4f} | "
         f"verify_retry_logit_bias={float(cfg.rollout.verify_retry_logit_bias):.4f}"
     )

@@ -38,6 +38,8 @@ def _run_segment_wave(
     digit_token_ids: Sequence[int],
     temperature: float,
     top_p: float,
+    verify_temperature: float,
+    verify_p: float,
     min_p: float,
     repetition_penalty: float,
     digit_temperature: float,
@@ -73,35 +75,53 @@ def _run_segment_wave(
 
     if active_idx:
         max_z_budget = max(states[i].remaining_budget for i in active_idx)
-        z_prompt_ids = [requests[i].prefix_ids for i in active_idx]
-        if supports_token_prompts:
-            z_rows = vllm_engine.generate_z(
-                prompt_token_ids=z_prompt_ids,
-                num_samples_per_prompt=1,
-                max_new_tokens=max_z_budget,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                min_p=float(min_p),
-                repetition_penalty=float(repetition_penalty),
-            )
-        else:
-            z_texts = [_decode_cached(x) for x in z_prompt_ids]
-            z_rows = vllm_engine.generate_z(
-                prompts=z_texts,
-                num_samples_per_prompt=1,
-                max_new_tokens=max_z_budget,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                min_p=float(min_p),
-                repetition_penalty=float(repetition_penalty),
-            )
-        if len(z_rows) != len(active_idx):
-            raise RuntimeError("Tree wave Z-phase row count mismatch")
+        row_by_req_idx: Dict[int, Dict[str, object]] = {}
+
+        # Group by identical prefix to reuse prefill and request sibling samples
+        # via num_samples_per_prompt=k (important for retry-child efficiency).
+        prefix_to_req_idxs: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+        for req_idx in active_idx:
+            key = tuple(int(x) for x in requests[req_idx].prefix_ids)
+            prefix_to_req_idxs[key].append(int(req_idx))
+
+        for key, req_idxs in prefix_to_req_idxs.items():
+            ordered_req_idxs = sorted(req_idxs, key=lambda i: int(requests[i].branch_slot))
+            k = int(len(ordered_req_idxs))
+            if k <= 0:
+                continue
+            if supports_token_prompts:
+                z_rows_group = vllm_engine.generate_z(
+                    prompt_token_ids=[list(key)],
+                    num_samples_per_prompt=k,
+                    max_new_tokens=max_z_budget,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    min_p=float(min_p),
+                    repetition_penalty=float(repetition_penalty),
+                )
+            else:
+                z_rows_group = vllm_engine.generate_z(
+                    prompts=[_decode_cached(key)],
+                    num_samples_per_prompt=k,
+                    max_new_tokens=max_z_budget,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    min_p=float(min_p),
+                    repetition_penalty=float(repetition_penalty),
+                )
+            if len(z_rows_group) != k:
+                raise RuntimeError(
+                    f"Tree wave grouped Z-phase row count mismatch: got={len(z_rows_group)} expected={k}"
+                )
+            for local_i, req_idx in enumerate(ordered_req_idxs):
+                row_by_req_idx[int(req_idx)] = dict(z_rows_group[local_i])
 
         need_digits: List[int] = []
-        for j, req_idx in enumerate(active_idx):
+        for req_idx in active_idx:
             st = states[req_idx]
-            row = z_rows[j]
+            row = row_by_req_idx.get(int(req_idx))
+            if row is None:
+                raise RuntimeError(f"Missing grouped Z-phase row for request index {req_idx}")
             z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
                 row=row,
                 answer_token_id=int(answer_token_id),
@@ -201,9 +221,9 @@ def _run_segment_wave(
                     if supports_token_prompts:
                         verify_rows = vllm_engine.generate_verify(
                             prompt_token_ids=verify_prompt_ids,
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            greedy=True,
+                            temperature=float(verify_temperature),
+                            top_p=float(verify_p),
+                            greedy=False,
                             min_p=float(min_p),
                             repetition_penalty=float(repetition_penalty),
                         )
@@ -211,9 +231,9 @@ def _run_segment_wave(
                         verify_texts = [_decode_cached(x) for x in verify_prompt_ids]
                         verify_rows = vllm_engine.generate_verify(
                             prompts=verify_texts,
-                            temperature=float(temperature),
-                            top_p=float(top_p),
-                            greedy=True,
+                            temperature=float(verify_temperature),
+                            top_p=float(verify_p),
+                            greedy=False,
                             min_p=float(min_p),
                             repetition_penalty=float(repetition_penalty),
                         )
@@ -276,6 +296,7 @@ def collect_tree_grpo_v1_batch(
     if len(prepared) == 0:
         return [], {}
 
+    # v1 is intentionally shallow and fixed-shape.
     root_k = int(cfg.tree.root_siblings)
     if root_k != 4:
         raise RuntimeError(f"This v1 implementation expects tree.root_siblings=4, got {root_k}")
@@ -284,11 +305,11 @@ def collect_tree_grpo_v1_batch(
     node_id_next = 0
     groups: Dict[int, TreeGroup] = {}
     nodes: List[TreeNode] = []
+    node_by_id: Dict[int, TreeNode] = {}
 
     prompt_meta: Dict[int, Dict[str, object]] = {}
 
     root_requests: List[ExpandRequest] = []
-    prompt_root_group: Dict[int, int] = {}
 
     for item in prepared:
         prompt_id = int(item["prompt_id"])
@@ -306,7 +327,6 @@ def collect_tree_grpo_v1_batch(
             parent_node_id=None,
             member_node_ids=[],
         )
-        prompt_root_group[prompt_id] = gid
 
         for branch_slot in range(root_k):
             root_requests.append(
@@ -334,6 +354,8 @@ def collect_tree_grpo_v1_batch(
         digit_token_ids=digit_token_ids,
         temperature=float(cfg.rollout.temperature),
         top_p=float(cfg.rollout.top_p),
+        verify_temperature=float(cfg.rollout.verify_temperature),
+        verify_p=float(cfg.rollout.verify_p),
         min_p=float(cfg.rollout.min_p),
         repetition_penalty=float(cfg.rollout.repetition_penalty),
         digit_temperature=float(cfg.rollout.digit_temperature),
@@ -371,10 +393,12 @@ def collect_tree_grpo_v1_batch(
             terminated_reason=str(seg.terminated_reason),
         )
         nodes.append(n)
+        node_by_id[int(nid)] = n
         groups[int(req.group_id)].member_node_ids.append(int(nid))
         root_nodes_by_prompt[int(req.prompt_id)].append(int(nid))
 
     # Expand only retry nodes from root, up to 2 parents per prompt, each with k=2 children.
+    # No deeper expansion in v1.
     child_requests: List[ExpandRequest] = []
     selected_retry_parents: set[int] = set()
 
@@ -382,17 +406,19 @@ def collect_tree_grpo_v1_batch(
         retry_roots = [
             nid
             for nid in node_ids
-            if int(nodes[nid].verify_token_id or -1) == int(retry_token_id)
+            if int(node_by_id[int(nid)].verify_token_id or -1) == int(retry_token_id)
         ]
-        retry_roots.sort(key=lambda nid: int(nodes[nid].branch_slot))
+        retry_roots.sort(key=lambda nid: int(node_by_id[int(nid)].branch_slot))
         keep = retry_roots[: int(cfg.tree.max_retry_parents_from_root)]
         selected_retry_parents.update(int(x) for x in keep)
         dropped = retry_roots[int(cfg.tree.max_retry_parents_from_root):]
         for nid in dropped:
-            nodes[nid].retry_block_reason = "root_retry_parent_cap"
+            # Intentionally pessimistic: parent-cap dropped retries are treated
+            # as truncated retry for Q_R fallback.
+            node_by_id[int(nid)].retry_block_reason = "root_retry_parent_cap"
 
         for parent_nid in keep:
-            parent = nodes[parent_nid]
+            parent = node_by_id[int(parent_nid)]
             gid = int(group_id_next)
             group_id_next += 1
             groups[gid] = TreeGroup(
@@ -428,6 +454,8 @@ def collect_tree_grpo_v1_batch(
         digit_token_ids=digit_token_ids,
         temperature=float(cfg.rollout.temperature),
         top_p=float(cfg.rollout.top_p),
+        verify_temperature=float(cfg.rollout.verify_temperature),
+        verify_p=float(cfg.rollout.verify_p),
         min_p=float(cfg.rollout.min_p),
         repetition_penalty=float(cfg.rollout.repetition_penalty),
         digit_temperature=float(cfg.rollout.digit_temperature),
@@ -464,18 +492,22 @@ def collect_tree_grpo_v1_batch(
             terminated_reason=str(seg.terminated_reason),
         )
         nodes.append(n)
+        node_by_id[int(nid)] = n
         groups[int(req.group_id)].member_node_ids.append(int(nid))
         if req.parent_node_id is not None:
-            nodes[int(req.parent_node_id)].child_node_ids.append(int(nid))
+            parent = node_by_id.get(int(req.parent_node_id))
+            if parent is None:
+                raise RuntimeError(f"Missing parent node_id={int(req.parent_node_id)} for child node_id={nid}")
+            parent.child_node_ids.append(int(nid))
 
     for root_nid in selected_retry_parents:
-        if len(nodes[root_nid].child_node_ids) == 0:
-            nodes[root_nid].retry_block_reason = "budget_truncated"
+        root_node = node_by_id[int(root_nid)]
+        if len(root_node.child_node_ids) == 0:
+            root_node.retry_block_reason = "budget_truncated"
 
     assign_tree_values_and_advantages(
         nodes=nodes,
         groups=groups,
-        finalize_token_id=int(finalize_token_id),
         retry_token_id=int(retry_token_id),
         c_retry=float(cfg.tree.c_retry),
         c_trunc=float(cfg.tree.c_trunc),

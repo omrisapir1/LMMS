@@ -33,6 +33,8 @@ class RolloutConfig:
     max_new_tokens: int = MAX_TOKENS
     temperature: float = 1.2
     top_p: float = 0.95
+    verify_temperature: float = 1.2
+    verify_p: float = 0.95
     min_p: float = 0.03
     repetition_penalty: float = 1.1
     digit_temperature: float = 1.0

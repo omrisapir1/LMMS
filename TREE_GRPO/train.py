@@ -4,7 +4,6 @@ import argparse
 import ast
 import copy
 import json
-import math
 import os
 import random
 import time
@@ -60,12 +59,6 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def _make_rng(seed: int) -> torch.Generator:
-    g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed))
-    return g
 
 
 def _apply_override(cfg: Config, key: str, raw_value: str) -> None:
@@ -188,11 +181,17 @@ def train(cfg: Config) -> None:
     z_allowed_t = torch.tensor(list(z_token_ids) + [int(answer_token_id)], dtype=torch.long, device=device)
     digit_allowed_t = torch.tensor(list(digit_token_ids), dtype=torch.long, device=device)
     verify_allowed_t = torch.tensor([int(finalize_token_id), int(retry_token_id)], dtype=torch.long, device=device)
+    if float(cfg.rollout.verify_temperature) <= 0.0:
+        raise ValueError("rollout.verify_temperature must be > 0")
+    if float(cfg.rollout.verify_p) <= 0.0 or float(cfg.rollout.verify_p) > 1.0:
+        raise ValueError("rollout.verify_p must be in (0, 1]")
 
     _log(
         f"Tree-GRPO v1 | root_siblings={cfg.tree.root_siblings} | "
         f"max_retry_parents_from_root={cfg.tree.max_retry_parents_from_root} | "
         f"retry_children_per_parent={cfg.tree.retry_children_per_parent} | "
+        f"verify_temperature={cfg.rollout.verify_temperature:.4f} | "
+        f"verify_p={cfg.rollout.verify_p:.4f} | "
         f"c_retry={cfg.tree.c_retry:.4f} c_trunc={cfg.tree.c_trunc:.4f} gamma={cfg.tree.gamma:.4f}"
     )
 
@@ -299,7 +298,6 @@ def train(cfg: Config) -> None:
 
     ds_index = 0
     rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
-    reward_rng = _make_rng(cfg.train.seed + 17)
 
     try:
         for update in range(1, int(cfg.train.updates) + 1):

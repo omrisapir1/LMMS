@@ -7,6 +7,7 @@ Current rollout shape:
 - Retry expansion: one additional level only
 - Expand at most 2 retry parents from root
 - Each expanded parent gets 2 children
+- No deeper expansion (intentional v1 constraint)
 
 Credit semantics:
 - `Q_F`, `Q_R`, `U=max(Q_F,Q_R)`, `V`
@@ -16,3 +17,4 @@ Credit semantics:
 
 Entry point:
 - `python -m TREE_GRPO.train`
+- `python train_tree_grpo.py`
