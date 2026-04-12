@@ -64,7 +64,7 @@ class RewardConfig:
     length_penalty: float = 0.00005
     reward_if_max_len: float = -0.1
     correct_length_discount: float = 0.1
-    early_success: float = 0.4
+    early_success: float = 0.7
     rounds_penalty_coef: float = 0.0005
 
 
@@ -86,7 +86,7 @@ class PPOConfig:
     adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
     adv_norm_hybrid_alpha: float = 0.3
     adv_norm_use_global_for_homogeneous_prompts: bool = True
-    value_warmup_steps: int = 25
+    value_warmup_steps: int = 1
     value_warmup_lr: float = 1e-4
 
 
@@ -97,7 +97,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 16
     seed: int = 42
     output_dir: str = "./runs/ppo"
     save_every: int = 25
