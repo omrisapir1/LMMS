@@ -54,7 +54,7 @@ def assign_tree_values_and_advantages(
 
             if not has_verify_action:
                 # Retry is not a legal action on forced-finalize rounds.
-                n.Q_R = float(n.Q_F)
+                n.Q_R = None
                 n.U = float(n.Q_F)
                 n.V = float(n.Q_F)
                 n.A_V = 0.0
@@ -73,12 +73,13 @@ def assign_tree_values_and_advantages(
                     backup = float(sum(best) / 2.0)
                 else:
                     backup = float(sum(child_vals) / float(len(child_vals)))
-                n.Q_R = -float(c_retry) - float(c_branch) + float(gamma) * float(backup)
+                n.Q_R = float(-float(c_retry) - float(c_branch) + float(gamma) * float(backup))
             else:
                 # Finalize-chosen nodes may not have sampled retry descendants.
                 # Keep counterfactual conservative-neutral in v1 (no truncation semantics).
                 n.Q_R = float(n.Q_F)
 
+            assert n.Q_R is not None
             n.U = float(max(n.Q_F, n.Q_R))
             n.V = float(n.Q_R if chosen_retry else n.Q_F)
 

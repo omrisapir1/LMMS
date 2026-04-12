@@ -73,7 +73,7 @@ class TreeNode:
 
     q: float = 0.0
     Q_F: float = 0.0
-    Q_R: float = 0.0
+    Q_R: Optional[float] = None
     U: float = 0.0
     V: float = 0.0
     A_Z: float = 0.0
