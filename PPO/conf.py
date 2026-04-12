@@ -86,7 +86,7 @@ class PPOConfig:
     adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
     adv_norm_hybrid_alpha: float = 0.3
     adv_norm_use_global_for_homogeneous_prompts: bool = True
-    value_warmup_steps: int = 1
+    value_warmup_steps: int = 5
     value_warmup_lr: float = 1e-4
 
 
