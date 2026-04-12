@@ -65,7 +65,7 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     ref_model_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    tree_prompts_per_update: int = 2
+    tree_prompts_per_update: int = 1
 
 
 @dataclass
