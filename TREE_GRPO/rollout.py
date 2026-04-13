@@ -842,163 +842,244 @@ def collect_tree_grpo_v1_batch(
         advantage_clip=float(cfg.tree.advantage_clip),
     )
 
-    trajectories: List[Trajectory] = []
+    # Compact k=1 retry chains: structural nodes are branch points (k>1) and leaves.
+    start_ids: List[int] = []
     for n in nodes:
-        if len(n.actions) == 0:
+        pid = int(n.parent_node_id) if n.parent_node_id is not None else None
+        if pid is None:
+            start_ids.append(int(n.node_id))
             continue
+        p = node_by_id.get(int(pid))
+        if p is None:
+            start_ids.append(int(n.node_id))
+            continue
+        if int(p.k_used) > 1:
+            start_ids.append(int(n.node_id))
+
+    start_ids = sorted(set(start_ids))
+    raw_chain_by_start: Dict[int, List[int]] = {}
+    start_for_raw: Dict[int, int] = {}
+    for sid in start_ids:
+        chain: List[int] = []
+        cur = int(sid)
+        while True:
+            if cur in start_for_raw:
+                break
+            node = node_by_id[int(cur)]
+            chain.append(int(cur))
+            start_for_raw[int(cur)] = int(sid)
+            can_linear_merge = (
+                bool(node.verify_action_present)
+                and int(node.verify_token_id or -1) == int(retry_token_id)
+                and int(node.k_used) == 1
+                and len(node.child_node_ids) == 1
+                and str(node.retry_block_reason) != "budget_exhausted_no_k1"
+            )
+            if not can_linear_merge:
+                break
+            nxt = int(node.child_node_ids[0])
+            if nxt not in node_by_id:
+                break
+            cur = int(nxt)
+        raw_chain_by_start[int(sid)] = list(chain)
+
+    compact_ids = {sid: i for i, sid in enumerate(start_ids)}
+
+    trajectories: List[Trajectory] = []
+    for sid in start_ids:
+        chain_ids = raw_chain_by_start[int(sid)]
+        chain_nodes = [node_by_id[int(x)] for x in chain_ids]
+        if len(chain_nodes) == 0:
+            continue
+        first = chain_nodes[0]
+        last = chain_nodes[-1]
+
+        actions: List[int] = []
+        action_types: List[str] = []
+        full_generated_ids: List[int] = []
+        returns: List[float] = []
+        advantages: List[float] = []
+        rounds_meta: List[Dict[str, object]] = []
+        for rn in chain_nodes:
+            actions.extend(list(rn.actions))
+            action_types.extend(list(rn.action_types))
+            full_generated_ids.extend(list(rn.full_generated_ids))
+            for t in rn.action_types:
+                if str(t) == "verify":
+                    returns.append(float(rn.V))
+                    advantages.append(float(rn.A_V))
+                else:
+                    returns.append(float(rn.U))
+                    advantages.append(float(rn.A_Z))
+            rounds_meta.append(
+                {
+                    "tree_node_id": int(compact_ids[int(sid)]),
+                    "round_raw_node_id": int(rn.node_id),
+                    "group_id": int(rn.group_id),
+                    "group_type": str(rn.group_type),
+                    "retry_depth": int(rn.retry_depth),
+                    "parent_node_id": int(rn.parent_node_id) if rn.parent_node_id is not None else None,
+                    "z_token_ids": list(rn.z_token_ids),
+                    "digit_token_ids": list(rn.digit_token_ids),
+                    "pred_digits": (None if rn.pred_digits is None else list(rn.pred_digits)),
+                    "verify_token_id": (None if rn.verify_token_id is None else int(rn.verify_token_id)),
+                    "verify_action_present": bool(rn.verify_action_present),
+                    "k_used": int(rn.k_used),
+                    "branching_decision": str(rn.branching_decision),
+                    "continued_linearly": bool(int(rn.k_used) == 1 and len(rn.child_node_ids) == 1),
+                    "leaf_end_type": str(rn.leaf_end_type),
+                    "was_forced_finalize": bool(rn.was_forced_finalize),
+                    "retry_depth_at_leaf": (
+                        int(rn.retry_depth)
+                        if str(rn.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
+                        else None
+                    ),
+                    "q": float(rn.q),
+                    "Q_F": float(rn.Q_F),
+                    "Q_R": (None if rn.Q_R is None else float(rn.Q_R)),
+                    "U": float(rn.U),
+                    "V": float(rn.V),
+                    "A_Z": float(rn.A_Z),
+                    "A_V": float(rn.A_V),
+                    "has_forced_retry_probe": bool(rn.has_forced_retry_probe),
+                    "probe_terminal_value": (
+                        None if rn.probe_terminal_value is None else float(rn.probe_terminal_value)
+                    ),
+                    "probe_terminal_node_id": (
+                        None if rn.probe_terminal_node_id is None else int(rn.probe_terminal_node_id)
+                    ),
+                    "probe_length_rounds": (
+                        None if rn.probe_length_rounds is None else int(rn.probe_length_rounds)
+                    ),
+                    "probe_leaf_end_type": (
+                        None if rn.probe_leaf_end_type is None else str(rn.probe_leaf_end_type)
+                    ),
+                    "probe_start_retry_depth": (
+                        None if rn.probe_start_retry_depth is None else int(rn.probe_start_retry_depth)
+                    ),
+                    "probe_nodes": (
+                        []
+                        if int(rn.node_id) not in probe_results
+                        else list(probe_results[int(rn.node_id)].get("probe_nodes", []))
+                    ),
+                    "retry_block_reason": str(rn.retry_block_reason),
+                }
+            )
+
+        if len(returns) != len(actions):
+            raise RuntimeError("Tree returns length mismatch after linear compaction")
+        if len(advantages) != len(actions):
+            raise RuntimeError("Tree advantages length mismatch after linear compaction")
 
         logp_t, entropy_t = _action_logp_entropy_tensors(
             model=model,
-            prompt_ids=n.prompt_ids,
-            prompt_attention_mask=n.prompt_attention_mask,
-            actions=n.actions,
-            action_types=n.action_types,
+            prompt_ids=first.prompt_ids,
+            prompt_attention_mask=first.prompt_attention_mask,
+            actions=actions,
+            action_types=action_types,
             z_allowed_t=z_allowed_t,
             digit_allowed_t=digit_allowed_t,
             verify_allowed_t=verify_allowed_t,
             temperature=float(cfg.rollout.temperature),
         )
 
-        returns: List[float] = []
-        advantages: List[float] = []
-        for t in n.action_types:
-            if str(t) == "verify":
-                returns.append(float(n.V))
-                advantages.append(float(n.A_V))
-            else:
-                returns.append(float(n.U))
-                advantages.append(float(n.A_Z))
+        compact_child_ids: List[int] = []
+        for raw_child in last.child_node_ids:
+            sid_child = start_for_raw.get(int(raw_child))
+            if sid_child is None:
+                continue
+            compact_child_ids.append(int(compact_ids[int(sid_child)]))
+        compact_child_ids = sorted(set(compact_child_ids))
 
-        if len(returns) != len(n.actions):
-            raise RuntimeError("Tree returns length mismatch")
-        if len(advantages) != len(n.actions):
-            raise RuntimeError("Tree advantages length mismatch")
+        compact_parent_id: Optional[int] = None
+        raw_parent = first.parent_node_id
+        if raw_parent is not None:
+            parent_start = start_for_raw.get(int(raw_parent))
+            if parent_start is not None and int(parent_start) in compact_ids:
+                compact_parent_id = int(compact_ids[int(parent_start)])
 
-        prompt_info = prompt_meta[int(n.prompt_id)]
+        prompt_info = prompt_meta[int(first.prompt_id)]
         reward_info: Dict[str, object] = {
-            "reward_full": int(1 if float(n.q) >= 1.0 else 0),
-            "reward_partial": float(n.q),
-            "reward": float(n.q),
-            "reward_final": float(n.V),
-            "exact_match": bool(float(n.q) >= 1.0),
-            "q": float(n.q),
-            "Q_F": float(n.Q_F),
-            "Q_R": (None if n.Q_R is None else float(n.Q_R)),
-            "U": float(n.U),
-            "V": float(n.V),
-            "A_Z": float(n.A_Z),
-            "A_V": float(n.A_V),
-            "group_id": int(n.group_id),
-            "group_type": str(n.group_type),
-            "retry_depth": int(n.retry_depth),
-            "parent_node_id": int(n.parent_node_id) if n.parent_node_id is not None else None,
-            "child_node_ids": [int(x) for x in n.child_node_ids],
-            "retry_block_reason": str(n.retry_block_reason),
-            "terminated_reason": str(n.terminated_reason),
-            "leaf_end_type": str(n.leaf_end_type),
-            "was_forced_finalize": bool(n.was_forced_finalize),
+            "reward_full": int(1 if float(last.q) >= 1.0 else 0),
+            "reward_partial": float(last.q),
+            "reward": float(last.q),
+            "reward_final": float(last.V),
+            "exact_match": bool(float(last.q) >= 1.0),
+            "q": float(last.q),
+            "Q_F": float(last.Q_F),
+            "Q_R": (None if last.Q_R is None else float(last.Q_R)),
+            "U": float(last.U),
+            "V": float(last.V),
+            "A_Z": float(last.A_Z),
+            "A_V": float(last.A_V),
+            "group_id": int(first.group_id),
+            "group_type": str(first.group_type),
+            "retry_depth": int(last.retry_depth),
+            "parent_node_id": compact_parent_id,
+            "child_node_ids": compact_child_ids,
+            "retry_block_reason": str(last.retry_block_reason),
+            "terminated_reason": str(last.terminated_reason),
+            "leaf_end_type": str(last.leaf_end_type),
+            "was_forced_finalize": bool(last.was_forced_finalize),
             "retry_depth_at_leaf": (
-                int(n.retry_depth)
-                if str(n.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
+                int(last.retry_depth)
+                if str(last.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
                 else None
             ),
-            "verify_action_present": bool(n.verify_action_present),
-            "k_used": int(n.k_used),
-            "branching_decision": str(n.branching_decision),
-            "has_forced_retry_probe": bool(n.has_forced_retry_probe),
-            "probe_terminal_value": (None if n.probe_terminal_value is None else float(n.probe_terminal_value)),
+            "verify_action_present": bool(last.verify_action_present),
+            "k_used": int(last.k_used),
+            "branching_decision": str(last.branching_decision),
+            "continued_linearly": bool(len(chain_ids) > 1),
+            "has_forced_retry_probe": bool(last.has_forced_retry_probe),
+            "probe_terminal_value": (None if last.probe_terminal_value is None else float(last.probe_terminal_value)),
             "probe_terminal_node_id": (
-                None if n.probe_terminal_node_id is None else int(n.probe_terminal_node_id)
+                None if last.probe_terminal_node_id is None else int(last.probe_terminal_node_id)
             ),
-            "probe_length_rounds": (None if n.probe_length_rounds is None else int(n.probe_length_rounds)),
-            "probe_leaf_end_type": (None if n.probe_leaf_end_type is None else str(n.probe_leaf_end_type)),
+            "probe_length_rounds": (None if last.probe_length_rounds is None else int(last.probe_length_rounds)),
+            "probe_leaf_end_type": (None if last.probe_leaf_end_type is None else str(last.probe_leaf_end_type)),
             "probe_start_retry_depth": (
-                None if n.probe_start_retry_depth is None else int(n.probe_start_retry_depth)
+                None if last.probe_start_retry_depth is None else int(last.probe_start_retry_depth)
             ),
             "probe_nodes": (
                 []
-                if int(n.node_id) not in probe_results
-                else list(probe_results[int(n.node_id)].get("probe_nodes", []))
+                if int(last.node_id) not in probe_results
+                else list(probe_results[int(last.node_id)].get("probe_nodes", []))
             ),
-            "tree_mode": "shallow_v1",
+            "tree_mode": "depth_prob_structural_nodes",
+            "structural_round_count": int(len(chain_ids)),
+            "raw_node_chain_ids": list(chain_ids),
         }
 
         traj = Trajectory(
-            prompt_id=int(n.prompt_id),
-            sample_id=f"{str(prompt_info['sample_id_base'])}_n{int(n.node_id)}",
+            prompt_id=int(first.prompt_id),
+            sample_id=f"{str(prompt_info['sample_id_base'])}_n{int(compact_ids[int(sid)])}",
             question=str(prompt_info["question"]),
-            prompt_ids=list(n.prompt_ids),
-            prompt_attention_mask=list(n.prompt_attention_mask),
-            actions=list(n.actions),
-            action_types=list(n.action_types),
+            prompt_ids=list(first.prompt_ids),
+            prompt_attention_mask=list(first.prompt_attention_mask),
+            actions=list(actions),
+            action_types=list(action_types),
             logp_old=logp_t.float().cpu().tolist(),
-            values_old=[0.0] * len(n.actions),
+            values_old=[0.0] * len(actions),
             entropy_old=entropy_t.float().cpu().tolist(),
-            terminated_by=str(n.terminated_reason),
-            generated_z_ids=list(n.z_token_ids),
-            generated_digit_ids=list(n.digit_token_ids),
+            terminated_by=str(last.terminated_reason),
+            generated_z_ids=list(first.z_token_ids),
+            generated_digit_ids=list(last.digit_token_ids),
             digit_logits=None,
             digit_probs=None,
-            digit_pred=(None if n.pred_digits is None else list(n.pred_digits)),
+            digit_pred=(None if last.pred_digits is None else list(last.pred_digits)),
             digit_true=[int(x) for x in list(prompt_info["true_digits"])],
             reward_info=reward_info,
-            num_generated_total=int(len(n.full_generated_ids)),
-            num_digits_generated=int(len(n.digit_token_ids)),
-            generated_verify_ids=([] if n.verify_token_id is None else [int(n.verify_token_id)]),
-            rounds_meta=[
-                {
-                    "tree_node_id": int(n.node_id),
-                    "group_id": int(n.group_id),
-                    "group_type": str(n.group_type),
-                    "retry_depth": int(n.retry_depth),
-                    "parent_node_id": int(n.parent_node_id) if n.parent_node_id is not None else None,
-                    "z_token_ids": list(n.z_token_ids),
-                    "digit_token_ids": list(n.digit_token_ids),
-                    "pred_digits": (None if n.pred_digits is None else list(n.pred_digits)),
-                    "verify_token_id": (None if n.verify_token_id is None else int(n.verify_token_id)),
-                    "verify_action_present": bool(n.verify_action_present),
-                    "k_used": int(n.k_used),
-                    "branching_decision": str(n.branching_decision),
-                    "leaf_end_type": str(n.leaf_end_type),
-                    "was_forced_finalize": bool(n.was_forced_finalize),
-                    "retry_depth_at_leaf": (
-                        int(n.retry_depth)
-                        if str(n.leaf_end_type) in ("model_finalize", "forced_finalize_max_retry")
-                        else None
-                    ),
-                    "q": float(n.q),
-                    "Q_F": float(n.Q_F),
-                    "Q_R": (None if n.Q_R is None else float(n.Q_R)),
-                    "U": float(n.U),
-                    "V": float(n.V),
-                    "A_Z": float(n.A_Z),
-                    "A_V": float(n.A_V),
-                    "has_forced_retry_probe": bool(n.has_forced_retry_probe),
-                    "probe_terminal_value": (
-                        None if n.probe_terminal_value is None else float(n.probe_terminal_value)
-                    ),
-                    "probe_terminal_node_id": (
-                        None if n.probe_terminal_node_id is None else int(n.probe_terminal_node_id)
-                    ),
-                    "probe_length_rounds": (
-                        None if n.probe_length_rounds is None else int(n.probe_length_rounds)
-                    ),
-                    "probe_leaf_end_type": (None if n.probe_leaf_end_type is None else str(n.probe_leaf_end_type)),
-                    "probe_start_retry_depth": (
-                        None if n.probe_start_retry_depth is None else int(n.probe_start_retry_depth)
-                    ),
-                    "probe_nodes": (
-                        []
-                        if int(n.node_id) not in probe_results
-                        else list(probe_results[int(n.node_id)].get("probe_nodes", []))
-                    ),
-                    "retry_block_reason": str(n.retry_block_reason),
-                }
-            ],
-            full_generated_ids=list(n.full_generated_ids),
-            termination_reason=str(n.terminated_reason),
+            num_generated_total=int(len(full_generated_ids)),
+            num_digits_generated=int(sum(len(x.digit_token_ids) for x in chain_nodes)),
+            generated_verify_ids=(
+                []
+                if last.verify_token_id is None
+                else [int(last.verify_token_id)]
+            ),
+            rounds_meta=rounds_meta,
+            full_generated_ids=list(full_generated_ids),
+            termination_reason=str(last.terminated_reason),
         )
-
         traj.returns = list(returns)
         traj.advantages = list(advantages)
         traj.advantages_norm_global = []
@@ -1007,6 +1088,7 @@ def collect_tree_grpo_v1_batch(
         trajectories.append(traj)
 
     stats = tree_summary(nodes=nodes, retry_token_id=int(retry_token_id))
+    stats["num_structural_nodes"] = float(len(start_ids))
     stats["num_groups"] = float(len(groups))
     stats["num_root_requests"] = float(len(root_requests))
     stats["num_child_requests"] = float(nonroot_request_count)
