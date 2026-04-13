@@ -514,14 +514,14 @@ def _run_forced_retry_probes(
 
 def collect_tree_grpo_v1_batch(
     *,
-    model,
+    model=None,
     tokenizer,
     vllm_engine: Any,
     prepared: Sequence[Dict[str, object]],
     cfg: Config,
-    z_allowed_t: torch.Tensor,
-    digit_allowed_t: torch.Tensor,
-    verify_allowed_t: torch.Tensor,
+    z_allowed_t: Optional[torch.Tensor] = None,
+    digit_allowed_t: Optional[torch.Tensor] = None,
+    verify_allowed_t: Optional[torch.Tensor] = None,
     answer_token_id: int,
     finalize_token_id: int,
     retry_token_id: int,
@@ -754,6 +754,15 @@ def collect_tree_grpo_v1_batch(
 
     max_active_wave = max(int(cfg.tree.max_active_nodes_per_wave), 1)
     while pending_requests:
+        pending_requests.sort(
+            key=lambda r: (
+                int(r.retry_depth),
+                -int(len(r.prefix_ids)),
+                int(r.prompt_id),
+                int(r.parent_node_id) if r.parent_node_id is not None else -1,
+                int(r.branch_slot),
+            )
+        )
         wave_reqs = pending_requests[:max_active_wave]
         pending_requests = pending_requests[max_active_wave:]
 
@@ -962,17 +971,29 @@ def collect_tree_grpo_v1_batch(
         if len(advantages) != len(actions):
             raise RuntimeError("Tree advantages length mismatch after linear compaction")
 
-        logp_t, entropy_t = _action_logp_entropy_tensors(
-            model=model,
-            prompt_ids=first.prompt_ids,
-            prompt_attention_mask=first.prompt_attention_mask,
-            actions=actions,
-            action_types=action_types,
-            z_allowed_t=z_allowed_t,
-            digit_allowed_t=digit_allowed_t,
-            verify_allowed_t=verify_allowed_t,
-            temperature=float(cfg.rollout.temperature),
+        compute_old_logp = (
+            model is not None
+            and z_allowed_t is not None
+            and digit_allowed_t is not None
+            and verify_allowed_t is not None
         )
+        if compute_old_logp:
+            logp_t, entropy_t = _action_logp_entropy_tensors(
+                model=model,
+                prompt_ids=first.prompt_ids,
+                prompt_attention_mask=first.prompt_attention_mask,
+                actions=actions,
+                action_types=action_types,
+                z_allowed_t=z_allowed_t,
+                digit_allowed_t=digit_allowed_t,
+                verify_allowed_t=verify_allowed_t,
+                temperature=float(cfg.rollout.temperature),
+            )
+            logp_old_list = logp_t.float().cpu().tolist()
+            entropy_old_list = entropy_t.float().cpu().tolist()
+        else:
+            logp_old_list = []
+            entropy_old_list = []
 
         compact_child_ids: List[int] = []
         for raw_child in last.child_node_ids:
@@ -1039,6 +1060,7 @@ def collect_tree_grpo_v1_batch(
             "tree_mode": "depth_prob_structural_nodes",
             "structural_round_count": int(len(chain_ids)),
             "raw_node_chain_ids": list(chain_ids),
+            "logp_pending": bool(not compute_old_logp),
         }
 
         traj = Trajectory(
@@ -1049,9 +1071,9 @@ def collect_tree_grpo_v1_batch(
             prompt_attention_mask=list(first.prompt_attention_mask),
             actions=list(actions),
             action_types=list(action_types),
-            logp_old=logp_t.float().cpu().tolist(),
+            logp_old=list(logp_old_list),
             values_old=[0.0] * len(actions),
-            entropy_old=entropy_t.float().cpu().tolist(),
+            entropy_old=list(entropy_old_list),
             terminated_by=str(last.terminated_reason),
             generated_z_ids=list(first.z_token_ids),
             generated_digit_ids=list(last.digit_token_ids),

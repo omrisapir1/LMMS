@@ -7,6 +7,7 @@ import json
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -306,6 +307,62 @@ def _action_stats_tensors_batched_policy_only(
     return logp_new, logp_ref, entropy_new, logp_old, advantages, lengths
 
 
+def _ensure_logp_entropy_old(
+    *,
+    model,
+    trajectories: List,
+    device: torch.device,
+    z_allowed_t: torch.Tensor,
+    digit_allowed_t: torch.Tensor,
+    verify_allowed_t: torch.Tensor,
+    z_id_to_local: torch.Tensor,
+    d_id_to_local: torch.Tensor,
+    v_id_to_local: torch.Tensor,
+    temperature: float,
+    pad_token_id: int,
+    token_stats_kernel,
+) -> None:
+    missing_idx: List[int] = []
+    for i, t in enumerate(trajectories):
+        if len(t.logp_old) != len(t.actions) or len(t.entropy_old) != len(t.actions):
+            missing_idx.append(i)
+    if len(missing_idx) == 0:
+        return
+
+    batch = [trajectories[i] for i in missing_idx]
+    for t in batch:
+        t.logp_old = [0.0] * len(t.actions)
+        t.entropy_old = [0.0] * len(t.actions)
+        t.values_old = [0.0] * len(t.actions)
+        if len(getattr(t, "advantages_norm", [])) != len(t.actions):
+            t.advantages_norm = list(t.advantages)
+
+    cache = _build_trajectory_device_cache(trajectories=batch, device=device)
+    with torch.no_grad():
+        logp_new, _, entropy_new, _, _, lengths = _action_stats_tensors_batched_policy_only(
+            model=model,
+            ref_model=None,
+            trajs=batch,
+            traj_cache=cache,
+            z_allowed_t=z_allowed_t,
+            digit_allowed_t=digit_allowed_t,
+            verify_allowed_t=verify_allowed_t,
+            z_id_to_local=z_id_to_local,
+            d_id_to_local=d_id_to_local,
+            v_id_to_local=v_id_to_local,
+            temperature=float(temperature),
+            pad_token_id=int(pad_token_id),
+            token_stats_kernel=token_stats_kernel,
+        )
+
+    offs = 0
+    lens = [int(x) for x in lengths.detach().cpu().tolist()]
+    for t, L in zip(batch, lens):
+        t.logp_old = logp_new[offs: offs + L].detach().float().cpu().tolist()
+        t.entropy_old = entropy_new[offs: offs + L].detach().float().cpu().tolist()
+        offs += L
+
+
 def train(cfg: Config) -> None:
     _set_seed(cfg.train.seed)
 
@@ -507,69 +564,120 @@ def train(cfg: Config) -> None:
     ds_index = 0
     rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
 
+    def _build_prepared_for_update(update_idx: int) -> List[Dict[str, object]]:
+        nonlocal ds_index
+        prompts_per_update = max(1, int(cfg.rollout.tree_prompts_per_update))
+        prepared_local: List[Dict[str, object]] = []
+        prompt_counter_local = 0
+        while len(prepared_local) < prompts_per_update:
+            sample = ds[int(train_row_indices[ds_index % len(train_row_indices)])]
+            ds_index += 1
+
+            question = str(sample[cfg.data.question_field])
+            true_digits = _extract_true_digits(
+                sample=sample,
+                answer_digits_field=cfg.data.answer_digits_field,
+                answer_field=cfg.data.answer_field,
+            )
+            if true_digits is None:
+                continue
+
+            prompt_text = _build_prompt_text(tokenizer, question)
+            prompt_pack = tokenizer(prompt_text, add_special_tokens=False, return_attention_mask=True)
+            prompt_ids = list(prompt_pack["input_ids"])
+            prompt_attn = list(prompt_pack.get("attention_mask") or [1] * len(prompt_ids))
+            prepared_local.append(
+                {
+                    "sample_id_base": f"u{update_idx}_p{prompt_counter_local}",
+                    "prompt_id": int(prompt_counter_local),
+                    "question": question,
+                    "true_digits": [int(x) for x in true_digits],
+                    "prompt_text": prompt_text,
+                    "prompt_ids": prompt_ids,
+                    "prompt_attention_mask": prompt_attn,
+                }
+            )
+            prompt_counter_local += 1
+        return prepared_local
+
+    def _collect_rollout_only(prepared_local: Sequence[Dict[str, object]]):
+        t0 = time.perf_counter()
+        tr, st = collect_tree_grpo_v1_batch(
+            model=None,
+            tokenizer=tokenizer,
+            vllm_engine=vllm_engine,
+            prepared=prepared_local,
+            cfg=cfg,
+            z_allowed_t=None,
+            digit_allowed_t=None,
+            verify_allowed_t=None,
+            answer_token_id=int(answer_token_id),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
+            digit_token_ids=digit_token_ids,
+        )
+        return tr, st, float(time.perf_counter() - t0)
+
     try:
+        prefetch_enabled = bool(getattr(cfg.rollout, "prefetch_next_rollout", True))
+        prefetch_exec: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1) if prefetch_enabled else None
+        rollout_future = None
+
         for update in range(1, int(cfg.train.updates) + 1):
             _t_update0 = time.perf_counter()
 
-            if vllm_engine is not None:
-                _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=update)
-
-            prompts_per_update = max(1, int(cfg.rollout.tree_prompts_per_update))
-            prepared: List[Dict[str, object]] = []
-            prompt_counter = 0
-            while len(prepared) < prompts_per_update:
-                sample = ds[int(train_row_indices[ds_index % len(train_row_indices)])]
-                ds_index += 1
-
-                question = str(sample[cfg.data.question_field])
-                true_digits = _extract_true_digits(
-                    sample=sample,
-                    answer_digits_field=cfg.data.answer_digits_field,
-                    answer_field=cfg.data.answer_field,
-                )
-                if true_digits is None:
-                    continue
-
-                prompt_text = _build_prompt_text(tokenizer, question)
-                prompt_pack = tokenizer(prompt_text, add_special_tokens=False, return_attention_mask=True)
-                prompt_ids = list(prompt_pack["input_ids"])
-                prompt_attn = list(prompt_pack.get("attention_mask") or [1] * len(prompt_ids))
-
-                prepared.append(
-                    {
-                        "sample_id_base": f"u{update}_p{prompt_counter}",
-                        "prompt_id": int(prompt_counter),
-                        "question": question,
-                        "true_digits": [int(x) for x in true_digits],
-                        "prompt_text": prompt_text,
-                        "prompt_ids": prompt_ids,
-                        "prompt_attention_mask": prompt_attn,
-                    }
-                )
-                prompt_counter += 1
-
-            trajectories, tree_stats = collect_tree_grpo_v1_batch(
-                model=model,
-                tokenizer=tokenizer,
-                vllm_engine=vllm_engine,
-                prepared=prepared,
-                cfg=cfg,
-                z_allowed_t=z_allowed_t,
-                digit_allowed_t=digit_allowed_t,
-                verify_allowed_t=verify_allowed_t,
-                answer_token_id=int(answer_token_id),
-                finalize_token_id=int(finalize_token_id),
-                retry_token_id=int(retry_token_id),
-                digit_token_ids=digit_token_ids,
-            )
+            if rollout_future is None:
+                if vllm_engine is not None:
+                    _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=update)
+                prepared_now = _build_prepared_for_update(update_idx=update)
+                if prefetch_exec is not None:
+                    rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_now)
+                else:
+                    trajectories, tree_stats, rollout_sec = _collect_rollout_only(prepared_now)
+            if rollout_future is not None:
+                trajectories, tree_stats, rollout_sec = rollout_future.result()
+                rollout_future = None
+            else:
+                rollout_sec = 0.0
 
             if not trajectories:
                 _log(f"update={update} | no trajectories; skipping")
+                if prefetch_exec is not None and update < int(cfg.train.updates):
+                    next_update = int(update + 1)
+                    if vllm_engine is not None:
+                        _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=next_update)
+                    prepared_next = _build_prepared_for_update(update_idx=next_update)
+                    rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_next)
                 continue
+
+            if prefetch_exec is not None and update < int(cfg.train.updates):
+                next_update = int(update + 1)
+                if vllm_engine is not None:
+                    _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=next_update)
+                prepared_next = _build_prepared_for_update(update_idx=next_update)
+                rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_next)
 
             # Tree mode: no global/per-prompt std normalization.
             for t in trajectories:
                 t.advantages_norm = list(t.advantages)
+
+            token_stats_kernel = _get_token_stats_kernel(
+                compile_update_stats=bool(getattr(cfg.runtime, "compile_update_stats", False))
+            )
+            _ensure_logp_entropy_old(
+                model=model,
+                trajectories=trajectories,
+                device=device,
+                z_allowed_t=z_allowed_t,
+                digit_allowed_t=digit_allowed_t,
+                verify_allowed_t=verify_allowed_t,
+                z_id_to_local=z_id_to_local,
+                d_id_to_local=d_id_to_local,
+                v_id_to_local=v_id_to_local,
+                temperature=float(cfg.rollout.temperature),
+                pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
+                token_stats_kernel=token_stats_kernel,
+            )
 
             roll_rows: List[Dict[str, object]] = []
             for traj in trajectories:
@@ -633,9 +741,6 @@ def train(cfg: Config) -> None:
             optimizer.zero_grad(set_to_none=True)
             trajectory_cache = _build_trajectory_device_cache(trajectories=trajectories, device=device)
             seq_lens = [c.seq_len for c in trajectory_cache]
-            token_stats_kernel = _get_token_stats_kernel(
-                compile_update_stats=bool(getattr(cfg.runtime, "compile_update_stats", False))
-            )
 
             minibatch_count = 0
             pol_acc = 0.0
@@ -774,6 +879,7 @@ def train(cfg: Config) -> None:
                         f"entropy={ent_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",
                         f"kl={kl_acc / denom:.4f}",
+                        f"t_rollout={float(rollout_sec):.3f}s",
                         f"t_update={t_total:.3f}s",
                     ]
                 )
@@ -789,6 +895,8 @@ def train(cfg: Config) -> None:
                     cfg=cfg,
                 )
     finally:
+        if "prefetch_exec" in locals() and prefetch_exec is not None:
+            prefetch_exec.shutdown(wait=False, cancel_futures=True)
         if vllm_engine is not None:
             vllm_engine.close()
 

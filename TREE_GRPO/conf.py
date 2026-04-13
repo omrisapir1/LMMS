@@ -75,6 +75,7 @@ class RolloutConfig:
     ref_model_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
     tree_prompts_per_update: int = 16
+    prefetch_next_rollout: bool = True
 
 
 @dataclass
@@ -82,7 +83,7 @@ class PPOConfig:
     clip_range: float = 0.2
     c_v: float = 0.25
     c_ent: float = 0.002
-    kl_coef: float = 0.01
+    kl_coef: float = 0.00
     ppo_epochs: int = 1
     minibatch_size: int = 16
     max_grad_norm: float = 1.0
