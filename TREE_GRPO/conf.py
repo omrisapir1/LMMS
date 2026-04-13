@@ -73,7 +73,7 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "max_num_seqs": 256*10,
-            "max_num_batched_tokens": 16384*10,
+            "max_num_batched_tokens": 16384,
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
             "swap_space": 8,
