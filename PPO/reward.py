@@ -228,7 +228,7 @@ def compute_multi_round_reward(
         selected_round_index = int(finalize_round_index)
         selected_round_answer_reward = 1.0
         reward_mode = "finalize_exact"
-    elif is_finalize_terminated and any_exact_match:
+    elif (is_finalize_terminated or str(terminated_reason) == "max_new_tokens") and any_exact_match:
         selected_round_index = int(first_exact_round_index)
         selected_round_answer_reward = float(early_success)
         reward_mode = "early_success_discounted"

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 MAX_TOKENS = 512
-BACH_SIZE = 64
+BATCH_SIZE = 16
+
 
 @dataclass
 class ModelConfig:
@@ -26,6 +26,25 @@ class DataConfig:
     rsft_trained_questions_path: str = "PPO/rsft_trained_questions.json"
 
 
+@dataclass
+class TreeConfig:
+    # Root remains fixed.
+    root_siblings: int = 4
+    # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.25, 0.30, 0.5, 0.7, 0.7, 1.0])
+    # Per-prompt safety budgets.
+    max_total_nodes_per_prompt: int = 320
+    max_leaves_per_prompt: int = 200
+    max_active_nodes_per_wave: int = 256
+    max_expanded_retry_nodes_per_level: int = 64
+    max_retry_depth: int = 1
+    c_retry: float = 0.05
+    gamma: float = 0.95
+    c_branch: float = 0.0
+    advantage_clip: float = 3.0
+
 
 @dataclass
 class RolloutConfig:
@@ -40,10 +59,9 @@ class RolloutConfig:
     digit_temperature: float = 1.0
     digit_top_p: float = 0.90
     digit_greedy: bool = False
-    action_scope: str = "ppo_only_z_tokens_and_verify"  # "ppo_only_z_tokens" | "ppo_full" | "ppo_only_z_tokens_and_verify"
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
-    vllm_batch_size: int = BACH_SIZE
+    vllm_batch_size: int = BATCH_SIZE
     vllm_tp_size: int = 1
     gpu_memory_utilization: float = 0.95
     vllm_seed: Optional[int] = None
@@ -52,22 +70,7 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     ref_model_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    episodes_per_batch: int = 512
-    rollouts_per_prompt: int = 8  # number of sampled completions per prompt
-    max_tokens_per_batch: int = MAX_TOKENS * BACH_SIZE * rollouts_per_prompt
-    verify_finalize_logit_bias: float = 0
-    verify_retry_logit_bias: float = 0
-
-
-@dataclass
-class RewardConfig:
-    partial_scale: float = 0.25
-    keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
-    length_penalty: float = 0.00005
-    reward_if_max_len: float = -0.1
-    correct_length_discount: float = 0.1
-    early_success: float = 0.85
-    rounds_penalty_coef: float = 0.0005
+    tree_prompts_per_update: int = 1
 
 
 @dataclass
@@ -76,19 +79,11 @@ class PPOConfig:
     c_v: float = 0.25
     c_ent: float = 0.002
     kl_coef: float = 0.01
-    apply_ce: bool = False
-    alpha_sft: float = 0.5
-    batch_frac_to_apply_ce: float = 0.25
-    ce_mode: str = "random"  # "successful_traces" | "random"
-    update_ref_model_each_steps: int = 100
     ppo_epochs: int = 1
     minibatch_size: int = 16
     max_grad_norm: float = 1.0
-    normalize_advantages: bool = True
-    adv_norm_mode: str = "hybrid"  # "global" | "per_prompt" | "hybrid" | "none"
-    adv_norm_hybrid_alpha: float = 0.3
-    adv_norm_use_global_for_homogeneous_prompts: bool = True
-    value_warmup_steps: int = 5
+    update_ref_model_each_steps: int = 100
+    value_warmup_steps: int = 0
     value_warmup_lr: float = 1e-4
 
 
@@ -101,17 +96,13 @@ class TrainConfig:
     updates: int = 10000
     grad_accum_steps: int = 16
     seed: int = 42
-    output_dir: str = "./runs/ppo"
+    output_dir: str = "./runs/tree_grpo_v1"
     save_every: int = 25
-    keep_last: int = 3
-    resume_from: str = None
-    resume_auto_latest: bool = False
 
 
 @dataclass
 class RuntimeConfig:
     use_bf16: bool = True
-    debug_restricted_logits_check: bool = False
     use_length_bucketing: bool = True
     length_bucket_width: int = 64
     compile_update_stats: bool = False
@@ -127,7 +118,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
-    reward: RewardConfig = field(default_factory=RewardConfig)
+    tree: TreeConfig = field(default_factory=TreeConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -141,7 +132,7 @@ DEFAULT_SET_ALLOWED_PREFIXES: Sequence[str] = (
     "model.",
     "data.",
     "rollout.",
-    "reward.",
+    "tree.",
     "ppo.",
     "train.",
     "runtime.",

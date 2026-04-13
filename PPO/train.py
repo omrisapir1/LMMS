@@ -355,12 +355,15 @@ def _sample_action_from_allowed_logits(
     *,
     temperature: float,
     top_p: float,
+    min_p: float,
     greedy: bool,
 ) -> Tuple[int, torch.Tensor, torch.Tensor, float]:
     if temperature <= 0:
         raise ValueError("rollout.temperature must be > 0")
     if top_p <= 0 or top_p > 1:
         raise ValueError("rollout.top_p must be in (0, 1]")
+    if min_p < 0 or min_p >= 1:
+        raise ValueError("rollout.min_p must be in [0, 1)")
 
     logits = allowed_logits / float(temperature)
     logp = torch.log_softmax(logits, dim=-1)
@@ -369,8 +372,33 @@ def _sample_action_from_allowed_logits(
     if greedy:
         local_idx = int(torch.argmax(logits, dim=-1).item())
     else:
+        if float(min_p) > 0.0:
+            p_max = float(torch.max(probs).item())
+            threshold = float(min_p) * p_max
+            keep = probs >= threshold
+            if bool(keep.any()):
+                probs = probs * keep.to(dtype=probs.dtype)
+                probs = probs / probs.sum()
         local_idx = _nucleus_sample_from_probs(probs, top_p=top_p)
     return local_idx, logp, probs, entropy
+
+
+def _apply_repetition_penalty_to_allowed_logits(
+    *,
+    allowed_logits: torch.Tensor,
+    allowed_token_ids: torch.Tensor,
+    seen_token_ids: set[int],
+    repetition_penalty: float,
+) -> torch.Tensor:
+    if float(repetition_penalty) == 1.0 or len(seen_token_ids) == 0:
+        return allowed_logits
+    out = allowed_logits.clone()
+    for local_idx, tok_id in enumerate(allowed_token_ids.tolist()):
+        if int(tok_id) not in seen_token_ids:
+            continue
+        val = out[local_idx]
+        out[local_idx] = val * float(repetition_penalty) if float(val.item()) < 0.0 else val / float(repetition_penalty)
+    return out
 
 
 def _forward_last_with_cache(core, input_ids, attention_mask, past_key_values):
@@ -831,12 +859,19 @@ def _action_stats_tensors_batched(
     ref_z_b: Optional[torch.Tensor] = None
     ref_d_b: Optional[torch.Tensor] = None
     ref_v_b: Optional[torch.Tensor] = None
+    ref_device: Optional[torch.device] = None
     if ref_model is not None:
+        ref_device = next(ref_model.parameters()).device
+        ref_input_ids = input_ids if ref_device == device else input_ids.to(ref_device)
+        ref_attention_mask = attention_mask if ref_device == device else attention_mask.to(ref_device)
+        z_allowed_ref = z_allowed_t if ref_device == device else z_allowed_t.to(ref_device)
+        digit_allowed_ref = digit_allowed_t if ref_device == device else digit_allowed_t.to(ref_device)
+        verify_allowed_ref = verify_allowed_t if ref_device == device else verify_allowed_t.to(ref_device)
         ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
         with torch.no_grad():
             ref_out = ref_base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=ref_input_ids,
+                attention_mask=ref_attention_mask,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
@@ -846,13 +881,13 @@ def _action_stats_tensors_batched(
         if ref_lm_head is None:
             raise RuntimeError("Reference model output embeddings (LM head) are unavailable")
         ref_weight = ref_lm_head.weight
-        ref_z_w = ref_weight.index_select(0, z_allowed_t)  # [|Z|,H]
-        ref_d_w = ref_weight.index_select(0, digit_allowed_t)  # [|D|,H]
-        ref_v_w = ref_weight.index_select(0, verify_allowed_t)  # [|V|,H]
+        ref_z_w = ref_weight.index_select(0, z_allowed_ref)  # [|Z|,H]
+        ref_d_w = ref_weight.index_select(0, digit_allowed_ref)  # [|D|,H]
+        ref_v_w = ref_weight.index_select(0, verify_allowed_ref)  # [|V|,H]
         ref_bias = getattr(ref_lm_head, "bias", None)
-        ref_z_b = ref_bias.index_select(0, z_allowed_t) if ref_bias is not None else None
-        ref_d_b = ref_bias.index_select(0, digit_allowed_t) if ref_bias is not None else None
-        ref_v_b = ref_bias.index_select(0, verify_allowed_t) if ref_bias is not None else None
+        ref_z_b = ref_bias.index_select(0, z_allowed_ref) if ref_bias is not None else None
+        ref_d_b = ref_bias.index_select(0, digit_allowed_ref) if ref_bias is not None else None
+        ref_v_b = ref_bias.index_select(0, verify_allowed_ref) if ref_bias is not None else None
 
     lengths_all = torch.tensor([c.action_len for c in cache], dtype=torch.long, device=device)
     nonzero_rows = torch.nonzero(lengths_all > 0, as_tuple=False).squeeze(-1)
@@ -906,26 +941,47 @@ def _action_stats_tensors_batched(
 
     if ref_model is not None:
         assert ref_hidden_all is not None and ref_z_w is not None and ref_d_w is not None and ref_v_w is not None
-        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows)
-        ref_h_states = ref_hidden_nz[batch_ids, state_positions]
+        assert ref_device is not None
+        if ref_device == device:
+            nonzero_rows_ref = nonzero_rows
+            batch_ids_ref = batch_ids
+            state_positions_ref = state_positions
+            action_ids_ref = action_ids
+            action_phase_ref = action_phase
+            z_id_to_local_ref = z_id_to_local
+            d_id_to_local_ref = d_id_to_local
+            v_id_to_local_ref = v_id_to_local
+        else:
+            nonzero_rows_ref = nonzero_rows.to(ref_device)
+            batch_ids_ref = batch_ids.to(ref_device)
+            state_positions_ref = state_positions.to(ref_device)
+            action_ids_ref = action_ids.to(ref_device)
+            action_phase_ref = action_phase.to(ref_device)
+            z_id_to_local_ref = z_id_to_local.to(ref_device)
+            d_id_to_local_ref = d_id_to_local.to(ref_device)
+            v_id_to_local_ref = v_id_to_local.to(ref_device)
+        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows_ref)
+        ref_h_states = ref_hidden_nz[batch_ids_ref, state_positions_ref]
         with torch.no_grad():
             logp_ref, _ref_entropy, ref_invalid = token_stats_kernel(
                 ref_h_states,
-                action_ids,
-                action_phase,
+                action_ids_ref,
+                action_phase_ref,
                 ref_z_w,
                 ref_z_b,
                 ref_d_w,
                 ref_d_b,
                 ref_v_w,
                 ref_v_b,
-                z_id_to_local,
-                d_id_to_local,
-                v_id_to_local,
+                z_id_to_local_ref,
+                d_id_to_local_ref,
+                v_id_to_local_ref,
                 float(temperature),
             )
         if bool(ref_invalid.any()):
             raise RuntimeError("Reference model found actions not in allowed set")
+        if logp_ref.device != device:
+            logp_ref = logp_ref.to(device)
     else:
         logp_ref = logp_new.detach()
 
@@ -982,6 +1038,10 @@ def _rollout_one_torch(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    digit_temperature: float,
+    digit_top_p: float,
+    min_p: float,
+    repetition_penalty: float,
     action_scope: str,
     digit_greedy: bool,
     reward_cfg,
@@ -1021,11 +1081,19 @@ def _rollout_one_torch(
         last_logits = out0.logits[:, -1, :].squeeze(0)
 
         for _ in range(max_new_tokens):
+            seen_token_ids = set(int(x) for x in actions)
             if phase == "z":
+                z_logits_allowed = _apply_repetition_penalty_to_allowed_logits(
+                    allowed_logits=last_logits.index_select(0, z_allowed_t),
+                    allowed_token_ids=z_allowed_t,
+                    seen_token_ids=seen_token_ids,
+                    repetition_penalty=float(repetition_penalty),
+                )
                 local_idx, _logp_allowed, _probs_allowed, _entropy = _sample_action_from_allowed_logits(
-                    last_logits.index_select(0, z_allowed_t),
+                    z_logits_allowed,
                     temperature=temperature,
                     top_p=top_p,
+                    min_p=min_p,
                     greedy=False,
                 )
                 action = int(z_allowed_t[local_idx].item())
@@ -1036,10 +1104,17 @@ def _rollout_one_torch(
                 else:
                     generated_z_ids.append(action)
             else:
+                d_logits_allowed = _apply_repetition_penalty_to_allowed_logits(
+                    allowed_logits=last_logits.index_select(0, digit_allowed_t),
+                    allowed_token_ids=digit_allowed_t,
+                    seen_token_ids=seen_token_ids,
+                    repetition_penalty=1.0,
+                )
                 local_idx, _logp_allowed, probs_allowed, _entropy = _sample_action_from_allowed_logits(
-                    last_logits.index_select(0, digit_allowed_t),
-                    temperature=temperature,
-                    top_p=top_p,
+                    d_logits_allowed,
+                    temperature=digit_temperature,
+                    top_p=digit_top_p,
+                    min_p=0.0,
                     greedy=bool(digit_greedy),
                 )
                 action = int(digit_allowed_t[local_idx].item())
@@ -1271,6 +1346,21 @@ def _collect_rollouts_vllm_batch(
         return []
     num_samples_per_prompt = max(1, int(rollouts_per_prompt))
     supports_token_prompts = vllm_engine.supports_prompt_token_ids()
+    decode_cache: Dict[Tuple[int, ...], str] = {}
+
+    def _decode_cached(ids: Sequence[int]) -> str:
+        key = tuple(int(x) for x in ids)
+        cached = decode_cache.get(key)
+        if cached is not None:
+            return cached
+        txt = tokenizer.decode(
+            list(key),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        decode_cache[key] = str(txt)
+        return str(txt)
+
     prompt_texts = [str(x["prompt_text"]) for x in prepared]
     prompt_ids_batch = [list(map(int, x["prompt_ids"])) for x in prepared]
     z_gen_rows = vllm_engine.generate_z(
@@ -1280,6 +1370,8 @@ def _collect_rollouts_vllm_batch(
         max_new_tokens=cfg.rollout.max_new_tokens,
         temperature=cfg.rollout.temperature,
         top_p=cfg.rollout.top_p,
+        min_p=cfg.rollout.min_p,
+        repetition_penalty=cfg.rollout.repetition_penalty,
     )
     expected_rows = len(prepared) * int(num_samples_per_prompt)
     if len(z_gen_rows) != expected_rows:
@@ -1332,13 +1424,7 @@ def _collect_rollouts_vllm_batch(
                 assert int(answer_token_id) not in digit_prompt_ids[:-1]
             digit_prompt_ids_batch.append(digit_prompt_ids)
             if not supports_token_prompts:
-                digit_prompt_texts.append(
-                    tokenizer.decode(
-                        digit_prompt_ids,
-                        skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                )
+                digit_prompt_texts.append(_decode_cached(digit_prompt_ids))
         else:
             z_prefix_by_idx[i] = z_prefix
 
@@ -1348,9 +1434,11 @@ def _collect_rollouts_vllm_batch(
         digit_gens = vllm_engine.generate_digits(
             prompts=digit_prompt_texts if not supports_token_prompts else None,
             prompt_token_ids=digit_prompt_ids_batch if supports_token_prompts else None,
-            temperature=cfg.rollout.temperature,
-            top_p=cfg.rollout.top_p,
+            temperature=cfg.rollout.digit_temperature,
+            top_p=cfg.rollout.digit_top_p,
             greedy=bool(cfg.rollout.digit_greedy),
+            min_p=0.0,
+            repetition_penalty=1.0,
         )
         for j, idx in enumerate(with_answer_idx):
             digits = [int(x) for x in digit_gens[j]]
@@ -1460,6 +1548,21 @@ def _collect_rollouts_vllm_batch_multiround(
 
     num_samples_per_prompt = max(1, int(rollouts_per_prompt))
     supports_token_prompts = bool(vllm_engine.supports_prompt_token_ids())
+    decode_cache: Dict[Tuple[int, ...], str] = {}
+
+    def _decode_cached(ids: Sequence[int]) -> str:
+        key = tuple(int(x) for x in ids)
+        cached = decode_cache.get(key)
+        if cached is not None:
+            return cached
+        txt = tokenizer.decode(
+            list(key),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        decode_cache[key] = str(txt)
+        return str(txt)
+
     total_sequences = len(prepared) * int(num_samples_per_prompt)
     max_tokens_global = int(cfg.rollout.max_new_tokens)
     if max_tokens_global <= 0:
@@ -1540,10 +1643,12 @@ def _collect_rollouts_vllm_batch_multiround(
                 max_new_tokens=max_z_budget,
                 temperature=cfg.rollout.temperature,
                 top_p=cfg.rollout.top_p,
+                min_p=cfg.rollout.min_p,
+                repetition_penalty=cfg.rollout.repetition_penalty,
             )
         else:
             z_texts = [
-                tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                _decode_cached(p)
                 for p in z_prompt_ids
             ]
             z_rows = vllm_engine.generate_z(
@@ -1552,6 +1657,8 @@ def _collect_rollouts_vllm_batch_multiround(
                 max_new_tokens=max_z_budget,
                 temperature=cfg.rollout.temperature,
                 top_p=cfg.rollout.top_p,
+                min_p=cfg.rollout.min_p,
+                repetition_penalty=cfg.rollout.repetition_penalty,
             )
         if len(z_rows) != len(start_active):
             raise RuntimeError("vLLM Z-phase row count mismatch in multi-round rollout")
@@ -1606,21 +1713,25 @@ def _collect_rollouts_vllm_batch_multiround(
                     digit_rows = vllm_engine.generate_digits(
                         prompt_token_ids=prompt_ids_batch,
                         num_digits=int(k),
-                        temperature=cfg.rollout.temperature,
-                        top_p=cfg.rollout.top_p,
+                        temperature=cfg.rollout.digit_temperature,
+                        top_p=cfg.rollout.digit_top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
+                        min_p=0.0,
+                        repetition_penalty=1.0,
                     )
                 else:
                     digit_texts = [
-                        tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                        _decode_cached(p)
                         for p in prompt_ids_batch
                     ]
                     digit_rows = vllm_engine.generate_digits(
                         prompts=digit_texts,
                         num_digits=int(k),
-                        temperature=cfg.rollout.temperature,
-                        top_p=cfg.rollout.top_p,
+                        temperature=cfg.rollout.digit_temperature,
+                        top_p=cfg.rollout.digit_top_p,
                         greedy=bool(cfg.rollout.digit_greedy),
+                        min_p=0.0,
+                        repetition_penalty=1.0,
                     )
                 if len(digit_rows) != len(idxs):
                     raise RuntimeError("vLLM digit-phase row count mismatch in multi-round rollout")
@@ -1660,21 +1771,25 @@ def _collect_rollouts_vllm_batch_multiround(
                     if supports_token_prompts:
                         verify_rows = vllm_engine.generate_verify(
                             prompt_token_ids=verify_prompt_ids,
-                            temperature=cfg.rollout.temperature,
-                            top_p=cfg.rollout.top_p,
-                            greedy=True,
+                            temperature=cfg.rollout.verify_temperature,
+                            top_p=cfg.rollout.verify_p,
+                            greedy=False,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
                         )
                     else:
                         verify_texts = [
-                            tokenizer.decode(p, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                            _decode_cached(p)
                             for p in verify_prompt_ids
                         ]
                         verify_rows = vllm_engine.generate_verify(
                             prompts=verify_texts,
-                            temperature=cfg.rollout.temperature,
-                            top_p=cfg.rollout.top_p,
-                            greedy=True,
+                            temperature=cfg.rollout.verify_temperature,
+                            top_p=cfg.rollout.verify_p,
+                            greedy=False,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             logit_bias=verify_logit_bias,
                         )
                     if len(verify_rows) != len(verify_owner):
@@ -2172,7 +2287,13 @@ def _find_latest_checkpoint_in_dir(root_dir: str) -> Optional[str]:
 
 
 def _resolve_resume_checkpoint_dir(cfg: Config) -> Optional[str]:
-    resume_from_raw = str(getattr(cfg.train, "resume_from", "")).strip()
+    resume_from_val = getattr(cfg.train, "resume_from", None)
+    if resume_from_val is None:
+        resume_from_raw = ""
+    else:
+        resume_from_raw = str(resume_from_val).strip()
+        if resume_from_raw.lower() in {"none", "null"}:
+            resume_from_raw = ""
     if resume_from_raw:
         p = os.path.abspath(os.path.expanduser(resume_from_raw))
         if not os.path.isdir(p):
@@ -2222,6 +2343,20 @@ def train(cfg: Config) -> None:
     device = torch.device(torch_device_cfg if torch.cuda.is_available() else "cpu")
     _log(f"Device: {device}")
 
+    ref_device_cfg = str(getattr(cfg.rollout, "ref_model_device", "cuda:1")).strip()
+    if torch.cuda.is_available():
+        ref_device = torch.device(ref_device_cfg)
+        if ref_device.type == "cuda":
+            ref_idx = int(ref_device.index) if ref_device.index is not None else 0
+            if ref_idx >= int(torch.cuda.device_count()):
+                _log(
+                    f"WARNING: rollout.ref_model_device={ref_device_cfg!r} is unavailable "
+                    f"(cuda device_count={torch.cuda.device_count()}); falling back to {device}"
+                )
+                ref_device = device
+    else:
+        ref_device = torch.device("cpu")
+
     resume_ckpt_dir = _resolve_resume_checkpoint_dir(cfg)
     model_init_path = (
         os.path.join(resume_ckpt_dir, "model")
@@ -2254,25 +2389,39 @@ def train(cfg: Config) -> None:
     ref_model: Optional[Any] = None
     if use_ref_model:
         ref_model = copy.deepcopy(model)
-        ref_model.to(device)
+        ref_model.to(ref_device)
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad_(False)
-        _log("Reference model enabled (kl_coef > 0)")
+        _log(f"Reference model enabled (kl_coef > 0) on device={ref_device}")
     else:
         _log("Reference model disabled (kl_coef <= 0); skipping ref model allocation")
 
     action_scope = validate_action_scope(cfg.rollout.action_scope)
     if action_scope == "ppo_full" and bool(cfg.rollout.digit_greedy):
         raise ValueError("digit_greedy=True is incompatible with ppo_full")
+    if float(cfg.rollout.temperature) <= 0.0:
+        raise ValueError("rollout.temperature must be > 0")
+    if float(cfg.rollout.top_p) <= 0.0 or float(cfg.rollout.top_p) > 1.0:
+        raise ValueError("rollout.top_p must be in (0, 1]")
+    if float(cfg.rollout.verify_temperature) <= 0.0:
+        raise ValueError("rollout.verify_temperature must be > 0")
+    if float(cfg.rollout.verify_p) <= 0.0 or float(cfg.rollout.verify_p) > 1.0:
+        raise ValueError("rollout.verify_p must be in (0, 1]")
+    if float(cfg.rollout.digit_temperature) <= 0.0:
+        raise ValueError("rollout.digit_temperature must be > 0")
+    if float(cfg.rollout.digit_top_p) <= 0.0 or float(cfg.rollout.digit_top_p) > 1.0:
+        raise ValueError("rollout.digit_top_p must be in (0, 1]")
+    if float(cfg.rollout.min_p) < 0.0 or float(cfg.rollout.min_p) >= 1.0:
+        raise ValueError("rollout.min_p must be in [0, 1)")
+    if float(cfg.rollout.repetition_penalty) <= 0.0:
+        raise ValueError("rollout.repetition_penalty must be > 0")
     rollout_backend = str(getattr(cfg.rollout, "backend", "vllm")).strip().lower()
     if action_scope == "ppo_only_z_tokens_and_verify":
         if rollout_backend != "vllm":
             raise ValueError("ppo_only_z_tokens_and_verify currently requires rollout.backend='vllm'")
         if not bool(cfg.rollout.vllm_enabled):
             raise ValueError("ppo_only_z_tokens_and_verify requires rollout.vllm_enabled=True")
-        if not bool(cfg.rollout.digit_greedy):
-            raise ValueError("ppo_only_z_tokens_and_verify requires rollout.digit_greedy=True")
     if not math.isfinite(float(cfg.rollout.verify_finalize_logit_bias)):
         raise ValueError("rollout.verify_finalize_logit_bias must be finite")
     if not math.isfinite(float(cfg.rollout.verify_retry_logit_bias)):
@@ -2326,6 +2475,8 @@ def train(cfg: Config) -> None:
     _log(
         f"Action scope={action_scope} | Z tokens={len(z_token_ids)} ({z_style}) | "
         f"answer_token_id={answer_token_id} | finalize_token_id={finalize_token_id} | retry_token_id={retry_token_id} | "
+        f"verify_temperature={float(cfg.rollout.verify_temperature):.4f} | "
+        f"verify_p={float(cfg.rollout.verify_p):.4f} | "
         f"verify_finalize_logit_bias={float(cfg.rollout.verify_finalize_logit_bias):.4f} | "
         f"verify_retry_logit_bias={float(cfg.rollout.verify_retry_logit_bias):.4f}"
     )
@@ -2665,6 +2816,10 @@ def train(cfg: Config) -> None:
                             max_new_tokens=cfg.rollout.max_new_tokens,
                             temperature=cfg.rollout.temperature,
                             top_p=cfg.rollout.top_p,
+                            digit_temperature=cfg.rollout.digit_temperature,
+                            digit_top_p=cfg.rollout.digit_top_p,
+                            min_p=cfg.rollout.min_p,
+                            repetition_penalty=cfg.rollout.repetition_penalty,
                             action_scope=action_scope,
                             digit_greedy=cfg.rollout.digit_greedy,
                             reward_cfg=cfg.reward,
