@@ -21,6 +21,7 @@ def assign_tree_values_and_advantages(
     nodes: List[TreeNode],
     groups: Dict[int, TreeGroup],
     retry_token_id: int,
+    max_retry_depth: int,
     c_retry: float,
     gamma: float,
     c_branch: float,
@@ -75,9 +76,21 @@ def assign_tree_values_and_advantages(
                     backup = float(sum(child_vals) / float(len(child_vals)))
                 n.Q_R = float(-float(c_retry) - float(c_branch) + float(gamma) * float(backup))
             else:
-                # Finalize-chosen nodes may not have sampled retry descendants.
-                # Keep counterfactual conservative-neutral in v1 (no truncation semantics).
-                n.Q_R = float(n.Q_F)
+                # Finalize-chosen nodes estimate retry value via forced-retry probe.
+                if int(n.retry_depth) >= int(max_retry_depth):
+                    raise RuntimeError(
+                        f"Node {n.node_id} has verify action at retry_depth >= max_retry_depth; invalid state"
+                    )
+                if not bool(getattr(n, "has_forced_retry_probe", False)):
+                    raise RuntimeError(
+                        f"Finalize node {n.node_id} missing forced-retry probe; cannot estimate Q_R"
+                    )
+                probe_v = getattr(n, "probe_terminal_value", None)
+                if probe_v is None:
+                    raise RuntimeError(
+                        f"Finalize node {n.node_id} has forced-retry probe flag but no probe_terminal_value"
+                    )
+                n.Q_R = float(-float(c_retry) - float(c_branch) + float(gamma) * float(probe_v))
 
             assert n.Q_R is not None
             n.U = float(max(n.Q_F, n.Q_R))

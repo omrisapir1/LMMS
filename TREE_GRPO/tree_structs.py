@@ -82,3 +82,11 @@ class TreeNode:
     was_forced_finalize: bool = False
     verify_action_present: bool = False
     leaf_end_type: str = "model_finalize"
+    has_forced_retry_probe: bool = False
+    probe_terminal_value: Optional[float] = None
+    probe_terminal_node_id: Optional[int] = None
+    probe_length_rounds: Optional[int] = None
+    probe_leaf_end_type: Optional[str] = None
+    probe_start_retry_depth: Optional[int] = None
+    is_forced_retry_probe: bool = False
+    probe_source_node_id: Optional[int] = None

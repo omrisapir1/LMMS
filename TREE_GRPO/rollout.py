@@ -325,6 +325,164 @@ def _run_segment_wave(
     return out
 
 
+def _run_forced_retry_probes(
+    *,
+    nodes: Sequence[TreeNode],
+    prompt_meta: Dict[int, Dict[str, object]],
+    tokenizer,
+    vllm_engine: Any,
+    cfg: Config,
+    answer_token_id: int,
+    finalize_token_id: int,
+    retry_token_id: int,
+    digit_token_ids: Sequence[int],
+    probe_node_id_start: int,
+) -> Tuple[Dict[int, Dict[str, object]], List[Dict[str, object]], int]:
+    """
+    For finalize-chosen nodes (where retry is still legal), run a single
+    forced-retry linear probe to terminal and return per-source probe results.
+    Probe nodes are rollout-only and must not be added to PPO training rows.
+    """
+    eligible_sources: List[TreeNode] = []
+    for n in nodes:
+        if not bool(n.verify_action_present):
+            continue
+        if int(n.verify_token_id or -1) != int(finalize_token_id):
+            continue
+        if int(n.retry_depth) >= int(cfg.tree.max_retry_depth):
+            continue
+        eligible_sources.append(n)
+
+    if len(eligible_sources) == 0:
+        return {}, [], int(probe_node_id_start)
+
+    source_state: Dict[int, Dict[str, object]] = {}
+    pending_pairs: List[Tuple[int, ExpandRequest]] = []
+    for src in eligible_sources:
+        src_id = int(src.node_id)
+        source_state[src_id] = {
+            "start_retry_depth": int(src.retry_depth),
+            "rounds": 0,
+            "terminal_value": None,
+            "terminal_node_id": None,
+            "terminal_leaf_end_type": None,
+            "probe_nodes": [],
+        }
+        if len(src.full_generated_ids) == 0:
+            raise RuntimeError(f"Source finalize node {src_id} has empty full_generated_ids")
+        if int(src.full_generated_ids[-1]) != int(finalize_token_id):
+            raise RuntimeError(f"Source node {src_id} is finalize-chosen but last token is not <FINALIZE>")
+
+        src_prefix_add = list(src.full_generated_ids[:-1])  # omit sampled verify token
+        next_prefix_ids = list(src.prompt_ids) + src_prefix_add
+        next_prefix_attention_mask = list(src.prompt_attention_mask) + [1] * len(src_prefix_add)
+        pending_pairs.append(
+            (
+                src_id,
+                ExpandRequest(
+                    prompt_id=int(src.prompt_id),
+                    true_digits=list(prompt_meta[int(src.prompt_id)]["true_digits"]),
+                    prefix_ids=next_prefix_ids,
+                    prefix_attention_mask=next_prefix_attention_mask,
+                    path_generated_len=max(int(src.path_generated_len_after) - 1, 0),
+                    retry_depth=int(src.retry_depth + 1),  # forced retry transition
+                    parent_node_id=None,
+                    group_id=-1,
+                    branch_slot=0,
+                ),
+            )
+        )
+
+    probe_rows: List[Dict[str, object]] = []
+    probe_node_id_next = int(probe_node_id_start)
+    while pending_pairs:
+        reqs = [req for _, req in pending_pairs]
+        segs = _run_segment_wave(
+            requests=reqs,
+            tokenizer=tokenizer,
+            vllm_engine=vllm_engine,
+            max_new_tokens_round=int(cfg.rollout.max_new_tokens),
+            max_retry_depth=int(cfg.tree.max_retry_depth),
+            answer_token_id=int(answer_token_id),
+            finalize_token_id=int(finalize_token_id),
+            retry_token_id=int(retry_token_id),
+            digit_token_ids=digit_token_ids,
+            temperature=float(cfg.rollout.temperature),
+            top_p=float(cfg.rollout.top_p),
+            verify_temperature=float(cfg.rollout.verify_temperature),
+            verify_p=float(cfg.rollout.verify_p),
+            min_p=float(cfg.rollout.min_p),
+            repetition_penalty=float(cfg.rollout.repetition_penalty),
+            digit_temperature=float(cfg.rollout.digit_temperature),
+            digit_top_p=float(cfg.rollout.digit_top_p),
+            digit_greedy=bool(cfg.rollout.digit_greedy),
+        )
+        if len(segs) != len(pending_pairs):
+            raise RuntimeError("Forced-retry probe wave size mismatch")
+
+        next_pairs: List[Tuple[int, ExpandRequest]] = []
+        for (src_id, req), seg in zip(pending_pairs, segs):
+            st = source_state[int(src_id)]
+            probe_node_id = int(probe_node_id_next)
+            probe_node_id_next += 1
+            q = 1.0 if (seg.pred_digits is not None and list(seg.pred_digits) == list(req.true_digits)) else 0.0
+            probe_row = {
+                "probe_node_id": probe_node_id,
+                "is_forced_retry_probe": True,
+                "probe_source_node_id": int(src_id),
+                "prompt_id": int(req.prompt_id),
+                "retry_depth": int(req.retry_depth),
+                "verify_action_present": bool(seg.verify_action_present),
+                "verify_token_id": (None if seg.verify_token_id is None else int(seg.verify_token_id)),
+                "leaf_end_type": str(seg.leaf_end_type),
+                "was_forced_finalize": bool(seg.was_forced_finalize),
+                "pred_digits": (None if seg.pred_digits is None else list(seg.pred_digits)),
+                "q": float(q),
+            }
+            st["probe_nodes"].append(probe_row)
+            probe_rows.append(probe_row)
+            st["rounds"] = int(st["rounds"]) + 1
+
+            is_retry = bool(seg.verify_action_present) and int(seg.verify_token_id or -1) == int(retry_token_id)
+            if is_retry:
+                next_pairs.append(
+                    (
+                        int(src_id),
+                        ExpandRequest(
+                            prompt_id=int(req.prompt_id),
+                            true_digits=list(req.true_digits),
+                            prefix_ids=list(seg.next_prefix_ids),
+                            prefix_attention_mask=list(seg.next_prefix_attention_mask),
+                            path_generated_len=int(seg.next_path_generated_len),
+                            retry_depth=int(req.retry_depth + 1),
+                            parent_node_id=None,
+                            group_id=-1,
+                            branch_slot=0,
+                        ),
+                    )
+                )
+            else:
+                st["terminal_value"] = float(q)
+                st["terminal_node_id"] = int(probe_node_id)
+                st["terminal_leaf_end_type"] = str(seg.leaf_end_type)
+        pending_pairs = next_pairs
+
+    out: Dict[int, Dict[str, object]] = {}
+    for src_id, st in source_state.items():
+        if st["terminal_value"] is None:
+            raise RuntimeError(f"Forced-retry probe for node {src_id} did not terminate")
+        out[int(src_id)] = {
+            "has_forced_retry_probe": True,
+            "probe_terminal_value": float(st["terminal_value"]),
+            "probe_terminal_node_id": int(st["terminal_node_id"]),
+            "probe_length_rounds": int(st["rounds"]),
+            "probe_leaf_end_type": str(st["terminal_leaf_end_type"]),
+            "probe_start_retry_depth": int(st["start_retry_depth"]),
+            "probe_nodes": list(st["probe_nodes"]),
+        }
+    return out, probe_rows, int(probe_node_id_next)
+
+
 def collect_tree_grpo_v1_batch(
     *,
     model,
@@ -592,10 +750,34 @@ def collect_tree_grpo_v1_batch(
                     f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
                 )
 
+    probe_results, _, _ = _run_forced_retry_probes(
+        nodes=nodes,
+        prompt_meta=prompt_meta,
+        tokenizer=tokenizer,
+        vllm_engine=vllm_engine,
+        cfg=cfg,
+        answer_token_id=int(answer_token_id),
+        finalize_token_id=int(finalize_token_id),
+        retry_token_id=int(retry_token_id),
+        digit_token_ids=digit_token_ids,
+        probe_node_id_start=int(node_id_next),
+    )
+    for source_id, result in probe_results.items():
+        src = node_by_id.get(int(source_id))
+        if src is None:
+            raise RuntimeError(f"Probe source node missing: {source_id}")
+        src.has_forced_retry_probe = bool(result["has_forced_retry_probe"])
+        src.probe_terminal_value = float(result["probe_terminal_value"])
+        src.probe_terminal_node_id = int(result["probe_terminal_node_id"])
+        src.probe_length_rounds = int(result["probe_length_rounds"])
+        src.probe_leaf_end_type = str(result["probe_leaf_end_type"])
+        src.probe_start_retry_depth = int(result["probe_start_retry_depth"])
+
     assign_tree_values_and_advantages(
         nodes=nodes,
         groups=groups,
         retry_token_id=int(retry_token_id),
+        max_retry_depth=int(cfg.tree.max_retry_depth),
         c_retry=float(cfg.tree.c_retry),
         gamma=float(cfg.tree.gamma),
         c_branch=float(cfg.tree.c_branch),
@@ -663,6 +845,21 @@ def collect_tree_grpo_v1_batch(
                 else None
             ),
             "verify_action_present": bool(n.verify_action_present),
+            "has_forced_retry_probe": bool(n.has_forced_retry_probe),
+            "probe_terminal_value": (None if n.probe_terminal_value is None else float(n.probe_terminal_value)),
+            "probe_terminal_node_id": (
+                None if n.probe_terminal_node_id is None else int(n.probe_terminal_node_id)
+            ),
+            "probe_length_rounds": (None if n.probe_length_rounds is None else int(n.probe_length_rounds)),
+            "probe_leaf_end_type": (None if n.probe_leaf_end_type is None else str(n.probe_leaf_end_type)),
+            "probe_start_retry_depth": (
+                None if n.probe_start_retry_depth is None else int(n.probe_start_retry_depth)
+            ),
+            "probe_nodes": (
+                []
+                if int(n.node_id) not in probe_results
+                else list(probe_results[int(n.node_id)].get("probe_nodes", []))
+            ),
             "tree_mode": "shallow_v1",
         }
 
@@ -714,6 +911,25 @@ def collect_tree_grpo_v1_batch(
                     "V": float(n.V),
                     "A_Z": float(n.A_Z),
                     "A_V": float(n.A_V),
+                    "has_forced_retry_probe": bool(n.has_forced_retry_probe),
+                    "probe_terminal_value": (
+                        None if n.probe_terminal_value is None else float(n.probe_terminal_value)
+                    ),
+                    "probe_terminal_node_id": (
+                        None if n.probe_terminal_node_id is None else int(n.probe_terminal_node_id)
+                    ),
+                    "probe_length_rounds": (
+                        None if n.probe_length_rounds is None else int(n.probe_length_rounds)
+                    ),
+                    "probe_leaf_end_type": (None if n.probe_leaf_end_type is None else str(n.probe_leaf_end_type)),
+                    "probe_start_retry_depth": (
+                        None if n.probe_start_retry_depth is None else int(n.probe_start_retry_depth)
+                    ),
+                    "probe_nodes": (
+                        []
+                        if int(n.node_id) not in probe_results
+                        else list(probe_results[int(n.node_id)].get("probe_nodes", []))
+                    ),
                     "retry_block_reason": str(n.retry_block_reason),
                 }
             ],
