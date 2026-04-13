@@ -42,7 +42,7 @@ class TreeConfig:
     max_total_nodes_per_prompt: int = 320
     max_leaves_per_prompt: int = 200
     max_active_nodes_per_wave: int = 256
-    max_expanded_retry_nodes_per_level: int = 64
+    max_expanded_retry_nodes_per_level: int = 50
     max_retry_depth: int = 1
     c_retry: float = 0.05
     gamma: float = 0.95
