@@ -235,32 +235,47 @@ def _run_segment_wave(
     # Always generate exactly 5 digits.
     digit_allowed_set = set(int(x) for x in digit_token_ids)
     id2d = {int(tok): i for i, tok in enumerate(digit_token_ids)}
-    digit_prompt_ids = [requests[idx].prefix_ids + states[idx].full_generated_ids for idx in active_idx]
-    if supports_token_prompts:
-        digit_rows = vllm_engine.generate_digits(
-            prompt_token_ids=digit_prompt_ids,
-            num_digits=5,
-            temperature=float(digit_temperature),
-            top_p=float(digit_top_p),
-            greedy=bool(digit_greedy),
-            min_p=0.0,
-            repetition_penalty=1.0,
-        )
-    else:
-        digit_rows = vllm_engine.generate_digits(
-            prompts=[_decode_cached(x) for x in digit_prompt_ids],
-            num_digits=5,
-            temperature=float(digit_temperature),
-            top_p=float(digit_top_p),
-            greedy=bool(digit_greedy),
-            min_p=0.0,
-            repetition_penalty=1.0,
-        )
-    if len(digit_rows) != len(active_idx):
-        raise RuntimeError("Tree wave digit-phase row count mismatch")
-    for j, req_idx in enumerate(active_idx):
+    # Prefix-aware grouped digit sampling (reuses prefill for identical prefixes).
+    digit_row_by_req_idx: Dict[int, List[int]] = {}
+    digit_prefix_to_req_idxs: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+    for req_idx in active_idx:
+        prompt_ids_key = tuple(int(x) for x in (requests[req_idx].prefix_ids + states[req_idx].full_generated_ids))
+        digit_prefix_to_req_idxs[prompt_ids_key].append(int(req_idx))
+    for key, req_idxs in digit_prefix_to_req_idxs.items():
+        ordered_req_idxs = sorted(req_idxs, key=lambda i: int(requests[i].branch_slot))
+        k = int(len(ordered_req_idxs))
+        if supports_token_prompts:
+            rows_group = vllm_engine.generate_digits(
+                prompt_token_ids=[list(key)],
+                num_samples_per_prompt=k,
+                num_digits=5,
+                temperature=float(digit_temperature),
+                top_p=float(digit_top_p),
+                greedy=bool(digit_greedy),
+                min_p=0.0,
+                repetition_penalty=1.0,
+            )
+        else:
+            rows_group = vllm_engine.generate_digits(
+                prompts=[_decode_cached(key)],
+                num_samples_per_prompt=k,
+                num_digits=5,
+                temperature=float(digit_temperature),
+                top_p=float(digit_top_p),
+                greedy=bool(digit_greedy),
+                min_p=0.0,
+                repetition_penalty=1.0,
+            )
+        if len(rows_group) != k:
+            raise RuntimeError(
+                f"Tree wave grouped digit row count mismatch: got={len(rows_group)} expected={k}"
+            )
+        for local_i, req_idx in enumerate(ordered_req_idxs):
+            digit_row_by_req_idx[int(req_idx)] = [int(x) for x in list(rows_group[local_i])]
+
+    for req_idx in active_idx:
         st = states[req_idx]
-        digits = [int(x) for x in list(digit_rows[j])]
+        digits = list(digit_row_by_req_idx.get(int(req_idx), []))
         if len(digits) != 5:
             raise RuntimeError(f"Digit phase must return exactly 5 tokens, got {len(digits)}")
         bad = [d for d in digits if d not in digit_allowed_set]
@@ -288,29 +303,44 @@ def _run_segment_wave(
         verify_prompt_ids.append(list(req.prefix_ids) + list(st.full_generated_ids))
 
     if need_verify:
-        if supports_token_prompts:
-            verify_rows = vllm_engine.generate_verify(
-                prompt_token_ids=verify_prompt_ids,
-                temperature=float(verify_temperature),
-                top_p=float(verify_p),
-                greedy=False,
-                min_p=float(min_p),
-                repetition_penalty=float(repetition_penalty),
-            )
-        else:
-            verify_rows = vllm_engine.generate_verify(
-                prompts=[_decode_cached(x) for x in verify_prompt_ids],
-                temperature=float(verify_temperature),
-                top_p=float(verify_p),
-                greedy=False,
-                min_p=float(min_p),
-                repetition_penalty=float(repetition_penalty),
-            )
-        if len(verify_rows) != len(need_verify):
-            raise RuntimeError("Tree wave verify-phase row count mismatch")
-        for row_i, req_idx in enumerate(need_verify):
+        verify_row_by_req_idx: Dict[int, List[int]] = {}
+        verify_prefix_to_req_idxs: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+        for local_i, req_idx in enumerate(need_verify):
+            verify_prefix_to_req_idxs[tuple(int(x) for x in verify_prompt_ids[local_i])].append(int(req_idx))
+
+        for key, req_idxs in verify_prefix_to_req_idxs.items():
+            ordered_req_idxs = sorted(req_idxs, key=lambda i: int(requests[i].branch_slot))
+            k = int(len(ordered_req_idxs))
+            if supports_token_prompts:
+                rows_group = vllm_engine.generate_verify(
+                    prompt_token_ids=[list(key)],
+                    num_samples_per_prompt=k,
+                    temperature=float(verify_temperature),
+                    top_p=float(verify_p),
+                    greedy=False,
+                    min_p=float(min_p),
+                    repetition_penalty=float(repetition_penalty),
+                )
+            else:
+                rows_group = vllm_engine.generate_verify(
+                    prompts=[_decode_cached(key)],
+                    num_samples_per_prompt=k,
+                    temperature=float(verify_temperature),
+                    top_p=float(verify_p),
+                    greedy=False,
+                    min_p=float(min_p),
+                    repetition_penalty=float(repetition_penalty),
+                )
+            if len(rows_group) != k:
+                raise RuntimeError(
+                    f"Tree wave grouped verify row count mismatch: got={len(rows_group)} expected={k}"
+                )
+            for local_i, req_idx in enumerate(ordered_req_idxs):
+                verify_row_by_req_idx[int(req_idx)] = [int(x) for x in list(rows_group[local_i])]
+
+        for req_idx in need_verify:
             st = states[req_idx]
-            row = [int(x) for x in list(verify_rows[row_i])]
+            row = list(verify_row_by_req_idx.get(int(req_idx), []))
             if len(row) != 1:
                 raise RuntimeError(f"Verify phase must return exactly 1 token, got {len(row)}")
             tok = int(row[0])

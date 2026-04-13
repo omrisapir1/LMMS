@@ -666,6 +666,7 @@ class VLLMRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         num_digits: int = 5,
         temperature: float,
         top_p: float,
@@ -678,6 +679,7 @@ class VLLMRolloutEngine:
         k = int(num_digits)
         if k < 1 or k > 5:
             raise RuntimeError(f"num_digits must be in [1, 5], got {k}")
+        n = max(1, int(num_samples_per_prompt))
         sp = self._build_sampling_params(
             allowed_token_ids=self.digit_allowed_token_ids,
             max_tokens=k,
@@ -687,6 +689,7 @@ class VLLMRolloutEngine:
             min_p=float(min_p),
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
+            n=n,
         )
 
         with self._lock:
@@ -698,13 +701,18 @@ class VLLMRolloutEngine:
                     raise RuntimeError("generate_digits requires text prompts when prompt_token_ids are unsupported")
                 outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
 
-        return [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
+        rows: List[List[int]] = []
+        for o in outs:
+            for out_j in list(getattr(o, "outputs", []) or []):
+                rows.append([int(x) for x in list(getattr(out_j, "token_ids", []) or [])])
+        return rows
 
     def generate_verify(
         self,
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         temperature: float,
         top_p: float,
         greedy: bool,
@@ -714,6 +722,7 @@ class VLLMRolloutEngine:
     ) -> List[List[int]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
+        n = max(1, int(num_samples_per_prompt))
         sp = self._build_sampling_params(
             allowed_token_ids=self.verify_allowed_token_ids,
             max_tokens=1,
@@ -724,6 +733,7 @@ class VLLMRolloutEngine:
             repetition_penalty=float(repetition_penalty),
             greedy=bool(greedy),
             logit_bias=logit_bias,
+            n=n,
         )
 
         with self._lock:
@@ -735,7 +745,10 @@ class VLLMRolloutEngine:
                     raise RuntimeError("generate_verify requires text prompts when prompt_token_ids are unsupported")
                 outs = self._llm.generate(list(prompts), sp, use_tqdm=False)
 
-        rows = [list(getattr(o.outputs[0], "token_ids", []) or []) for o in outs]
+        rows: List[List[int]] = []
+        for o in outs:
+            for out_j in list(getattr(o, "outputs", []) or []):
+                rows.append([int(x) for x in list(getattr(out_j, "token_ids", []) or [])])
         for row in rows:
             if len(row) != 1:
                 raise RuntimeError(f"vLLM verify generation must return exactly 1 token, got {len(row)}")

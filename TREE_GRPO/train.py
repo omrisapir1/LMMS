@@ -507,6 +507,21 @@ def train(cfg: Config) -> None:
         vllm_kwargs.setdefault("tensor_parallel_size", int(cfg.rollout.vllm_tp_size))
         vllm_kwargs.setdefault("gpu_memory_utilization", float(cfg.rollout.gpu_memory_utilization))
         vllm_kwargs.setdefault("weight_transfer_device", str(device))
+        vllm_kwargs.setdefault("max_num_seqs", 256)
+        vllm_kwargs.setdefault("max_num_batched_tokens", 16384)
+        vllm_kwargs.setdefault("enable_prefix_caching", True)
+        vllm_kwargs.setdefault("enable_chunked_prefill", True)
+        vllm_kwargs.setdefault("swap_space", 8)
+        vllm_kwargs.setdefault("disable_log_stats", True)
+        _log(
+            "vLLM perf knobs | "
+            f"max_num_seqs={vllm_kwargs.get('max_num_seqs')} | "
+            f"max_num_batched_tokens={vllm_kwargs.get('max_num_batched_tokens')} | "
+            f"enable_prefix_caching={vllm_kwargs.get('enable_prefix_caching')} | "
+            f"enable_chunked_prefill={vllm_kwargs.get('enable_chunked_prefill')} | "
+            f"swap_space={vllm_kwargs.get('swap_space')} | "
+            f"disable_log_stats={vllm_kwargs.get('disable_log_stats')}"
+        )
         if int(cfg.rollout.vllm_tp_size) == 1:
             vllm_cvd = str(getattr(cfg.rollout, "vllm_cuda_visible_devices", "")).strip()
             if vllm_cvd:

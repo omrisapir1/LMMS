@@ -249,6 +249,7 @@ class HFRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         num_digits: int = 5,
         temperature: float,
         top_p: float,
@@ -280,6 +281,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
+                        num_return_sequences=max(1, int(num_samples_per_prompt)),
                     )
                     for gen in gens:
                         if len(gen) != k:
@@ -295,6 +297,7 @@ class HFRolloutEngine:
         prompts: Optional[Sequence[str]] = None,
         prompt_token_ids: Optional[Sequence[Sequence[int]]] = None,
         *,
+        num_samples_per_prompt: int = 1,
         temperature: float,
         top_p: float,
         greedy: bool,
@@ -323,6 +326,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
+                        num_return_sequences=max(1, int(num_samples_per_prompt)),
                         logit_bias=logit_bias,
                     )
                     for gen in gens:
