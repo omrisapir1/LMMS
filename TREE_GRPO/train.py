@@ -369,11 +369,37 @@ def train(cfg: Config) -> None:
         raise ValueError("rollout.verify_temperature must be > 0")
     if float(cfg.rollout.verify_p) <= 0.0 or float(cfg.rollout.verify_p) > 1.0:
         raise ValueError("rollout.verify_p must be in (0, 1]")
+    p4 = list(cfg.tree.tree_p4_by_depth)
+    p2 = list(cfg.tree.tree_p2_by_depth)
+    p1 = list(cfg.tree.tree_p1_by_depth)
+    if len(p4) == 0 or len(p2) == 0 or len(p1) == 0:
+        raise ValueError("tree_p*_by_depth lists must be non-empty")
+    for i in range(max(len(p4), len(p2), len(p1))):
+        a = float(p4[min(i, len(p4) - 1)])
+        b = float(p2[min(i, len(p2) - 1)])
+        c = float(p1[min(i, len(p1) - 1)])
+        if a < 0.0 or b < 0.0 or c < 0.0:
+            raise ValueError(f"Branching probabilities must be >=0 at depth={i}")
+        if abs((a + b + c) - 1.0) > 1e-6:
+            raise ValueError(f"Branching probabilities must sum to 1 at depth={i}: got {a+b+c}")
+    if int(cfg.tree.max_total_nodes_per_prompt) <= 0:
+        raise ValueError("tree.max_total_nodes_per_prompt must be > 0")
+    if int(cfg.tree.max_leaves_per_prompt) <= 0:
+        raise ValueError("tree.max_leaves_per_prompt must be > 0")
+    if int(cfg.tree.max_active_nodes_per_wave) <= 0:
+        raise ValueError("tree.max_active_nodes_per_wave must be > 0")
+    if int(cfg.tree.max_expanded_retry_nodes_per_level) <= 0:
+        raise ValueError("tree.max_expanded_retry_nodes_per_level must be > 0")
 
     _log(
         f"Tree-GRPO v1 | root_siblings={cfg.tree.root_siblings} | "
-        f"max_retry_parents_from_root={cfg.tree.max_retry_parents_from_root} | "
-        f"retry_children_per_parent={cfg.tree.retry_children_per_parent} | "
+        f"tree_p4_by_depth={cfg.tree.tree_p4_by_depth} | "
+        f"tree_p2_by_depth={cfg.tree.tree_p2_by_depth} | "
+        f"tree_p1_by_depth={cfg.tree.tree_p1_by_depth} | "
+        f"max_total_nodes_per_prompt={cfg.tree.max_total_nodes_per_prompt} | "
+        f"max_leaves_per_prompt={cfg.tree.max_leaves_per_prompt} | "
+        f"max_active_nodes_per_wave={cfg.tree.max_active_nodes_per_wave} | "
+        f"max_expanded_retry_nodes_per_level={cfg.tree.max_expanded_retry_nodes_per_level} | "
         f"max_retry_depth={cfg.tree.max_retry_depth} | "
         f"verify_temperature={cfg.rollout.verify_temperature:.4f} | "
         f"verify_p={cfg.rollout.verify_p:.4f} | "
@@ -582,6 +608,8 @@ def train(cfg: Config) -> None:
                     "was_forced_finalize": traj.reward_info.get("was_forced_finalize", None),
                     "retry_depth_at_leaf": traj.reward_info.get("retry_depth_at_leaf", None),
                     "verify_action_present": traj.reward_info.get("verify_action_present", None),
+                    "k_used": traj.reward_info.get("k_used", None),
+                    "branching_decision": traj.reward_info.get("branching_decision", None),
                     "has_forced_retry_probe": traj.reward_info.get("has_forced_retry_probe", None),
                     "probe_terminal_value": traj.reward_info.get("probe_terminal_value", None),
                     "probe_terminal_node_id": traj.reward_info.get("probe_terminal_node_id", None),

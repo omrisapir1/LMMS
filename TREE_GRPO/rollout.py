@@ -599,7 +599,14 @@ def collect_tree_grpo_v1_batch(
         digit_greedy=bool(cfg.rollout.digit_greedy),
     )
 
-    def _append_node(req: ExpandRequest, seg: SegmentResult, *, group_type: str) -> int:
+    def _append_node(
+        req: ExpandRequest,
+        seg: SegmentResult,
+        *,
+        group_type: str,
+        k_used: int = 0,
+        branching_decision: str = "not_retry",
+    ) -> int:
         nonlocal node_id_next
         nid = int(node_id_next)
         node_id_next += 1
@@ -630,6 +637,8 @@ def collect_tree_grpo_v1_batch(
             was_forced_finalize=bool(seg.was_forced_finalize),
             verify_action_present=bool(seg.verify_action_present),
             leaf_end_type=str(seg.leaf_end_type),
+            k_used=int(k_used),
+            branching_decision=str(branching_decision),
         )
         nodes.append(n)
         node_by_id[int(nid)] = n
@@ -646,81 +655,116 @@ def collect_tree_grpo_v1_batch(
         nid = _append_node(req=req, seg=seg, group_type="root_siblings")
         root_nodes_by_prompt[int(req.prompt_id)].append(int(nid))
 
-    # Root split policy:
-    # - Expand up to K retry parents with k=2 children.
-    # - Remaining retry roots continue as k=1 (no unresolved retry leaves).
+    prompt_total_nodes: Dict[int, int] = defaultdict(int)
+    prompt_reserved_nodes: Dict[int, int] = defaultdict(int)
+    prompt_live_paths: Dict[int, int] = defaultdict(int)
+    prompt_terminal_leaves: Dict[int, int] = defaultdict(int)
+    expanded_split_by_prompt_level: Dict[Tuple[int, int], int] = defaultdict(int)
+    budget_exhausted_no_k1 = 0
+
+    for n in nodes:
+        pid = int(n.prompt_id)
+        prompt_total_nodes[pid] += 1
+        is_retry = bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id)
+        if is_retry:
+            prompt_live_paths[pid] += 1
+        else:
+            prompt_terminal_leaves[pid] += 1
+
     pending_requests: List[ExpandRequest] = []
 
-    for prompt_id, node_ids in root_nodes_by_prompt.items():
-        retry_roots = [
-            nid
-            for nid in node_ids
-            if bool(node_by_id[int(nid)].verify_action_present)
-            and int(node_by_id[int(nid)].verify_token_id or -1) == int(retry_token_id)
-        ]
-        retry_roots.sort(key=lambda nid: int(node_by_id[int(nid)].branch_slot))
-        keep = retry_roots[: int(cfg.tree.max_retry_parents_from_root)]
-        dropped = retry_roots[int(cfg.tree.max_retry_parents_from_root):]
+    def _select_k_with_budgets(parent: TreeNode) -> Tuple[int, str]:
+        pid = int(parent.prompt_id)
+        d = int(parent.retry_depth)
+        sampled_k, sampled_decision = _sample_branch_k(cfg, d)
+        candidates: List[int]
+        if sampled_k == 4:
+            candidates = [4, 2, 1]
+        elif sampled_k == 2:
+            candidates = [2, 1]
+        else:
+            candidates = [1]
 
-        for parent_nid in keep:
-            parent = node_by_id[int(parent_nid)]
-            gid = int(group_id_next)
-            group_id_next += 1
-            groups[gid] = TreeGroup(
-                group_id=gid,
-                prompt_id=int(prompt_id),
-                group_type="retry_children",
-                parent_node_id=int(parent_nid),
-                member_node_ids=[],
-            )
-            for branch_slot in range(int(cfg.tree.retry_children_per_parent)):
-                pending_requests.append(
-                    ExpandRequest(
-                        prompt_id=int(prompt_id),
-                        true_digits=list(prompt_meta[int(prompt_id)]["true_digits"]),
-                        prefix_ids=list(parent.prompt_ids) + list(parent.full_generated_ids),
-                        prefix_attention_mask=list(parent.prompt_attention_mask) + [1] * len(parent.full_generated_ids),
-                        path_generated_len=int(parent.path_generated_len_after),
-                        retry_depth=int(parent.retry_depth + 1),
-                        parent_node_id=int(parent_nid),
-                        group_id=int(gid),
-                        branch_slot=int(branch_slot),
-                    )
-                )
-                nonroot_request_count += 1
+        for cand in candidates:
+            if cand > 1 and int(expanded_split_by_prompt_level[(pid, d)]) >= int(
+                cfg.tree.max_expanded_retry_nodes_per_level
+            ):
+                continue
+            if int(prompt_total_nodes[pid] + prompt_reserved_nodes[pid] + cand) > int(cfg.tree.max_total_nodes_per_prompt):
+                continue
+            projected_final_leaves = int(prompt_terminal_leaves[pid] + prompt_live_paths[pid] - 1 + cand)
+            if projected_final_leaves > int(cfg.tree.max_leaves_per_prompt):
+                continue
 
-        # Not split because of parent cap: continue with a single route.
-        for parent_nid in dropped:
-            parent = node_by_id[int(parent_nid)]
-            parent.retry_block_reason = "continued_single_after_parent_cap"
-            gid = int(group_id_next)
-            group_id_next += 1
-            groups[gid] = TreeGroup(
-                group_id=gid,
-                prompt_id=int(prompt_id),
-                group_type="retry_single_continue",
-                parent_node_id=int(parent_nid),
-                member_node_ids=[],
+            if cand > 1:
+                expanded_split_by_prompt_level[(pid, d)] += 1
+            prompt_live_paths[pid] = int(prompt_live_paths[pid] - 1 + cand)
+            prompt_reserved_nodes[pid] += int(cand)
+            decision = sampled_decision if cand == sampled_k else "downgraded_due_to_budget"
+            return int(cand), str(decision)
+
+        # Could not continue even with k=1 due hard budgets.
+        prompt_live_paths[pid] = int(prompt_live_paths[pid] - 1)
+        return 0, "downgraded_due_to_budget"
+
+    def _enqueue_children(parent: TreeNode) -> None:
+        nonlocal group_id_next, nonroot_request_count, budget_exhausted_no_k1
+        k, decision = _select_k_with_budgets(parent)
+        parent.k_used = int(k)
+        parent.branching_decision = str(decision)
+        if decision == "downgraded_due_to_budget":
+            parent.retry_block_reason = "downgraded_due_to_budget"
+        if int(k) <= 0:
+            budget_exhausted_no_k1 += 1
+            parent.retry_block_reason = "budget_exhausted_no_k1"
+            print(
+                f"[TREE_GRPO][WARN] budget exhausted for retry node={parent.node_id} "
+                f"prompt_id={parent.prompt_id} depth={parent.retry_depth}; stopping expansion"
             )
+            return
+
+        gid = int(group_id_next)
+        group_id_next += 1
+        gtype = "retry_children" if int(k) > 1 else "retry_single_continue"
+        groups[gid] = TreeGroup(
+            group_id=gid,
+            prompt_id=int(parent.prompt_id),
+            group_type=gtype,
+            parent_node_id=int(parent.node_id),
+            member_node_ids=[],
+        )
+        for branch_slot in range(int(k)):
             pending_requests.append(
                 ExpandRequest(
-                    prompt_id=int(prompt_id),
-                    true_digits=list(prompt_meta[int(prompt_id)]["true_digits"]),
+                    prompt_id=int(parent.prompt_id),
+                    true_digits=list(prompt_meta[int(parent.prompt_id)]["true_digits"]),
                     prefix_ids=list(parent.prompt_ids) + list(parent.full_generated_ids),
                     prefix_attention_mask=list(parent.prompt_attention_mask) + [1] * len(parent.full_generated_ids),
                     path_generated_len=int(parent.path_generated_len_after),
                     retry_depth=int(parent.retry_depth + 1),
-                    parent_node_id=int(parent_nid),
+                    parent_node_id=int(parent.node_id),
                     group_id=int(gid),
-                    branch_slot=0,
+                    branch_slot=int(branch_slot),
                 )
             )
             nonroot_request_count += 1
 
-    # After root split phase, all retry continuations are k=1 until terminal.
+    # Root is always 4 siblings; branching policy starts at retry children decisions.
+    for prompt_id, node_ids in root_nodes_by_prompt.items():
+        ordered = sorted(node_ids, key=lambda nid: int(node_by_id[int(nid)].branch_slot))
+        for nid in ordered:
+            n = node_by_id[int(nid)]
+            is_retry = bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id)
+            if is_retry:
+                _enqueue_children(n)
+
+    max_active_wave = max(int(cfg.tree.max_active_nodes_per_wave), 1)
     while pending_requests:
+        wave_reqs = pending_requests[:max_active_wave]
+        pending_requests = pending_requests[max_active_wave:]
+
         segs = _run_segment_wave(
-            requests=pending_requests,
+            requests=wave_reqs,
             tokenizer=tokenizer,
             vllm_engine=vllm_engine,
             max_new_tokens_round=int(cfg.rollout.max_new_tokens),
@@ -739,41 +783,26 @@ def collect_tree_grpo_v1_batch(
             digit_top_p=float(cfg.rollout.digit_top_p),
             digit_greedy=bool(cfg.rollout.digit_greedy),
         )
-        next_pending: List[ExpandRequest] = []
-        for req, seg in zip(pending_requests, segs):
+        for req, seg in zip(wave_reqs, segs):
+            pid = int(req.prompt_id)
+            prompt_reserved_nodes[pid] = max(int(prompt_reserved_nodes[pid] - 1), 0)
             gid = groups[int(req.group_id)].group_type
             nid = _append_node(req=req, seg=seg, group_type=str(gid))
+            prompt_total_nodes[pid] += 1
             node = node_by_id[int(nid)]
-            if bool(node.verify_action_present) and int(node.verify_token_id or -1) == int(retry_token_id):
-                cgid = int(group_id_next)
-                group_id_next += 1
-                groups[cgid] = TreeGroup(
-                    group_id=cgid,
-                    prompt_id=int(node.prompt_id),
-                    group_type="retry_single_continue",
-                    parent_node_id=int(nid),
-                    member_node_ids=[],
-                )
-                next_pending.append(
-                    ExpandRequest(
-                        prompt_id=int(node.prompt_id),
-                        true_digits=list(prompt_meta[int(node.prompt_id)]["true_digits"]),
-                        prefix_ids=list(node.prompt_ids) + list(node.full_generated_ids),
-                        prefix_attention_mask=list(node.prompt_attention_mask) + [1] * len(node.full_generated_ids),
-                        path_generated_len=int(node.path_generated_len_after),
-                        retry_depth=int(node.retry_depth + 1),
-                        parent_node_id=int(nid),
-                        group_id=int(cgid),
-                        branch_slot=0,
-                    )
-                )
-                nonroot_request_count += 1
-        pending_requests = next_pending
+            is_retry = bool(node.verify_action_present) and int(node.verify_token_id or -1) == int(retry_token_id)
+            if is_retry:
+                _enqueue_children(node)
+            else:
+                prompt_live_paths[pid] = int(prompt_live_paths[pid] - 1)
+                prompt_terminal_leaves[pid] += 1
 
     # Strict invariant: no unresolved retry leaves in normal algorithm.
     for n in nodes:
         if bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id):
             if len(n.child_node_ids) == 0:
+                if str(n.retry_block_reason) == "budget_exhausted_no_k1":
+                    continue
                 n.retry_block_reason = "exception_missing_retry_child"
                 raise RuntimeError(
                     f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
@@ -874,6 +903,8 @@ def collect_tree_grpo_v1_batch(
                 else None
             ),
             "verify_action_present": bool(n.verify_action_present),
+            "k_used": int(n.k_used),
+            "branching_decision": str(n.branching_decision),
             "has_forced_retry_probe": bool(n.has_forced_retry_probe),
             "probe_terminal_value": (None if n.probe_terminal_value is None else float(n.probe_terminal_value)),
             "probe_terminal_node_id": (
@@ -926,6 +957,8 @@ def collect_tree_grpo_v1_batch(
                     "pred_digits": (None if n.pred_digits is None else list(n.pred_digits)),
                     "verify_token_id": (None if n.verify_token_id is None else int(n.verify_token_id)),
                     "verify_action_present": bool(n.verify_action_present),
+                    "k_used": int(n.k_used),
+                    "branching_decision": str(n.branching_decision),
                     "leaf_end_type": str(n.leaf_end_type),
                     "was_forced_finalize": bool(n.was_forced_finalize),
                     "retry_depth_at_leaf": (
@@ -978,4 +1011,5 @@ def collect_tree_grpo_v1_batch(
     stats["num_root_requests"] = float(len(root_requests))
     stats["num_child_requests"] = float(nonroot_request_count)
     stats["num_trajectories"] = float(len(trajectories))
+    stats["num_budget_exhausted_no_k1"] = float(budget_exhausted_no_k1)
     return trajectories, stats

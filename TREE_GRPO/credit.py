@@ -76,6 +76,14 @@ def assign_tree_values_and_advantages(
                     backup = float(sum(child_vals) / float(len(child_vals)))
                 n.Q_R = float(-float(c_retry) - float(c_branch) + float(gamma) * float(backup))
             else:
+                if bool(chosen_retry) and str(getattr(n, "retry_block_reason", "")) == "budget_exhausted_no_k1":
+                    # Rare budget-edge fallback: no retry continuation could be allocated.
+                    # Keep training numerically stable with conservative immediate retry cost.
+                    n.Q_R = float(-float(c_retry) - float(c_branch))
+                    n.U = float(max(n.Q_F, n.Q_R))
+                    n.V = float(n.Q_R)
+                    n.A_V = float(n.Q_R - 0.5 * (n.Q_F + n.Q_R))
+                    continue
                 # Finalize-chosen nodes estimate retry value via forced-retry probe.
                 if int(n.retry_depth) >= int(max_retry_depth):
                     raise RuntimeError(
