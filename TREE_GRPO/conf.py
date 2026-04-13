@@ -31,9 +31,13 @@ class TreeConfig:
     # Root remains fixed.
     root_siblings: int = 4
     # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
-    tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
-    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
-    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.25, 0.30, 0.5, 0.7, 0.7, 1.0])
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.0, 0., 0., 0., 0., 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.5, 0.0, 0.0, 0.0, 0., 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0])
+
+    # tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
+    # tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
+    # tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.25, 0.30, 0.5, 0.7, 0.7, 1.0])
     # Per-prompt safety budgets.
     max_total_nodes_per_prompt: int = 320
     max_leaves_per_prompt: int = 200
