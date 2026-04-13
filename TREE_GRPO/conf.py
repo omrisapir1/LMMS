@@ -72,8 +72,8 @@ class RolloutConfig:
     vllm_tmp_ckpt_dir: str = ""
     vllm_engine_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
-            "max_num_seqs": 256,
-            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 256*10,
+            "max_num_batched_tokens": 16384*10,
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
             "swap_space": 8,
@@ -83,7 +83,7 @@ class RolloutConfig:
     torch_device: str = "cuda:0"
     ref_model_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    tree_prompts_per_update: int = 1
+    tree_prompts_per_update: int = 8
     prefetch_next_rollout: bool = True
 
 
