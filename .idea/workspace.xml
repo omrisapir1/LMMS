@@ -64,35 +64,35 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python tests.Python tests in test_math_env_phase1.py.executor": "Run",
-    "Python tests.Python tests in test_ppo_logprob_consistency.py.executor": "Debug",
-    "Python tests.pytest in test_thought_embedding_pipeline.py.executor": "Run",
-    "Python.action_space.executor": "Run",
-    "Python.generate.executor": "Run",
-    "Python.generate_easy.executor": "Run",
-    "Python.test_split.executor": "Run",
-    "Python.tokenizer_ext.executor": "Run",
-    "Python.train (1).executor": "Debug",
-    "Python.train (2).executor": "Run",
-    "Python.train.executor": "Run",
-    "Python.trainer.executor": "Debug",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "codex/vllm-rollout-efficiency-check",
-    "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/RSFT",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "advanced.settings",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python tests.Python tests in test_math_env_phase1.py.executor&quot;: &quot;Run&quot;,
+    &quot;Python tests.Python tests in test_ppo_logprob_consistency.py.executor&quot;: &quot;Debug&quot;,
+    &quot;Python tests.pytest in test_thought_embedding_pipeline.py.executor&quot;: &quot;Run&quot;,
+    &quot;Python.action_space.executor&quot;: &quot;Run&quot;,
+    &quot;Python.generate.executor&quot;: &quot;Run&quot;,
+    &quot;Python.generate_easy.executor&quot;: &quot;Run&quot;,
+    &quot;Python.test_split.executor&quot;: &quot;Run&quot;,
+    &quot;Python.tokenizer_ext.executor&quot;: &quot;Run&quot;,
+    &quot;Python.train (1).executor&quot;: &quot;Debug&quot;,
+    &quot;Python.train (2).executor&quot;: &quot;Run&quot;,
+    &quot;Python.train.executor&quot;: &quot;Run&quot;,
+    &quot;Python.trainer.executor&quot;: &quot;Debug&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;codex/vllm-rollout-efficiency-check&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/Users/omri.sapir/learning/LMMS/RSFT&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;advanced.settings&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/RSFT" />
