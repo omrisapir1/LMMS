@@ -660,7 +660,6 @@ def collect_tree_grpo_v1_batch(
     prompt_live_paths: Dict[int, int] = defaultdict(int)
     prompt_terminal_leaves: Dict[int, int] = defaultdict(int)
     expanded_split_by_prompt_level: Dict[Tuple[int, int], int] = defaultdict(int)
-    budget_exhausted_no_k1 = 0
 
     for n in nodes:
         pid = int(n.prompt_id)
@@ -690,10 +689,12 @@ def collect_tree_grpo_v1_batch(
                 cfg.tree.max_expanded_retry_nodes_per_level
             ):
                 continue
-            if int(prompt_total_nodes[pid] + prompt_reserved_nodes[pid] + cand) > int(cfg.tree.max_total_nodes_per_prompt):
+            if cand > 1 and int(prompt_total_nodes[pid] + prompt_reserved_nodes[pid] + cand) > int(
+                cfg.tree.max_total_nodes_per_prompt
+            ):
                 continue
             projected_final_leaves = int(prompt_terminal_leaves[pid] + prompt_live_paths[pid] - 1 + cand)
-            if projected_final_leaves > int(cfg.tree.max_leaves_per_prompt):
+            if cand > 1 and projected_final_leaves > int(cfg.tree.max_leaves_per_prompt):
                 continue
 
             if cand > 1:
@@ -703,25 +704,18 @@ def collect_tree_grpo_v1_batch(
             decision = sampled_decision if cand == sampled_k else "downgraded_due_to_budget"
             return int(cand), str(decision)
 
-        # Could not continue even with k=1 due hard budgets.
-        prompt_live_paths[pid] = int(prompt_live_paths[pid] - 1)
-        return 0, "downgraded_due_to_budget"
+        # Strict invariant: retry continuation is always at least k=1.
+        prompt_live_paths[pid] = int(prompt_live_paths[pid])
+        prompt_reserved_nodes[pid] += 1
+        return 1, "downgraded_due_to_budget"
 
     def _enqueue_children(parent: TreeNode) -> None:
-        nonlocal group_id_next, nonroot_request_count, budget_exhausted_no_k1
+        nonlocal group_id_next, nonroot_request_count
         k, decision = _select_k_with_budgets(parent)
         parent.k_used = int(k)
         parent.branching_decision = str(decision)
         if decision == "downgraded_due_to_budget":
             parent.retry_block_reason = "downgraded_due_to_budget"
-        if int(k) <= 0:
-            budget_exhausted_no_k1 += 1
-            parent.retry_block_reason = "budget_exhausted_no_k1"
-            print(
-                f"[TREE_GRPO][WARN] budget exhausted for retry node={parent.node_id} "
-                f"prompt_id={parent.prompt_id} depth={parent.retry_depth}; stopping expansion"
-            )
-            return
 
         gid = int(group_id_next)
         group_id_next += 1
@@ -801,8 +795,6 @@ def collect_tree_grpo_v1_batch(
     for n in nodes:
         if bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id):
             if len(n.child_node_ids) == 0:
-                if str(n.retry_block_reason) == "budget_exhausted_no_k1":
-                    continue
                 n.retry_block_reason = "exception_missing_retry_child"
                 raise RuntimeError(
                     f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
@@ -873,7 +865,6 @@ def collect_tree_grpo_v1_batch(
                 and int(node.verify_token_id or -1) == int(retry_token_id)
                 and int(node.k_used) == 1
                 and len(node.child_node_ids) == 1
-                and str(node.retry_block_reason) != "budget_exhausted_no_k1"
             )
             if not can_linear_merge:
                 break
@@ -1093,5 +1084,5 @@ def collect_tree_grpo_v1_batch(
     stats["num_root_requests"] = float(len(root_requests))
     stats["num_child_requests"] = float(nonroot_request_count)
     stats["num_trajectories"] = float(len(trajectories))
-    stats["num_budget_exhausted_no_k1"] = float(budget_exhausted_no_k1)
+    stats["num_budget_exhausted_no_k1"] = 0.0
     return trajectories, stats
