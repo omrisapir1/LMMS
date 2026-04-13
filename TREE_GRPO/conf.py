@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 MAX_TOKENS = 512
 BATCH_SIZE = 16
@@ -28,12 +28,17 @@ class DataConfig:
 
 @dataclass
 class TreeConfig:
-    # v1 is intentionally shallow:
-    #   root siblings (fixed to 4 by collector)
-    #   one retry expansion layer (children of root-retry nodes only)
+    # Root remains fixed.
     root_siblings: int = 4
-    max_retry_parents_from_root: int = 2
-    retry_children_per_parent: int = 2
+    # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.25, 0.30, 0.5, 0.7, 0.7, 1.0])
+    # Per-prompt safety budgets.
+    max_total_nodes_per_prompt: int = 320
+    max_leaves_per_prompt: int = 200
+    max_active_nodes_per_wave: int = 256
+    max_expanded_retry_nodes_per_level: int = 64
     max_retry_depth: int = 1
     c_retry: float = 0.05
     gamma: float = 0.95

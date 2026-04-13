@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -26,6 +27,34 @@ class _WaveState:
         self.was_forced_finalize: bool = False
         self.verify_action_present: bool = False
         self.leaf_end_type: str = "non_terminal_retry"
+
+
+def _depth_prob(values: Sequence[float], depth: int) -> float:
+    if len(values) == 0:
+        raise RuntimeError("Branching probability list must be non-empty")
+    idx = int(depth)
+    if idx < 0:
+        idx = 0
+    if idx >= len(values):
+        idx = len(values) - 1
+    return float(values[idx])
+
+
+def _sample_branch_k(cfg: Config, retry_depth: int) -> Tuple[int, str]:
+    p4 = _depth_prob(cfg.tree.tree_p4_by_depth, retry_depth)
+    p2 = _depth_prob(cfg.tree.tree_p2_by_depth, retry_depth)
+    p1 = _depth_prob(cfg.tree.tree_p1_by_depth, retry_depth)
+    total = float(p4 + p2 + p1)
+    if total <= 0.0:
+        raise RuntimeError(f"Invalid branching probabilities at depth={retry_depth}: sum={total}")
+    p4n = p4 / total
+    p2n = p2 / total
+    r = random.random()
+    if r < p4n:
+        return 4, "p4"
+    if r < (p4n + p2n):
+        return 2, "p2"
+    return 1, "p1"
 
 
 def _action_logp_entropy_tensors(

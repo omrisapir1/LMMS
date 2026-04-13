@@ -90,3 +90,5 @@ class TreeNode:
     probe_start_retry_depth: Optional[int] = None
     is_forced_retry_probe: bool = False
     probe_source_node_id: Optional[int] = None
+    k_used: int = 0
+    branching_decision: str = "not_retry"
