@@ -82,9 +82,13 @@ def assign_tree_values_and_advantages(
                         f"Node {n.node_id} has verify action at retry_depth >= max_retry_depth; invalid state"
                     )
                 if not bool(getattr(n, "has_forced_retry_probe", False)):
-                    raise RuntimeError(
-                        f"Finalize node {n.node_id} missing forced-retry probe; cannot estimate Q_R"
-                    )
+                    # Probe capping path: keep neutral fallback for unprobed finalize nodes.
+                    n.Q_R = float(n.Q_F)
+                    n.U = float(max(n.Q_F, n.Q_R))
+                    n.V = float(n.Q_R if chosen_retry else n.Q_F)
+                    q_chosen = float(n.Q_R if chosen_retry else n.Q_F)
+                    n.A_V = float(q_chosen - 0.5 * (n.Q_F + n.Q_R))
+                    continue
                 probe_v = getattr(n, "probe_terminal_value", None)
                 if probe_v is None:
                     raise RuntimeError(

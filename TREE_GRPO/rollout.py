@@ -396,7 +396,7 @@ def _run_forced_retry_probes(
     retry_token_id: int,
     digit_token_ids: Sequence[int],
     probe_node_id_start: int,
-) -> Tuple[Dict[int, Dict[str, object]], List[Dict[str, object]], int]:
+) -> Tuple[Dict[int, Dict[str, object]], List[Dict[str, object]], int, Dict[str, int], set[int]]:
     """
     For finalize-chosen nodes (where retry is still legal), run a single
     forced-retry linear probe to terminal and return per-source probe results.
@@ -413,11 +413,30 @@ def _run_forced_retry_probes(
         eligible_sources.append(n)
 
     if len(eligible_sources) == 0:
-        return {}, [], int(probe_node_id_start)
+        return {}, [], int(probe_node_id_start), {"candidates": 0, "launched": 0, "skipped_by_cap": 0}, set()
+
+    selected_source_ids: set[int] = set()
+    skipped_by_cap: set[int] = set()
+    by_prompt: Dict[int, List[TreeNode]] = defaultdict(list)
+    for n in eligible_sources:
+        by_prompt[int(n.prompt_id)].append(n)
+    cap = int(getattr(cfg.tree, "max_probes_per_prompt", 0))
+    selected_sources: List[TreeNode] = []
+    for _pid, rows in by_prompt.items():
+        if cap > 0 and len(rows) > cap:
+            random.shuffle(rows)
+            keep = rows[:cap]
+            drop = rows[cap:]
+            selected_sources.extend(keep)
+            selected_source_ids.update(int(x.node_id) for x in keep)
+            skipped_by_cap.update(int(x.node_id) for x in drop)
+        else:
+            selected_sources.extend(rows)
+            selected_source_ids.update(int(x.node_id) for x in rows)
 
     source_state: Dict[int, Dict[str, object]] = {}
     pending_pairs: List[Tuple[int, ExpandRequest]] = []
-    for src in eligible_sources:
+    for src in selected_sources:
         src_id = int(src.node_id)
         source_state[src_id] = {
             "start_retry_depth": int(src.retry_depth),
@@ -539,7 +558,12 @@ def _run_forced_retry_probes(
             "probe_start_retry_depth": int(st["start_retry_depth"]),
             "probe_nodes": list(st["probe_nodes"]),
         }
-    return out, probe_rows, int(probe_node_id_next)
+    stats = {
+        "candidates": int(len(eligible_sources)),
+        "launched": int(len(selected_sources)),
+        "skipped_by_cap": int(len(skipped_by_cap)),
+    }
+    return out, probe_rows, int(probe_node_id_next), stats, skipped_by_cap
 
 
 def collect_tree_grpo_v1_batch(
@@ -839,7 +863,7 @@ def collect_tree_grpo_v1_batch(
                     f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
                 )
 
-    probe_results, _, _ = _run_forced_retry_probes(
+    probe_results, _, _, probe_stats, probe_skipped_by_cap = _run_forced_retry_probes(
         nodes=nodes,
         prompt_meta=prompt_meta,
         tokenizer=tokenizer,
@@ -972,6 +996,7 @@ def collect_tree_grpo_v1_batch(
                     "A_Z": float(rn.A_Z),
                     "A_V": float(rn.A_V),
                     "has_forced_retry_probe": bool(rn.has_forced_retry_probe),
+                    "probe_skipped_by_cap": bool(int(rn.node_id) in probe_skipped_by_cap),
                     "probe_terminal_value": (
                         None if rn.probe_terminal_value is None else float(rn.probe_terminal_value)
                     ),
@@ -1073,6 +1098,7 @@ def collect_tree_grpo_v1_batch(
             "branching_decision": str(last.branching_decision),
             "continued_linearly": bool(len(chain_ids) > 1),
             "has_forced_retry_probe": bool(last.has_forced_retry_probe),
+            "probe_skipped_by_cap": bool(int(last.node_id) in probe_skipped_by_cap),
             "probe_terminal_value": (None if last.probe_terminal_value is None else float(last.probe_terminal_value)),
             "probe_terminal_node_id": (
                 None if last.probe_terminal_node_id is None else int(last.probe_terminal_node_id)
@@ -1137,4 +1163,7 @@ def collect_tree_grpo_v1_batch(
     stats["num_child_requests"] = float(nonroot_request_count)
     stats["num_trajectories"] = float(len(trajectories))
     stats["num_budget_exhausted_no_k1"] = 0.0
+    stats["num_probe_candidates"] = float(probe_stats.get("candidates", 0))
+    stats["num_probes_launched"] = float(probe_stats.get("launched", 0))
+    stats["num_probes_skipped_by_cap"] = float(probe_stats.get("skipped_by_cap", 0))
     return trajectories, stats
