@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/nemotron-7B-12K"
+    init_ckpt: str = "omrisap/LMMS_RSFT"
     answer_token: str = "<ANSWER>"
     finalize_token: str = "<FINALIZE>"
     retry_token: str = "<RETRY>"
@@ -66,7 +66,7 @@ class TrainConfig:
     seed: int = 42
     use_bf16: bool = True
     optimizer_8bit: bool = True
-    warmup_steps: int = 50
+    warmup_steps: int = 9999
     resume_from: Optional[str] = None
 
     def __post_init__(self) -> None:
