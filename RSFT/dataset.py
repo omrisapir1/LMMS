@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from datasets import load_dataset
 
@@ -79,6 +81,54 @@ def parse_true_digits(row: Dict[str, object], *, answer_digits_field: str, answe
     return _parse_final_answer_relaxed(row.get(answer_field))
 
 
+def extract_question_text(row: Dict[str, object], *, question_field: str) -> Optional[str]:
+    q = row.get(question_field)
+    if q is None and question_field != "question":
+        q = row.get("question")
+    if q is None and question_field != "problem":
+        q = row.get("problem")
+    if q is None:
+        return None
+    text = str(q).strip()
+    if not text:
+        return None
+    return text
+
+
+def load_excluded_questions(json_path: str) -> Set[str]:
+    p = os.path.abspath(str(json_path))
+    with open(p, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError(f"Excluded-questions file must contain a JSON list: {p}")
+    out: Set[str] = set()
+    for item in raw:
+        text = str(item).strip()
+        if text:
+            out.add(text)
+    return out
+
+
+def filter_records_by_questions(
+    *,
+    records: Sequence[Dict[str, object]],
+    question_field: str,
+    excluded_questions: Set[str],
+) -> Tuple[List[Dict[str, object]], int]:
+    if len(excluded_questions) == 0:
+        return [dict(x) for x in records], 0
+
+    filtered: List[Dict[str, object]] = []
+    removed = 0
+    for row in records:
+        q_text = extract_question_text(row, question_field=question_field)
+        if q_text is not None and q_text in excluded_questions:
+            removed += 1
+            continue
+        filtered.append(dict(row))
+    return filtered, removed
+
+
 def load_hf_records(dataset_name: str, split: str) -> List[Dict[str, object]]:
     ds = load_dataset(dataset_name, split=split)
     return [dict(x) for x in ds]
@@ -94,23 +144,19 @@ def prepare_prompt_examples(
 ) -> List[PromptExample]:
     out: List[PromptExample] = []
     for row in records:
-        q = row.get(question_field)
-        if q is None and question_field != "question":
-            q = row.get("question")
-        if q is None and question_field != "problem":
-            q = row.get("problem")
-        if q is None:
+        q_text = extract_question_text(row, question_field=question_field)
+        if q_text is None:
             continue
         true_digits = parse_true_digits(row, answer_digits_field=answer_digits_field, answer_field=answer_field)
         if true_digits is None:
             continue
 
-        prompt_text = build_prompt_text(tokenizer, str(q))
+        prompt_text = build_prompt_text(tokenizer, q_text)
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False, return_attention_mask=False).get("input_ids", [])
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             continue
 
-        out.append(PromptExample(question=str(q), prompt_ids=[int(x) for x in prompt_ids], true_digits=[int(x) for x in true_digits]))
+        out.append(PromptExample(question=q_text, prompt_ids=[int(x) for x in prompt_ids], true_digits=[int(x) for x in true_digits]))
     return out
 
 

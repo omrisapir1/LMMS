@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -632,6 +633,7 @@ def collect_tree_grpo_v1_batch(
                 )
             )
 
+    t_tree_rollout0 = time.perf_counter()
     root_segments = _run_segment_wave(
         requests=root_requests,
         tokenizer=tokenizer,
@@ -854,6 +856,8 @@ def collect_tree_grpo_v1_batch(
                 prompt_live_paths[pid] = int(prompt_live_paths[pid] - 1)
                 prompt_terminal_leaves[pid] += 1
 
+    t_tree_rollout = float(time.perf_counter() - t_tree_rollout0)
+
     # Strict invariant: no unresolved retry leaves in normal algorithm.
     for n in nodes:
         if bool(n.verify_action_present) and int(n.verify_token_id or -1) == int(retry_token_id):
@@ -863,7 +867,8 @@ def collect_tree_grpo_v1_batch(
                     f"Retry node {n.node_id} has no child. This should only happen as an exceptional system failure."
                 )
 
-    probe_results, _, _, probe_stats, probe_skipped_by_cap = _run_forced_retry_probes(
+    t_probe0 = time.perf_counter()
+    probe_results, probe_rows, _, probe_stats, probe_skipped_by_cap = _run_forced_retry_probes(
         nodes=nodes,
         prompt_meta=prompt_meta,
         tokenizer=tokenizer,
@@ -875,6 +880,7 @@ def collect_tree_grpo_v1_batch(
         digit_token_ids=digit_token_ids,
         probe_node_id_start=int(node_id_next),
     )
+    t_probe = float(time.perf_counter() - t_probe0)
     for source_id, result in probe_results.items():
         src = node_by_id.get(int(source_id))
         if src is None:
@@ -1163,7 +1169,10 @@ def collect_tree_grpo_v1_batch(
     stats["num_child_requests"] = float(nonroot_request_count)
     stats["num_trajectories"] = float(len(trajectories))
     stats["num_budget_exhausted_no_k1"] = 0.0
+    stats["t_main_tree_rollout_s"] = float(t_tree_rollout)
+    stats["t_probe_rollout_s"] = float(t_probe)
     stats["num_probe_candidates"] = float(probe_stats.get("candidates", 0))
     stats["num_probes_launched"] = float(probe_stats.get("launched", 0))
     stats["num_probes_skipped_by_cap"] = float(probe_stats.get("skipped_by_cap", 0))
+    stats["num_probe_rounds"] = float(len(probe_rows))
     return trajectories, stats

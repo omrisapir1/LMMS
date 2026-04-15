@@ -34,5 +34,6 @@
     <mapping directory="$USER_HOME$/hiredscore/git/skills-service" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/smith" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/LMMS_RSFT" vcs="Git" />
   </component>
 </project>

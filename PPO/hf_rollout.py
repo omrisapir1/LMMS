@@ -79,9 +79,45 @@ class HFRolloutEngine:
         self._lock = threading.RLock()
         self._model = None
         self._device = None
+        self._profile = {
+            "generate_z_calls": 0,
+            "generate_digits_calls": 0,
+            "generate_verify_calls": 0,
+            "z_batch_sum": 0,
+            "digits_batch_sum": 0,
+            "verify_batch_sum": 0,
+            "z_batch_max": 0,
+            "digits_batch_max": 0,
+            "verify_batch_max": 0,
+            "z_n_sum": 0,
+            "digits_n_sum": 0,
+            "verify_n_sum": 0,
+            "z_n_max": 0,
+            "digits_n_max": 0,
+            "verify_n_max": 0,
+        }
 
     def close(self) -> None:
         return
+
+    def reset_profile_stats(self) -> None:
+        with self._lock:
+            for k in list(self._profile.keys()):
+                self._profile[k] = 0
+
+    def get_profile_stats(self) -> Dict[str, float]:
+        with self._lock:
+            out = {k: float(v) for k, v in self._profile.items()}
+        def _avg(sum_key: str, calls_key: str) -> float:
+            c = out.get(calls_key, 0.0)
+            return 0.0 if c <= 0 else float(out.get(sum_key, 0.0) / c)
+        out["z_batch_avg"] = _avg("z_batch_sum", "generate_z_calls")
+        out["digits_batch_avg"] = _avg("digits_batch_sum", "generate_digits_calls")
+        out["verify_batch_avg"] = _avg("verify_batch_sum", "generate_verify_calls")
+        out["z_n_avg"] = _avg("z_n_sum", "generate_z_calls")
+        out["digits_n_avg"] = _avg("digits_n_sum", "generate_digits_calls")
+        out["verify_n_avg"] = _avg("verify_n_sum", "generate_verify_calls")
+        return out
 
     def supports_prompt_token_ids(self) -> bool:
         return True
@@ -206,6 +242,14 @@ class HFRolloutEngine:
     ) -> List[Dict[str, object]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[Dict[str, object]] = []
+        n = max(1, int(num_samples_per_prompt))
+        with self._lock:
+            batch_n = int(len(inputs))
+            self._profile["generate_z_calls"] += 1
+            self._profile["z_batch_sum"] += batch_n
+            self._profile["z_batch_max"] = max(int(self._profile["z_batch_max"]), batch_n)
+            self._profile["z_n_sum"] += int(n)
+            self._profile["z_n_max"] = max(int(self._profile["z_n_max"]), int(n))
 
         with self._lock:
             if self._model is None:
@@ -215,7 +259,6 @@ class HFRolloutEngine:
             try:
                 with torch.no_grad():
                     z_allowed = sorted(set(int(x) for x in self.z_allowed_token_ids) | {int(self.answer_token_id)})
-                    n = max(1, int(num_samples_per_prompt))
                     gens = self._run_generate_batch(
                         input_ids_rows=inputs,
                         allowed_token_ids=z_allowed,
@@ -263,6 +306,15 @@ class HFRolloutEngine:
         if k < 1 or k > 5:
             raise RuntimeError(f"num_digits must be in [1, 5], got {k}")
 
+        n = max(1, int(num_samples_per_prompt))
+        with self._lock:
+            batch_n = int(len(inputs))
+            self._profile["generate_digits_calls"] += 1
+            self._profile["digits_batch_sum"] += batch_n
+            self._profile["digits_batch_max"] = max(int(self._profile["digits_batch_max"]), batch_n)
+            self._profile["digits_n_sum"] += int(n)
+            self._profile["digits_n_max"] = max(int(self._profile["digits_n_max"]), int(n))
+
         with self._lock:
             if self._model is None:
                 raise RuntimeError("HF rollout model is not set")
@@ -281,7 +333,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
-                        num_return_sequences=max(1, int(num_samples_per_prompt)),
+                        num_return_sequences=int(n),
                     )
                     for gen in gens:
                         if len(gen) != k:
@@ -307,6 +359,14 @@ class HFRolloutEngine:
     ) -> List[List[int]]:
         inputs = self._build_inputs(prompts, prompt_token_ids)
         rows: List[List[int]] = []
+        n = max(1, int(num_samples_per_prompt))
+        with self._lock:
+            batch_n = int(len(inputs))
+            self._profile["generate_verify_calls"] += 1
+            self._profile["verify_batch_sum"] += batch_n
+            self._profile["verify_batch_max"] = max(int(self._profile["verify_batch_max"]), batch_n)
+            self._profile["verify_n_sum"] += int(n)
+            self._profile["verify_n_max"] = max(int(self._profile["verify_n_max"]), int(n))
 
         with self._lock:
             if self._model is None:
@@ -326,7 +386,7 @@ class HFRolloutEngine:
                         repetition_penalty=float(repetition_penalty),
                         greedy=bool(greedy),
                         eos_token_id=None,
-                        num_return_sequences=max(1, int(num_samples_per_prompt)),
+                        num_return_sequences=int(n),
                         logit_bias=logit_bias,
                     )
                     for gen in gens:

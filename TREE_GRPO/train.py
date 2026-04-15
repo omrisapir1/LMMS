@@ -617,6 +617,8 @@ def train(cfg: Config) -> None:
 
     def _collect_rollout_only(prepared_local: Sequence[Dict[str, object]]):
         t0 = time.perf_counter()
+        if vllm_engine is not None and hasattr(vllm_engine, "reset_profile_stats"):
+            vllm_engine.reset_profile_stats()
         tr, st = collect_tree_grpo_v1_batch(
             model=None,
             tokenizer=tokenizer,
@@ -631,7 +633,12 @@ def train(cfg: Config) -> None:
             retry_token_id=int(retry_token_id),
             digit_token_ids=digit_token_ids,
         )
-        return tr, st, float(time.perf_counter() - t0)
+        engine_stats: Dict[str, float] = {}
+        if vllm_engine is not None and hasattr(vllm_engine, "get_profile_stats"):
+            got = vllm_engine.get_profile_stats()
+            if isinstance(got, dict):
+                engine_stats = {str(k): float(v) for k, v in got.items()}
+        return tr, st, float(time.perf_counter() - t0), engine_stats
 
     try:
         prefetch_enabled = bool(getattr(cfg.rollout, "prefetch_next_rollout", True))
@@ -640,27 +647,33 @@ def train(cfg: Config) -> None:
 
         for update in range(1, int(cfg.train.updates) + 1):
             _t_update0 = time.perf_counter()
+            t_sync_s = 0.0
 
             if rollout_future is None:
                 if vllm_engine is not None:
+                    _t_sync0 = time.perf_counter()
                     _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=update)
+                    t_sync_s += float(time.perf_counter() - _t_sync0)
                 prepared_now = _build_prepared_for_update(update_idx=update)
                 if prefetch_exec is not None:
                     rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_now)
                 else:
-                    trajectories, tree_stats, rollout_sec = _collect_rollout_only(prepared_now)
+                    trajectories, tree_stats, rollout_sec, rollout_prof = _collect_rollout_only(prepared_now)
             if rollout_future is not None:
-                trajectories, tree_stats, rollout_sec = rollout_future.result()
+                trajectories, tree_stats, rollout_sec, rollout_prof = rollout_future.result()
                 rollout_future = None
             else:
                 rollout_sec = 0.0
+                rollout_prof = {}
 
             if not trajectories:
                 _log(f"update={update} | no trajectories; skipping")
                 if prefetch_exec is not None and update < int(cfg.train.updates):
                     next_update = int(update + 1)
                     if vllm_engine is not None:
+                        _t_sync0 = time.perf_counter()
                         _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=next_update)
+                        t_sync_s += float(time.perf_counter() - _t_sync0)
                     prepared_next = _build_prepared_for_update(update_idx=next_update)
                     rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_next)
                 continue
@@ -668,7 +681,9 @@ def train(cfg: Config) -> None:
             if prefetch_exec is not None and update < int(cfg.train.updates):
                 next_update = int(update + 1)
                 if vllm_engine is not None:
+                    _t_sync0 = time.perf_counter()
                     _ = vllm_engine.maybe_sync_from_torch(model=model, tokenizer=tokenizer, update_idx=next_update)
+                    t_sync_s += float(time.perf_counter() - _t_sync0)
                 prepared_next = _build_prepared_for_update(update_idx=next_update)
                 rollout_future = prefetch_exec.submit(_collect_rollout_only, prepared_next)
 
@@ -679,6 +694,7 @@ def train(cfg: Config) -> None:
             token_stats_kernel = _get_token_stats_kernel(
                 compile_update_stats=bool(getattr(cfg.runtime, "compile_update_stats", False))
             )
+            _t_oldlogp0 = time.perf_counter()
             _ensure_logp_entropy_old(
                 model=model,
                 trajectories=trajectories,
@@ -693,6 +709,7 @@ def train(cfg: Config) -> None:
                 pad_token_id=int(tokenizer.pad_token_id) if tokenizer.pad_token_id is not None else 0,
                 token_stats_kernel=token_stats_kernel,
             )
+            t_oldlogp_s = float(time.perf_counter() - _t_oldlogp0)
 
             roll_rows: List[Dict[str, object]] = []
             for traj in trajectories:
@@ -754,6 +771,7 @@ def train(cfg: Config) -> None:
                 roll_rows.append(row)
             _ = rollout_logger.write_step(step=update, rows=roll_rows)
 
+            _t_ppo0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             trajectory_cache = _build_trajectory_device_cache(trajectories=trajectories, device=device)
             seq_lens = [c.seq_len for c in trajectory_cache]
@@ -877,6 +895,7 @@ def train(cfg: Config) -> None:
                 ref_model.eval()
                 for p in ref_model.parameters():
                     p.requires_grad_(False)
+            t_ppo_s = float(time.perf_counter() - _t_ppo0)
 
             denom = float(max(minibatch_count, 1))
             t_total = time.perf_counter() - _t_update0
@@ -892,6 +911,32 @@ def train(cfg: Config) -> None:
                         f"mean_az={tree_stats.get('mean_az', 0.0):.4f}",
                         f"mean_av={tree_stats.get('mean_av', 0.0):.4f}",
                         f"probes={int(tree_stats.get('num_probes_launched', 0.0))}/{int(tree_stats.get('num_probe_candidates', 0.0))}",
+                        f"probe_rounds={int(tree_stats.get('num_probe_rounds', 0.0))}",
+                        f"t_sync={t_sync_s:.3f}s",
+                        f"t_tree={float(tree_stats.get('t_main_tree_rollout_s', 0.0)):.3f}s",
+                        f"t_probe={float(tree_stats.get('t_probe_rollout_s', 0.0)):.3f}s",
+                        f"t_oldlogp={t_oldlogp_s:.3f}s",
+                        f"t_ppo={t_ppo_s:.3f}s",
+                        f"calls(z/d/v)="
+                        f"{int(rollout_prof.get('generate_z_calls', 0.0))}/"
+                        f"{int(rollout_prof.get('generate_digits_calls', 0.0))}/"
+                        f"{int(rollout_prof.get('generate_verify_calls', 0.0))}",
+                        f"bsz_avg(z/d/v)="
+                        f"{rollout_prof.get('z_batch_avg', 0.0):.2f}/"
+                        f"{rollout_prof.get('digits_batch_avg', 0.0):.2f}/"
+                        f"{rollout_prof.get('verify_batch_avg', 0.0):.2f}",
+                        f"bsz_max(z/d/v)="
+                        f"{int(rollout_prof.get('z_batch_max', 0.0))}/"
+                        f"{int(rollout_prof.get('digits_batch_max', 0.0))}/"
+                        f"{int(rollout_prof.get('verify_batch_max', 0.0))}",
+                        f"n_avg(z/d/v)="
+                        f"{rollout_prof.get('z_n_avg', 0.0):.2f}/"
+                        f"{rollout_prof.get('digits_n_avg', 0.0):.2f}/"
+                        f"{rollout_prof.get('verify_n_avg', 0.0):.2f}",
+                        f"n_max(z/d/v)="
+                        f"{int(rollout_prof.get('z_n_max', 0.0))}/"
+                        f"{int(rollout_prof.get('digits_n_max', 0.0))}/"
+                        f"{int(rollout_prof.get('verify_n_max', 0.0))}",
                         f"policy_loss={pol_acc / denom:.4f}",
                         f"entropy={ent_acc / denom:.4f}",
                         f"clipfrac={clip_acc / denom:.4f}",

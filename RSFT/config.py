@@ -28,7 +28,7 @@ class RolloutConfig:
     backend: str = "vllm"  # "vllm" | "hf"
     vllm_batch_size: int = 64
     rollouts_per_prompt: int = 8
-    max_rounds: int = 30
+    max_rounds: int = 50
     retry_on_correct_prob: float = 0.0
     retry_on_correct_only_first_round: bool = True
     max_new_tokens: int = 1024

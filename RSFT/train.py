@@ -23,7 +23,15 @@ from PPO.rollout_logger import RolloutLogger
 from PPO.token_contract import resolve_digit_token_ids, validate_answer_token_single, validate_single_token
 from PPO.vllm_rollout import VLLMRolloutEngine
 from RSFT.config import Config, DEFAULT_SET_ALLOWED_PREFIXES
-from RSFT.dataset import PromptExample, load_hf_records, make_digit_id_to_value_map, prepare_prompt_examples, sample_unique_prompt_batch
+from RSFT.dataset import (
+    PromptExample,
+    filter_records_by_questions,
+    load_excluded_questions,
+    load_hf_records,
+    make_digit_id_to_value_map,
+    prepare_prompt_examples,
+    sample_unique_prompt_batch,
+)
 from RSFT.eval_vllm import evaluate_with_rollout_engine
 from RSFT.logic import (
     TARGET_VERIFY,
@@ -86,6 +94,7 @@ METRICS_FIELDS: List[str] = [
     "eval_modes_ran",
     "eval_time",
 ]
+EXCLUDED_QUESTIONS_JSON = "rsft_not_to_train_questions.json"
 
 def _log(msg: str, log_path: str) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
@@ -812,8 +821,26 @@ def train(cfg: Optional[Config] = None) -> str:
         _set_optimizer_lr(optimizer, normal_lr)
     optimizer.zero_grad(set_to_none=True)
 
+    excluded_questions_path = os.path.join(os.path.dirname(__file__), EXCLUDED_QUESTIONS_JSON)
+    if not os.path.isfile(excluded_questions_path):
+        raise FileNotFoundError(f"Missing excluded-questions file: {excluded_questions_path}")
+    excluded_questions = load_excluded_questions(excluded_questions_path)
+    _log(
+        f"Loaded excluded questions: count={len(excluded_questions)} path={excluded_questions_path}",
+        log_path,
+    )
+
     _log("Loading train records", log_path)
     train_records = load_hf_records(str(cfg.data.dataset_name), str(cfg.data.train_split))
+    train_records, removed_train = filter_records_by_questions(
+        records=train_records,
+        question_field=str(cfg.data.question_field),
+        excluded_questions=excluded_questions,
+    )
+    _log(
+        f"Filtered train records by excluded questions: removed={removed_train}, remaining={len(train_records)}",
+        log_path,
+    )
     train_examples = prepare_prompt_examples(
         records=train_records,
         tokenizer=tokenizer,
@@ -826,6 +853,15 @@ def train(cfg: Optional[Config] = None) -> str:
 
     _log("Loading eval records", log_path)
     eval_records = load_hf_records(str(cfg.data.dataset_name), str(cfg.data.eval_split))
+    eval_records, removed_eval = filter_records_by_questions(
+        records=eval_records,
+        question_field=str(cfg.data.question_field),
+        excluded_questions=excluded_questions,
+    )
+    _log(
+        f"Filtered eval records by excluded questions: removed={removed_eval}, remaining={len(eval_records)}",
+        log_path,
+    )
     eval_examples = prepare_prompt_examples(
         records=eval_records,
         tokenizer=tokenizer,
