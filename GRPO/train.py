@@ -628,6 +628,11 @@ def train(cfg: Config) -> None:
             total_loss = 0.0
             total_pg = 0.0
             total_ent = 0.0
+            diag_token_count = 0.0
+            diag_clip_count = 0.0
+            diag_abs_logp_delta_sum = 0.0
+            diag_ratio_sum = 0.0
+            diag_ratio_sq_sum = 0.0
 
             amp_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -675,6 +680,8 @@ def train(cfg: Config) -> None:
                             1.0 - float(cfg.grpo.clip_range),
                             1.0 + float(cfg.grpo.clip_range),
                         )
+                        abs_logp_delta = (logp_new - logp_old).abs()
+                        clipped_mask = ((ratio < (1.0 - float(cfg.grpo.clip_range))) | (ratio > (1.0 + float(cfg.grpo.clip_range))))
                         s1 = ratio * adv
                         s2 = ratio_clip * adv
                         pg_obj = torch.minimum(s1, s2).mean()
@@ -687,6 +694,12 @@ def train(cfg: Config) -> None:
                     total_loss += float(loss.detach().item())
                     total_pg += float(pg_obj.detach().item())
                     total_ent += float(ent_mean.detach().item())
+                    tok_n = float(ratio.numel())
+                    diag_token_count += tok_n
+                    diag_clip_count += float(clipped_mask.float().sum().detach().item())
+                    diag_abs_logp_delta_sum += float(abs_logp_delta.sum().detach().item())
+                    diag_ratio_sum += float(ratio.sum().detach().item())
+                    diag_ratio_sq_sum += float((ratio * ratio).sum().detach().item())
                     updates_done += 1
 
                     if accum >= int(max(1, cfg.train.grad_accum_steps)):
@@ -704,6 +717,13 @@ def train(cfg: Config) -> None:
             z_rewards = [float(t.reward_info.get("z_reward_mean_children", 0.0)) for t in trajectories if t.reward_info.get("phase") == "z"]
             adv_abs = [abs(float(a)) for t in trajectories for a in t.advantages]
             dt = time.perf_counter() - t0
+            clip_frac = (diag_clip_count / diag_token_count) if diag_token_count > 0.0 else 0.0
+            ratio_mean = (diag_ratio_sum / diag_token_count) if diag_token_count > 0.0 else 0.0
+            ratio_var = (diag_ratio_sq_sum / diag_token_count) - (ratio_mean * ratio_mean) if diag_token_count > 0.0 else 0.0
+            if ratio_var < 0.0:
+                ratio_var = 0.0
+            ratio_std = ratio_var ** 0.5
+            mean_abs_logp_delta = (diag_abs_logp_delta_sum / diag_token_count) if diag_token_count > 0.0 else 0.0
 
             _log(
                 " | ".join(
@@ -719,6 +739,10 @@ def train(cfg: Config) -> None:
                         f"loss={(total_loss/max(1, updates_done)):.4f}",
                         f"pg={(total_pg/max(1, updates_done)):.4f}",
                         f"ent={(total_ent/max(1, updates_done)):.4f}",
+                        f"clip_frac={clip_frac:.4f}",
+                        f"abs_logp_delta={mean_abs_logp_delta:.4f}",
+                        f"ratio_mean={ratio_mean:.4f}",
+                        f"ratio_std={ratio_std:.4f}",
                         f"sec={dt:.2f}",
                     ]
                 )

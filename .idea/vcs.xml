@@ -14,6 +14,7 @@
     <mapping directory="$USER_HOME$/hiredscore/git/cicd" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/company-db-api" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/config-resolver" vcs="Git" />
+    <mapping directory="$USER_HOME$/hiredscore/git/continuity-planning-service" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/data_access_service" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/dotfiles" vcs="Git" />
     <mapping directory="$USER_HOME$/hiredscore/git/gimme" vcs="Git" />
