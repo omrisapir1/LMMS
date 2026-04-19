@@ -64,7 +64,7 @@ class RewardConfig:
 class GRPOConfig:
     clip_range: float = 0.2
     c_ent: float = 0.001
-    kl_coef: float = 0.01
+    kl_coef: float = 0.05
     ppo_epochs: int = 1
     minibatch_size: int = 128
     max_tokens_per_mini_batch: int = 4096*2
