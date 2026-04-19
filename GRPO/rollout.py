@@ -73,6 +73,7 @@ def collect_grpo_batch(
     answer_token_id: int,
     digit_token_ids: Sequence[int],
     reward_rng: torch.Generator,
+    answer_logit_bias: float = 0.0,
 ) -> Tuple[List[GRPOTrajectory], Dict[str, float]]:
     if len(prepared) == 0:
         return [], {}
@@ -110,6 +111,7 @@ def collect_grpo_batch(
             min_p=float(cfg.rollout.z_min_p),
             repetition_penalty=float(cfg.rollout.z_repetition_penalty),
             greedy=False,
+            logit_bias={int(answer_token_id): float(answer_logit_bias)} if float(answer_logit_bias) != 0.0 else None,
         )
         if len(z_rows) != n_z:
             raise RuntimeError(f"Z rollout count mismatch: got={len(z_rows)} expected={n_z}")

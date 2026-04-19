@@ -586,6 +586,7 @@ class VLLMRolloutEngine:
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         greedy: bool = False,
+        logit_bias: Optional[Dict[int, float]] = None,
     ) -> List[Dict[str, object]]:
         if self._llm is None:
             raise RuntimeError("vLLM engine is not initialized")
@@ -611,6 +612,7 @@ class VLLMRolloutEngine:
             n=n,
             logprobs=None,
             stop_on_answer=True,
+            logit_bias=(None if logit_bias is None else {int(k): float(v) for k, v in dict(logit_bias).items()}),
         )
 
         with self._lock:

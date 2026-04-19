@@ -415,6 +415,18 @@ def _assign_old_logp(
         offset += ll
 
 
+def _scheduled_answer_logit_bias(cfg: Config, step: int) -> float:
+    start = float(cfg.rollout.answer_start_logit_bias)
+    sched_steps = int(cfg.rollout.steps_for_linear_schaduler_logit_bias)
+    step0 = max(int(step) - 1, 0)
+    if sched_steps <= 0:
+        return float(start)
+    if step0 >= sched_steps:
+        return 0.0
+    frac = float(step0) / float(sched_steps)
+    return float(start) * (1.0 - frac)
+
+
 def train(cfg: Config) -> None:
     if str(cfg.rollout.backend).lower() != "vllm":
         raise ValueError("GRPO currently supports rollout.backend='vllm' only")
@@ -512,6 +524,7 @@ def train(cfg: Config) -> None:
         for step in range(1, int(cfg.train.updates) + 1):
             t0 = time.perf_counter()
             vllm_engine.maybe_sync_from_torch(model, tokenizer, step)
+            answer_logit_bias = _scheduled_answer_logit_bias(cfg, step)
 
             k = min(int(cfg.rollout.prompts_per_update), len(rows))
             prepared = random.sample(rows, k=k)
@@ -523,6 +536,7 @@ def train(cfg: Config) -> None:
                 answer_token_id=answer_token_id,
                 digit_token_ids=digit_token_ids,
                 reward_rng=reward_rng,
+                answer_logit_bias=float(answer_logit_bias),
             )
             if len(trajectories) == 0:
                 raise RuntimeError("No trajectories collected for update")
@@ -627,6 +641,7 @@ def train(cfg: Config) -> None:
                         f"digit_reward_mean={(sum(rewards)/len(rewards)) if rewards else 0.0:.4f}",
                         f"z_reward_mean={(sum(z_rewards)/len(z_rewards)) if z_rewards else 0.0:.4f}",
                         f"digit_exact_rate={rollout_stats.get('digit_exact_rate', 0.0):.4f}",
+                        f"answer_logit_bias={float(answer_logit_bias):.4f}",
                         f"adv_abs_mean={(sum(adv_abs)/len(adv_abs)) if adv_abs else 0.0:.4f}",
                         f"loss={(total_loss/max(1, updates_done)):.4f}",
                         f"pg={(total_pg/max(1, updates_done)):.4f}",

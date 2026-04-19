@@ -9,7 +9,7 @@ BATCH_SIZE = 64
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/LMMS_RSFT"
+    init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
     trust_remote_code: bool = True
 
@@ -34,6 +34,8 @@ class RolloutConfig:
     z_top_p: float = 0.95
     z_min_p: float = 0.03
     z_repetition_penalty: float = 1.1
+    answer_start_logit_bias: float = 0.0
+    steps_for_linear_schaduler_logit_bias: int = 0
     digit_temperature: float = 1.0
     digit_top_p: float = 0.9
     digit_greedy: bool = False
