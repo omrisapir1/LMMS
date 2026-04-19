@@ -466,9 +466,12 @@ def train(cfg: Config) -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.init_ckpt, trust_remote_code=cfg.model.trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.init_ckpt,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         trust_remote_code=cfg.model.trust_remote_code,
     )
     model.to(device)
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
     model.train()
 
     answer_token_id = int(resolve_answer_token_id(tokenizer, answer_token=cfg.model.answer_token))
