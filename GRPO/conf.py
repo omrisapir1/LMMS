@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 MAX_TOKENS = 512
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 
 
 @dataclass
@@ -41,7 +41,7 @@ class RolloutConfig:
     digit_greedy: bool = False
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
-    vllm_batch_size: int = BATCH_SIZE
+    vllm_batch_size: int = 4096
     vllm_tp_size: int = 1
     gpu_memory_utilization: float = 0.95
     vllm_seed: Optional[int] = None
@@ -49,7 +49,7 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    prompts_per_update: int = 128
+    prompts_per_update: int = 16
 
 
 @dataclass
