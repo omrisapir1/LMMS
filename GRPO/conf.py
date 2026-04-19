@@ -32,11 +32,11 @@ class RolloutConfig:
     z_temperature: float = 1.2
     z_top_p: float = 0.95
     z_min_p: float = 0.03
-    z_repetition_penalty: float = 1.1
+    z_repetition_penalty: float = 1.05
     answer_start_logit_bias: float = 0
     steps_for_linear_schaduler_logit_bias: int = 0
     digit_temperature: float = 1.0
-    digit_top_p: float = 0.9
+    digit_top_p: float = 0.85
     digit_greedy: bool = False
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
@@ -53,7 +53,7 @@ class RolloutConfig:
 
 @dataclass
 class RewardConfig:
-    partial_scale: float = 0.25
+    partial_scale: float = 0.0
     keep_prob: Tuple[float, float, float, float, float] = (0.02, 0.05, 0.1, 0.5, 1.0)
     length_penalty: float = 0.0
     correct_length_discount: float = 1.0
@@ -69,20 +69,20 @@ class GRPOConfig:
     minibatch_size: int = 128
     max_tokens_per_mini_batch: int = 4096*2
     max_grad_norm: float = 1.0
-    update_ref_model_each_steps: int = 100
+    update_ref_model_each_steps: int = 150
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 2e-5
+    lr: float = 1e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
-    updates: int = 10000
+    updates: int = 100000
     grad_accum_steps: int = 16
     seed: int = 42
     output_dir: str = "./runs/grpo"
-    save_every: int = 25
+    save_every: int = 500
 
 
 @dataclass
