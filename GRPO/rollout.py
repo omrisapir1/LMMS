@@ -64,6 +64,17 @@ def _action_types_for_digits(num_digits: int = 5) -> List[str]:
     return ["digit"] * int(num_digits)
 
 
+def _iter_batches(seq: Sequence[int], batch_size: int) -> List[List[int]]:
+    bsz = max(int(batch_size), 1)
+    out: List[List[int]] = []
+    i = 0
+    n = len(seq)
+    while i < n:
+        out.append([int(x) for x in seq[i : i + bsz]])
+        i += bsz
+    return out
+
+
 def collect_grpo_batch(
     *,
     prepared: Sequence[Dict[str, object]],
@@ -84,6 +95,7 @@ def collect_grpo_batch(
 
     n_z = int(cfg.rollout.n_z_traces)
     n_digit = int(cfg.rollout.n_digit_traces)
+    vllm_batch_size = max(int(getattr(cfg.rollout, "vllm_batch_size", 1)), 1)
     if n_z <= 0 or n_digit <= 0:
         raise ValueError("rollout.n_z_traces and rollout.n_digit_traces must be > 0")
 
@@ -94,16 +106,17 @@ def collect_grpo_batch(
     total_digit_rollouts = 0
     total_exact = 0
 
-    for item in prepared:
-        prompt_id = int(item["prompt_id"])
-        question = str(item["question"])
-        true_digits = [int(x) for x in list(item["true_digits"])]
-        prompt_ids = [int(x) for x in list(item["prompt_ids"])]
-        prompt_attn = [int(x) for x in list(item["prompt_attention_mask"])]
-        sample_base = str(item["sample_id_base"])
+    prepared_idx = list(range(len(prepared)))
+    z_infos_by_prompt: Dict[int, List[Dict[str, object]]] = {}
 
+    # Z phase batched by rollout.vllm_batch_size.
+    for idx_batch in _iter_batches(prepared_idx, vllm_batch_size):
+        batch_prompt_token_ids = [
+            [int(x) for x in list(prepared[i]["prompt_ids"])]
+            for i in idx_batch
+        ]
         z_rows = vllm_engine.generate_z(
-            prompt_token_ids=[prompt_ids],
+            prompt_token_ids=batch_prompt_token_ids,
             num_samples_per_prompt=n_z,
             max_new_tokens=int(cfg.rollout.max_z_new_tokens),
             temperature=float(cfg.rollout.z_temperature),
@@ -113,37 +126,56 @@ def collect_grpo_batch(
             greedy=False,
             logit_bias={int(answer_token_id): float(answer_logit_bias)} if float(answer_logit_bias) != 0.0 else None,
         )
-        if len(z_rows) != n_z:
-            raise RuntimeError(f"Z rollout count mismatch: got={len(z_rows)} expected={n_z}")
+        expected_z = len(idx_batch) * n_z
+        if len(z_rows) != expected_z:
+            raise RuntimeError(f"Z rollout count mismatch: got={len(z_rows)} expected={expected_z}")
 
-        z_infos: List[Dict[str, object]] = []
-        for zi, row in enumerate(z_rows):
-            z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
-                row=dict(row),
-                answer_token_id=int(answer_token_id),
-                budget=int(cfg.rollout.max_z_new_tokens),
-            )
-            if not has_answer:
-                raise RuntimeError(
-                    "GRPO Z phase must end with <ANSWER>; increase rollout.max_z_new_tokens or adjust sampling"
+        row_pos = 0
+        for i in idx_batch:
+            item = prepared[i]
+            prompt_ids = [int(x) for x in list(item["prompt_ids"])]
+            prompt_attn = [int(x) for x in list(item["prompt_attention_mask"])]
+            prompt_id = int(item["prompt_id"])
+
+            z_infos: List[Dict[str, object]] = []
+            for zi in range(n_z):
+                row = dict(z_rows[row_pos])
+                row_pos += 1
+                z_prefix, has_answer = _extract_z_phase_from_vllm_row_with_budget(
+                    row=row,
+                    answer_token_id=int(answer_token_id),
+                    budget=int(cfg.rollout.max_z_new_tokens),
                 )
-            z_actions = [int(x) for x in z_prefix] + [int(answer_token_id)]
-            z_types = _action_types_for_z(len(z_prefix))
-            z_prefix_full = prompt_ids + z_actions
-            z_attn_full = prompt_attn + [1] * len(z_actions)
-            z_infos.append(
-                {
-                    "z_index": int(zi),
-                    "z_actions": z_actions,
-                    "z_action_types": z_types,
-                    "prefix_ids": z_prefix_full,
-                    "prefix_attn": z_attn_full,
-                    "digit_rewards": [],
-                }
-            )
+                if not has_answer:
+                    raise RuntimeError(
+                        "GRPO Z phase must end with <ANSWER>; increase rollout.max_z_new_tokens or adjust sampling"
+                    )
+                z_actions = [int(x) for x in z_prefix] + [int(answer_token_id)]
+                z_types = _action_types_for_z(len(z_prefix))
+                z_infos.append(
+                    {
+                        "z_index": int(zi),
+                        "z_actions": z_actions,
+                        "z_action_types": z_types,
+                        "prefix_ids": prompt_ids + z_actions,
+                        "prefix_attn": prompt_attn + [1] * len(z_actions),
+                        "digit_rewards": [],
+                    }
+                )
+            z_infos_by_prompt[prompt_id] = z_infos
 
-        # Per-Z second group: sample n_digit_traces 5-digit completions.
-        digit_prompt_token_ids = [list(z["prefix_ids"]) for z in z_infos]
+    # Digit phase batched by rollout.vllm_batch_size (over parent Z prompts).
+    digit_jobs: List[Tuple[Dict[str, object], Dict[str, object]]] = []
+    for item in prepared:
+        prompt_id = int(item["prompt_id"])
+        if prompt_id not in z_infos_by_prompt:
+            raise RuntimeError(f"Missing z infos for prompt_id={prompt_id}")
+        for z in z_infos_by_prompt[prompt_id]:
+            digit_jobs.append((item, z))
+
+    for job_batch_idx in _iter_batches(list(range(len(digit_jobs))), vllm_batch_size):
+        batch_jobs = [digit_jobs[j] for j in job_batch_idx]
+        digit_prompt_token_ids = [[int(x) for x in list(z["prefix_ids"])] for (_item, z) in batch_jobs]
         digit_rows = vllm_engine.generate_digits(
             prompt_token_ids=digit_prompt_token_ids,
             num_samples_per_prompt=n_digit,
@@ -154,18 +186,23 @@ def collect_grpo_batch(
             min_p=0.0,
             repetition_penalty=1.0,
         )
-        if len(digit_rows) != n_z * n_digit:
+        expected_digits = len(batch_jobs) * n_digit
+        if len(digit_rows) != expected_digits:
             raise RuntimeError(
-                f"Digit rollout count mismatch: got={len(digit_rows)} expected={n_z * n_digit}"
+                f"Digit rollout count mismatch: got={len(digit_rows)} expected={expected_digits}"
             )
 
-        row_idx = 0
-        for z in z_infos:
+        row_pos = 0
+        for item, z in batch_jobs:
+            prompt_id = int(item["prompt_id"])
+            question = str(item["question"])
+            true_digits = [int(x) for x in list(item["true_digits"])]
+            sample_base = str(item["sample_id_base"])
             z_idx = int(z["z_index"])
-            z_children: List[Tuple[List[int], float, Dict[str, object]]] = []
+
             for di in range(n_digit):
-                digit_ids = [int(x) for x in list(digit_rows[row_idx])]
-                row_idx += 1
+                digit_ids = [int(x) for x in list(digit_rows[row_pos])]
+                row_pos += 1
                 if len(digit_ids) != 5:
                     raise RuntimeError(f"Digit phase must return exactly 5 tokens, got {len(digit_ids)}")
                 bad = [tid for tid in digit_ids if tid not in digit_allowed_set]
@@ -188,15 +225,11 @@ def collect_grpo_batch(
                 reward_scalar = float(reward_info["reward_final"])
                 total_digit_rollouts += 1
                 total_exact += int(bool(reward_info.get("exact_match", False)))
-
-                z_children.append((digit_ids, reward_scalar, reward_info))
                 z["digit_rewards"].append(reward_scalar)
 
                 child_mean = float(
                     sum(float(x) for x in z["digit_rewards"]) / float(len(z["digit_rewards"]))
                 )
-
-                # We assign centered advantages after all children are collected.
                 trajectories.append(
                     GRPOTrajectory(
                         prompt_id=prompt_id,
@@ -224,12 +257,27 @@ def collect_grpo_batch(
                     )
                 )
 
-        # Set digit advantages by parent-Z group mean-centering.
+    # Advantages and Z trajectories per prompt.
+    for item in prepared:
+        prompt_id = int(item["prompt_id"])
+        question = str(item["question"])
+        true_digits = [int(x) for x in list(item["true_digits"])]
+        prompt_ids = [int(x) for x in list(item["prompt_ids"])]
+        prompt_attn = [int(x) for x in list(item["prompt_attention_mask"])]
+        sample_base = str(item["sample_id_base"])
+        z_infos = z_infos_by_prompt.get(prompt_id, [])
+        if len(z_infos) != n_z:
+            raise RuntimeError(f"Missing Z infos for prompt_id={prompt_id}: got={len(z_infos)} expected={n_z}")
+
         for z in z_infos:
             z_idx = int(z["z_index"])
             rewards = [float(x) for x in list(z["digit_rewards"])]
+            if len(rewards) != n_digit:
+                raise RuntimeError(
+                    f"Digit reward count mismatch for prompt_id={prompt_id}, z={z_idx}: "
+                    f"got={len(rewards)} expected={n_digit}"
+                )
             centered = _group_mean_center(rewards)
-            # Update trajectories that belong to this prompt/z pair.
             match = [
                 t
                 for t in trajectories
@@ -243,13 +291,11 @@ def collect_grpo_batch(
                 t.advantages = [float(adv)] * len(t.actions)
                 t.reward_info["adv_centered"] = float(adv)
 
-        # Z-group reward: average of n_digit_traces under each Z.
         z_rewards = [
             float(sum(float(x) for x in list(z["digit_rewards"])) / float(n_digit))
             for z in z_infos
         ]
         z_centered = _group_mean_center(z_rewards)
-
         for z, z_r, z_adv in zip(z_infos, z_rewards, z_centered):
             z_idx = int(z["z_index"])
             trajectories.append(

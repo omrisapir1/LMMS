@@ -439,6 +439,12 @@ def _scheduled_answer_logit_bias(cfg: Config, step: int) -> float:
 
 
 def train(cfg: Config) -> None:
+    if bnb is None:
+        raise RuntimeError(
+            "bitsandbytes is required for GRPO training (AdamW8bit). "
+            "Install it and retry."
+        )
+
     if str(cfg.rollout.backend).lower() != "vllm":
         raise ValueError("GRPO currently supports rollout.backend='vllm' only")
 
@@ -491,24 +497,14 @@ def train(cfg: Config) -> None:
             model.resize_token_embeddings(len(tokenizer))
     pad_token_id = int(tokenizer.pad_token_id)
 
-    if bnb is not None:
-        optimizer = bnb.optim.AdamW8bit(
-            model.parameters(),
-            lr=float(cfg.train.lr),
-            betas=tuple(cfg.train.betas),
-            eps=float(cfg.train.eps),
-            weight_decay=float(cfg.train.weight_decay),
-        )
-        _log("Optimizer: bitsandbytes AdamW8bit")
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(cfg.train.lr),
-            betas=tuple(cfg.train.betas),
-            eps=float(cfg.train.eps),
-            weight_decay=float(cfg.train.weight_decay),
-        )
-        _log("Optimizer: torch AdamW (bitsandbytes not available)")
+    optimizer = bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=float(cfg.train.lr),
+        betas=tuple(cfg.train.betas),
+        eps=float(cfg.train.eps),
+        weight_decay=float(cfg.train.weight_decay),
+    )
+    _log("Optimizer: bitsandbytes AdamW8bit")
 
     vllm_kwargs = dict(cfg.rollout.vllm_engine_kwargs)
     if str(cfg.rollout.vllm_cuda_visible_devices).strip():

@@ -16,6 +16,8 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/GRPO/conf.py" beforeDir="false" afterPath="$PROJECT_DIR$/GRPO/conf.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/GRPO/rollout.py" beforeDir="false" afterPath="$PROJECT_DIR$/GRPO/rollout.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/GRPO/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/GRPO/train.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/.gitattributes" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/README.md" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/added_tokens.json" beforeDir="false" />
