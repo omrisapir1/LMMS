@@ -391,39 +391,45 @@ def _assign_old_logp(
     d_temperature: float,
     pad_token_id: int,
     use_bf16: bool,
+    eval_batch_size: int,
 ) -> None:
     if len(trajectories) == 0:
         return
 
-    cache = _build_trajectory_device_cache(
-        trajectories=trajectories,
-        device=device,
-        require_old_logp=False,
-    )
+    bs = max(1, int(eval_batch_size))
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (torch.cuda.is_available() and use_bf16)
         else nullcontext()
     )
-    with torch.no_grad(), amp_ctx:
-        logp_new, _entropy, _old, _adv, lengths = _action_stats_tensors_batched(
-            model=model,
-            trajs=trajectories,
-            traj_cache=cache,
-            z_allowed_t=z_allowed_t,
-            d_allowed_t=d_allowed_t,
-            z_id_to_local=z_id_to_local,
-            d_id_to_local=d_id_to_local,
-            z_temperature=float(z_temperature),
-            d_temperature=float(d_temperature),
-            pad_token_id=int(pad_token_id),
-        )
 
-    offset = 0
-    for traj, L in zip(trajectories, lengths.tolist()):
-        ll = int(L)
-        traj.old_logp = [float(x) for x in logp_new[offset : offset + ll].detach().cpu().tolist()]
-        offset += ll
+    for start in range(0, len(trajectories), bs):
+        end = min(start + bs, len(trajectories))
+        traj_chunk = list(trajectories[start:end])
+        cache = _build_trajectory_device_cache(
+            trajectories=traj_chunk,
+            device=device,
+            require_old_logp=False,
+        )
+        with torch.no_grad(), amp_ctx:
+            logp_new, _entropy, _old, _adv, lengths = _action_stats_tensors_batched(
+                model=model,
+                trajs=traj_chunk,
+                traj_cache=cache,
+                z_allowed_t=z_allowed_t,
+                d_allowed_t=d_allowed_t,
+                z_id_to_local=z_id_to_local,
+                d_id_to_local=d_id_to_local,
+                z_temperature=float(z_temperature),
+                d_temperature=float(d_temperature),
+                pad_token_id=int(pad_token_id),
+            )
+
+        offset = 0
+        for traj, L in zip(traj_chunk, lengths.tolist()):
+            ll = int(L)
+            traj.old_logp = [float(x) for x in logp_new[offset : offset + ll].detach().cpu().tolist()]
+            offset += ll
 
 
 def _scheduled_answer_logit_bias(cfg: Config, step: int) -> float:
@@ -560,6 +566,7 @@ def train(cfg: Config) -> None:
                 d_temperature=float(cfg.rollout.digit_temperature),
                 pad_token_id=pad_token_id,
                 use_bf16=bool(cfg.runtime.use_bf16),
+                eval_batch_size=int(cfg.runtime.old_logp_eval_batch_size),
             )
 
             cache_all = _build_trajectory_device_cache(trajectories=trajectories, device=device)
