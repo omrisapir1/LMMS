@@ -74,7 +74,7 @@ class GRPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-4
+    lr: float = 5e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
