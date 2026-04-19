@@ -23,7 +23,6 @@ from PPO.train import (
     _build_minibatch_order,
     _build_prompt_text,
     _extract_true_digits,
-    _load_rsft_trained_questions,
     _question_text,
 )
 from PPO.rollout_logger import RolloutLogger
@@ -368,21 +367,10 @@ def _save_checkpoint(
 def _prepare_dataset_rows(cfg: Config, tokenizer) -> List[Dict[str, object]]:
     ds = load_dataset(cfg.data.dataset_name, split=cfg.data.train_split)
 
-    trained_questions: set[str] = set()
-    path = str(getattr(cfg.data, "rsft_trained_questions_path", "") or "").strip()
-    if path:
-        try:
-            trained_questions, abs_path = _load_rsft_trained_questions(path)
-            _log(f"Loaded RSFT-trained question filter: {len(trained_questions)} from {abs_path}")
-        except Exception as exc:
-            _log(f"Skipping RSFT question filter due to load error: {type(exc).__name__}: {exc}")
-
     rows: List[Dict[str, object]] = []
     for i, sample in enumerate(ds):
         q = _question_text(sample.get(cfg.data.question_field))
         if not q:
-            continue
-        if trained_questions and q in trained_questions:
             continue
 
         true_digits = _extract_true_digits(

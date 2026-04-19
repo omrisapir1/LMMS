@@ -21,7 +21,6 @@ class DataConfig:
     question_field: str = "problem"
     answer_digits_field: str = "answer_digits"
     answer_field: str = "final_answer"
-    rsft_trained_questions_path: str = "PPO/rsft_trained_questions.json"
 
 
 @dataclass
