@@ -90,7 +90,7 @@ class RuntimeConfig:
     use_bf16: bool = True
     use_length_bucketing: bool = True
     length_bucket_width: int = 64
-    old_logp_eval_batch_size: int = 128
+    old_logp_eval_batch_size: int = 64
 
 @dataclass
 class LoggingConfig:
