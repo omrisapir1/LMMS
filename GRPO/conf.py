@@ -64,15 +64,17 @@ class RewardConfig:
 class GRPOConfig:
     clip_range: float = 0.2
     c_ent: float = 0.001
+    kl_coef: float = 0.01
     ppo_epochs: int = 1
-    minibatch_size: int = 256
+    minibatch_size: int = 128
     max_tokens_per_mini_batch: int = 4096*2
     max_grad_norm: float = 1.0
+    update_ref_model_each_steps: int = 100
 
 
 @dataclass
 class TrainConfig:
-    lr: float = 5e-6
+    lr: float = 1e-4
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
@@ -88,7 +90,7 @@ class RuntimeConfig:
     use_bf16: bool = True
     use_length_bucketing: bool = True
     length_bucket_width: int = 64
-    old_logp_eval_batch_size: int = 256
+    old_logp_eval_batch_size: int = 128
 
 @dataclass
 class LoggingConfig:

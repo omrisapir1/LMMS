@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import os
 import random
@@ -251,6 +252,7 @@ def _token_stats_two_phase(
 def _action_stats_tensors_batched(
     *,
     model,
+    ref_model,
     trajs: Sequence[GRPOTrajectory],
     traj_cache: Sequence[TrajectoryDeviceCache],
     z_allowed_t: torch.Tensor,
@@ -260,12 +262,12 @@ def _action_stats_tensors_batched(
     z_temperature: float,
     d_temperature: float,
     pad_token_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
     if not trajs:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
         empty_l = torch.empty((0,), dtype=torch.long, device=device)
-        return empty, empty, empty, empty, empty_l
+        return empty, empty, empty, empty, empty, empty_l
 
     cache = list(traj_cache)
     if len(cache) != len(trajs):
@@ -305,7 +307,7 @@ def _action_stats_tensors_batched(
     if nonzero_rows.numel() == 0:
         empty = torch.empty((0,), dtype=torch.float32, device=device)
         empty_l = torch.empty((0,), dtype=torch.long, device=device)
-        return empty, empty, empty, empty, empty_l
+        return empty, empty, empty, empty, empty, empty_l
 
     lengths = lengths_all.index_select(0, nonzero_rows)
     hidden_nz = hidden_all.index_select(0, nonzero_rows)
@@ -337,7 +339,76 @@ def _action_stats_tensors_batched(
     if bool(invalid.any()):
         raise RuntimeError("Found actions not in allowed action vocab for phase")
 
-    return logp_new, entropy_new, old_logp, advantages, lengths
+    if ref_model is None:
+        logp_ref = logp_new.detach()
+    else:
+        ref_device = next(ref_model.parameters()).device
+        if ref_device == device:
+            ref_input_ids = input_ids
+            ref_attention_mask = attention_mask
+            nonzero_rows_ref = nonzero_rows
+            batch_ids_ref = batch_ids
+            state_positions_ref = state_positions
+            action_ids_ref = action_ids
+            action_phase_ref = action_phase
+            z_id_to_local_ref = z_id_to_local
+            d_id_to_local_ref = d_id_to_local
+            z_allowed_ref = z_allowed_t
+            d_allowed_ref = d_allowed_t
+        else:
+            ref_input_ids = input_ids.to(ref_device)
+            ref_attention_mask = attention_mask.to(ref_device)
+            nonzero_rows_ref = nonzero_rows.to(ref_device)
+            batch_ids_ref = batch_ids.to(ref_device)
+            state_positions_ref = state_positions.to(ref_device)
+            action_ids_ref = action_ids.to(ref_device)
+            action_phase_ref = action_phase.to(ref_device)
+            z_id_to_local_ref = z_id_to_local.to(ref_device)
+            d_id_to_local_ref = d_id_to_local.to(ref_device)
+            z_allowed_ref = z_allowed_t.to(ref_device)
+            d_allowed_ref = d_allowed_t.to(ref_device)
+
+        ref_base_model = ref_model.get_submodule(ref_model.base_model_prefix)
+        with torch.no_grad():
+            ref_out = ref_base_model(
+                input_ids=ref_input_ids,
+                attention_mask=ref_attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        ref_hidden_all = ref_out.last_hidden_state
+        ref_hidden_nz = ref_hidden_all.index_select(0, nonzero_rows_ref)
+        ref_h_states = ref_hidden_nz[batch_ids_ref, state_positions_ref]
+        ref_lm_head = ref_model.get_output_embeddings()
+        if ref_lm_head is None:
+            raise RuntimeError("Reference model output embeddings are unavailable")
+        ref_weight = ref_lm_head.weight
+        ref_z_w = ref_weight.index_select(0, z_allowed_ref)
+        ref_d_w = ref_weight.index_select(0, d_allowed_ref)
+        ref_bias = getattr(ref_lm_head, "bias", None)
+        ref_z_b = ref_bias.index_select(0, z_allowed_ref) if ref_bias is not None else None
+        ref_d_b = ref_bias.index_select(0, d_allowed_ref) if ref_bias is not None else None
+        with torch.no_grad():
+            logp_ref, _entropy_ref, invalid_ref = _token_stats_two_phase(
+                ref_h_states,
+                action_ids_ref,
+                action_phase_ref,
+                ref_z_w,
+                ref_z_b,
+                ref_d_w,
+                ref_d_b,
+                z_id_to_local_ref,
+                d_id_to_local_ref,
+                float(z_temperature),
+                float(d_temperature),
+            )
+        if bool(invalid_ref.any()):
+            raise RuntimeError("Found actions not in allowed action vocab for ref phase")
+        if logp_ref.device != device:
+            logp_ref = logp_ref.to(device)
+
+    return logp_new, logp_ref, entropy_new, old_logp, advantages, lengths
 
 
 def _save_checkpoint(
@@ -408,6 +479,7 @@ def _prepare_dataset_rows(cfg: Config, tokenizer) -> List[Dict[str, object]]:
 def _assign_old_logp(
     *,
     model,
+    ref_model,
     trajectories: Sequence[GRPOTrajectory],
     device: torch.device,
     z_allowed_t: torch.Tensor,
@@ -439,8 +511,9 @@ def _assign_old_logp(
             require_old_logp=False,
         )
         with torch.no_grad(), amp_ctx:
-            logp_new, _entropy, _old, _adv, lengths = _action_stats_tensors_batched(
+            logp_new, _logp_ref, _entropy, _old, _adv, lengths = _action_stats_tensors_batched(
                 model=model,
+                ref_model=ref_model,
                 trajs=traj_chunk,
                 traj_cache=cache,
                 z_allowed_t=z_allowed_t,
@@ -499,6 +572,19 @@ def train(cfg: Config) -> None:
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
+    use_ref_model = float(cfg.grpo.kl_coef) > 0.0
+    ref_model = None
+    if use_ref_model:
+        ref_model = copy.deepcopy(model)
+        ref_model.to(device)
+        ref_model.gradient_checkpointing_enable()
+        ref_model.config.use_cache = False
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        _log(f"Reference model enabled (kl_coef={float(cfg.grpo.kl_coef):.6f})")
+    else:
+        _log("Reference model disabled (grpo.kl_coef <= 0)")
 
     answer_token_id = int(resolve_answer_token_id(tokenizer, answer_token=cfg.model.answer_token))
     validate_answer_token_single(tokenizer, cfg.model.answer_token, answer_token_id)
@@ -587,6 +673,7 @@ def train(cfg: Config) -> None:
 
             _assign_old_logp(
                 model=model,
+                ref_model=None,
                 trajectories=trajectories,
                 device=device,
                 z_allowed_t=z_allowed_t,
@@ -628,6 +715,8 @@ def train(cfg: Config) -> None:
             total_loss = 0.0
             total_pg = 0.0
             total_ent = 0.0
+            total_kl = 0.0
+            total_kl_pen = 0.0
             diag_token_count = 0.0
             diag_clip_count = 0.0
             diag_abs_logp_delta_sum = 0.0
@@ -662,8 +751,9 @@ def train(cfg: Config) -> None:
                     cache_mb = [cache_all[i] for i in idxs]
 
                     with amp_ctx:
-                        logp_new, entropy, logp_old, adv, _lengths = _action_stats_tensors_batched(
+                        logp_new, logp_ref, entropy, logp_old, adv, _lengths = _action_stats_tensors_batched(
                             model=model,
+                            ref_model=ref_model,
                             trajs=traj_mb,
                             traj_cache=cache_mb,
                             z_allowed_t=z_allowed_t,
@@ -684,9 +774,12 @@ def train(cfg: Config) -> None:
                         clipped_mask = ((ratio < (1.0 - float(cfg.grpo.clip_range))) | (ratio > (1.0 + float(cfg.grpo.clip_range))))
                         s1 = ratio * adv
                         s2 = ratio_clip * adv
+                        kl_tok = logp_new - logp_ref
+                        kl_mean = kl_tok.mean()
+                        kl_penalty = float(cfg.grpo.kl_coef) * kl_mean
                         pg_obj = torch.minimum(s1, s2).mean()
                         ent_mean = entropy.mean()
-                        loss = -pg_obj
+                        loss = -pg_obj + kl_penalty
                         scaled_loss = loss / float(max(1, int(cfg.train.grad_accum_steps)))
 
                     scaled_loss.backward()
@@ -694,6 +787,8 @@ def train(cfg: Config) -> None:
                     total_loss += float(loss.detach().item())
                     total_pg += float(pg_obj.detach().item())
                     total_ent += float(ent_mean.detach().item())
+                    total_kl += float(kl_mean.detach().item())
+                    total_kl_pen += float(kl_penalty.detach().item())
                     tok_n = float(ratio.numel())
                     diag_token_count += tok_n
                     diag_clip_count += float(clipped_mask.float().sum().detach().item())
@@ -739,6 +834,8 @@ def train(cfg: Config) -> None:
                         f"loss={(total_loss/max(1, updates_done)):.4f}",
                         f"pg={(total_pg/max(1, updates_done)):.4f}",
                         f"ent={(total_ent/max(1, updates_done)):.4f}",
+                        f"kl={(total_kl/max(1, updates_done)):.4f}",
+                        f"kl_pen={(total_kl_pen/max(1, updates_done)):.4f}",
                         f"clip_frac={clip_frac:.4f}",
                         f"abs_logp_delta={mean_abs_logp_delta:.4f}",
                         f"ratio_mean={ratio_mean:.4f}",
@@ -747,6 +844,15 @@ def train(cfg: Config) -> None:
                     ]
                 )
             )
+
+            if (
+                ref_model is not None
+                and int(cfg.grpo.update_ref_model_each_steps) > 0
+                and (int(step) % int(cfg.grpo.update_ref_model_each_steps) == 0)
+            ):
+                ref_model.load_state_dict(model.state_dict(), strict=True)
+                ref_model.eval()
+                _log(f"Reference model sync at step={step}")
 
             if int(cfg.train.save_every) > 0 and (step % int(cfg.train.save_every) == 0):
                 _save_checkpoint(
