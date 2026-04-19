@@ -34,7 +34,7 @@ class RolloutConfig:
     z_top_p: float = 0.95
     z_min_p: float = 0.03
     z_repetition_penalty: float = 1.1
-    answer_start_logit_bias: float = -1
+    answer_start_logit_bias: float = 0
     steps_for_linear_schaduler_logit_bias: int = 200
     digit_temperature: float = 1.0
     digit_top_p: float = 0.9
