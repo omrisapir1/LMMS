@@ -20,8 +20,6 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/gimme/hs_gimme/db_facade/mongo_utils.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/gimme/hs_gimme/db_facade/mongo_utils.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/.gitattributes" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/README.md" beforeDir="false" />
@@ -65,7 +63,7 @@
     </option>
   </component>
   <component name="Git.Settings">
-    <option name="RECENT_GIT_ROOT_PATH" value="$USER_HOME$/hiredscore/git/continuity-planning-service" />
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
     <option name="ROOT_SYNC" value="DONT_SYNC" />
   </component>
   <component name="HighlightingSettingsPerFile">
@@ -107,7 +105,7 @@
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "master",
+    "git-widget-placeholder": "main",
     "last_opened_file_path": "/Users/omri.sapir/learning/LMMS/RSFT",
     "node.js.detected.package.eslint": "true",
     "node.js.detected.package.tslint": "true",
