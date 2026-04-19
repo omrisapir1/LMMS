@@ -66,7 +66,7 @@ class GRPOConfig:
     clip_range: float = 0.2
     c_ent: float = 0.001
     ppo_epochs: int = 1
-    minibatch_size: int = 1
+    minibatch_size: int = 16
     max_grad_norm: float = 1.0
 
 
