@@ -49,7 +49,7 @@ class RolloutConfig:
     vllm_engine_kwargs: Dict[str, Any] = field(default_factory=dict)
     torch_device: str = "cuda:0"
     vllm_cuda_visible_devices: str = "1"
-    prompts_per_update: int = 16
+    prompts_per_update: int = 1
 
 
 @dataclass

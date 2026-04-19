@@ -26,6 +26,7 @@ from PPO.train import (
     _load_rsft_trained_questions,
     _question_text,
 )
+from PPO.rollout_logger import RolloutLogger
 from PPO.vllm_rollout import VLLMRolloutEngine
 
 _RUN_LOG_PATH: Optional[str] = None
@@ -494,6 +495,7 @@ def train(cfg: Config) -> None:
     d_id_to_local[d_allowed_t] = torch.arange(d_allowed_t.numel(), dtype=torch.long, device=device)
 
     rows = _prepare_dataset_rows(cfg, tokenizer)
+    rollout_logger = RolloutLogger(os.path.join(cfg.train.output_dir, "rollouts"))
 
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
@@ -568,6 +570,27 @@ def train(cfg: Config) -> None:
                 use_bf16=bool(cfg.runtime.use_bf16),
                 eval_batch_size=int(cfg.runtime.old_logp_eval_batch_size),
             )
+
+            roll_rows: List[Dict[str, object]] = []
+            for traj in trajectories:
+                row = {
+                    "schema_version": 1,
+                    "id": traj.sample_id,
+                    "prompt_id": int(traj.prompt_id),
+                    "question": traj.question,
+                    "input_ids": traj.prompt_ids,
+                    "actions": traj.actions,
+                    "action_types": traj.action_types,
+                    "prompt_attention_mask": traj.prompt_attention_mask,
+                    "reward_info": traj.reward_info,
+                    "returns": traj.returns,
+                    "advantages": traj.advantages,
+                    "logp_old": traj.old_logp,
+                }
+                if bool(cfg.logging.log_action_tokens):
+                    row["action_tokens"] = tokenizer.convert_ids_to_tokens(traj.actions)
+                roll_rows.append(row)
+            rollout_path = rollout_logger.write_step(step=step, rows=roll_rows)
 
             cache_all = _build_trajectory_device_cache(trajectories=trajectories, device=device)
             seq_lens = [c.seq_len for c in cache_all]
@@ -656,6 +679,7 @@ def train(cfg: Config) -> None:
                         f"z_reward_mean={(sum(z_rewards)/len(z_rewards)) if z_rewards else 0.0:.4f}",
                         f"digit_exact_rate={rollout_stats.get('digit_exact_rate', 0.0):.4f}",
                         f"answer_logit_bias={float(answer_logit_bias):.4f}",
+                        f"rollout_jsonl={rollout_path}",
                         f"adv_abs_mean={(sum(adv_abs)/len(adv_abs)) if adv_abs else 0.0:.4f}",
                         f"loss={(total_loss/max(1, updates_done)):.4f}",
                         f"pg={(total_pg/max(1, updates_done)):.4f}",
