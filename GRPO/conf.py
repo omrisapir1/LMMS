@@ -34,7 +34,7 @@ class RolloutConfig:
     z_top_p: float = 0.95
     z_min_p: float = 0.03
     z_repetition_penalty: float = 1.1
-    answer_start_logit_bias: float = -3.0
+    answer_start_logit_bias: float = -5.0
     steps_for_linear_schaduler_logit_bias: int = 200
     digit_temperature: float = 1.0
     digit_top_p: float = 0.9
@@ -66,7 +66,8 @@ class GRPOConfig:
     clip_range: float = 0.2
     c_ent: float = 0.001
     ppo_epochs: int = 1
-    minibatch_size: int = 32
+    minibatch_size: int = 64
+    max_tokens_per_mini_batch: int = 4096
     max_grad_norm: float = 1.0
 
 

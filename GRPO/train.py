@@ -104,6 +104,44 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _iter_minibatch_indices(
+    *,
+    order: Sequence[int],
+    seq_lens: Sequence[int],
+    max_examples: int,
+    max_tokens: int,
+) -> List[List[int]]:
+    mb = max(1, int(max_examples))
+    tok_cap = int(max_tokens)
+    out: List[List[int]] = []
+    if tok_cap <= 0:
+        for start in range(0, len(order), mb):
+            out.append([int(x) for x in order[start : start + mb]])
+        return out
+
+    cur: List[int] = []
+    cur_tok = 0
+    for idx in order:
+        i = int(idx)
+        tok = int(seq_lens[i]) if i < len(seq_lens) else 0
+        if tok < 0:
+            tok = 0
+
+        would_exceed_examples = len(cur) >= mb
+        would_exceed_tokens = (len(cur) > 0) and (cur_tok + tok > tok_cap)
+        if would_exceed_examples or would_exceed_tokens:
+            out.append(list(cur))
+            cur = []
+            cur_tok = 0
+
+        cur.append(i)
+        cur_tok += tok
+
+    if cur:
+        out.append(list(cur))
+    return out
+
+
 def _phase_id(action_type: str) -> int:
     t = str(action_type)
     if t in ("z", "answer"):
@@ -619,8 +657,14 @@ def train(cfg: Config) -> None:
                 )
 
                 mb = max(1, int(cfg.grpo.minibatch_size))
-                for start in range(0, len(order), mb):
-                    idxs = order[start : start + mb]
+                mb_tok_cap = int(getattr(cfg.grpo, "max_tokens_per_mini_batch", 0))
+                idx_batches = _iter_minibatch_indices(
+                    order=order,
+                    seq_lens=seq_lens,
+                    max_examples=mb,
+                    max_tokens=mb_tok_cap,
+                )
+                for idxs in idx_batches:
                     traj_mb = [trajectories[i] for i in idxs]
                     cache_mb = [cache_all[i] for i in idxs]
 
@@ -647,7 +691,7 @@ def train(cfg: Config) -> None:
                         s2 = ratio_clip * adv
                         pg_obj = torch.minimum(s1, s2).mean()
                         ent_mean = entropy.mean()
-                        loss = -(pg_obj + float(cfg.grpo.c_ent) * ent_mean)
+                        loss = -pg_obj
                         scaled_loss = loss / float(max(1, int(cfg.train.grad_accum_steps)))
 
                     scaled_loss.backward()
