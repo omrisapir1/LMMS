@@ -116,6 +116,7 @@ def _build_trajectory_device_cache(
     *,
     trajectories: Sequence[GRPOTrajectory],
     device: torch.device,
+    require_old_logp: bool = True,
 ) -> List[TrajectoryDeviceCache]:
     out: List[TrajectoryDeviceCache] = []
     for traj in trajectories:
@@ -123,7 +124,7 @@ def _build_trajectory_device_cache(
         action_len = int(len(traj.actions))
         if action_len != len(traj.action_types):
             raise RuntimeError("actions/action_types length mismatch")
-        if action_len != len(traj.old_logp):
+        if require_old_logp and action_len != len(traj.old_logp):
             raise RuntimeError("actions/old_logp length mismatch")
         if action_len != len(traj.advantages):
             raise RuntimeError("actions/advantages length mismatch")
@@ -144,6 +145,12 @@ def _build_trajectory_device_cache(
         else:
             state_positions = torch.empty((0,), dtype=torch.long, device=device)
 
+        old_logp_vals = list(traj.old_logp)
+        if not require_old_logp and len(old_logp_vals) == 0:
+            old_logp_vals = [0.0] * action_len
+        elif len(old_logp_vals) != action_len:
+            raise RuntimeError("actions/old_logp length mismatch")
+
         out.append(
             TrajectoryDeviceCache(
                 seq_ids=seq_ids,
@@ -153,7 +160,7 @@ def _build_trajectory_device_cache(
                 state_positions=state_positions,
                 seq_len=int(seq_ids.numel()),
                 action_len=action_len,
-                old_logp=torch.tensor(traj.old_logp, dtype=torch.float32, device=device),
+                old_logp=torch.tensor(old_logp_vals, dtype=torch.float32, device=device),
                 advantages=torch.tensor(traj.advantages, dtype=torch.float32, device=device),
             )
         )
@@ -388,7 +395,11 @@ def _assign_old_logp(
     if len(trajectories) == 0:
         return
 
-    cache = _build_trajectory_device_cache(trajectories=trajectories, device=device)
+    cache = _build_trajectory_device_cache(
+        trajectories=trajectories,
+        device=device,
+        require_old_logp=False,
+    )
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (torch.cuda.is_available() and use_bf16)
