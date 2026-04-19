@@ -30,7 +30,10 @@ from PPO.vllm_rollout import VLLMRolloutEngine
 
 _RUN_LOG_PATH: Optional[str] = None
 
-import bitsandbytes as bnb  # type: ignore
+try:
+    import bitsandbytes as bnb  # type: ignore
+except Exception:
+    bnb = None
 
 
 
@@ -412,17 +415,7 @@ def _assign_old_logp(
         offset += ll
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    cfg = Config()
-    for kv in args.set:
-        if "=" not in kv:
-            raise ValueError(f"Invalid --set format: {kv!r}")
-        key, raw = kv.split("=", 1)
-        _apply_override(cfg, key.strip(), raw.strip())
-
+def train(cfg: Config) -> None:
     if str(cfg.rollout.backend).lower() != "vllm":
         raise ValueError("GRPO currently supports rollout.backend='vllm' only")
 
@@ -658,6 +651,19 @@ def main() -> None:
             vllm_engine.close()
         except Exception:
             pass
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    cfg = Config()
+    for kv in args.set:
+        if "=" not in kv:
+            raise ValueError(f"Invalid --set format: {kv!r}")
+        key, raw = kv.split("=", 1)
+        _apply_override(cfg, key.strip(), raw.strip())
+    train(cfg)
 
 
 if __name__ == "__main__":

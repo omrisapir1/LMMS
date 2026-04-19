@@ -7,8 +7,6 @@
     <list default="true" id="acd00e1c-b137-4c66-ae6e-7c76fadcc727" name="Changes" comment="important">
       <change afterPath="$USER_HOME$/hiredscore/git/hiring-navigator-agent/src/brain_agents_service/hs_brain_agents/recruiter_agent/__init__.py" afterDir="false" />
       <change afterPath="$USER_HOME$/hiredscore/git/hiring-navigator-agent/src/brain_agents_service/hs_brain_agents/recruiter_agent/graph.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/RSFT/KAggle_DEMO.ipynb" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/RSFT/final.parquet" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/application_insights/application_insights_service/hs_application_insights_service/skills.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/application_insights/application_insights_service/hs_application_insights_service/skills.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pdm.lock" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pdm.lock" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pyproject.toml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/brain_mlops/data_lake/pyproject.toml" afterDir="false" />
@@ -18,6 +16,7 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/GRPO/conf.py" beforeDir="false" afterPath="$PROJECT_DIR$/GRPO/conf.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/.gitattributes" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/README.md" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/added_tokens.json" beforeDir="false" />
@@ -34,7 +33,6 @@
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/tokenizer.json" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/tokenizer_config.json" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/vocab.json" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

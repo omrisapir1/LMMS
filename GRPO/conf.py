@@ -28,7 +28,7 @@ class DataConfig:
 class RolloutConfig:
     backend: str = "vllm"
     n_z_traces: int = 8
-    n_digit_traces: int = 4
+    n_digit_traces: int = 6
     max_z_new_tokens: int = MAX_TOKENS
     z_temperature: float = 1.2
     z_top_p: float = 0.95
