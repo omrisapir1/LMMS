@@ -34,7 +34,7 @@ class RolloutConfig:
     z_top_p: float = 0.95
     z_min_p: float = 0.03
     z_repetition_penalty: float = 1.1
-    answer_start_logit_bias: float = -8
+    answer_start_logit_bias: float = -2.0
     steps_for_linear_schaduler_logit_bias: int = 200
     digit_temperature: float = 1.0
     digit_top_p: float = 0.9
@@ -72,7 +72,7 @@ class GRPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 5e-6
+    lr: float = 5e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8

@@ -146,15 +146,18 @@ def collect_grpo_batch(
                     answer_token_id=int(answer_token_id),
                     budget=int(cfg.rollout.max_z_new_tokens),
                 )
-                if not has_answer:
-                    raise RuntimeError(
-                        "GRPO Z phase must end with <ANSWER>; increase rollout.max_z_new_tokens or adjust sampling"
-                    )
-                z_actions = [int(x) for x in z_prefix] + [int(answer_token_id)]
-                z_types = _action_types_for_z(len(z_prefix))
+                if has_answer:
+                    z_actions = [int(x) for x in z_prefix] + [int(answer_token_id)]
+                    z_types = _action_types_for_z(len(z_prefix))
+                else:
+                    # If no <ANSWER> was emitted within budget, keep the sampled Z prefix and
+                    # assign zero reward later for this Z branch.
+                    z_actions = [int(x) for x in z_prefix]
+                    z_types = ["z"] * len(z_actions)
                 z_infos.append(
                     {
                         "z_index": int(zi),
+                        "has_answer": bool(has_answer),
                         "z_actions": z_actions,
                         "z_action_types": z_types,
                         "prefix_ids": prompt_ids + z_actions,
@@ -171,7 +174,8 @@ def collect_grpo_batch(
         if prompt_id not in z_infos_by_prompt:
             raise RuntimeError(f"Missing z infos for prompt_id={prompt_id}")
         for z in z_infos_by_prompt[prompt_id]:
-            digit_jobs.append((item, z))
+            if bool(z.get("has_answer", False)):
+                digit_jobs.append((item, z))
 
     for job_batch_idx in _iter_batches(list(range(len(digit_jobs))), vllm_batch_size):
         batch_jobs = [digit_jobs[j] for j in job_batch_idx]
@@ -271,6 +275,8 @@ def collect_grpo_batch(
 
         for z in z_infos:
             z_idx = int(z["z_index"])
+            if not bool(z.get("has_answer", False)):
+                continue
             rewards = [float(x) for x in list(z["digit_rewards"])]
             if len(rewards) != n_digit:
                 raise RuntimeError(
@@ -292,7 +298,11 @@ def collect_grpo_batch(
                 t.reward_info["adv_centered"] = float(adv)
 
         z_rewards = [
-            float(sum(float(x) for x in list(z["digit_rewards"])) / float(n_digit))
+            (
+                float(sum(float(x) for x in list(z["digit_rewards"])) / float(n_digit))
+                if bool(z.get("has_answer", False))
+                else 0.0
+            )
             for z in z_infos
         ]
         z_centered = _group_mean_center(z_rewards)
@@ -314,6 +324,7 @@ def collect_grpo_batch(
                         "phase": "z",
                         "prompt_id": prompt_id,
                         "z_index": z_idx,
+                        "has_answer": bool(z.get("has_answer", False)),
                         "z_reward_mean_children": float(z_r),
                         "adv_centered": float(z_adv),
                         "child_rewards": [float(x) for x in list(z["digit_rewards"])],
