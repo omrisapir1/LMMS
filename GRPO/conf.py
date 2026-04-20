@@ -66,7 +66,7 @@ class GRPOConfig:
     c_ent: float = 0.001
     kl_coef: float = 0.005
     ppo_epochs: int = 1
-    minibatch_size: int = 128
+    minibatch_size: int = 64
     max_tokens_per_mini_batch: int = 4096*2
     max_grad_norm: float = 1.0
     update_ref_model_each_steps: int = 150
@@ -74,7 +74,7 @@ class GRPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 1e-5
+    lr: float = 4e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
