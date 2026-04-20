@@ -31,9 +31,9 @@ class TreeConfig:
     # Root remains fixed.
     root_siblings: int = 4
     # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
-    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.75, 0, 0.0, 0., 0., 0., 0., 0.0])
-    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.5, 0, 0.0, 0.0, 0.0, 0., 0.0])
-    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.5, 1, 1.0, 1.0, 1.0, 1.0, 1.0])
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.25, 0, 0.0, 0., 0., 0., 0., 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.5, 0.25, 0, 0.0, 0.0, 0.0, 0., 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.75, 1, 1.0, 1.0, 1.0, 1.0, 1.0])
 
     # tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
     # tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
@@ -66,7 +66,7 @@ class RolloutConfig:
     digit_greedy: bool = False
     vllm_enabled: bool = True
     vllm_sync_every: int = 2
-    vllm_batch_size: int = BATCH_SIZE
+    vllm_batch_size: int = BATCH_SIZE * 100
     vllm_tp_size: int = 1
     gpu_memory_utilization: float = 0.95
     vllm_seed: Optional[int] = None
@@ -95,7 +95,7 @@ class PPOConfig:
     c_ent: float = 0.002
     kl_coef: float = 0.00
     ppo_epochs: int = 1
-    minibatch_size: int = 16
+    minibatch_size: int = 64
     max_grad_norm: float = 1.0
     update_ref_model_each_steps: int = 100
     value_warmup_steps: int = 0

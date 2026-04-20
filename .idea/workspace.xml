@@ -21,7 +21,7 @@
       <change beforePath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/data_access_service/.run/Flask (data_access_service.app).run.xml" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/gimme/hs_gimme/db_facade/mongo_utils.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/gimme/hs_gimme/db_facade/mongo_utils.py" afterDir="false" />
       <change beforePath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" beforeDir="false" afterPath="$USER_HOME$/hiredscore/git/smith/smith_client/hs_smith_client/input_validator.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/GRPO/conf.py" beforeDir="false" afterPath="$PROJECT_DIR$/GRPO/conf.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/.gitattributes" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/README.md" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/added_tokens.json" beforeDir="false" />
@@ -94,7 +94,7 @@
     "Python tests.pytest in test_fetch.py.executor": "Run",
     "Python tests.pytest in test_thought_embedding_pipeline.py.executor": "Run",
     "Python.action_space.executor": "Run",
-    "Python.fetch_test.executor": "Debug",
+    "Python.fetch_test.executor": "Run",
     "Python.generate.executor": "Run",
     "Python.generate_easy.executor": "Run",
     "Python.test_split.executor": "Run",
@@ -410,7 +410,7 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/LMMS$pytest_in_test_thought_embedding_pipeline_py.coverage" NAME="pytest in test_thought_embedding_pipeline.py Coverage Results" MODIFIED="1774599134367" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/LMMS$generate.coverage" NAME="generate Coverage Results" MODIFIED="1767196339473" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/data" />
-    <SUITE FILE_PATH="coverage/LMMS$fetch_test.coverage" NAME="fetch_test Coverage Results" MODIFIED="1776622112502" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$USER_HOME$/hiredscore/git/continuity-planning-service" />
+    <SUITE FILE_PATH="coverage/LMMS$fetch_test.coverage" NAME="fetch_test Coverage Results" MODIFIED="1776677207506" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$USER_HOME$/hiredscore/git/continuity-planning-service" />
     <SUITE FILE_PATH="coverage/LMMS$action_space.coverage" NAME="action_space Coverage Results" MODIFIED="1766429953964" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/env" />
     <SUITE FILE_PATH="coverage/LMMS$generate_easy.coverage" NAME="generate_easy Coverage Results" MODIFIED="1766647695636" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/data" />
     <SUITE FILE_PATH="coverage/LMMS$train.coverage" NAME="train Coverage Results" MODIFIED="1766918957297" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
