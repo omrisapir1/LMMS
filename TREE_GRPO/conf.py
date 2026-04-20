@@ -109,7 +109,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 16
+    grad_accum_steps: int = 32
     seed: int = 42
     output_dir: str = "./runs/tree_grpo_v1"
     save_every: int = 25
