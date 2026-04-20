@@ -104,7 +104,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 3e-5
+    lr: float = 2e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
