@@ -38,6 +38,7 @@
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/tokenizer.json" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/tokenizer_config.json" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/LMMS_RSFT/vocab.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/TREE_GRPO/conf.py" beforeDir="false" afterPath="$PROJECT_DIR$/TREE_GRPO/conf.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -94,7 +95,7 @@
     "Python tests.pytest in test_fetch.py.executor": "Run",
     "Python tests.pytest in test_thought_embedding_pipeline.py.executor": "Run",
     "Python.action_space.executor": "Run",
-    "Python.fetch_test.executor": "Run",
+    "Python.fetch_test.executor": "Debug",
     "Python.generate.executor": "Run",
     "Python.generate_easy.executor": "Run",
     "Python.test_split.executor": "Run",
@@ -410,7 +411,7 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/LMMS$pytest_in_test_thought_embedding_pipeline_py.coverage" NAME="pytest in test_thought_embedding_pipeline.py Coverage Results" MODIFIED="1774599134367" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/LMMS$generate.coverage" NAME="generate Coverage Results" MODIFIED="1767196339473" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/data" />
-    <SUITE FILE_PATH="coverage/LMMS$fetch_test.coverage" NAME="fetch_test Coverage Results" MODIFIED="1776677207506" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$USER_HOME$/hiredscore/git/continuity-planning-service" />
+    <SUITE FILE_PATH="coverage/LMMS$fetch_test.coverage" NAME="fetch_test Coverage Results" MODIFIED="1776689123112" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$USER_HOME$/hiredscore/git/continuity-planning-service" />
     <SUITE FILE_PATH="coverage/LMMS$action_space.coverage" NAME="action_space Coverage Results" MODIFIED="1766429953964" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/env" />
     <SUITE FILE_PATH="coverage/LMMS$generate_easy.coverage" NAME="generate_easy Coverage Results" MODIFIED="1766647695636" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/data" />
     <SUITE FILE_PATH="coverage/LMMS$train.coverage" NAME="train Coverage Results" MODIFIED="1766918957297" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

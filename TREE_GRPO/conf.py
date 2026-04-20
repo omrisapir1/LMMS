@@ -31,9 +31,9 @@ class TreeConfig:
     # Root remains fixed.
     root_siblings: int = 4
     # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
-    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.25, 0, 0.0, 0., 0., 0., 0., 0.0])
-    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.5, 0.25, 0, 0.0, 0.0, 0.0, 0., 0.0])
-    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.75, 1, 1.0, 1.0, 1.0, 1.0, 1.0])
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.0, 0., 0., 0., 0., 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.5, 0.25, 0.25, 0.0, 0.0, 0.0, 0., 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0])
 
     # tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
     # tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
@@ -43,7 +43,7 @@ class TreeConfig:
     max_leaves_per_prompt: int = 200
     max_active_nodes_per_wave: int = 256
     max_expanded_retry_nodes_per_level: int = 64
-    max_retry_depth: int = 30
+    max_retry_depth: int = 50
     c_retry: float = 0.05
     gamma: float = 0.95
     c_branch: float = 0.0
@@ -90,11 +90,11 @@ class RolloutConfig:
 
 @dataclass
 class PPOConfig:
-    clip_range: float = 0.2
+    clip_range: float = 0.1
     c_v: float = 0.25
     c_ent: float = 0.002
     kl_coef: float = 0.00
-    ppo_epochs: int = 1
+    ppo_epochs: int = 2
     minibatch_size: int = 64
     max_grad_norm: float = 1.0
     update_ref_model_each_steps: int = 100
@@ -104,7 +104,7 @@ class PPOConfig:
 
 @dataclass
 class TrainConfig:
-    lr: float = 2e-5
+    lr: float = 4e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
