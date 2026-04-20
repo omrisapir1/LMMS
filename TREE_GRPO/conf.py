@@ -48,7 +48,7 @@ class TreeConfig:
     gamma: float = 0.95
     c_branch: float = 0.0
     advantage_clip: float = 3.0
-    max_probes_per_prompt: int = 3
+    max_probes_per_prompt: int = 2
 
 
 @dataclass
