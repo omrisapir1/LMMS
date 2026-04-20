@@ -31,9 +31,9 @@ class TreeConfig:
     # Root remains fixed.
     root_siblings: int = 4
     # Depth-dependent branching policy for retry nodes, k in {4,2,1}.
-    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.5, 0.25, 0.0, 0., 0., 0., 0., 0.0])
-    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.25, 0.0, 0.0, 0.0, 0., 0.0])
-    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0])
+    tree_p4_by_depth: List[float] = field(default_factory=lambda: [0.25, 0, 0.0, 0., 0., 0., 0., 0.0])
+    tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.5, 0.25, 0, 0.0, 0.0, 0.0, 0., 0.0])
+    tree_p1_by_depth: List[float] = field(default_factory=lambda: [0.25, 0.75, 1, 1.0, 1.0, 1.0, 1.0, 1.0])
 
     # tree_p4_by_depth: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.35, 0.2, 0.1, 0.1, 0.0])
     # tree_p2_by_depth: List[float] = field(default_factory=lambda: [0.0, 0.25, 0.25, 0.35, 0.3, 0.2, 0.2, 0.0])
@@ -48,7 +48,7 @@ class TreeConfig:
     gamma: float = 0.95
     c_branch: float = 0.0
     advantage_clip: float = 3.0
-    max_probes_per_prompt: int = 2
+    max_probes_per_prompt: int = 5
 
 
 @dataclass
@@ -90,12 +90,12 @@ class RolloutConfig:
 
 @dataclass
 class PPOConfig:
-    clip_range: float = 0.1
+    clip_range: float = 0.2
     c_v: float = 0.25
     c_ent: float = 0.002
-    kl_coef: float = 0.005
+    kl_coef: float = 0.00
     ppo_epochs: int = 1
-    minibatch_size: int = 16
+    minibatch_size: int = 64
     max_grad_norm: float = 1.0
     update_ref_model_each_steps: int = 100
     value_warmup_steps: int = 0
@@ -109,7 +109,7 @@ class TrainConfig:
     betas: Tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     updates: int = 10000
-    grad_accum_steps: int = 64
+    grad_accum_steps: int = 16
     seed: int = 42
     output_dir: str = "./runs/tree_grpo_v1"
     save_every: int = 25
