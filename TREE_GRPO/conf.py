@@ -9,7 +9,7 @@ BATCH_SIZE = 16
 
 @dataclass
 class ModelConfig:
-    init_ckpt: str = "omrisap/LMMS_RSFT"
+    init_ckpt: str = "omrisap/nemotron-7B-12K"
     answer_token: str = "<ANSWER>"
     finalize_token: str = "<FINALIZE>"
     retry_token: str = "<RETRY>"
