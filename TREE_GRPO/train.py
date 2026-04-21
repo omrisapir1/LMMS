@@ -94,11 +94,11 @@ def _resolve_strict_vocab_token_id(tokenizer, token_text: str, *, label: str) ->
     return int(tok_id)
 
 
-def _ensure_tokens_on_tokenizer_and_model(*, tokenizer, model, tokens: Sequence[str], label: str) -> None:
+def _ensure_tokens_on_tokenizer_and_model(*, tokenizer, model, tokens: Sequence[str], label: str) -> bool:
     vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
     missing = [str(t) for t in tokens if str(t) not in vocab]
     if not missing:
-        return
+        return False
 
     added = int(tokenizer.add_special_tokens({"additional_special_tokens": missing}))
     if added <= 0:
@@ -116,6 +116,7 @@ def _ensure_tokens_on_tokenizer_and_model(*, tokenizer, model, tokens: Sequence[
         f"Added {int(added)} {label} tokenizer token(s): {missing} | "
         f"resized model vocab {old_vocab_size} -> {new_vocab_size}"
     )
+    return True
 
 
 def _save_checkpoint(
@@ -415,12 +416,19 @@ def train(cfg: Config) -> None:
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
-    _ensure_tokens_on_tokenizer_and_model(
+    verify_tokens_added = _ensure_tokens_on_tokenizer_and_model(
         tokenizer=tokenizer,
         model=model,
         tokens=[str(cfg.model.finalize_token), str(cfg.model.retry_token)],
         label="verify",
     )
+    rollout_init_ckpt = str(cfg.model.init_ckpt)
+    if verify_tokens_added:
+        rollout_init_ckpt = os.path.join(cfg.train.output_dir, "vllm_init_ckpt")
+        os.makedirs(rollout_init_ckpt, exist_ok=True)
+        model.save_pretrained(rollout_init_ckpt)
+        tokenizer.save_pretrained(rollout_init_ckpt)
+        _log(f"Saved expanded tokenizer/model for vLLM init: {rollout_init_ckpt}")
 
     use_ref_model = float(cfg.ppo.kl_coef) > 0.0
     ref_model: Optional[Any] = None
@@ -560,7 +568,7 @@ def train(cfg: Config) -> None:
 
         vllm_seed = int(cfg.rollout.vllm_seed) if cfg.rollout.vllm_seed is not None else int(cfg.train.seed)
         vllm_engine = VLLMRolloutEngine(
-            init_ckpt=cfg.model.init_ckpt,
+            init_ckpt=rollout_init_ckpt,
             tokenizer=tokenizer,
             answer_token_id=int(answer_token_id),
             z_allowed_token_ids=z_allowed_t.tolist(),
