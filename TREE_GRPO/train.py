@@ -94,6 +94,30 @@ def _resolve_strict_vocab_token_id(tokenizer, token_text: str, *, label: str) ->
     return int(tok_id)
 
 
+def _ensure_tokens_on_tokenizer_and_model(*, tokenizer, model, tokens: Sequence[str], label: str) -> None:
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    missing = [str(t) for t in tokens if str(t) not in vocab]
+    if not missing:
+        return
+
+    added = int(tokenizer.add_special_tokens({"additional_special_tokens": missing}))
+    if added <= 0:
+        added = int(tokenizer.add_tokens(missing, special_tokens=True))
+
+    vocab_after = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    still_missing = [str(t) for t in tokens if str(t) not in vocab_after]
+    if still_missing:
+        raise RuntimeError(f"Failed adding {label} tokens to tokenizer: {still_missing}")
+
+    old_vocab_size = int(model.get_input_embeddings().weight.size(0))
+    model.resize_token_embeddings(len(tokenizer))
+    new_vocab_size = int(model.get_input_embeddings().weight.size(0))
+    _log(
+        f"Added {int(added)} {label} tokenizer token(s): {missing} | "
+        f"resized model vocab {old_vocab_size} -> {new_vocab_size}"
+    )
+
+
 def _save_checkpoint(
     *,
     output_dir: str,
@@ -391,6 +415,12 @@ def train(cfg: Config) -> None:
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
+    _ensure_tokens_on_tokenizer_and_model(
+        tokenizer=tokenizer,
+        model=model,
+        tokens=[str(cfg.model.finalize_token), str(cfg.model.retry_token)],
+        label="verify",
+    )
 
     use_ref_model = float(cfg.ppo.kl_coef) > 0.0
     ref_model: Optional[Any] = None
